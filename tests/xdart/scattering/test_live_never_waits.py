@@ -3,15 +3,17 @@ to stop or be waiting forever"; "if something fails, a live run or a directory r
 should be logged and skipped and the remaining scan processing should continue").
 
 A frame waiting for its own metadata is noted in the log and the Live status ("the log output should show it is
-waiting"); after the limit ("10 s for .txt, 30 s for SPEC") it is processed without it ("a give up and processing
-without the metadata is preferable"), or, when the Run normalizes by a monitor from it, its scan is skipped from that
-frame on ("it is fine to skip the entire scan altogether"). A scan whose admission or construction fails is skipped
-and listed; the other scans continue ("Skip that scan, keep the Run"); an output that cannot be written still fails
-the Run ("Still fail the Run"). Real Runs over real TIFF + .txt or SPEC scans; the limits are shortened here."""
+waiting"). A frame without its .txt is never processed without it (maintainer, 2026-10-26: "If I have chosen txt as
+the metadata type, then any frame without the txt sidecar should be skipped. There is no need to wait. When the live
+loop comes back to an image and there's a txt sidecar present it gets integrated"): it is processed when its .txt
+lands, and left out once a later frame of its series has its own (his pick "Leave N out"). A sidecar that never holds
+still, or a SPEC row that never comes (30 s), skips its scan from that frame on. A scan whose admission or
+construction fails is skipped and listed; the other scans continue ("Skip that scan, keep the Run"); an output that
+cannot be written still fails the Run ("Still fail the Run"). Real Runs over real TIFF + .txt or SPEC scans; the
+limits are shortened here."""
 from __future__ import annotations
 
 import logging
-import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,12 +43,12 @@ def quick(monkeypatch):
     monkeypatch.setattr(run_executor, "_METADATA_WAIT_LIMIT_S", {"sidecar": 1., "spec": 1.})
 
 
-def _intent(tmp_path, raw, *, live, monitor=None):
+def _intent(tmp_path, raw, *, live, monitor=None, fmt="txt"):
     poni = tmp_path / "cal.poni"
     write_poni(poni)
     args = {"npt": 8, "method": "numpy", **({} if monitor is None else {"monitor": monitor})}
     return RunIntent(
-        source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format="txt"), poni_file=str(poni),
+        source_spec=DirectorySourceSpec(raw, suffixes=(".tif",), metadata_format=fmt), poni_file=str(poni),
         project_root=str(raw), save_path=str(tmp_path / "processed"), output_mode="Append",
         processing_mode="Int 1D", live_mode=live, max_cores=1, bai_1d_args=args)
 
@@ -64,8 +66,10 @@ def _messages(caplog):
     return [record.getMessage() for record in caplog.records]
 
 
-def test_a_frame_whose_txt_never_comes_is_noted_then_processed_without_it_and_the_scan_goes_on(
+def test_a_frame_whose_txt_never_comes_waits_and_is_left_out_once_a_later_frame_has_its_own(
         tmp_path, quick, caplog):
+    """The frame waits, noted, past the limit while nothing later has come, and is not processed without its .txt;
+    once the next frame lands with its own, it is left out and the series goes on in its output, numbered in order."""
     caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -77,21 +81,46 @@ def test_a_frame_whose_txt_never_comes_is_noted_then_processed_without_it_and_th
         _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)  # its .txt never comes
         _wait(executor, events, lambda values: _said(values, "waits for the metadata of grow_0002.tif") or _ended(
             values), timeout=15.)
-        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
+        _settle(executor, events, 1.5)  # past the 1 s limit
+        held = 2 in _labels(events, "grow")
         _frame(raw, "grow", 3, "txt", 3.0)
-        _wait(executor, events, lambda values: 3 in _labels(values, "grow") or _ended(values), timeout=15.)
+        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
         _settle(executor, events, .5)
+        skipped = executor._exact_run(identity).files_skipped
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert not held, "a frame was processed without its .txt"
+    assert skipped == 1, f"the left-out image is not counted as skipped: {skipped}"
+    assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
+    assert not _said(events, "stopped growing"), terminal
+    messages = _messages(caplog)
+    assert "grow_int1d.nexus is waiting for the metadata of grow_0002.tif [LIVE]" in messages
+    assert ("grow_int1d.nexus: grow_0002.tif is left out; its metadata did not arrive and a later frame's did "
+            "[LIVE]") in messages
+    assert "Left out without their metadata (1): grow_0002.tif (grow_int1d.nexus) [LIVE]" in messages
+    assert not any("processed without" in message for message in messages), messages
+    labels, i0, _epoch = _output(tmp_path, "grow")
+    assert (labels, i0) == ((1, 2), (1.0, 3.0)), (labels, i0)
+
+
+def test_a_frame_still_waiting_for_its_txt_when_the_run_stops_is_named_at_its_end(tmp_path, quick, caplog):
+    caplog.set_level(logging.INFO)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    executor, identity = _live(tmp_path, raw, 8909)
+    events = []
+    try:
+        _frame(raw, "grow", 1, "txt", 1.0)
+        _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
+        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)
+        _wait(executor, events, lambda values: _said(values, "waits for the metadata of grow_0002.tif") or _ended(
+            values), timeout=15.)
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
-    assert "waits for the metadata" not in terminal[0][1] and not _said(events, "stopped growing"), terminal
-    messages = _messages(caplog)
-    assert "grow_int1d.nexus is waiting for the metadata of grow_0002.tif [LIVE]" in messages
-    assert ("grow_int1d.nexus: the metadata of grow_0002.tif did not arrive within 1 s; the frame is processed "
-            "without it [LIVE]") in messages
-    assert "Processed without their metadata (1): grow_0002.tif (grow_int1d.nexus) [LIVE]" in messages
-    labels, i0, _epoch = _output(tmp_path, "grow")
-    assert labels == (1, 2, 3) and (i0[0], i0[2]) == (1.0, 3.0) and math.isnan(i0[1]), (labels, i0)
+    assert ("Not processed, still waiting for their metadata (1): grow_int1d.nexus waits for the metadata of "
+            "grow_0002.tif [LIVE]") in _messages(caplog)
+    assert _output(tmp_path, "grow")[:2] == ((1,), (1.0,))
 
 
 def test_a_sidecar_that_never_settles_skips_its_scan_from_that_frame_and_the_run_goes_on(
@@ -132,9 +161,9 @@ def test_a_sidecar_that_never_settles_skips_its_scan_from_that_frame_and_the_run
     assert _output(tmp_path, "grow")[0] == (1,) and _output(tmp_path, "next")[0] == (1,)
 
 
-def test_a_given_up_frame_whose_txt_lands_later_stops_its_scan_and_the_run_goes_on(tmp_path, quick, caplog):
-    """A frame processed without its metadata keeps that: its .txt landing later is never read as its metadata, and
-    its scan stops growing, named; a later scan runs."""
+def test_a_frame_whose_txt_lands_late_is_processed_with_it_and_its_scan_goes_on(tmp_path, quick, caplog):
+    """The frame waits past the limit with no later frame; its .txt lands, and the frame is processed with its own
+    values, the scan growing on."""
     caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -144,25 +173,20 @@ def test_a_given_up_frame_whose_txt_lands_later_stops_its_scan_and_the_run_goes_
         _frame(raw, "grow", 1, "txt", 1.0)
         _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
         _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)
+        _settle(executor, events, 1.5)  # past the 1 s limit
+        held = 2 in _labels(events, "grow")
+        _frame(raw, "grow", 2, "txt", 7.0, image=False)  # its .txt, late
         _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
-        _frame(raw, "grow", 2, "txt", 7.0, image=False)  # its .txt, after the Run stopped waiting for it
-        _settle(executor, events, 1.)
         _frame(raw, "grow", 3, "txt", 3.0)
-        _wait(executor, events, lambda values: _said(values, "grow_int1d.nexus stopped growing") or 3 in _labels(
-            values, "grow") or _ended(values), timeout=15.)
-        _frame(raw, "next", 1, "txt", 5.0)
-        _wait(executor, events, lambda values: 1 in _labels(values, "next") or _ended(values), timeout=15.)
+        _wait(executor, events, lambda values: 3 in _labels(values, "grow") or _ended(values), timeout=15.)
         _settle(executor, events, .5)
     finally:
         terminal = _stop(executor, identity, events)
+    assert not held, "a frame was processed without its .txt"
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
-    assert "grow_int1d.nexus stopped growing" in terminal[0][1], terminal
-    assert any(message.startswith("grow_int1d.nexus stops growing: it could not be processed")
-               and "the metadata of grow_0002.tif arrived after the Run stopped waiting for it" in message
-               for message in _messages(caplog))
-    labels, i0, _epoch = _output(tmp_path, "grow")
-    assert labels == (1, 2) and i0[0] == 1.0 and math.isnan(i0[1]), (labels, i0)
-    assert _output(tmp_path, "next")[0] == (1,)
+    assert not _said(events, "stopped growing"), terminal
+    assert "grow_int1d.nexus no longer waits for the metadata of grow_0002.tif [LIVE]" in _messages(caplog)
+    assert _output(tmp_path, "grow")[:2] == ((1, 2, 3), (1.0, 7.0, 3.0))
 
 
 def test_a_waited_frame_keeps_its_one_deadline_until_it_is_admitted(monkeypatch):
@@ -172,14 +196,14 @@ def test_a_waited_frame_keeps_its_one_deadline_until_it_is_admitted(monkeypatch)
     monkeypatch.setattr(run_executor, "monotonic", lambda: 100.5)
     watch, run = StandardRunExecutor(join_timeout=2.)._watch_metadata_wait, SimpleNamespace(live_waiting={})
     target, held = Path("grow_int1d.nexus"), ("grow_0002.tif", 100.0, "grow_int1d.nexus", "settling", 100.0)
-    waits, given_up = {"k": held}, {}
-    assert not watch(run, target, "k", None, waits, given_up, retried=True) and waits["k"] == held
-    assert not watch(run, target, "k", None, waits, given_up, admitted=frozenset({"grow_0001.tif"}))
+    waits = {"k": held}
+    assert not watch(run, target, "k", None, waits, retried=True) and waits["k"] == held
+    assert not watch(run, target, "k", None, waits, admitted=frozenset({"grow_0001.tif"}))
     assert waits["k"] == held
-    assert not watch(run, target, "k", None, waits, given_up, admitted=frozenset({"grow_0001.tif", "grow_0002.tif"}))
+    assert not watch(run, target, "k", None, waits, admitted=frozenset({"grow_0001.tif", "grow_0002.tif"}))
     assert "k" not in waits
     waits["k"] = held
-    assert not watch(run, target, "k", None, waits, given_up) and "k" not in waits  # covered, or its files left
+    assert not watch(run, target, "k", None, waits) and "k" not in waits  # covered, or its files left
 
 
 def test_a_spec_point_whose_row_never_comes_skips_its_scan_from_there(tmp_path, quick, caplog):
@@ -204,27 +228,35 @@ def test_a_spec_point_whose_row_never_comes_skips_its_scan_from_there(tmp_path, 
     assert spec_rows._output(tmp_path) == ((1,), (100.0,))
 
 
-def test_a_run_normalizing_by_a_monitor_skips_the_scan_whose_metadata_never_comes(tmp_path, quick, caplog):
+def test_a_run_normalizing_by_a_monitor_never_processes_a_frame_without_its_metadata(tmp_path, quick, caplog):
+    """Under Auto too: a Run whose monitor comes from the metadata expects a sidecar for every frame, so it asks
+    nothing. A frame whose I0 has not come waits past the limit while the next scan goes on, and is left out once a
+    later frame has its own."""
     caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
-    executor, identity = _live(tmp_path, raw, 8903, monitor="I0")
-    events = []
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True, monitor="I0", fmt="auto"), request_value=8903)
+    events, asked = [], []
     try:
         _frame(raw, "grow", 1, "txt", 1.0)
         _wait(executor, events, lambda values: 1 in _labels(values, "grow") or _ended(values))
-        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)  # its I0 never comes
-        _wait(executor, events, lambda values: _said(values, "stopped growing") or _ended(values), timeout=15.)
+        _frame(raw, "grow", 2, "txt", 2.0, sidecar=False)  # its I0 has not come
         _frame(raw, "next", 1, "txt", 5.0)  # the Run goes on with the next scan
         _wait(executor, events, lambda values: 1 in _labels(values, "next") or _ended(values), timeout=15.)
+        _settle(executor, events, 1.5)  # past the 1 s limit
+        held = 2 in _labels(events, "grow")
+        asked.append(executor.pending_metadata_question(identity))
+        _frame(raw, "grow", 3, "txt", 3.0)
+        _wait(executor, events, lambda values: 2 in _labels(values, "grow") or _ended(values), timeout=15.)
         _settle(executor, events, .5)
     finally:
         terminal = _stop(executor, identity, events)
+    assert not held and asked == [None], (held, asked)
     assert [kind for kind, _detail in terminal] == ["STOPPED"], terminal
-    assert "grow_int1d.nexus stopped growing" in terminal[0][1], terminal
-    assert any("did not arrive within 1 s, and this Run normalizes by a monitor from it" in message
-               for message in _messages(caplog))
-    assert _output(tmp_path, "grow")[0] == (1,) and _output(tmp_path, "next")[0] == (1,)
+    assert not _said(events, "stopped growing"), terminal
+    assert not any("asking whether" in message for message in _messages(caplog))
+    assert _output(tmp_path, "grow")[:2] == ((1, 2), (1.0, 3.0)) and _output(tmp_path, "next")[0] == (1,)
 
 
 def _refuse_admission_of(monkeypatch, stem):

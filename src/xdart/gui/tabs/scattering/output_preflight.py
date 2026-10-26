@@ -399,9 +399,9 @@ class LiveDirectoryAttempt:
     proof: LivePrefixProof | None = field(default=None, compare=False)
     # (image, kind): the member whose own metadata the group waits on, its
     # per-image sidecar (an explicit .txt/.pdi/.metadata, or Auto's) missing
-    # ("sidecar") or present but changing or unreadable ("settling"), its SPEC
-    # row not yet written ("spec"), or a sidecar that came for a frame the Run
-    # gave up waiting for ("late"). Never a container or a listing.
+    # ("sidecar"), missing while a later member has its own ("superseded": the
+    # Run leaves it out) or present but changing or unreadable ("settling"), or
+    # its SPEC row not yet written ("spec"). Never a container or a listing.
     waiting_metadata: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -1267,6 +1267,8 @@ def live_directory_groups(
     receipt: AdmissionReceipt,
     observation: object,
     assigned: dict[tuple[str, str], str] | None = None,
+    *,
+    left_out: frozenset[str] = frozenset(),
 ) -> tuple[LiveDirectoryGroup, ...]:
     """Project current name/stat revisions into output-shaped Live groups.
 
@@ -1275,6 +1277,8 @@ def live_directory_groups(
     :func:`materialize_live_directory_group`.  ``assigned``: the Run's output
     names so far (:func:`_name_output_groups`), seeded from its admission, so a
     scan keeps its output while a same-named scan appears in another folder.
+    ``left_out``: images the Run left out of their series (by path), for want of their own sidecar once a later frame
+    had its own; a series goes on without them and keeps its output.
     """
 
     deferred = receipt.deferred_directory
@@ -1293,9 +1297,12 @@ def live_directory_groups(
     ), assigned)
     groups: list[LiveDirectoryGroup] = []
     for candidates, name in _output_groups(receipt.candidate, current):
+        kept = tuple(candidate for candidate in candidates if str(Path(candidate.path)) not in left_out)
+        if not kept:
+            continue
         subset = RunCandidatePlan(
             current.generation,
-            candidates,
+            kept,
             current.root,
             current.recursive,
             current.name_filter,
@@ -1355,7 +1362,6 @@ def _live_metadata_ready(
     published_members: int = 0,
     observe_from: int = 0,
     spec_cache: dict | None = None,
-    given_up: frozenset[str] = frozenset(),
     sidecar_optional: bool = False,
 ) -> tuple[int, str, tuple[str, str] | None]:
     """How many leading members of a Live group have their metadata ready.
@@ -1364,13 +1370,11 @@ def _live_metadata_ready(
     Auto candidates look the same on two observations a poll apart, and a
     sidecar exists, so a new frame waits for a sidecar still being written or
     about to land: under Auto too, since an image can be readable well before
-    its sidecar is listed (the Run's wait for it ends in the executor, which
-    gives up on a frame whose sidecar never comes, after the same limit when
-    the Run has seen no sidecar at all).  ``sidecar_optional``: the Run has
-    found its folder has none (Auto, no sidecar seen, one frame already given
-    up on), so a member without one is ready once its observation holds
-    still, all the leading ones together, instead of each being given up on
-    in its own poll.
+    its sidecar is listed (the executor decides how long: a Run whose type is
+    a sidecar waits for each frame's own, and Auto with none found yet asks
+    once).  ``sidecar_optional``: the Run has settled it has no sidecars
+    (Auto), so a member without one is ready once its observation holds
+    still, all the leading ones together.
     Under SPEC a new member is ready once its own
     SPEC row is complete: a row is final once written, so one look suffices
     (qualification then proves it), and no other point's row is ever borrowed;
@@ -1381,11 +1385,9 @@ def _live_metadata_ready(
     rather than wait forever as if they were new frames.
     Also returns why the first member that is not ready waits and, when that
     is its own metadata, (its image's name, kind): "sidecar" (none yet),
-    "settling" (present, not yet holding still) or "spec"; None otherwise. A
-    member in ``given_up`` (by image name) holds nothing while it has no
-    sidecar: the Run waited long enough and processes it without its metadata.
-    One that has a sidecar now is "late": it is never read as that frame's
-    metadata (a SPEC row is never given up on: its scan is skipped).
+    "settling" (present, not yet holding still), "superseded" (none, and a
+    later frame of the series has its own: the Run leaves it out) or "spec";
+    None otherwise.
     """
 
     candidates = group.plan.candidates
@@ -1416,12 +1418,13 @@ def _live_metadata_ready(
         previous = observations.get(key)
         observations[key] = seen
         if ready < len(candidates):
+            if waiting is not None and waiting[1] == "sidecar" and seen:
+                # A later frame of this series has its own sidecar, so the waiting frame's is not coming: it is left
+                # out and the series goes on (maintainer, 2026-10-26: "any frame without the txt sidecar should be
+                # skipped. There is no need to wait"; his pick "Leave N out").
+                waiting = (waiting[0], "superseded")
             continue
-        if image.name in given_up:
-            if seen:  # given up on, then a sidecar came: never read as this frame's metadata
-                ready, reason, waiting = index, (f"the metadata of {image.name} arrived after the Run stopped "
-                                                 "waiting for it"), (image.name, "late")
-        elif (
+        if (
             previous != seen
             or any(revision is None for _path, revision in seen)
             or (not seen and index >= published_members and not sidecar_optional)
@@ -1522,7 +1525,6 @@ def materialize_live_directory_group(
     spec_cache: dict | None = None,
     owned: bool = False,
     committed_cache: dict | None = None,
-    given_up: frozenset[str] = frozenset(),
     sidecar_optional: bool = False,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
@@ -1538,8 +1540,7 @@ def materialize_live_directory_group(
     any other outcome is admitted as before. ``owned``: the Run is writing
     this output now, so its file is never read here. ``committed_cache``: the
     Run's committed counts by output file version (:func:`_committed_images`).
-    ``given_up``: images whose metadata the Run stopped waiting for;
-    ``sidecar_optional``: the Run knows the folder has none (:func:`_live_metadata_ready`).
+    ``sidecar_optional``: the Run has settled it has no sidecars (:func:`_live_metadata_ready`).
     """
 
     fresh = getattr(session, "fresh", frozenset())  # first seen by this poll's listing
@@ -1563,14 +1564,14 @@ def materialize_live_directory_group(
         count, waiting, sidecar = _live_metadata_ready(
             configuration, group, sidecar_observations,
             published_members=published_members,
-            observe_from=covered, spec_cache=spec_cache, given_up=given_up, sidecar_optional=sidecar_optional,
+            observe_from=covered, spec_cache=spec_cache, sidecar_optional=sidecar_optional,
         )
         if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
             # A publication proves its prefix in its own poll; one that changed
             # is looked at again in full, as an uncovered poll would.
             covered, (count, waiting, sidecar) = 0, _live_metadata_ready(
                 configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache,
-                given_up=given_up, sidecar_optional=sidecar_optional)
+                sidecar_optional=sidecar_optional)
         # A file only this listing has seen waits for another: one that ran during writes can show
         # a later file and miss an earlier one, and frame labels follow the members' order.
         if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],

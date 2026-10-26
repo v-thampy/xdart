@@ -741,6 +741,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._metadata_dialog = self._scan_roi_dialog = None
         self._metadata_plot_dialog = None
         self._peak_dialog = self._phase_dialog = None
+        # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
+        self._metadata_question_dialog = None
         self._scan_roi_generation = 0
         self._peak_generation = self._phase_generation = 0
         self._analysis_identity = None; self._analysis_kind = None
@@ -2885,7 +2887,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._metadata_operations.begin_close()
             self._processed_browser.retire_terminal(force=True)
             for dialog in (self._metadata_dialog, self._metadata_plot_dialog, self._scan_roi_dialog,
-                           self._peak_dialog, self._phase_dialog):
+                           self._peak_dialog, self._phase_dialog, self._metadata_question_dialog):
                 if dialog is not None: dialog.close()
             ScatteringWorkspace._clear_presentation_targets(self)
             self._source_selection.begin_close()
@@ -4085,6 +4087,49 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return True
         return not self._launch(token, result)
 
+    def _sync_metadata_question(self, executor) -> None:
+        """Live Auto's one question per Run (maintainer, 2026-10-26: his pick "Once per Run"): whether it expects a
+        metadata sidecar, asked while a frame waits for one and none has been found. The box leaves the page usable
+        and closes once the Run settles: an answer, a sidecar found, or none within the sidecar limit."""
+        identity = self._lifecycle.active_run_identity
+        pending = getattr(executor, "pending_metadata_question", None)
+        question = None if identity is None or pending is None else pending(identity)
+        dialog = self._metadata_question_dialog
+        if question is None:
+            if dialog is not None:
+                self._metadata_question_dialog = None
+                dialog.close()
+            return
+        if dialog is not None:
+            return
+        image, output = question
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle("Metadata sidecar")
+        dialog.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        dialog.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        dialog.setText(f"No metadata sidecar has been found for {image} ({output}), nor for any other image "
+                       "in this Run.")
+        dialog.setInformativeText(
+            "Does each image of this Run have a metadata sidecar?\n\n"
+            "Yes: each image waits for its own sidecar.\n"
+            "No: images are processed without metadata.\n\n"
+            "With no answer, images are processed without metadata after 150 s.")
+        expected = dialog.addButton(QtWidgets.QMessageBox.StandardButton.Yes)
+        dialog.addButton(QtWidgets.QMessageBox.StandardButton.No)
+        dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+        def finished(_result: int) -> None:
+            if self._metadata_question_dialog is dialog:
+                self._metadata_question_dialog = None
+            button = dialog.clickedButton()
+            if button is not None:
+                executor.answer_metadata_question(identity, button is expected)
+
+        dialog.finished.connect(finished)
+        self._metadata_question_dialog = dialog
+        dialog.show()
+
     def _confirm_append_overwrite(self, failure: AdmissionFailure) -> None:
         snapshot = self._intents.snapshot()
         if (snapshot.revision != failure.token.revision
@@ -4885,6 +4930,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     "Standard event drain failed", error
                 )
                 candidate = ()
+            self._sync_metadata_question(executor)
             if type(candidate) is tuple:
                 events = candidate
             else:

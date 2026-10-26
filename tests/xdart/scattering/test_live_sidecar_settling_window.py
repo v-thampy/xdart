@@ -12,8 +12,9 @@ from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 IMAGE = "scan_0002.tif"
 
 
-def test_a_frame_waits_up_to_150_s_for_its_txt() -> None:
-    # Maintainer, 2026-10-26: "exposures can be as long as 120s"; his pick "150 s". SPEC rows keep 30 s.
+def test_the_sidecar_limit_is_150_s() -> None:
+    # Maintainer, 2026-10-26: "exposures can be as long as 120s"; his pick "150 s": a sidecar's settling window and
+    # Auto's question. SPEC rows keep 30 s.
     assert run_executor._METADATA_WAIT_LIMIT_S == {"sidecar": 150.0, "spec": 30.0}
 
 
@@ -24,13 +25,12 @@ def _watcher(monkeypatch):
     monkeypatch.setattr(run_executor, "_METADATA_WAIT_LIMIT_S", {"sidecar": 10.0, "spec": 30.0})
     executor = StandardRunExecutor(join_timeout=1.)
     monkeypatch.setattr(executor, "_skip_live_append", lambda *args, **kwargs: skipped.append(kwargs["reason"]))
-    run = SimpleNamespace(live_waiting={}, sidecars_seen=True, metadata_given_up=[])
-    waits, given_up = {}, {}
+    run = SimpleNamespace(live_waiting={}, metadata_kind="sidecar")
+    waits = {}
 
     def look(at, waiting, **kwargs):
         clock[0] = at
-        return executor._watch_metadata_wait(run, Path("/out/scan_int1d.nexus"), "key", waiting, waits, given_up,
-                                             **kwargs)
+        return executor._watch_metadata_wait(run, Path("/out/scan_int1d.nexus"), "key", waiting, waits, **kwargs)
     return look, skipped, waits
 
 

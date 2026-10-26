@@ -331,9 +331,9 @@ def test_q3e_under_auto_a_sidecar_landing_just_after_its_image_is_picked_up(tmp_
     assert (labels, i0) == ((1, 2), (1.0, 2.0))
 
 
-def test_q3f_under_auto_a_frame_without_any_sidecar_is_still_reduced_without_metadata(tmp_path, monkeypatch):
-    """Under Auto a frame without a sidecar waits as an explicit format's does (the sidecar limit, here shortened:
-    C1 of the 03af89cc review), then is reduced without metadata."""
+def test_q3f_under_auto_once_a_sidecar_is_found_a_frame_without_one_waits_until_stop(tmp_path, monkeypatch):
+    """Under Auto the first sidecar found makes a sidecar the Run's type (maintainer, 2026-10-26), so a frame without
+    one waits for it past the limit, as an explicit format's does (q5), and is not reduced without metadata."""
     monkeypatch.setattr(run_executor, '_METADATA_WAIT_LIMIT_S', {'sidecar': 1., 'spec': 1.})
     raw = tmp_path / 'raw'
     raw.mkdir()
@@ -343,13 +343,11 @@ def test_q3f_under_auto_a_frame_without_any_sidecar_is_still_reduced_without_met
     try:
         _wait(executor, events, lambda values: 1 in _labels(values) or _terminal(values))
         _frame(raw, 'scan', 2, 'txt', 2.0, sidecar=False)  # no sidecar, ever
-        _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
-        _settle(executor, events)
+        _settle(executor, events, 2.)
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    labels, i0, _epoch = _output(tmp_path)
-    assert labels == (1, 2) and i0[0] == 1.0 and np.isnan(i0[1]), (labels, i0)
+    assert _output(tmp_path)[:2] == ((1,), (1.0,))
 
 
 def test_q4a_a_published_sidecar_changed_at_the_same_extent_stops_its_output_growing(tmp_path):
@@ -414,13 +412,13 @@ def test_q4b_a_published_sidecar_change_arriving_with_the_next_image_is_still_fe
 
 
 def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_that_output(tmp_path, monkeypatch):
-    """Frame 2 waited for its sidecar (the sidecar limit, here shortened: C1 of the 03af89cc review) and was
-    published without it; the sidecar landing after the Run stopped waiting stops the output, named for the late
-    metadata."""
+    """The Run found no sidecar and its question went unanswered (its limit, here shortened), so its frames were
+    published without metadata; a sidecar landing after its frame was published stops the output."""
     monkeypatch.setattr(run_executor, '_METADATA_WAIT_LIMIT_S', {'sidecar': 1., 'spec': 1.})
+    monkeypatch.setattr(run_executor, '_METADATA_QUESTION_AFTER_S', .3)
     raw = tmp_path / 'raw'
     raw.mkdir()
-    _frame(raw, 'scan', 1, 'txt', 1.0)
+    _frame(raw, 'scan', 1, 'txt', 1.0, sidecar=False)
     executor, identity = _run(tmp_path, raw, 'auto', 3240)
     events = []
     try:
@@ -436,7 +434,7 @@ def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert 'scan_int1d.nexus stopped growing' in terminal[0][1], terminal
     labels, i0, epoch = _output(tmp_path)
-    assert labels == (1, 2) and i0[0] == 1.0 and np.isnan(i0[1]), (labels, i0)
+    assert labels == (1, 2) and i0 is None, (labels, i0)
     assert (epoch['digest'], epoch['extent']) == (digest, published)
 
 

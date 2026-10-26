@@ -131,15 +131,18 @@ _CONTAINER_READ_CHUNK_FRAMES = 8
 _SOURCE_PREFETCH_FRAMES = 4
 _DISPLAY_PROJECTION_FRAMES = 8
 _LIVE_DIRECTORY_POLL_S = 0.1
-# A Live Run never waits forever (maintainer, 2026-10-24: "I don't want a live run to stop or be waiting forever"): a
-# frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the log and the Live status
-# ("When waiting for the sidecar the log output should show it is waiting"), and after the limit for its kind it is
-# processed without it; a SPEC row that never comes (an aborted point), or a Run that normalizes by a monitor from it,
-# skips its scan from that frame on instead ("it is fine to skip the entire scan altogether"). The limits were "10 s
-# for .txt, 30 s for SPEC"; a .txt now waits 150 s (maintainer, 2026-10-26: "exposures can be as long as 120s", his
-# pick "150 s"). It is only the most a frame waits: one whose .txt holds still and reads cleanly goes on at once.
+# A Live Run never stops for one frame (maintainer, 2026-10-24: "I don't want a live run to stop or be waiting
+# forever"): a frame waiting this long for its own metadata (its sidecar, or its SPEC row) is noted in the log and the
+# Live status ("When waiting for the sidecar the log output should show it is waiting") while the other scans and
+# folders go on. A frame without its sidecar waits for it, or for its series' next frame (_watch_metadata_wait); a SPEC
+# row that never comes (an aborted point, 30 s) or a sidecar that never holds still (150 s from its first sighting)
+# skips its scan from that frame on ("it is fine to skip the entire scan altogether"). The sidecar limit, 150 s
+# (maintainer, 2026-10-26: "exposures can be as long as 120s", his pick "150 s"), also bounds Auto's question.
 _METADATA_WAIT_NOTE_S = 2.0
 _METADATA_WAIT_LIMIT_S = {"sidecar": 150.0, "spec": 30.0}
+# Auto asks whether the Run expects sidecars once its first frame has waited this long for one: a .txt can land seconds
+# after its image (5.1 s on the share, beamline 2026-10-26), so one on its way raises no question.
+_METADATA_QUESTION_AFTER_S = 10.0
 # A scan found changed is reduced again once its images and sidecars have held still this long: an acquisition can
 # write an image and its sidecar a moment later (maintainer, 2026-10-24: "Go ahead with your recommendation").
 _REBUILD_QUIET_S = 2.0
@@ -537,11 +540,19 @@ class _StandardRun:
     # Live outputs whose next frame has waited _METADATA_WAIT_NOTE_S for its own
     # metadata: physical target key -> the note the status carries meanwhile.
     live_waiting: dict[str, str] = field(default_factory=dict)
-    # Frames a Live Run processed without their metadata: "image (output)".
-    metadata_given_up: list[str] = field(default_factory=list)
-    # Under Auto: whether the Run has seen a sidecar beside any image (its first listing shows one, or an admission
-    # read or waited on one). A folder with none does not hold each frame for the sidecar limit.
-    sidecars_seen: bool = False
+    # The Run's metadata type, for every folder (maintainer, 2026-10-26: "in a live or directory run, it can be assumed
+    # that the moment a metadata sidecar is found, that type applies universally for all data in all folders for that
+    # run"): "sidecar" from an explicit sidecar format or the first sidecar Auto finds anywhere, "none" once the Run
+    # settled it has none, None while Auto has found none yet.
+    metadata_kind: str | None = None
+    # Auto's one question while it has found no sidecar ("Once per Run"): (image, output name, asked at), and the
+    # page's answer (True: a sidecar is expected).
+    metadata_question: tuple[str, str, float] | None = None
+    metadata_answer: bool | None = None
+    # Images left out of their series for want of their own sidecar once a later frame had its own (his pick "Leave N
+    # out"), by path, and their names for the Run's end ("image (output)").
+    left_out: set[str] = field(default_factory=set)
+    metadata_left_out: list[str] = field(default_factory=list)
     current_file_total: int = 0
     current_files_incremental: bool = False
     resources: RunResources | None = None
@@ -1776,28 +1787,36 @@ class StandardRunExecutor:
 
     def _watch_metadata_wait(self, run: _StandardRun, target: Path | None, target_key: str,
                              waiting: tuple[str, str] | None,
-                             waits: dict[str, tuple[str, float, str, str, float | None]],
-                             given_up: dict[str, set[str]], *, retried: bool = False,
-                             admitted: frozenset[str] | None = None) -> bool:
+                             waits: dict[str, tuple[str, float, str, str, float | None]], *, retried: bool = False,
+                             admitted: frozenset[str] | None = None, paths=()) -> bool:
         """Time the frame an output waits on for its own metadata (``waiting``: (image, kind), as
         ``LiveDirectoryAttempt.waiting_metadata``; None: it no longer waits, its scan is covered, or its files left the
-        directory). After _METADATA_WAIT_NOTE_S the log and the Live status say so; after the limit for its kind a frame
-        whose sidecar never came is given up on, processed without its metadata; a sidecar still changing, a SPEC row,
-        or a Run normalizing by a monitor from it skips the scan from that frame on, as does a sidecar that comes for a
-        frame given up on (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on). ``retried``: the
-        attempt did not admit the frame, nor name it (its guarded read met the file changing, a listing was due, a
-        candidate went stale), or a READY attempt's ``admitted`` images leave it out (a fresh listing cut before it):
-        the same frame still waits, with its one deadline (Codex N-0c4e4237). A sidecar settles within the limit
-        from its first sighting, not from its image's: one first seen near the limit is looked at again, not skipped
-        at the look that found it (beamline 2026-10-25, four scans skipped "did not settle within 10 s" a moment after
-        their sidecars appeared); the first sighting is kept, so the whole wait stays bounded."""
-        if waiting is not None and waiting[1] == "late":
+        directory). After _METADATA_WAIT_NOTE_S the log and the Live status say so. A frame without its sidecar in a
+        Run whose type is a sidecar (``run.metadata_kind``) waits without a deadline while the other folders go on,
+        is processed when its sidecar comes, and is left out of its series once a later frame has its own
+        ("superseded": the next listing groups the series without it, from ``paths``; maintainer, 2026-10-26: "any
+        frame without the txt sidecar should be skipped. There is no need to wait. When the live loop comes back to an
+        image and there's a txt sidecar present it gets integrated", his pick "Leave N out"). Under Auto with no
+        sidecar found yet the Run asks once whether it expects one (:meth:`pending_metadata_question`); with no answer
+        within the sidecar limit it has none, and its frames are processed without metadata. A sidecar still changing
+        after the limit from its first sighting, or a SPEC row that never comes, skips the scan from that frame on
+        (Codex N-69301b5f NW-R1: never read unsettled; True: the caller moves on). ``retried``: the attempt did not
+        admit the frame, nor name it (its guarded read met the file changing, a listing was due, a candidate went
+        stale), or a READY attempt's ``admitted`` images leave it out (a fresh listing cut before it): the same frame
+        still waits, with its one deadline (Codex N-0c4e4237). A sidecar settles within the limit from its first
+        sighting, not from its image's: one first seen near the limit is looked at again, not skipped at the look that
+        found it (beamline 2026-10-25, four scans skipped "did not settle within 10 s" a moment after their sidecars
+        appeared); the first sighting is kept, so the whole wait stays bounded."""
+        now, held = monotonic(), waits.get(target_key)
+        if waiting is not None and waiting[1] == "superseded":
+            image, name = waiting[0], Path(target).name
             run.live_waiting.pop(target_key, None)
             waits.pop(target_key, None)
-            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
-                f"the metadata of {waiting[0]} arrived after the Run stopped waiting for it"))
-            return True
-        now, held = monotonic(), waits.get(target_key)
+            run.left_out.update(str(Path(path)) for path in paths if Path(path).name == image)
+            run.metadata_left_out.append(f"{image} ({name})")
+            log_events.event(logger, logging.WARNING, "%s: %s is left out; its metadata did not arrive and a later "
+                             "frame's did [LIVE]", name, image)
+            return False
         if waiting is None and held is not None and (retried or admitted is not None and held[0] not in admitted):
             waiting = (held[0], held[3])  # not admitted: it still waits, as it was last seen
         if waiting is None or held is None or held[0] != waiting[0]:
@@ -1813,21 +1832,15 @@ class StandardRunExecutor:
         sighted = held[4] if held[4] is not None else (now if waiting[1] == "settling" else None)
         waits[target_key] = (*held[:3], waiting[1], sighted)  # its latest kind, and its sidecar's first sighting
         (image, kind), name = waiting, held[2]
-        limit, quiet = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind], False
-        if kind == "sidecar" and not run.sidecars_seen and live_metadata_format(
-                run.configuration.thaw_source_spec()) == "auto":
-            # Auto, and no sidecar beside any image so far (an empty folder at the Run's start, or one whose images
-            # have none). The first frame waits the full limit, as any other does: a .txt can land seconds after its
-            # image (beamline 2026-10-26: 5.1 s on the share), and a frame given up on is processed without it, as are
-            # all later ones (maintainer, 2026-10-26: "shouldn't this be 150s like the other case then to be safe?").
-            # Once the Run has given up on one, the folder is known to have none and later frames go on at once,
-            # without a warning each.
-            quiet = bool(run.metadata_given_up)
-            limit = 0.0 if quiet else limit
+        if kind == "sidecar" and run.metadata_kind is None and now - held[1] >= _METADATA_QUESTION_AFTER_S:
+            self._settle_metadata_kind(run, image, name, now)
+        if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
+            run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
+            log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [LIVE]", name, image)
+        if kind == "sidecar":
+            return False  # it waits for its sidecar, its series' next frame's, or the Run's answer
+        limit = _METADATA_WAIT_LIMIT_S["sidecar" if kind == "settling" else kind]
         if now - (sighted if kind == "settling" else held[1]) < limit:
-            if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
-                run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
-                log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [LIVE]", name, image)
             return False
         run.live_waiting.pop(target_key, None)
         waits.pop(target_key, None)
@@ -1835,22 +1848,47 @@ class StandardRunExecutor:
             self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
                 f"the SPEC row of {image} did not arrive within {limit:g} s"))
             return True
-        if kind == "settling":  # present but never holding still: the rare case, not read unsettled
-            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
-                f"the metadata of {image} did not settle within {limit:g} s"))
-            return True
-        if any(str((args or {}).get("monitor") or "").strip()
-               for args in (run.configuration.bai_1d_args, run.configuration.bai_2d_args)):
-            self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
-                f"the metadata of {image} did not arrive within {limit:g} s, and this Run normalizes by a monitor "
-                "from it"))
-            return True
-        given_up.setdefault(target_key, set()).add(image)
-        if not quiet:
-            run.metadata_given_up.append(f"{image} ({name})")
-            log_events.event(logger, logging.WARNING, "%s: the metadata of %s did not arrive within %g s; the frame "
-                             "is processed without it [LIVE]", name, image, limit)
-        return False
+        # Present but never holding still: the rare case, not read unsettled.
+        self._skip_live_append(run, target, target_key, None, constructed=False, failed=True, reason=(
+            f"the metadata of {image} did not settle within {limit:g} s"))
+        return True
+
+    @staticmethod
+    def _settle_metadata_kind(run: _StandardRun, image: str, name: str, now: float) -> None:
+        """Auto, no sidecar found yet, and ``image`` of output ``name`` still without one: the Run asks once whether
+        it expects one (maintainer, 2026-10-26: his pick "Once per Run"), and settles its type on the page's answer,
+        or on "none" when none comes within the sidecar limit (his words: with no answer in 150 s, no metadata is
+        used). Its frames then wait for their sidecars, or go on without metadata, in every folder."""
+        if run.metadata_question is None:
+            run.metadata_question = (image, name, now)
+            log_events.event(logger, logging.INFO, "%s: %s has no metadata sidecar, and none has been found in this "
+                             "Run; asking whether it expects one [LIVE]", name, image)
+        answer, limit = run.metadata_answer, _METADATA_WAIT_LIMIT_S["sidecar"]
+        if answer is None and now - run.metadata_question[2] < limit:
+            return
+        run.metadata_kind = "sidecar" if answer else "none"
+        if answer:
+            log_events.event(logger, logging.INFO, "This Run expects a metadata sidecar for every frame: a frame "
+                             "waits for its own [LIVE]")
+        else:
+            log_events.event(logger, logging.WARNING, "This Run has no metadata sidecars (%s): its frames are "
+                             "processed without metadata [LIVE]",
+                             "answered" if answer is not None else f"no answer within {limit:g} s")
+
+    def pending_metadata_question(self, run_identity: RunIdentity) -> tuple[str, str] | None:
+        """The Live Run's open question (:meth:`_settle_metadata_kind`): (image, output name) while it waits for the
+        page's answer, else None (also once answered, before the Live loop's next look settles it)."""
+        run = self._exact_run(run_identity)
+        question = None if run is None or run.closed else run.metadata_question
+        return (None if question is None or run.metadata_kind is not None or run.metadata_answer is not None
+                else question[:2])
+
+    def answer_metadata_question(self, run_identity: RunIdentity, expected: bool) -> None:
+        """The page's answer to :meth:`pending_metadata_question`: whether the Run expects a metadata sidecar. The
+        Live loop settles the Run's type at its next look."""
+        run = self._exact_run(run_identity)
+        if run is not None and run.metadata_question is not None and run.metadata_kind is None:
+            run.metadata_answer = bool(expected)
 
     def _open_scan(self, run: _StandardRun, artifact: Path, note: str = "") -> None:
         """The log's ``New Scan`` banner for ``artifact``'s output (maintainer, 2026-10-24)."""
@@ -2575,9 +2613,8 @@ class StandardRunExecutor:
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
         # The image each output's next frame waits on for its metadata, since when, the output's name, the wait's
-        # latest kind and when its sidecar was first seen; and the images each output stopped waiting for.
+        # latest kind and when its sidecar was first seen.
         metadata_waits: dict[str, tuple[str, float, str, str, float | None]] = {}
-        given_up: dict[str, set[str]] = {}
         # A scan found changed: its revision and when its rebuild may start (_REBUILD_QUIET_S).
         rebuild_holds: dict[str, tuple[tuple[object, ...], float]] = {}
         # SPEC readiness by SPEC file revision: no read while it is unchanged.
@@ -2586,8 +2623,15 @@ class StandardRunExecutor:
         run.live_proofs.clear()
         # Each image's sidecar as last seen; admission waits until it holds still.
         sidecar_observations: dict[str, tuple[tuple[str, object], ...]] = {}
-        # Under Auto the folder's first listing says whether sidecars are expected at all (run.sidecars_seen).
-        meta_auto = live_metadata_format(configuration.thaw_source_spec()) == "auto"
+        # The Run's metadata type (run.metadata_kind): an explicit sidecar format is one from the start, as is Auto in
+        # a Run that normalizes by a monitor from its metadata (no frame can go without it); otherwise under Auto the
+        # first sidecar found anywhere makes it one, for every folder.
+        metadata_format = live_metadata_format(configuration.thaw_source_spec())
+        meta_auto = metadata_format == "auto"
+        if metadata_format not in (None, "auto", "spec") or meta_auto and any(
+                str((args or {}).get("monitor") or "").strip()
+                for args in (configuration.bai_1d_args, configuration.bai_2d_args)):
+            run.metadata_kind = "sidecar"
         discovered_paths: set[Path] = set(deferred.discovered_paths)
         processed_paths: set[Path] = set()
         skipped_paths: set[Path] = set()
@@ -2629,24 +2673,26 @@ class StandardRunExecutor:
 
         with _run_effect(run):
             publish(force=True)
-        # The last poll's groups, reused while the session returns the same
-        # Snapshot object under the same adapter registrations.
-        grouped: tuple[object, tuple[object, ...], tuple[object, ...]] | None = None
+        # The last poll's groups, reused while the session returns the same Snapshot object under the same adapter
+        # registrations and the Run has left out no image since.
+        grouped: tuple[object, tuple[object, ...], tuple[object, ...], frozenset[str]] | None = None
         polls, loop_started, first_written = 0, monotonic(), False
         while not run.stop_requested:
             times, poll_started = _LivePollTimes(), monotonic()
             with _run_effect(run):
                 observation = session.observe(refresh=True)
                 registry = registry_identity()
-                if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
+                left_out = frozenset(run.left_out)
+                if (grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry
+                        or grouped[3] != left_out):
                     grouped = (observation.discovered_snapshot, registry,
-                               live_directory_groups(receipt, observation, run.live_output_names))
+                               live_directory_groups(receipt, observation, run.live_output_names, left_out=left_out),
+                               left_out)
                 groups = grouped[2]
-                if polls == 0 and meta_auto:
-                    # What the folder holds at the Run's start: a sidecar beside any image means each frame waits for
-                    # its own as it lands; none means the first frame waits for its own, and once the Run has given
-                    # up on it the folder is known to have none.
-                    run.sidecars_seen = any_auto_sidecar(path for group in groups for path in group.physical_paths)
+                skipped_paths.update(Path(path) for path in left_out)  # a left-out image is skipped, not pending
+                if (polls == 0 and meta_auto and run.metadata_kind is None
+                        and any_auto_sidecar(path for group in groups for path in group.physical_paths)):
+                    run.metadata_kind = "sidecar"  # a sidecar beside any image at the Run's start: the Run's type
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
@@ -2755,7 +2801,7 @@ class StandardRunExecutor:
                         seen_targets.add(target_key)
                     settled_revisions[target_key] = (
                         revision, _CoveredOutput(group.target, signature, registry, monotonic()))
-                    self._watch_metadata_wait(run, group.target, target_key, None, metadata_waits, given_up)
+                    self._watch_metadata_wait(run, group.target, target_key, None, metadata_waits)
                     processed_paths.update(group.physical_paths)
                     publish(force=True)
                     continue
@@ -2794,23 +2840,23 @@ class StandardRunExecutor:
                             spec_cache=spec_cache,
                             owned=owned,
                             committed_cache=committed_counts,
-                            given_up=frozenset(given_up.get(target_key, ())),
-                            # The folder is known to have no sidecars (its first frame given up on after the limit):
-                            # its frames are admitted together, not one given up on per poll.
-                            sidecar_optional=meta_auto and not run.sidecars_seen and bool(run.metadata_given_up),
+                            # The Run has settled it has no sidecars: its frames are admitted together, unwaited.
+                            sidecar_optional=meta_auto and run.metadata_kind == "none",
                         )
                         times.add("admission", started)
-                        if not run.sidecars_seen and (
-                                attempt.waiting_metadata is not None and attempt.waiting_metadata[1] == "settling"
+                        if meta_auto and run.metadata_kind is None and (
+                                attempt.waiting_metadata is not None
+                                and attempt.waiting_metadata[1] in {"settling", "superseded"}
                                 or attempt.decision is not None and any(
                                     source.metadata_file is not None
                                     for source in attempt.decision.item.graph.stamp.metadata_sources)):
-                            run.sidecars_seen = True  # one is there: the frames after it wait for theirs
+                            run.metadata_kind = "sidecar"  # one is found: the Run's type, for every folder
                         if self._watch_metadata_wait(
-                                run, group.target, target_key, attempt.waiting_metadata, metadata_waits, given_up,
+                                run, group.target, target_key, attempt.waiting_metadata, metadata_waits,
                                 retried=attempt.state is ProbeState.IN_PROGRESS,
                                 admitted=None if attempt.decision is None else frozenset(
-                                    Path(member.path).name for member in attempt.decision.item.source_stamp.members)):
+                                    Path(member.path).name for member in attempt.decision.item.source_stamp.members),
+                                paths=group.physical_paths):
                             skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
                             publish(force=True)
                             continue
@@ -2839,15 +2885,6 @@ class StandardRunExecutor:
                             raise RuntimeError(
                                 "Live output target changed after JIT"
                             )
-                        late = next((Path(source.source_path).name for source in decision.item.graph.stamp.metadata_sources
-                                     if source.metadata_file is not None
-                                     and Path(source.source_path).name in given_up.get(target_key, ())), None)
-                        if late is not None:  # its sidecar came between the look and admission's read
-                            self._watch_metadata_wait(run, group.target, target_key, (late, "late"), metadata_waits,
-                                                      given_up)
-                            skipped_paths.update(path for path in group.physical_paths if path not in processed_paths)
-                            publish(force=True)
-                            continue
                         drift = (
                             () if retained is None or retained.decision is None
                             else published_metadata_drift(
@@ -3037,7 +3074,9 @@ class StandardRunExecutor:
                     return True
 
             for key in [key for key in metadata_waits if key not in polled]:  # its files left the directory
-                self._watch_metadata_wait(run, None, key, None, metadata_waits, given_up)
+                self._watch_metadata_wait(run, None, key, None, metadata_waits)
+            if run.metadata_question is not None and run.metadata_kind is None:  # its answer or deadline, waited or not
+                self._settle_metadata_kind(run, *run.metadata_question[:2], monotonic())
             with run.live_revision_lock:
                 containers = tuple(value.decision.item.source_stamp for value in run.processed_live_revisions.values()
                                    if value.decision is not None and value.decision.item.descriptor is not None)
@@ -4156,9 +4195,12 @@ class StandardRunExecutor:
         if warnings:
             log_events.event(logger, logging.WARNING, "Skipped in this Run (%d): %s [RUN-SKIPPED]", len(warnings),
                              "; ".join(warnings))
-        if run.metadata_given_up:
-            log_events.event(logger, logging.WARNING, "Processed without their metadata (%d): %s [LIVE]",
-                             len(run.metadata_given_up), ", ".join(run.metadata_given_up))
+        if run.metadata_left_out:
+            log_events.event(logger, logging.WARNING, "Left out without their metadata (%d): %s [LIVE]",
+                             len(run.metadata_left_out), ", ".join(run.metadata_left_out))
+        if run.live_waiting:
+            log_events.event(logger, logging.WARNING, "Not processed, still waiting for their metadata (%d): %s [LIVE]",
+                             len(run.live_waiting), "; ".join(run.live_waiting.values()))
         if receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING:
             logger.warning(
                 "[RUN-CLEANUP] output=%s retained=%s light_pending=%s failures=%s",
