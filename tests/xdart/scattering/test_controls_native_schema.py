@@ -241,3 +241,11 @@ def test_a_save_path_folder_with_a_dot_in_its_name_is_refused_saying_why(tmp_pat
             "file name."), refused
     for value in (str(project / "processed"), str(project / "result.nexus")):  # a folder; an output file
         assert reduce_control_edit(store.snapshot(), SAVE_PATH, value).save_path == value
+    # Codex N-2f830f81 DOT-R1: a leading dot is a dot (no suffix), and "." names the Project folder itself.
+    (project / ".processed").mkdir()
+    dotted_project = tmp_path / "project.v2"
+    dotted_project.mkdir()
+    for owner, value, name in ((project, str(project / ".processed"), ".processed"), (dotted_project, ".", "project.v2")):
+        snapshot = RunIntentStore(RunIntent(project_root=str(owner), save_path=str(owner / "outputs"))).snapshot()
+        refused = reduce_control_edit(snapshot, SAVE_PATH, value)
+        assert type(refused) is EditRefusal and f"may not contain a dot ({name})" in refused.reason, refused

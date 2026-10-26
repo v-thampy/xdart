@@ -1173,9 +1173,9 @@ def _control_value(
         if (path == MASK_FILE and type(value) is str and value
                 and Path(value).suffix.lower() not in {".edf", ".npy"}):
             return EditRefusal("Mask files must use .edf or .npy")
-        if path == SAVE_PATH and type(value) is str and _dotted_folder(intent, value):
+        if path == SAVE_PATH and type(value) is str and (dotted := _dotted_folder(intent, value)):
             return EditRefusal(
-                f"A Save Path folder name may not contain a dot ({Path(value).name}): a name with a dot reads "
+                f"A Save Path folder name may not contain a dot ({dotted}): a name with a dot reads "
                 "as an output file name. Rename the folder or choose another one.")
         return value if type(value) is str else EditRefusal("A path must be text.")
     if path == OUTPUT_MODE:
@@ -1206,20 +1206,22 @@ def _control_value(
     return EditRefusal("Unknown control.")
 
 
-def _dotted_folder(intent: RunIntent, value: str) -> bool:
-    """Whether *value* names an existing folder whose name has a dot, which a Save Path refuses (maintainer,
-    2026-10-26: "the save path can simply reject a folder name with a dot with a message saying why"; a notebook
-    replay reads such a name as an output file name). A dotted name that is no folder names an output file and stays
-    allowed; a relative one is the Project's, as the Save Path is."""
+def _dotted_folder(intent: RunIntent, value: str) -> str:
+    """The name of the existing folder *value* names when that name has a dot, which a Save Path refuses
+    (maintainer, 2026-10-26: "the save path can simply reject a folder name with a dot with a message saying why"; a
+    notebook replay reads such a name as an output file name), else "". A dotted name that is no folder names an
+    output file and stays allowed; a relative one is the Project's, as the Save Path is, and ``.`` or ``..`` name the
+    folder they lead to (Codex N-2f830f81 DOT-R1: ``.processed`` has a dot but no suffix)."""
     folder = Path(value).expanduser()
-    if not folder.suffix:
-        return False
     if not folder.is_absolute() and str(intent.project_root or "").strip():
         folder = Path(str(intent.project_root)).expanduser() / folder
+    name = Path(os.path.normpath(folder)).name
+    if "." not in name:
+        return ""
     try:
-        return folder.is_dir()
+        return name if Path(os.path.normpath(folder)).is_dir() else ""
     except OSError:
-        return False
+        return ""
 
 
 def _finite_float(value: object) -> float | EditRefusal:
