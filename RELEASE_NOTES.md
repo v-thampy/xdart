@@ -1,16 +1,103 @@
 # Release notes
 
-## 1.2.5 (unreleased)
+## 1.2.5 (2026-10-26)
+
+### Added
+
+- **Live says when it has caught up:** while a running Live Run has processed
+  everything it found, its status leads with "Up to date, waiting for new
+  images", for example "Running · Up to date, waiting for new images · 561
+  processed · 0 skipped · 561 discovered". A new image brings back the usual
+  counts.
+- **An Append says how many frames are new:** its status reads, for example,
+  "Running · 35 processed (5 new)" and, once it ends, "Complete · 35 Frames
+  (5 new)". Frames its outputs already held count as processed from the first
+  status.
+- **Warnings:** a button beside Show log (Int, Stitch and RSM) filters the log
+  to warnings, errors and each Run's start and end, with a count. Pressed while
+  the log is hidden, it shows the log.
+- **A clearer log:** each Run opens and closes with a dated `==== … ====` line,
+  and each scan with a `**** … ****` line and an empty line after it. A scan's
+  end gives its frames and processing time, and skipped, stopped and rebuilt
+  scans say plainly what happened. Timing and diagnostic lines appear only with
+  Config ▸ Debug ▸ Debug Logging or the new Config ▸ Debug ▸ Performance
+  Monitoring (remembered between sessions), and Debug Logging's lines no longer
+  count as warnings. The log panel is shown at start, and its Show log /
+  Warnings / Latest buttons sit at its bottom edge.
+- **Data Browser filter:** it takes the control panel's filename filter and
+  tooltip: space-separated terms must all match, `|` or OR gives alternatives,
+  `-term` or NOT excludes, and `*` lists every result. Left empty it is Auto,
+  the current mode's own results, shown faded ("Auto: _int2d"); Reintegrate and
+  Average results are no longer listed by default. A **Dirs** button shows or
+  hides folders in the scan list.
+- **Run controls:** Pause is yellow (❚❚ Pause) and Resume orange (❚▶ Resume).
+  While a Run cannot be browsed, the Data Browser's scan list is grayed out and
+  its tooltip says why; the running scan's frames stay available. Switching Live
+  on says to pause or stop the Run to browse the scans it has processed, and the
+  Metadata window says its table is available once the Run stops.
 
 ### Changed
 
-- Live rechecks settled input prefixes every ten seconds to reduce polling cost.
-  A change to an already processed input can remain unnoticed within that window.
-- Directory and Live outputs now use buffered writes by default, avoiding
-  repeated disk flushes over a share. Checkpoint and lineage checks remain;
-  a power loss can leave the newest output incomplete and require Replace.
-  An explicitly enabled durable flush runs at each checkpoint and once more after
-  the output closes, instead of three times per epoch.
+- **A Folder Run writes its outputs flat into the Save Path:** it no longer
+  recreates the source's subfolders there. A scan name found in more than one
+  folder is saved as `<folder>_<scan>` for each of them; names are compared
+  ignoring case, and a name already taken gets `_2`, `_3`, and so on. A Live Run
+  never renames a scan it has written. Notebook replay names and places outputs
+  the same way. Outputs that 1.2.4 wrote in subfolders are not continued: an
+  Append writes those scans again in the Save Path.
+- **The Save Path is never read as input:** a Folder Run with Subdirs leaves out
+  a Save Path inside its source folder, where 1.2.4 refused to run.
+- **A Save Path folder name may not contain a dot:** choosing or typing an
+  existing folder whose name has one is refused, saying why, since such a name
+  reads as an output file name.
+- **One metadata format per Run:** the first sidecar format a Run finds, or the
+  one you chose, applies to every image in every folder of that Run.
+  - In a Live Run, an image waits for its own sidecar while the other series
+    and folders go on, and it is processed when the sidecar lands. The status
+    and the log name an image that waits. An image whose series has moved on (a
+    later image already has its sidecar) is left out and counted as skipped.
+    The Run's end lists the images left out and those still waiting.
+  - Under Auto, when no image of the Run has a sidecar and one has waited 10 s,
+    xdart asks once whether this Run's images have sidecars. Yes: each image
+    waits for its own. No, or no answer within 150 s: images are processed
+    without metadata.
+  - A Folder Run with sidecars leaves out images without their own. The last
+    image of a series waits up to 150 s for its own only if it was written
+    within the last 150 s, so reprocessing old data never waits.
+  - In Live, a sidecar still changing 150 s after it appears, or a SPEC row
+    missing for 30 s, skips its scan from that frame on.
+- **A Live or Folder Run no longer stops at one scan:** a scan that cannot be
+  read, admitted or processed (an unreadable image, a grazing-incidence scan
+  without its incidence motor, a refused Append, and so on) is named in the log,
+  skipped and listed at the end, and the other scans go on; in Live only that
+  scan stops growing. A failure to write an output still fails the Run.
+- **Changed images are reprocessed:** when an image that a scan's output already
+  holds is replaced on disk by a new acquisition, an Append reduces that scan
+  again whole and replaces its output, and the end of the Run lists it under
+  "Scans reprocessed". For outputs written by 1.2.5, the start time in the
+  image's .txt sidecar tells a new acquisition from the same image copied
+  again, which is left alone; older outputs reprocess a re-dated image too. A
+  Live Run rebuilds a finished scan whose images changed on disk the same way;
+  the scan it is growing stops growing instead, and the next Run rebuilds it.
+  Stitch and RSM Append also treat an output as out of date when one of its
+  images changed size or modification time.
+- **An Append onto an output written by an earlier xdart skips that scan** when
+  its new frames carry the start-time column that output lacks (`epoch_local`,
+  see Fixes). The scan is named and the Run goes on; Replace reprocesses it.
+- **Overlay keeps its curves:** through a Run's scans, its end-of-Run Browse and
+  the next Run, in Live and Folder Runs alike. Only Clear, a change to an axis
+  the curves cannot share (q to q_ip, say) or a reintegration starts a new
+  overlay. A fast Run's curves are all drawn by its end: the Run keeps its
+  finished scans' 1-D curves in memory, within the display's memory budget, and
+  ends once they are drawn. Curves excluded in Overlay stay out of Sum and
+  Average.
+- **A Norm Channel stays on across a Run's scans,** each scan's frames
+  normalized by their own scan's values. A Run reads an already processed
+  output's saved values only while a Norm Channel is chosen.
+- **Legends name the scan:** curves are labelled by their scan (`b_1`, `b_2`),
+  never by the output's suffix (`b_int1d_1`), during a Run and in Browse.
+- **An Append ends on the last frame it processed,** even when already processed
+  scans follow it in the folder.
 - **Append adds new frames to the existing output in place:** xdart no longer
   copies a scan's output, or reads it in full, before and after adding the new
   frames; it opens the output and writes only the new frames. The same holds
@@ -19,6 +106,9 @@
   next Append skips it and says to use Replace, which rebuilds it from the
   images; if the output can no longer be opened at all, move or delete it, then
   run again. Stop is not a failure: the frames added before it are kept.
+- **A directory Append over a scan that grew reads only the new frames:** the
+  frames its output already holds (the same image names, sizes and times as its
+  saved record) are not read or checked again.
 - **A Run of many short series no longer rebuilds pyFAI's integration tables for
   each one:** xdart builds them once per Run and reuses them for every series
   with the same calibration, energy, mask and integration settings, in directory
@@ -30,7 +120,28 @@
   angles: 1.8 s per series before, 0.7 s once every angle is cached); the sensor
   parallax correction is reused too. Kept sets stay within the memory the Run is
   planned for, and at most 8 per kind. Energy scans and calibrations with a
-  spline or a detector flat field still build them for each series.
+  spline or a detector flat field still build them for each series. The tables
+  also stay built from one Run to the next while the settings are unchanged, so
+  a Run's first frame no longer waits for them, and on Windows the memory plan
+  now counts the PC's physical memory, so every worker's tables stay built. In
+  Standard mode a short series on a large detector (tables of 1 GiB or more)
+  starts only the workers whose tables are built, plus one per 16 frames, since
+  each new worker builds its own; long series, energy scans and Live runs use
+  every worker the Run is given.
+- **Live over many folders on a network share starts and polls faster:** it
+  reads a scan's images only once their metadata is ready, reuses directory
+  listings, and checks a complete TIFF from its header instead of decoding it.
+- Live rechecks settled input prefixes every ten seconds to reduce polling cost.
+  A change to an already processed input can remain unnoticed within that window.
+- Directory and Live outputs now use buffered writes by default, avoiding
+  repeated disk flushes over a share. Checkpoint and lineage checks remain;
+  a power loss can leave the newest output incomplete and require Replace.
+  An explicitly enabled durable flush runs at each checkpoint and once more after
+  the output closes, instead of three times per epoch.
+- **Stitch and RSM:** a queue goes on to its next prepared output after one
+  fails, while the form is unchanged, and its summary names the failures.
+  Stitch's default Save Path follows the Project folder as Int's does, and
+  Stitch and RSM Runs open and close with the same log lines as Int.
 
 ### Fixes
 
@@ -38,15 +149,33 @@
   already holds every frame, from the same image files at the same sizes and times
   and with the same settings, is now skipped at once. xdart no longer reads such a
   scan again, and no longer warns "same-extent source identity changed" when only
-  its metadata files or the file server's bookkeeping changed. A scan with new
-  frames still checks its earlier files before adding the new ones, and a changed
-  image still warns. To reprocess a scan whose metadata you changed, use Replace.
+  its metadata files or the file server's bookkeeping changed. A Live Run does the
+  same: it shows a scan processed earlier from its saved output instead of reading
+  it again. To reprocess a scan whose metadata you changed, use Replace.
+- **Windows network shares:** Windows can set a file's creation time a moment
+  after the file is written. Live and Append no longer take that for a changed
+  image, and Append recognizes outputs saved while it still counted.
 - **Append to an output on a network folder:** a run could stop with "writer begin
   incomplete: stream checkpoint failed identity verification" when the output's
   modification time moved a moment after xdart wrote it. Windows can set a file's
   final write time when the program closes it, and the reported failure fits that;
   xdart now records the file's state after that close. Not yet confirmed on the
   beamline share.
+- **A brief file error on a share** (a permission error, or WinError 64, while a
+  file is renamed into place) is retried at the next look instead of failing the
+  Run.
+- **An energy scan in q whose new frames reach beyond its grid:** a directory
+  Append reduces it again whole on the wider grid, where it failed the whole Run;
+  a Live Run keeps growing it on its first grid and drops the points outside it.
+- **Saved start times are exact:** an output stored each frame's start time
+  rounded to 128 s. It now keeps the full value, beside the clock time the .txt
+  records (`epoch_local`).
+- **The Save Path follows the Project folder** on Windows however the folder
+  dialog spells it (slashes, letter case).
+- **Browse keeps a scan's spelling on Windows:** its legend could show the name
+  in lower case.
+- **A refused Append says what differs:** the first image that differs, by name,
+  size or modification time, and what to do about it.
 - **The controls are no longer cut off at their right edge:** since 1.2.4's Show
   log, a window narrow enough to leave the controls column at its minimum width
   cut two pixels off the controls' right edge (Int, Stitch and RSM), and Int showed
