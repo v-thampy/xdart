@@ -500,6 +500,9 @@ class _StandardRun:
     frames_new: int = 0
     # An Append Run, which reports frames_new; kept here because cleanup drops the configuration before the end.
     appends: bool = False
+    # A Live Run's output name for each (folder, scan) so far: a scan keeps its output's name (flat outputs,
+    # output_preflight._name_output_groups).
+    live_output_names: dict[tuple[str, str], str] = field(default_factory=dict)
     # Scans a directory Append skipped instead of failing the run: (output, reason).
     append_skips: list[tuple[str, str, str]] = field(default_factory=list)
     # Scans an Append reduced again whole, their processed images changed on disk: (output, reason), once each
@@ -2593,7 +2596,8 @@ class StandardRunExecutor:
                 observation = session.observe(refresh=True)
                 registry = registry_identity()
                 if grouped is None or grouped[0] is not observation.discovered_snapshot or grouped[1] != registry:
-                    grouped = (observation.discovered_snapshot, registry, live_directory_groups(receipt, observation))
+                    grouped = (observation.discovered_snapshot, registry,
+                               live_directory_groups(receipt, observation, run.live_output_names))
                 groups = grouped[2]
                 if polls == 0 and meta_auto:
                     # What the folder holds at the Run's start: a sidecar beside any image means each frame waits for

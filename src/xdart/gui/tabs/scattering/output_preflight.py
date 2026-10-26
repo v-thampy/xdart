@@ -530,6 +530,7 @@ def _bounded_directory_plan(plan: RunCandidatePlan) -> RunCandidatePlan:
         plan.recursive,
         plan.name_filter,
         tuple(value[1] for value in aligned),
+        output_names=plan.output_names,
     )
 
 
@@ -578,7 +579,7 @@ def prepare_output(
         observation = session.observe(refresh=True)
         discovered = observation.discovered_snapshot
         complete_plan = RunCandidatePlan.from_snapshot(discovered)
-        bounded_plan = _bounded_directory_plan(complete_plan)
+        bounded_plan = _name_output_groups(_bounded_directory_plan(complete_plan))
         excluded = tuple(
             candidate
             for candidate in complete_plan.candidates
@@ -628,7 +629,7 @@ def prepare_output(
                 if cancelled():
                     raise RuntimeError("admission cancelled")
                 observation = session.observe(refresh=False)
-            plan = RunCandidatePlan.from_observation(observation)
+            plan = _name_output_groups(RunCandidatePlan.from_observation(observation))
             # A GI directory Run admits every scan before it starts: one that cannot be admitted (a GI motor missing
             # in a frame, a qualification error) is skipped and named, and the others run (maintainer, 2026-10-24:
             # "a live run or a directory run shouldn't stop").
@@ -637,7 +638,8 @@ def prepare_output(
                 try:
                     group_items = _directory_items(candidate, RunCandidatePlan(
                         plan.generation, group, plan.root, plan.recursive, plan.name_filter,
-                        tuple(plan.descriptor_for(value) for value in group)), cancelled=cancelled)
+                        tuple(plan.descriptor_for(value) for value in group), output_names=plan.output_names),
+                        cancelled=cancelled)
                     _validate_exact_tiff_gi_motor(intent, group_items)
                 except (ValueError, OSError) as error:
                     if isinstance(error, (SourceRevisionChanged, PointImagesRequired, InterruptedError)):
@@ -812,28 +814,8 @@ def _directory_target(
     name: str,
 ) -> Path:
     output_root = Path(configuration.save_path)
-    output_directory: Path | None = None
-    if _save_path_is_directory(output_root):
-        try:
-            relative_parent = candidate.path.parent.relative_to(plan.root)
-        except ValueError as error:
-            raise ValueError(
-                "directory candidate escaped admitted root: "
-                f"{candidate.path}"
-            ) from error
-        output_directory = output_root / relative_parent
-        try:
-            resolved_root = output_root.resolve(strict=False)
-            resolved_output = output_directory.resolve(strict=False)
-        except (OSError, RuntimeError) as error:
-            raise ValueError(
-                f"directory output could not be resolved: {output_directory}"
-            ) from error
-        if not resolved_output.is_relative_to(resolved_root):
-            raise ValueError(
-                "directory output escaped selected root: "
-                f"{output_directory}"
-            )
+    # Flat in the Save Path, as the eager branch of _directory_items places it.
+    output_directory = output_root if _save_path_is_directory(output_root) else None
     # Hand the directory DOWN as a directory (F1).  Passing it as a request
     # string let a dotted sub-folder read as a file and split the naming.
     directory, family = _run_output_naming(configuration, name, output_directory)
@@ -1283,12 +1265,15 @@ def live_group_coverage(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") 
 def live_directory_groups(
     receipt: AdmissionReceipt,
     observation: object,
+    assigned: dict[tuple[str, str], str] | None = None,
 ) -> tuple[LiveDirectoryGroup, ...]:
     """Project current name/stat revisions into output-shaped Live groups.
 
     This step opens no candidate content.  Exact content readiness remains a
     separate, Stop-aware JIT operation in
-    :func:`materialize_live_directory_group`.
+    :func:`materialize_live_directory_group`.  ``assigned``: the Run's output
+    names so far (:func:`_name_output_groups`), seeded from its admission, so a
+    scan keeps its output while a same-named scan appears in another folder.
     """
 
     deferred = receipt.deferred_directory
@@ -1300,9 +1285,11 @@ def live_directory_groups(
         or not deferred.candidates.matches_config(discovered)
     ):
         raise TypeError("live directory observation lost its admitted owner")
-    current = _bounded_directory_plan(
+    if assigned is not None and not assigned:
+        _name_output_groups(deferred.candidates, assigned)
+    current = _name_output_groups(_bounded_directory_plan(
         RunCandidatePlan.from_snapshot(discovered)
-    )
+    ), assigned)
     groups: list[LiveDirectoryGroup] = []
     for candidates, name in _output_groups(receipt.candidate, current):
         subset = RunCandidatePlan(
@@ -1311,6 +1298,7 @@ def live_directory_groups(
             current.root,
             current.recursive,
             current.name_filter,
+            output_names=current.output_names,
         )
         groups.append(LiveDirectoryGroup(
             subset,
@@ -1336,13 +1324,77 @@ def _output_groups(configuration: FrozenRunConfiguration | OutputCandidate,
     if series is not None and series.stem is not None:
         return ((tuple(sorted(plan.candidates, key=lambda value: series.key(value.path.name))), series.stem),) \
             if plan.candidates else ()
+    renamed = {(folder, scan): output for folder, scan, output in plan.output_names}
     groups = []
     for group in _directory_candidate_groups(plan):
         adapter = get_adapter(group[0].adapter_id)
         if adapter is None:
             raise ValueError(f"candidate {group[0].path} lost its adapter")
-        groups.append((group, adapter.scan_name(group[0].path)))
+        scan = adapter.scan_name(group[0].path)
+        groups.append((group, renamed.get((_group_folder(plan, group[0]), scan), scan)))
     return tuple(groups)
+
+
+def _group_folder(plan: RunCandidatePlan, candidate: Candidate) -> str:
+    """A scan's folder below the plan's root, as POSIX text (``.`` for the root)."""
+    try:
+        return candidate.path.parent.relative_to(plan.root).as_posix()
+    except ValueError as error:
+        raise ValueError(f"directory candidate escaped admitted root: {candidate.path}") from error
+
+
+def _container_output_name(plan: RunCandidatePlan, candidate: Candidate, name: str) -> str:
+    """A container's output name: the name its descriptor gives it, or the plan's when the plan renamed it (the plan
+    keys a container by its adapter's scan name, which the descriptor's mirrors, :func:`_name_output_groups`)."""
+    adapter = get_adapter(candidate.adapter_id)
+    if adapter is None or not plan.output_names:
+        return name
+    output = {(folder, key): value for folder, key, value in plan.output_names}.get(
+        (_group_folder(plan, candidate), adapter.scan_name(candidate.path)))
+    return name if output is None else output
+
+
+def _name_output_groups(plan: RunCandidatePlan, assigned: dict[tuple[str, str], str] | None = None
+                        ) -> RunCandidatePlan:
+    """``plan`` with its scans' output names: outputs go flat into the Save Path, so a scan name found in more than
+    one folder names each subfolder's output ``<folder>_<scan>`` (a nested folder's parts joined by ``_``) and a
+    root-level scan keeps its own (maintainer, 2026-10-25: "Prefix only on a clash"). Names are compared ignoring
+    case, as a Windows or macOS Save Path compares them, and no two scans share an output: a scan keeps its own name
+    before any is named after its folder, and a name already taken gets ``_2``, ``_3``, ... ``assigned`` (a Live
+    Run's, kept across its polls): the names its scans already have, which never change; a newcomer whose own name is
+    taken, or found in another folder, is named after its folder (a root-level one after the root's). Only the
+    renamed scans are recorded; every plan built from this one carries them."""
+    keys = []
+    for group in _directory_candidate_groups(plan):
+        adapter = get_adapter(group[0].adapter_id)
+        if adapter is None:
+            raise ValueError(f"candidate {group[0].path} lost its adapter")
+        keys.append((_group_folder(plan, group[0]), adapter.scan_name(group[0].path)))
+    known = {} if assigned is None else assigned
+    names = {key: known[key] for key in keys if key in known}
+    taken = {output.casefold() for output in known.values()}
+    folders: dict[str, set[str]] = {}
+    for folder, scan in (*known, *keys):
+        folders.setdefault(scan.casefold(), set()).add(folder)
+    newcomers = sorted(key for key in dict.fromkeys(keys) if key not in known)  # one order for every re-check
+    for folder, scan in newcomers:
+        if (len(folders[scan.casefold()]) == 1 or folder == ".") and scan.casefold() not in taken:
+            names[(folder, scan)] = scan
+            taken.add(scan.casefold())
+    for folder, scan in newcomers:
+        if (folder, scan) in names:
+            continue
+        output = base = f"{plan.root.name if folder == '.' else folder.replace('/', '_')}_{scan}"
+        count = 1
+        while output.casefold() in taken:
+            count += 1
+            output = f"{base}_{count}"
+        names[(folder, scan)] = output
+        taken.add(output.casefold())
+    if assigned is not None:
+        assigned.update(names)
+    renamed = tuple(sorted((folder, scan, output) for (folder, scan), output in names.items() if output != scan))
+    return plan if renamed == plan.output_names else replace(plan, output_names=renamed)
 
 
 def _live_metadata_ready(
@@ -1628,6 +1680,7 @@ def materialize_live_directory_group(
         group.plan.recursive,
         group.plan.name_filter,
         tuple(value.descriptor for value in observations),
+        output_names=group.plan.output_names,
     )
     registry, admitted = registry_identity(), []
     fmt = live_metadata_format(configuration.thaw_source_spec())
@@ -1761,6 +1814,7 @@ def materialize_deferred_output(
         plan.recursive,
         plan.name_filter,
         tuple(descriptors),
+        output_names=plan.output_names,
     )
     try:
         items = _directory_items(
@@ -1958,7 +2012,7 @@ def validate_admitted_receipt(
         if is_cancelled():
             raise RuntimeError("admission cancelled")
         observation = session.observe(refresh=False)
-    plan = RunCandidatePlan.from_observation(observation)
+    plan = _name_output_groups(RunCandidatePlan.from_observation(observation))
     skipped = {target for target, _kind, _reason in receipt.skipped_outputs}
     if skipped:  # a GI directory Run's admission skipped these scans: they are left out again, the others checked
         collected = []
@@ -1966,7 +2020,8 @@ def validate_admitted_receipt(
             if str(_directory_target(receipt.candidate, plan, group[0], name)) not in skipped:
                 collected.extend(_directory_items(receipt.candidate, RunCandidatePlan(
                     plan.generation, group, plan.root, plan.recursive, plan.name_filter,
-                    tuple(plan.descriptor_for(value) for value in group)), cancelled=is_cancelled))
+                    tuple(plan.descriptor_for(value) for value in group), output_names=plan.output_names),
+                    cancelled=is_cancelled))
         current_items = tuple(collected)
     else:
         current_items = _directory_items(
@@ -2347,10 +2402,9 @@ def _directory_items(
     spec_cache: dict | None = None,
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
-    resolved_output_root = None
     if _save_path_is_directory(output_root):
         try:
-            resolved_output_root = output_root.resolve(strict=False)
+            output_root.resolve(strict=False)
         except (OSError, RuntimeError) as error:
             raise ValueError(
                 f"directory output could not be resolved: {output_root}"
@@ -2431,7 +2485,8 @@ def _directory_items(
                 raise ValueError("processed output cannot be raw input")
             if descriptor.frame_count < 1:
                 continue
-            name = descriptor.scan_name or candidate.path.stem.removesuffix("_master")
+            name = _container_output_name(
+                plan, candidate, descriptor.scan_name or candidate.path.stem.removesuffix("_master"))
             spec = SourceSpec(
                 candidate.path, descriptor.kind,
                 entry=descriptor.resolved_entry or descriptor.requested_entry,
@@ -2447,34 +2502,10 @@ def _directory_items(
                 cancelled=cancelled, infer_point_images=not _is_live(configuration),
                 published_members=published_members, spec_cache=spec_cache,  # a container's published frames
             )
-        output_directory: Path | None = None
-        if _save_path_is_directory(output_root):
-            try:
-                relative_parent = candidate.path.parent.relative_to(plan.root)
-            except ValueError as error:
-                raise ValueError(
-                    "directory candidate escaped admitted root: "
-                    f"{candidate.path}"
-                ) from error
-            # Preserve each recursive source parent beneath the selected
-            # output directory. Direct children keep the existing flat shape;
-            # the shared owner still makes the filename/suffix decision.
-            output_directory = output_root / relative_parent
-            try:
-                resolved_output = output_directory.resolve(strict=False)
-            except (OSError, RuntimeError) as error:
-                raise ValueError(
-                    "directory output could not be resolved: "
-                    f"{output_directory}"
-                ) from error
-            if (
-                resolved_output_root is None
-                or not resolved_output.is_relative_to(resolved_output_root)
-            ):
-                raise ValueError(
-                    "directory output escaped selected root: "
-                    f"{output_directory}"
-                )
+        # Every output goes flat into the Save Path; a scan name found in two folders is named after its folder
+        # (the plan's output_names, _name_output_groups). Maintainer, 2026-10-25: "in the early avatars xdart would
+        # save all processed files in the parent save path ... it makes it much easier to navigate".
+        output_directory = output_root if _save_path_is_directory(output_root) else None
         # ONE naming decision feeds both the filename and the recorded family,
         # so they cannot diverge for a dotted sub-folder (Fable F1).
         directory, family = _run_output_naming(

@@ -139,8 +139,17 @@ class RunCandidatePlan:
     recursive: bool
     name_filter: str | None
     descriptors: tuple[ContainerDescriptor | None, ...] = ()
+    #: The scans whose output takes another name than their own: (folder relative to ``root`` as POSIX text, ``.``
+    #: for the root; scan name; output name). A directory Run writes every output flat into its Save Path, so a scan
+    #: name found in two folders names each subfolder's output after its folder (maintainer, 2026-10-25, "Prefix only
+    #: on a clash"); a plan carries the names it was given to every plan built from it.
+    output_names: tuple[tuple[str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
+        if type(self.output_names) is not tuple or not all(
+                type(entry) is tuple and len(entry) == 3 and all(type(value) is str and value for value in entry)
+                for entry in self.output_names):
+            raise TypeError("RunCandidatePlan output_names must be (folder, scan, output) text triples")
         descriptors = tuple(self.descriptors)
         if not descriptors:
             descriptors = (None,) * len(self.candidates)
@@ -389,7 +398,8 @@ class RunCandidatePlan:
         return RunCandidatePlan(
             generation=self.generation, candidates=new_candidates,
             root=self.root, recursive=self.recursive,
-            name_filter=self.name_filter, descriptors=new_descriptors)
+            name_filter=self.name_filter, descriptors=new_descriptors,
+            output_names=self.output_names)
 
 
 __all__ = ["RunCandidatePlan", "RunReconcile", "SupersededPlanError"]

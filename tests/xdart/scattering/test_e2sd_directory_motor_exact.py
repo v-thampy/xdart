@@ -1847,7 +1847,7 @@ def test_deferred_raw_series_uses_known_shape_and_counts_ready_members(
 
 @pytest.mark.parametrize("grazing_incidence", (False, True))
 @pytest.mark.parametrize("folder_name", ("processed", "2026.09.18", "processed.nexus"))
-def test_recursive_same_named_containers_preserve_relative_output_directories(
+def test_recursive_same_named_containers_are_named_after_their_folders_flat_in_the_save_path(
     tmp_path: Path,
     grazing_incidence: bool,
     folder_name: str,
@@ -1884,10 +1884,11 @@ def test_recursive_same_named_containers_preserve_relative_output_directories(
             }
         family = "scan_0001_gi" if grazing_incidence else "scan_0001"
         assert targets == {
-            # Same stem, different relative directories -- the point of this
-            # test. The stable slot rides along; it does not disambiguate them.
-            first: output / "data" / f"{family}_int2d.nexus",
-            second: output / "live_test" / f"{family}_int2d.nexus",
+            # Same stem, different folders -- the point of this test. Outputs go flat into the Save Path, so each
+            # is named after its folder (maintainer, 2026-10-25, "Prefix only on a clash"); the stable slot rides
+            # along and does not disambiguate them.
+            first: output / f"data_{family}_int2d.nexus",
+            second: output / f"live_test_{family}_int2d.nexus",
         }
         assert len(reservations) == 1
         assert set(reservations[0]) == set(targets.values())
@@ -1924,9 +1925,11 @@ def test_recursive_explicit_target_refuses_before_reservation(
             session.close()
 
 
-def test_recursive_output_parent_symlink_cannot_escape_selected_root(
+def test_recursive_outputs_land_in_the_save_path_itself_never_in_a_linked_subfolder(
     tmp_path: Path,
 ) -> None:
+    # A subfolder of the Save Path that links outside it once took a mirrored source folder's outputs out of the
+    # selected root; flat outputs are written in the Save Path itself, so nothing reaches the link.
     output = tmp_path / "processed"
     outside = tmp_path / "outside"
     output.mkdir()
@@ -1940,17 +1943,14 @@ def test_recursive_output_parent_symlink_cannot_escape_selected_root(
     reservations: list[tuple[Path, ...]] = []
     source_bytes = tuple(path.read_bytes() for path in sources)
     try:
-        with pytest.raises(
-            ValueError,
-            match="directory output escaped selected root",
-        ):
-            prepare_output(
-                start,
-                cancelled=lambda: False,
-                session_owner=sessions.append,
-                targets_owner=reservations.append,
-            )
-        assert reservations == []
+        prepare_output(
+            start,
+            cancelled=lambda: False,
+            session_owner=sessions.append,
+            targets_owner=reservations.append,
+        )
+        assert len(reservations) == 1 and reservations[0]
+        assert all(target.parent == output for target in reservations[0]), reservations
         assert tuple(outside.iterdir()) == ()
         assert tuple(path.read_bytes() for path in sources) == source_bytes
     finally:
