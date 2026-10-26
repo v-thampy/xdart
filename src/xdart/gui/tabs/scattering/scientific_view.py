@@ -2370,7 +2370,7 @@ class ScientificView(QtWidgets.QFrame):
             (self.next_frame, "setEnabled", False),
             (self.title, "setText", (
                 "2D Viewer · Render failed" if failure else "Current")),
-            (self.status, "setText", (
+            (self, "_set_status_text", (
                 "2D Viewer · Render failed; retry available."
                 if failure else "")),
             (self.progress, "setText", "0/0"),

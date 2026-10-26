@@ -92,3 +92,20 @@ def test_a_clipped_footer_exposes_its_current_full_text_in_the_tooltip(qapp):
     finally:
         view.close()
         view.deleteLater()
+
+
+def test_the_2d_viewer_clear_also_replaces_the_footer_tooltip(qapp):  # noqa: F811
+    """The ninth footer write, in clear_viewer_2d's chrome reset, goes through the same setter (Codex N-9a2596d5 routed
+    the other eight): a failed clear says so in the text and the tooltip, and the old file name leaves both."""
+    from xdart.gui.tabs.scattering.scientific_view import ScientificView
+
+    view = ScientificView()
+    try:
+        assert view.reconcile_operation_status(f"{IMAGE} [Output: LaB6_4deg_300mm_15s_10261256_int2d.nexus]")
+        view.clear_viewer_2d(None, failure=True)
+        assert view.status.text() == "2D Viewer · Render failed; retry available."
+        assert "2D Viewer · Render failed" in view.status.toolTip() and IMAGE not in view.status.toolTip()
+    finally:
+        view.close()
+        view.deleteLater()
+
