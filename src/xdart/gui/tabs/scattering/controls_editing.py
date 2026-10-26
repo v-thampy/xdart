@@ -1173,6 +1173,10 @@ def _control_value(
         if (path == MASK_FILE and type(value) is str and value
                 and Path(value).suffix.lower() not in {".edf", ".npy"}):
             return EditRefusal("Mask files must use .edf or .npy")
+        if path == SAVE_PATH and type(value) is str and _dotted_folder(intent, value):
+            return EditRefusal(
+                f"A Save Path folder name may not contain a dot ({Path(value).name}): a name with a dot reads "
+                "as an output file name. Rename the folder or choose another one.")
         return value if type(value) is str else EditRefusal("A path must be text.")
     if path == OUTPUT_MODE:
         return (
@@ -1200,6 +1204,22 @@ def _control_value(
             )
         return parsed
     return EditRefusal("Unknown control.")
+
+
+def _dotted_folder(intent: RunIntent, value: str) -> bool:
+    """Whether *value* names an existing folder whose name has a dot, which a Save Path refuses (maintainer,
+    2026-10-26: "the save path can simply reject a folder name with a dot with a message saying why"; a notebook
+    replay reads such a name as an output file name). A dotted name that is no folder names an output file and stays
+    allowed; a relative one is the Project's, as the Save Path is."""
+    folder = Path(value).expanduser()
+    if not folder.suffix:
+        return False
+    if not folder.is_absolute() and str(intent.project_root or "").strip():
+        folder = Path(str(intent.project_root)).expanduser() / folder
+    try:
+        return folder.is_dir()
+    except OSError:
+        return False
 
 
 def _finite_float(value: object) -> float | EditRefusal:

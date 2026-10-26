@@ -224,3 +224,20 @@ def test_output_path_equivalence_normalizes_its_folder_but_keeps_its_filename(tm
     assert _same_output_path(str(equivalent), str(target))
     assert _same_output_path("outputs/result_rsm.nexus", str(target), root=str(tmp_path))
     assert not _same_output_path(str(target), str(target.with_name("custom_rsm.nexus")))
+
+
+def test_a_save_path_folder_with_a_dot_in_its_name_is_refused_saying_why(tmp_path):
+    # Maintainer, 2026-10-26: "the save path can simply reject a folder name with a dot with a message saying why"
+    # (a notebook replay reads such a name as an output file name). An output file name keeps its dot.
+    from xdart.gui.tabs.scattering.controls_editing import EditRefusal
+    from xdart.gui.tabs.scattering.controls_inventory import SAVE_PATH
+    project = tmp_path / "project"
+    (project / "processed.v2").mkdir(parents=True)
+    store = RunIntentStore(RunIntent(project_root=str(project), save_path=str(project / "xdart_processed_data")))
+    for value in (str(project / "processed.v2"), "processed.v2"):  # absolute, and relative to the Project
+        refused = reduce_control_edit(store.snapshot(), SAVE_PATH, value)
+        assert type(refused) is EditRefusal and refused.reason.startswith(
+            "A Save Path folder name may not contain a dot (processed.v2): a name with a dot reads as an output "
+            "file name."), refused
+    for value in (str(project / "processed"), str(project / "result.nexus")):  # a folder; an output file
+        assert reduce_control_edit(store.snapshot(), SAVE_PATH, value).save_path == value
