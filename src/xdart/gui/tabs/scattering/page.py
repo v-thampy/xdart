@@ -7230,7 +7230,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     and selection is not None
                     and selection.names(browse)
                 ):
-                    viewer_source = browse.requested_path
+                    # The caller's spelling: requested_path is case-folded on Windows (BrowseLoadRequest).
+                    viewer_source = (getattr(browse.operation, "display_path", "")
+                                     or browse.requested_path)
                 else:
                     one_d = controller.viewer_1d_context
                     if (

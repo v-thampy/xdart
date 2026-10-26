@@ -1640,14 +1640,12 @@ class ContextController:
             source_root = os.path.normcase(os.path.abspath(os.path.expanduser(
                 source_root
             )))
+        # Compared case-folded (normcase); the scan is named from the caller's spelling (BrowseLoadRequest).
+        display_path = os.path.abspath(os.path.expanduser(source_path))
         if terminal_commit_identity is None:
-            source_path = os.path.normcase(os.path.abspath(os.path.expanduser(
-                source_path
-            )))
+            source_path = os.path.normcase(display_path)
         else:
-            requested = os.path.normcase(os.path.abspath(os.path.expanduser(
-                source_path
-            )))
+            requested = os.path.normcase(display_path)
             sealed = os.path.normcase(os.path.abspath(os.path.expanduser(
                 terminal_commit_identity.target
             )))
@@ -1663,6 +1661,7 @@ class ContextController:
             source_path,
             terminal_commit_identity,
             source_root,
+            display_path=display_path,
         )
         accepted = self._browse_loader.begin(request)
         if accepted is not request:

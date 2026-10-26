@@ -93,6 +93,11 @@ class BrowseLoadRequest:
     source_path: str
     terminal_commit_identity: StreamTerminal | None = None
     source_root: str | None = None
+    #: ``source_path`` as the caller spelled it (absolute): the scan is NAMED from this, while every comparison uses
+    #: ``source_path``, which is case-folded on Windows (normcase), so a Browse does not read
+    #: ``effect_of_rocking_…`` for ``Effect_of_Rocking_…`` (maintainer, 2026-10-25). Empty: name it from
+    #: ``source_path``.
+    display_path: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -116,6 +121,8 @@ class BrowseLoadRequest:
                 self.terminal_commit_identity is not None
                 and type(self.terminal_commit_identity) is not StreamTerminal
             )
+            or type(self.display_path) is not str
+            or (self.display_path and os.path.normcase(self.display_path) != self.source_path)
         ):
             raise TypeError("browse load request is invalid")
 

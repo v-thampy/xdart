@@ -866,7 +866,7 @@ class BrowseLoader:
                 status = BrowseLoadStatus.CANCELLED
             else:
                 scan_key = canonical_browse_scan_key(
-                    request.source_path
+                    request.display_path or request.source_path
                 )
             if status is BrowseLoadStatus.CANCELLED:
                 pass
