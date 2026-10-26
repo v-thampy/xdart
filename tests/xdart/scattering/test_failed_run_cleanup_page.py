@@ -9,11 +9,14 @@ writer refusal, which still fails the Run, as any write that fails otherwise doe
 from __future__ import annotations
 
 import types
+import threading
+import time
 
 import h5py
 import pytest
 
 pytest.importorskip("pyqtgraph")
+from pyqtgraph.Qt import QtCore
 
 from tests.xdart.scattering.test_browse_reference_rings_run import _page, _poni, _pump
 from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _settle, _stop, _wait
@@ -118,3 +121,40 @@ def test_a_failed_run_whose_cleanup_was_left_pending_is_settled_by_the_page_and_
         assert _pump(qapp, lambda: page._lifecycle.phase is RunPhase.RUNNING, 30.), page._lifecycle.phase
         page._shell.run_controls.stopButton.click()
         assert _pump(qapp, lambda: any(event.kind in _TERMINAL for event in observed), 60.)
+
+
+def test_pending_failed_cleanup_keeps_the_gui_heartbeat_running(qapp, tmp_path, older_output, monkeypatch):
+    # Retain the real packet's pending-cleanup setup; the changed seam below is
+    # a call-through gate, never a fabricated close result.
+    monkeypatch.setattr(run_executor, "Light1DLeaseState", types.SimpleNamespace(RELEASED=object()), raising=False)
+    with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
+        entered, release = threading.Event(), threading.Event()
+        actual, callers, beats = page._run_executor._close_run, [], []
+
+        def slow_close(identity):
+            callers.append(threading.current_thread() is threading.main_thread())
+            entered.set()
+            gate = threading.Timer(.6, release.set)
+            gate.start()
+            try:
+                assert release.wait(5.)
+                return actual(identity)
+            finally:
+                gate.join()
+
+        monkeypatch.setattr(page._run_executor, "_close_run", slow_close)
+        heartbeat = QtCore.QTimer(page)
+        heartbeat.setInterval(10)
+        heartbeat.timeout.connect(lambda: beats.append(time.monotonic())
+                                  if entered.is_set() and not release.is_set() else None)
+        heartbeat.start()
+        try:
+            terminal = _failed_run(qapp, page, older_output, observed)
+            assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
+            assert _pump(qapp, lambda: page._start_permitted() == (True, ""), 10.)
+            assert callers == [False], 'failed cleanup ran on the GUI thread or overlapped itself'
+            assert len(beats) >= 5, 'cleanup stopped GUI heartbeats while close was pending'
+            assert page._context_controller.browse_lifecycle_admissible()
+        finally:
+            release.set()
+            heartbeat.stop()

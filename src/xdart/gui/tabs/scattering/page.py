@@ -745,6 +745,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._peak_dialog = self._phase_dialog = None
         # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
         self._metadata_question_dialog = None
+        self._metadata_question_shown_for = None
         # When the drain last retried a failed Run's pending cleanup (_settle_failed_cleanup).
         self._failed_cleanup_retried_at = float("-inf")
         self._scan_roi_generation = 0
@@ -3961,7 +3962,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         self._failed_cleanup_retried_at = time.monotonic()
         try:
-            receipt = executor.close(identity)
+            receipt = executor.close(identity, background=True)
         except Exception as error:
             self._error_notice("Standard cleanup failed", error)
             return False
@@ -4131,6 +4132,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if dialog is not None:
             return
+        if self._metadata_question_shown_for is identity:
+            return  # a dismissed question remains unanswered, without reopening
+        self._metadata_question_shown_for = identity
         image, output = question
         dialog = QtWidgets.QMessageBox(self)
         dialog.setWindowTitle("Metadata sidecar")
@@ -4144,7 +4148,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             "No: images are processed without metadata.\n\n"
             "With no answer, images are processed without metadata after 150 s.")
         expected = dialog.addButton(QtWidgets.QMessageBox.StandardButton.Yes)
-        dialog.addButton(QtWidgets.QMessageBox.StandardButton.No)
+        expected.setToolTip("Expect the same metadata sidecar format for every image in this Run.")
+        without = dialog.addButton(QtWidgets.QMessageBox.StandardButton.No)
+        without.setToolTip("Process this Run without reading image metadata sidecars.")
         dialog.setWindowModality(QtCore.Qt.WindowModality.NonModal)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
 

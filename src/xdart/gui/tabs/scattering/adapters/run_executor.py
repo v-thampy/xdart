@@ -18,7 +18,7 @@ from xdart.modules.frame_publication import (
 from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused, saved_energy_selection
 from xrd_tools.io.frame_view import read_frame_scalar_catalog
-from xrd_tools.io.metadata import MetadataSourceChanged, any_auto_sidecar
+from xrd_tools.io.metadata import MetadataSourceChanged, auto_sidecar_format
 from xrd_tools.io.record_writer import MetadataColumnsAbsent
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
@@ -560,6 +560,9 @@ class _StandardRun:
     # run"): "sidecar" from an explicit sidecar format or the first sidecar Auto finds anywhere, "none" once the Run
     # settled it has none, None while Auto has found none yet.
     metadata_kind: str | None = None
+    # Resolved parser for this Run, independent of its frozen configuration:
+    # Auto until the first sidecar, its exact format thereafter, None after No.
+    metadata_format: str | None = "auto"
     # Auto's one question while it has found no sidecar ("Once per Run"): (image, output name, asked at), and the
     # page's answer (True: a sidecar is expected).
     metadata_question: tuple[str, str, float] | None = None
@@ -677,9 +680,9 @@ def _observe_quartile_completion(run: _StandardRun) -> None:
         logger.exception("[PERF-QUARTILE] telemetry disabled after snapshot failure")
 
 
-def _live_proof(configuration, graph, record, registry) -> LivePrefixProof:
+def _live_proof(metadata_format, graph, record, registry) -> LivePrefixProof:
     """A published Live output's proof, with its members' sidecar observations from ``record``."""
-    return LivePrefixProof(graph, metadata_format=live_metadata_format(configuration.thaw_source_spec()),
+    return LivePrefixProof(graph, metadata_format=metadata_format,
                            record=record, registry=registry)
 
 
@@ -1287,14 +1290,19 @@ class StandardRunExecutor:
             raise RuntimeError("acquisition context is not ready")
         runtime.resume(run.session)
 
-    def close(self, run_identity: RunIdentity) -> ExecutorClosed:
+    def close(self, run_identity: RunIdentity, *, background: bool = False) -> ExecutorClosed:
         with self._lock:
             owner = self._retirement
+            active = self._active
+            if background and active is not None and active.identity is run_identity and (
+                    owner is None or owner.run_identity is not run_identity):
+                owner = DisplayRetirementOwner(run_identity, lambda: self._close_run(run_identity))
+                self._retirement = owner
         if (
             owner is not None
             and owner.run_identity is run_identity
         ):
-            receipt = owner.attempt()
+            receipt = owner.attempt(background=True) if background else owner.attempt()
             if receipt.cleanup_status is CleanupStatus.CLEANED:
                 with self._lock:
                     active = self._active
@@ -1882,6 +1890,8 @@ class StandardRunExecutor:
         if answer is None and now - run.metadata_question[2] < limit:
             return
         run.metadata_kind = "sidecar" if answer else "none"
+        if not answer:
+            run.metadata_format = None
         if answer:
             log_events.event(logger, logging.INFO, "This Run expects a metadata sidecar for every frame: a frame "
                              "waits for its own [LIVE]")
@@ -2642,6 +2652,7 @@ class StandardRunExecutor:
         # a Run that normalizes by a monitor from its metadata (no frame can go without it); otherwise under Auto the
         # first sidecar found anywhere makes it one, for every folder.
         metadata_format = live_metadata_format(configuration.thaw_source_spec())
+        run.metadata_format = metadata_format
         meta_auto = metadata_format == "auto"
         if metadata_format not in (None, "auto", "spec") or meta_auto and any(
                 str((args or {}).get("monitor") or "").strip()
@@ -2705,9 +2716,10 @@ class StandardRunExecutor:
                                left_out)
                 groups = grouped[2]
                 skipped_paths.update(Path(path) for path in left_out)  # a left-out image is skipped, not pending
-                if (polls == 0 and meta_auto and run.metadata_kind is None
-                        and any_auto_sidecar(path for group in groups for path in group.physical_paths)):
-                    run.metadata_kind = "sidecar"  # a sidecar beside any image at the Run's start: the Run's type
+                if polls == 0 and meta_auto and run.metadata_format == "auto":
+                    found_format = auto_sidecar_format(path for group in groups for path in group.physical_paths)
+                    if found_format is not None:
+                        run.metadata_kind, run.metadata_format = "sidecar", found_format
                 for group in groups:
                     discovered_paths.update(group.physical_paths)
                 publish()
@@ -2772,7 +2784,8 @@ class StandardRunExecutor:
                         # strict check: a proof rebuilt on its pass holds both.
                         registry = registry_identity()
                         seen = observe_live_members(configuration, [
-                            member.path for member in retained.decision.item.source_stamp.members])
+                            member.path for member in retained.decision.item.source_stamp.members],
+                            metadata_format=run.metadata_format)
                         try:
                             validate_planned_source(
                                 retained.decision.item,
@@ -2782,7 +2795,7 @@ class StandardRunExecutor:
                             settled_revisions.pop(target_key, None)
                         else:
                             run.live_proofs[target_key] = _live_proof(
-                                configuration, retained.decision.item.graph, seen, registry)
+                                run.metadata_format, retained.decision.item.graph, seen, registry)
                             continue
                 held = rebuild_holds.get(target_key)
                 if held is not None and held[0] == revision and monotonic() < held[1]:
@@ -2838,6 +2851,11 @@ class StandardRunExecutor:
                         # The registrations this attempt is qualified under.
                         registry = registry_identity()
                         started = monotonic()
+                        if meta_auto and run.metadata_format == "auto":
+                            found_format = auto_sidecar_format(group.physical_paths)
+                            if found_format is not None:
+                                run.metadata_kind, run.metadata_format = "sidecar", found_format
+                                sidecar_observations.clear()
                         attempt = materialize_live_directory_group(
                             receipt,
                             configuration,
@@ -2857,15 +2875,19 @@ class StandardRunExecutor:
                             committed_cache=committed_counts,
                             # The Run has settled it has no sidecars: its frames are admitted together, unwaited.
                             sidecar_optional=meta_auto and run.metadata_kind == "none",
+                            metadata_format=run.metadata_format,
                         )
                         times.add("admission", started)
-                        if meta_auto and run.metadata_kind is None and (
-                                attempt.waiting_metadata is not None
-                                and attempt.waiting_metadata[1] in {"settling", "superseded"}
-                                or attempt.decision is not None and any(
+                        if meta_auto and run.metadata_format == "auto" and attempt.decision is not None and any(
                                     source.metadata_file is not None
-                                    for source in attempt.decision.item.graph.stamp.metadata_sources)):
-                            run.metadata_kind = "sidecar"  # one is found: the Run's type, for every folder
+                                    for source in attempt.decision.item.graph.stamp.metadata_sources):
+                            # A sidecar landed during JIT. Bind before any writer
+                            # opens, then re-admit under that one parser.
+                            found_format = auto_sidecar_format(group.physical_paths)
+                            if found_format is not None:
+                                run.metadata_kind, run.metadata_format = "sidecar", found_format
+                                sidecar_observations.clear()
+                            continue
                         if self._watch_metadata_wait(
                                 run, group.target, target_key, attempt.waiting_metadata, metadata_waits,
                                 retried=attempt.state is ProbeState.IN_PROGRESS,
@@ -3047,7 +3069,7 @@ class StandardRunExecutor:
                         with run.live_revision_lock:
                             run.processed_live_revisions[target_key] = attempt
                         run.live_proofs[target_key] = _live_proof(
-                            configuration, decision.item.graph, sidecar_observations, registry)
+                            run.metadata_format, decision.item.graph, sidecar_observations, registry)
                         if not attempt.partial:
                             # A partial attempt leaves members still waiting
                             # for their metadata: retry them next poll.

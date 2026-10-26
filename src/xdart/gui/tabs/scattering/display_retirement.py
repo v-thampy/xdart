@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Lock
+from threading import Lock, Thread
 from typing import Callable
 
 from .events import (
@@ -93,7 +93,7 @@ class DisplayRetirementOwner:
             self.run_identity, receipt.cleanup_status
         )
 
-    def attempt(self) -> ExecutorClosed:
+    def attempt(self, *, background: bool = False) -> ExecutorClosed:
         with self._lock:
             receipt = self._receipt
             if (
@@ -106,6 +106,21 @@ class DisplayRetirementOwner:
                     self.run_identity, CleanupStatus.CLEANUP_PENDING
                 )
             self._in_flight = True
+        if background:
+            # Claim single-flight ownership before dispatch. GUI polls receive
+            # only this owner's exact receipt; close and its waits run here.
+            try:
+                Thread(target=self._finish_attempt, name="scattering-display-retire", daemon=True).start()
+            except Exception as error:
+                with self._lock:
+                    self._in_flight = False
+                    self._receipt = ExecutorClosed(
+                        self.run_identity, CleanupStatus.CLEANUP_PENDING,
+                        detach_exception(error, "display.retire.start"))
+            return self.receipt
+        return self._finish_attempt()
+
+    def _finish_attempt(self) -> ExecutorClosed:
         try:
             receipt = self._close()
         except Exception as error:

@@ -1354,6 +1354,9 @@ def _container_output_name(plan: RunCandidatePlan, candidate: Candidate, name: s
     return name if output is None else output
 
 
+_CONFIG_METADATA_FORMAT = object()
+
+
 def _live_metadata_ready(
     configuration: FrozenRunConfiguration,
     group: LiveDirectoryGroup,
@@ -1363,6 +1366,7 @@ def _live_metadata_ready(
     observe_from: int = 0,
     spec_cache: dict | None = None,
     sidecar_optional: bool = False,
+    metadata_format=_CONFIG_METADATA_FORMAT,
 ) -> tuple[int, str, tuple[str, str] | None]:
     """How many leading members of a Live group have their metadata ready.
 
@@ -1391,7 +1395,8 @@ def _live_metadata_ready(
     """
 
     candidates = group.plan.candidates
-    meta_format = live_metadata_format(configuration.thaw_source_spec())
+    meta_format = (live_metadata_format(configuration.thaw_source_spec())
+                   if metadata_format is _CONFIG_METADATA_FORMAT else metadata_format)
     if meta_format is None:
         return len(candidates), "", None
     if meta_format == "spec":
@@ -1418,7 +1423,7 @@ def _live_metadata_ready(
         previous = observations.get(key)
         observations[key] = seen
         if ready < len(candidates):
-            if waiting is not None and waiting[1] == "sidecar" and seen:
+            if waiting is not None and waiting[1] == "sidecar" and seen and ready >= published_members:
                 # A later frame of this series has its own sidecar, so the waiting frame's is not coming: it is left
                 # out and the series goes on (maintainer, 2026-10-26: "any frame without the txt sidecar should be
                 # skipped. There is no need to wait"; his pick "Leave N out").
@@ -1434,11 +1439,13 @@ def _live_metadata_ready(
     return ready, reason, waiting
 
 
-def observe_live_members(configuration: FrozenRunConfiguration, paths) -> dict[str, object]:
+def observe_live_members(configuration: FrozenRunConfiguration, paths, *,
+                         metadata_format=_CONFIG_METADATA_FORMAT) -> dict[str, object]:
     """Each image's sidecar observation now, from fresh listings, by record key."""
     from xrd_tools.io.metadata import live_sidecar_observation
 
-    fmt = live_metadata_format(configuration.thaw_source_spec())
+    fmt = (live_metadata_format(configuration.thaw_source_spec())
+           if metadata_format is _CONFIG_METADATA_FORMAT else metadata_format)
     listings: dict = {}
     return {} if fmt in (None, "spec") else {
         observation_key(path): live_sidecar_observation(path, fmt, listings=listings) for path in paths}
@@ -1449,7 +1456,7 @@ def _prefix_current_rebased(configuration: FrozenRunConfiguration, graph: Prepar
     """The strict published-prefix check; a pass rebases the proof on what was observed before it."""
     proof = proof if proof is not None and proof.graph is graph else None
     seen = None if proof is None else observe_live_members(
-        configuration, [member.path for member in graph.stamp.members])
+        configuration, [member.path for member in graph.stamp.members], metadata_format=proof.metadata_format)
     registry = registry_identity()
     if not _published_prefix_current(graph, cancelled):
         return False
@@ -1526,6 +1533,7 @@ def materialize_live_directory_group(
     owned: bool = False,
     committed_cache: dict | None = None,
     sidecar_optional: bool = False,
+    metadata_format=_CONFIG_METADATA_FORMAT,
 ) -> LiveDirectoryAttempt:
     """Probe and JIT-admit one exact Live group revision.
 
@@ -1556,13 +1564,14 @@ def materialize_live_directory_group(
             configuration, group, sidecar_observations,
             published_members=published_members,
             observe_from=covered, spec_cache=spec_cache, sidecar_optional=sidecar_optional,
+            metadata_format=metadata_format,
         )
         if covered and count > covered and proof.verified_at == checked and not proof.holds(cancelled=cancelled):
             # A publication proves its prefix in its own poll; one that changed
             # is looked at again in full, as an uncovered poll would.
             covered, (count, waiting, sidecar) = 0, _live_metadata_ready(
                 configuration, group, sidecar_observations, published_members=published_members, spec_cache=spec_cache,
-                sidecar_optional=sidecar_optional)
+                sidecar_optional=sidecar_optional, metadata_format=metadata_format)
         # A file only this listing has seen waits for another: one that ran during writes can show
         # a later file and miss an earlier one, and frame labels follow the members' order.
         if (cut := next((index for index, value in enumerate(group.plan.candidates[published_members:count],
@@ -1638,10 +1647,11 @@ def materialize_live_directory_group(
         output_names=group.plan.output_names,
     )
     registry, admitted = registry_identity(), []
-    fmt = live_metadata_format(configuration.thaw_source_spec())
+    fmt = (live_metadata_format(configuration.thaw_source_spec())
+           if metadata_format is _CONFIG_METADATA_FORMAT else metadata_format)
     # The discovery the in-poll proof compares with is taken before qualification.
     record = sidecar_observations if sidecar_observations is not None else observe_live_members(
-        configuration, ready.paths)
+        configuration, ready.paths, metadata_format=fmt)
 
     def recheck(graph: PreparedSourceExecutionGraph) -> bool:
         admitted.append(LivePrefixProof(graph, record=record, registry=registry, metadata_format=fmt,
@@ -1669,7 +1679,7 @@ def materialize_live_directory_group(
             cancelled=cancelled,  # a container's published frames: its SPEC rows' fence (R5b)
             published_members=published_members if published_graph is None or published_graph.descriptor is None
             else published_graph.stamp.frame_count,
-            prefix=prefix, spec_cache=spec_cache, recheck=recheck,
+            prefix=prefix, spec_cache=spec_cache, recheck=recheck, metadata_format=fmt,
         )
     except RuntimeError as error:
         if error.args == ("admission cancelled",):
@@ -1721,6 +1731,7 @@ def materialize_deferred_output(
     published_members: int = 0,
     prefix: PreparedSourceExecutionGraph | None = None, spec_cache: dict | None = None,
     recheck: Callable[[PreparedSourceExecutionGraph], bool] | None = None,
+    metadata_format=_CONFIG_METADATA_FORMAT,
 ) -> tuple[AdmittedOutput | None, int, int]:
     """``recheck`` (a live admission's in-poll proof) is a TIFF series' second look, instead of a
     second validation (a container keeps it); ``prefix``/``spec_cache``: as in _directory_items. With
@@ -1777,7 +1788,7 @@ def materialize_deferred_output(
             subset,
             cancelled=cancelled,
             published_members=published_members,
-            prefix=prefix, spec_cache=spec_cache,
+            prefix=prefix, spec_cache=spec_cache, metadata_format=metadata_format,
         )
     except (ValueError, OSError):
         # A semantic/schema failure remains terminal when every admitted
@@ -2355,6 +2366,7 @@ def _directory_items(
     published_members: int = 0,
     prefix: PreparedSourceExecutionGraph | None = None,
     spec_cache: dict | None = None,
+    metadata_format=_CONFIG_METADATA_FORMAT,
 ) -> tuple[PlannedOutput, ...]:
     output_root, items, consumed = Path(configuration.save_path), [], set()
     if _save_path_is_directory(output_root):
@@ -2370,7 +2382,8 @@ def _directory_items(
         else configuration.source
     )
     watch = live_selection(selected_source)
-    metadata_format = "auto" if watch is None else watch.metadata_format
+    metadata_format = (("auto" if watch is None else watch.metadata_format)
+                       if metadata_format is _CONFIG_METADATA_FORMAT else metadata_format)
     # A Live Image Series keeps its own selection: options, name and members' order.
     series = None if watch is None or not _is_live(configuration) else watch.series
     groups = {value.path: group for group in _output_groups(configuration, plan) for value in group[0]}
@@ -2392,8 +2405,8 @@ def _directory_items(
                 options={
                     "selected_file": str(candidate.path),
                     "scan_name": name,
-                    "metadata_format": metadata_format,
                     **({} if series is None else dict(selected_source.options)),
+                    "metadata_format": metadata_format,
                     "files": tuple(value.path for value in members),
                 },
             )

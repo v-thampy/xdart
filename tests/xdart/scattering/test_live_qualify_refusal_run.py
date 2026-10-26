@@ -411,9 +411,9 @@ def test_q4b_a_published_sidecar_change_arriving_with_the_next_image_is_still_fe
     assert (labels, i0) == ((1,), (7.0,))
 
 
-def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_that_output(tmp_path, monkeypatch):
+def test_q4c_under_auto_no_metadata_remains_final_after_a_sidecar_appears(tmp_path, monkeypatch):
     """The Run found no sidecar and its question went unanswered (its limit, here shortened), so its frames were
-    published without metadata; a sidecar landing after its frame was published stops the output."""
+    published without metadata; later sidecars do not change that final policy or its published prefix."""
     monkeypatch.setattr(run_executor, '_METADATA_WAIT_LIMIT_S', {'sidecar': 1., 'spec': 1.})
     monkeypatch.setattr(run_executor, '_METADATA_QUESTION_AFTER_S', .3)
     raw = tmp_path / 'raw'
@@ -427,15 +427,17 @@ def test_q4c_under_auto_a_sidecar_appearing_after_its_frame_was_published_stops_
         _wait(executor, events, lambda values: 2 in _labels(values) or _terminal(values))
         digest, published = _published(executor, identity, members=2)
         (raw / 'scan_0002.txt').write_text(SIDECARS['txt'](2.0))  # appears after frame 2 was published
-        _wait(executor, events, lambda values: _said(values, 'stopped growing') or _terminal(values))
-        _settle(executor, events)
+        _settle(executor, events, .4)
+        rechecked = _published(executor, identity, members=2)
+        _frame(raw, 'scan', 3, 'txt', 3.0, sidecar=False)
+        _wait(executor, events, lambda values: 3 in _labels(values) or _terminal(values))
     finally:
         terminal = _stop(executor, identity, events)
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
-    assert 'scan_int1d.nexus stopped growing' in terminal[0][1], terminal
+    assert not _said(events, 'stopped growing'), terminal
     labels, i0, epoch = _output(tmp_path)
-    assert labels == (1, 2) and i0 is None, (labels, i0)
-    assert (epoch['digest'], epoch['extent']) == (digest, published)
+    assert labels == (1, 2, 3) and i0 is None, (labels, i0)
+    assert rechecked == (digest, published)
 
 
 def test_q5_an_explicit_sidecar_that_never_arrives_keeps_its_frame_pending_until_stop(tmp_path):

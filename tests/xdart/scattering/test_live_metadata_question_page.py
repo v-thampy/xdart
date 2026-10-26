@@ -62,3 +62,12 @@ def test_the_question_closes_itself_once_a_sidecar_is_found(qapp, asked_page):  
     assert closed == [None], closed  # closed by the Run's settling, not by a click
     run = page._run_executor._exact_run(page._lifecycle.active_run_identity)
     assert run.metadata_kind == "sidecar" and run.metadata_answer is None, (run.metadata_kind, run.metadata_answer)
+
+
+def test_dismissing_the_question_does_not_ask_again_in_the_same_run(qapp, asked_page):
+    page, _raw, _observed = asked_page
+    identity = page._lifecycle.active_run_identity
+    page._metadata_question_dialog.close()
+    _pump(qapp, lambda: False, .4)
+    assert page._run_executor.pending_metadata_question(identity) is not None
+    assert page._metadata_question_dialog is None, 'the once-per-Run question reopened after dismissal'
