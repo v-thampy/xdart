@@ -1580,6 +1580,19 @@ def materialize_live_directory_group(
         facts = dict(target=group.target.name, candidates=len(group.plan.candidates), ready=count, waiting=waiting,
                      published=published_members, covered=covered,
                      published_graph=None if published_graph is None else len(published_graph.stamp.members))
+        # A saved prefix has no Run graph. Protect its committed members before returning even when none are
+        # ready: Leave-N-out applies only to new images, never to a saved member whose sidecar disappeared.
+        # Read the existing hint only for a partial admission or a proposed omission, never an owned writer.
+        facts["committed"] = (None if published_graph is not None or owned or count >= len(group.plan.candidates)
+                              or (count == 0 and (sidecar is None or sidecar[1] != "superseded"))
+                              else _committed_images(group.target, committed_cache))
+        if facts["committed"] is not None and count < facts["committed"]:
+            if sidecar is not None and sidecar[1] == "superseded":
+                sidecar = (sidecar[0], "sidecar")
+            live_readiness_debug("live_readiness", **facts, decision="wait: committed prefix held")
+            return LiveDirectoryAttempt(
+                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
+            )
         if count == 0:
             live_readiness_debug("live_readiness", **facts, decision="wait: none ready")
             return LiveDirectoryAttempt(
@@ -1600,17 +1613,6 @@ def materialize_live_directory_group(
             # at whole once that settles (one found changed is reduced again),
             # never admitted as shorter than its output (Codex N-cdab3fe2).
             live_readiness_debug("live_readiness", **facts, decision="wait: published prefix held")
-            return LiveDirectoryAttempt(
-                group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
-            )
-        # An output this Run has no graph of (an earlier Run's, or one it only showed from its saved record) knows
-        # its committed prefix from its own record: a member of it still waiting for its metadata holds the scan as a
-        # published one does, never admitted as shorter than the output (Codex N-f8157cee; ROOT-CAUSE-S3R1). An
-        # output this Run writes is never read here: its graph knows, and a read overlapping its writer is unsafe.
-        facts["committed"] = (None if published_graph is not None or owned or count >= len(group.plan.candidates)
-                              else _committed_images(group.target, committed_cache))
-        if facts["committed"] is not None and count < facts["committed"]:
-            live_readiness_debug("live_readiness", **facts, decision="wait: committed prefix held")
             return LiveDirectoryAttempt(
                 group, ProbeState.IN_PROGRESS, reason=waiting, waiting_metadata=sidecar,
             )

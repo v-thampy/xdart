@@ -98,3 +98,32 @@ def test_a_published_frame_cannot_be_left_out_when_its_sidecar_disappears(tmp_pa
     assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
     assert left_out == (), 'a published member was removed and its series relabelled'
     assert _output(tmp_path)[0] == (1, 2)
+
+
+def test_a_saved_prefix_cannot_be_left_out_when_its_sidecar_disappears(tmp_path, caplog):
+    raw = tmp_path / 'raw'
+    raw.mkdir()
+    for label in (1, 2):
+        _frame(raw, 'scan', label, 'txt', float(label))
+    seed, seed_id, seeded = _run_to_terminal(_intent(tmp_path, raw, live=False), request_value=3525)
+    seed.close(seed_id)
+    assert [event.kind.name for event in seeded if event.kind in _TERMINAL] == ['FINISHED']
+    caplog.set_level('DEBUG', logger='xdart.gui.tabs.scattering.output_preflight')
+    executor = StandardRunExecutor(join_timeout=2.)
+    identity = _start(executor, _intent(tmp_path, raw, live=True), request_value=3526)
+    events = []
+    try:
+        _wait(executor, events, lambda values: len(executor.frame_catalog(identity).entries) == 2)
+        assert not executor.processed_live_revisions(identity), 'the prefix is adopted from its saved record'
+        (raw / 'scan_0001.txt').unlink()
+        _frame(raw, 'scan', 3, 'txt', 3.)
+        _frame(raw, 'other', 1, 'txt', 4.)
+        _frame_ready(executor, events, 1, 'other')
+        _settle(executor, events, 1.)
+        left_out = tuple(executor._exact_run(identity).left_out)
+    finally:
+        terminal = _stop(executor, identity, events)
+    assert [kind for kind, _detail in terminal] == ['STOPPED'], terminal
+    assert left_out == (), 'a saved member was removed and its series relabelled'
+    assert _output(tmp_path)[0] == (1, 2)
+    assert _output(tmp_path, 'other')[0] == (1,)
