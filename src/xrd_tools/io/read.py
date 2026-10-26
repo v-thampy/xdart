@@ -756,19 +756,19 @@ def relative_source_path(src, root=None) -> str:
     relpath** against it (depth-robust + cross-OS).  When ``src`` is OUTSIDE the
     root, or no root is given, return the **absolute POSIX path** -- and warn for
     the outside-root case (out-of-tree raw is loadable but not portable).  Pair
-    this with ``@source_base = root`` written on the entry.
+    this with ``@source_base = root`` written on the entry.  On Windows a mapped
+    drive and its share's network path are one place (``X:\\bl11-3`` inside
+    ``\\\\server\\share\\bl11-3`` when ``X:`` maps that share), so the two
+    spellings still store a relative path (:mod:`xrd_tools.io.mapped_drives`).
     """
     import os
+    from xrd_tools.io.mapped_drives import relative_within
     src_abs = os.path.abspath(os.path.expanduser(str(src)))
     if root:
         root_abs = os.path.abspath(os.path.expanduser(str(root)))
-        try:
-            inside = (os.path.normcase(os.path.commonpath([src_abs, root_abs]))
-                      == os.path.normcase(root_abs))
-        except ValueError:          # different drives (Windows) -> not inside
-            inside = False
-        if inside:
-            return Path(os.path.relpath(src_abs, root_abs)).as_posix()
+        relative = relative_within(src_abs, root_abs)
+        if relative is not None:
+            return relative
         # Warn ONCE per (source directory, root): every frame of a scan
         # shares the source dir (one Eiger master / one TIFF series dir),
         # so the per-frame call otherwise repeated this for the whole scan.

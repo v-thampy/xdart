@@ -10,6 +10,7 @@ from pathlib import Path
 from xrd_tools.analysis.angular_support import DEFAULT_RECORD_ANGULAR_SUPPORT
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.core.filters import compile_filter
+from xrd_tools.io.mapped_drives import as_network_path
 from xrd_tools.corrections.detector import DEFAULT_MIN_FLAT_FRACTION
 from xrd_tools.reduction.background import FrameBackgroundPlan
 from xrd_tools.session.intent_store import (
@@ -602,9 +603,9 @@ def _same_folder(left: str, right: str) -> bool:
     """One folder however it is spelled: separators, a trailing separator, and case where the platform ignores it.
     On Windows a folder dialog returns forward slashes while the default Save Path is built with backslashes, so an
     exact comparison took the old Project's default for a separately chosen folder and left it behind (beamline
-    2026-10-23)."""
+    2026-10-23); and a mapped drive is its share's network path (X: is \\\\ssrlblfs1...\\hardx, 2026-10-26)."""
     def spelled(value: str) -> str:
-        return os.path.normcase(os.path.normpath(os.path.expanduser(value)))
+        return os.path.normcase(os.path.normpath(as_network_path(os.path.expanduser(value))))
     return spelled(left) == spelled(right)
 
 

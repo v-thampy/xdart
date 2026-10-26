@@ -54,21 +54,24 @@ def ask(parent, title: str, *, start: str = "", folder: bool = False, many: bool
     files, or (``save``) a file to write, starting in ``start`` exactly as given; [] when cancelled.
     Nothing is remembered: :func:`browse` applies the shared Browse rule around it, and a caller that
     keeps that rule itself (Int's workspace seeds from ``browse_start_dir`` and remembers a pick only
-    once it is accepted) calls this."""
+    once it is accepted) calls this. A pick on a share a drive letter maps is spelled with that drive,
+    as Explorer gives it (the Windows dialog returns ``\\\\server\\share\\...``; maintainer, 2026-10-26:
+    "they should point to the same path in xdart", his pick "Drive letter, X:\\...")."""
     from pyqtgraph.Qt import QtWidgets
+    from xrd_tools.io.mapped_drives import as_mapped_drive
 
     try:
         if save:
             chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(parent, title, start, file_filter)
-            return [chosen] if chosen else []
+            return [as_mapped_drive(chosen)] if chosen else []
         if folder:
             chosen = QtWidgets.QFileDialog.getExistingDirectory(parent, title, start)
-            return [chosen] if chosen else []
+            return [as_mapped_drive(chosen)] if chosen else []
         if many:
             picks, _filter = QtWidgets.QFileDialog.getOpenFileNames(parent, title, start, file_filter)
-            return list(picks or ())
+            return [as_mapped_drive(pick) for pick in picks or ()]
         chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(parent, title, start, file_filter)
-        return [chosen] if chosen else []
+        return [as_mapped_drive(chosen)] if chosen else []
     finally:
         # Native pickers can activate the main window instead of the modeless window that opened them.
         _restore_parent(parent)
