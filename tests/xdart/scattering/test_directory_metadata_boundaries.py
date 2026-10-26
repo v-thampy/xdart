@@ -2,6 +2,7 @@
 import os
 import threading
 import time
+import pytest
 
 from tests.xdart.scattering.test_directory_metadata_type import _intent, _aged
 from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _output, _wait
@@ -50,7 +51,8 @@ def test_future_server_mtime_cannot_extend_the_last_frame_wait(tmp_path, monkeyp
         'a future server timestamp made the Run wait beyond its limit until Stop')
 
 
-def test_retrying_metadata_admission_counts_each_omission_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize('late_sidecar', (False, True))
+def test_retrying_metadata_admission_counts_each_omission_once(tmp_path, monkeypatch, late_sidecar):
     import xrd_tools.io.metadata as metadata
     raw = tmp_path / 'raw'
     raw.mkdir()
@@ -69,6 +71,8 @@ def test_retrying_metadata_admission_counts_each_omission_once(tmp_path, monkeyp
         if armed.is_set() and not changed:
             changed.append(str(path))
             path.write_text(path.read_text().replace('I0 = 1.0', 'I0 = 8.0'))
+            if late_sidecar:
+                _frame(raw, 'scan', 2, 'txt', 2., image=False)
         return read_txt(path, *args, **kwargs)
 
     monkeypatch.setattr(StandardRunExecutor, '_without_unsidecarred', filtered)
@@ -84,7 +88,8 @@ def test_retrying_metadata_admission_counts_each_omission_once(tmp_path, monkeyp
     assert _output(tmp_path)[:2] == ((1, 2), (8., 3.))
 
 
-def test_a_background_append_never_leaves_out_an_already_committed_image(tmp_path):
+@pytest.mark.parametrize('rewritten', (False, True))
+def test_a_background_append_never_leaves_out_an_already_committed_image(tmp_path, rewritten):
     raw = tmp_path / 'raw'
     raw.mkdir()
     background = _frame(tmp_path, 'bg', 1, 'txt', 1., sidecar=False)
@@ -96,13 +101,19 @@ def test_a_background_append_never_leaves_out_an_already_committed_image(tmp_pat
     seed.close(seed_id)
     assert next(event for event in seeded if event.kind in _TERMINAL).kind is StandardEventKind.FINISHED
     (raw / 'scan_0001.txt').unlink()
+    if rewritten:
+        _frame(raw, 'scan', 1, 'txt', 1., sidecar=False)
     _frame(raw, 'scan', 2, 'txt', 2.)
     executor, identity, events = _run_to_terminal(intent, request_value=7905)
     run = executor._exact_run(identity)
     left_out = tuple(run.metadata_left_out)
     executor.close(identity)
-    assert _output(tmp_path)[0] == (1, 2), (left_out, [event.detail for event in events if event.kind in _TERMINAL])
-    assert not left_out, 'a saved frame was filtered out because the optimized prefix was unavailable'
+    if rewritten:
+        assert _output(tmp_path)[:2] == ((1,), (1.,)), 'a changed raw image was reprocessed without its chosen TXT'
+        assert left_out, 'a changed image is new work, not a committed image protected from omission'
+    else:
+        assert _output(tmp_path)[0] == (1, 2), (left_out, [event.detail for event in events if event.kind in _TERMINAL])
+        assert not left_out, 'a saved frame was filtered out because the optimized prefix was unavailable'
 
 
 def test_a_filtered_energy_extension_can_rebuild_from_its_owned_receipt(tmp_path):

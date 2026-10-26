@@ -16,7 +16,7 @@ from xdart.modules.frame_publication import (
     publication_from_frame_view,
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
-from xrd_tools.io.append import AppendRefused, committed_image_paths, saved_energy_selection
+from xrd_tools.io.append import AppendRefused, committed_image_members, saved_energy_selection
 from xrd_tools.io.frame_view import read_frame_scalar_catalog
 from xrd_tools.io.metadata import MetadataSourceChanged, auto_sidecar_format
 from xrd_tools.io.record_writer import MetadataColumnsAbsent
@@ -3167,18 +3167,24 @@ class StandardRunExecutor:
             listings: dict = {}
             return {index for index in range(start, len(candidates))
                     if index not in protected
-                    and not live_sidecar_observation(candidates[index].path, sidecar_format, listings=listings)}
+                    and (str(candidates[index].path) in run.left_out
+                         or not live_sidecar_observation(candidates[index].path, sidecar_format, listings=listings))}
 
         absent = missing()
         if absent and committed is None and run.configuration.output_mode == "Append":
             # Background and other full-qualification paths have no optimized prefix graph. Their saved image
             # membership still cannot be filtered away. Qualification/target checks remain the write authority.
-            saved = committed_image_paths(entry.target, entry="entry")
+            saved = committed_image_members(entry.target, entry="entry")
             if saved is not None:
                 saved = set(saved)
                 protected.update(index for index, value in enumerate(candidates)
-                                 if os.path.normcase(os.path.abspath(str(value.path))) in saved)
+                                 if (os.path.normcase(os.path.abspath(str(value.path))), value.size, value.mtime_ns)
+                                 in saved)
                 absent.difference_update(protected)
+        live_readiness_debug("directory_metadata", target=str(entry.target), format=sidecar_format,
+                             protected=tuple(sorted(protected)), absent=tuple(sorted(absent)),
+                             left_out=tuple(index for index, value in enumerate(candidates)
+                                            if str(value.path) in run.left_out))
         last = len(candidates) - 1
         written = int(getattr(candidates[last], "mtime_ns", 0) or 0) / 1e9
         remaining = min(limit, max(0., limit - (wall_time() - written)))
