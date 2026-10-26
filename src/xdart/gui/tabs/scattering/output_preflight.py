@@ -1,12 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
-import itertools
 import json
 import logging
 import os
 from pathlib import Path
-import re
 import tempfile
 from time import monotonic
 from typing import Any, Callable
@@ -26,12 +24,8 @@ from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.append import CommittedAppendCoverage, committed_image_count
 from xrd_tools.io.image import read_detector_image_layout, read_image
 from xrd_tools.io.output_path import (
-    ARTIFACT_FAMILY_MAX_BYTES,
-    ARTIFACT_FAMILY_MAX_LENGTH,
     FINITE_OPERATION_SLOTS,
-    GI_FAMILY_MARKER,
     OVERWRITE_MODE,
-    family_prefix,
     generated_artifact_family,
     is_artifact_family,
     resolve_output_target,
@@ -806,6 +800,7 @@ from xrd_tools.reduction.background import background_resource_terms as _backgro
 
 
 from xrd_tools.sources.run_plan import directory_candidate_groups as _directory_candidate_groups
+from xrd_tools.sources.run_plan import group_folder as _group_folder, name_output_groups as _name_output_groups
 
 
 def _save_path_is_directory(path: Path) -> bool:
@@ -1341,14 +1336,6 @@ def _output_groups(configuration: FrozenRunConfiguration | OutputCandidate,
     return tuple(groups)
 
 
-def _group_folder(plan: RunCandidatePlan, candidate: Candidate) -> str:
-    """A scan's folder below the plan's root, as POSIX text (``.`` for the root)."""
-    try:
-        return candidate.path.parent.relative_to(plan.root).as_posix()
-    except ValueError as error:
-        raise ValueError(f"directory candidate escaped admitted root: {candidate.path}") from error
-
-
 def _container_output_name(plan: RunCandidatePlan, candidate: Candidate, name: str) -> str:
     """A container's output name: the name its descriptor gives it, or the plan's when the plan renamed it (the plan
     keys a container by its adapter's scan name, which the descriptor's mirrors, :func:`_name_output_groups`)."""
@@ -1358,77 +1345,6 @@ def _container_output_name(plan: RunCandidatePlan, candidate: Candidate, name: s
     output = {(folder, key): value for folder, key, value in plan.output_names}.get(
         (_group_folder(plan, candidate), adapter.scan_name(candidate.path)))
     return name if output is None else output
-
-
-#: A name given in place of a scan's own leaves room for the marker a GI Run adds to its family, so it is a legal
-#: family in either mode (output_path.is_artifact_family), and every file named from it fits one path component
-#: (output_path.ARTIFACT_FAMILY_MAX_BYTES).
-_ALLOCATED_NAME_ROOM = ARTIFACT_FAMILY_MAX_LENGTH - len(GI_FAMILY_MARKER)
-_ALLOCATED_NAME_BYTES = ARTIFACT_FAMILY_MAX_BYTES - len(GI_FAMILY_MARKER.encode("utf-8"))
-
-
-def _clip(text: str, chars: int, size: int) -> str:
-    """The longest start of *text* within *chars* characters and *size* UTF-8 bytes."""
-    text = text[:max(chars, 0)]
-    while text and len(text.encode("utf-8")) > size:
-        text = text[:-1]
-    return text
-
-
-def _allocated_name(prefix: str, scan: str, number: int) -> str | None:
-    """A scan's output name after its folder: ``<prefix>_<scan>``, numbered ``_2``, ``_3``, ... from ``number`` 2,
-    within a legal family's characters and bytes. The folder part gives way first, then the scan's; with no folder
-    text left it is the numbered scan name, and None for ``number`` 1 (Codex N-978a0cde FLAT-R1 and N-40897109
-    FLAT-R3: a legal folder name never makes a scan unprocessable)."""
-    suffix = f"_{number}" if number > 1 else ""
-    room, size = _ALLOCATED_NAME_ROOM - len(suffix), _ALLOCATED_NAME_BYTES - len(suffix)
-    head = re.sub(r"[\s_]+$", "", _clip(prefix, room - len(scan) - 1, size - len(scan.encode("utf-8")) - 1))
-    if head:
-        return f"{head}_{scan}{suffix}"
-    return f"{_clip(scan, room, size)}{suffix}" if suffix else None
-
-
-def _name_output_groups(plan: RunCandidatePlan, assigned: dict[tuple[str, str], str] | None = None
-                        ) -> RunCandidatePlan:
-    """``plan`` with its scans' output names: outputs go flat into the Save Path, so a scan name found in more than
-    one folder names each subfolder's output ``<folder>_<scan>`` (a nested folder's parts joined by ``_``) and a
-    root-level scan keeps its own (maintainer, 2026-10-25: "Prefix only on a clash"). Names are compared ignoring
-    case, as a Windows or macOS Save Path compares them, and no two scans share an output: a scan keeps its own name
-    before any is named after its folder, and a name already taken gets ``_2``, ``_3``, ... A folder's name is made
-    a legal start of a family (output_path.family_prefix) and shortened to fit (:func:`_allocated_name`).
-    ``assigned`` (a Live Run's, kept across its polls): the names its scans already have, which never change; a
-    newcomer whose own name is taken, or found in another folder, is named after its folder (a root-level one after
-    the root's). Only the renamed scans are recorded; every plan built from this one carries them."""
-    keys = []
-    for group in _directory_candidate_groups(plan):
-        adapter = get_adapter(group[0].adapter_id)
-        if adapter is None:
-            raise ValueError(f"candidate {group[0].path} lost its adapter")
-        keys.append((_group_folder(plan, group[0]), adapter.scan_name(group[0].path)))
-    known = {} if assigned is None else assigned
-    names = {key: known[key] for key in keys if key in known}
-    taken = {output.casefold() for output in known.values()}
-    folders: dict[str, set[str]] = {}
-    for folder, scan in (*known, *keys):
-        folders.setdefault(scan.casefold(), set()).add(folder)
-    newcomers = sorted(key for key in dict.fromkeys(keys) if key not in known)  # one order for every re-check
-    for folder, scan in newcomers:
-        if (len(folders[scan.casefold()]) == 1 or folder == ".") and scan.casefold() not in taken:
-            names[(folder, scan)] = scan
-            taken.add(scan.casefold())
-    for folder, scan in newcomers:
-        if (folder, scan) in names:
-            continue
-        prefix = family_prefix(plan.root.name if folder == "." else folder.replace("/", "_"))
-        output = next(name for number in itertools.count(1)
-                      if (name := _allocated_name(prefix, scan, number)) is not None
-                      and name.casefold() not in taken)
-        names[(folder, scan)] = output
-        taken.add(output.casefold())
-    if assigned is not None:
-        assigned.update(names)
-    renamed = tuple(sorted((folder, scan, output) for (folder, scan), output in names.items() if output != scan))
-    return plan if renamed == plan.output_names else replace(plan, output_names=renamed)
 
 
 def _live_metadata_ready(

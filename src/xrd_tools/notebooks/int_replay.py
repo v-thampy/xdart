@@ -44,9 +44,12 @@ def _source_at(spec, previous, root):
 
 
 def _directory_sources(spec):
+    """Each scan of a Folder source and its output name. The outputs go flat into OUTPUT_ROOT, named as the GUI
+    names a directory Run's (run_plan.name_output_groups: a scan name found in more than one folder is named after
+    its folder); a series reads as that name there too, a container keeps its own."""
     from xrd_tools.sources.adapters import get_adapter
     from xrd_tools.sources.directory_index import DirectoryIndex
-    from xrd_tools.sources.run_plan import RunCandidatePlan, directory_candidate_groups
+    from xrd_tools.sources.run_plan import RunCandidatePlan, directory_candidate_groups, group_folder, name_output_groups
     from xrd_tools.sources.selection import image_series_spec
     from xrd_tools.sources.probe import ProbeState
     index = DirectoryIndex(spec.root, recursive=spec.recursive, name_filter=spec.name_filter)
@@ -55,12 +58,16 @@ def _directory_sources(spec):
     if spec.suffixes:
         snapshot = replace(snapshot, candidates=tuple(candidate for candidate in snapshot.candidates
                            if candidate.path.suffix.casefold() in spec.suffixes))
-    for group in directory_candidate_groups(RunCandidatePlan.from_snapshot(snapshot)):
+    plan = name_output_groups(RunCandidatePlan.from_snapshot(snapshot))
+    renamed = {(folder, scan): output for folder, scan, output in plan.output_names}
+    for group in directory_candidate_groups(plan):
         candidate = group[0]
         adapter = get_adapter(candidate.adapter_id)
-        relative = candidate.path.parent.relative_to(spec.root)
+        scan_name = adapter.scan_name(candidate.path)
+        name = renamed.get((group_folder(plan, candidate), scan_name), scan_name)
         if SourceKind.IMAGE_FILE in adapter.kinds:
-            yield image_series_spec(candidate.path, metadata_format=spec.metadata_format), relative
+            series = image_series_spec(candidate.path, metadata_format=spec.metadata_format)
+            yield replace(series, options={**series.options, 'scan_name': name}), name
         else:
             observed = adapter.probe(candidate.path)
             if observed.state is ProbeState.IMAGELESS:
@@ -71,7 +78,7 @@ def _directory_sources(spec):
             if descriptor.kind is SourceKind.PROCESSED_NEXUS:
                 continue  # ordinary Int Directory also excludes processed records
             yield SourceSpec(candidate.path, descriptor.kind, entry=descriptor.resolved_entry or
-                             descriptor.requested_entry), relative
+                             descriptor.requested_entry), name
 
 
 @dataclass
@@ -133,10 +140,10 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
         if getattr(intent, key + '_file') and getattr(assets, key + '_bytes') is None:
             raise ValueError(f'REPLAY_CORRECTION_REQUIRED: selected {key} is unavailable')
     sources = _directory_sources(intent.source_spec) if type(intent.source_spec) is DirectorySourceSpec else (
-        (intent.source_spec, Path()),)
+        (intent.source_spec, None),)
     outputs, created, targets = [], False, set()
     mask, flat, dark = assets.mask, assets.flat, assets.dark
-    for spec, relative in sources:
+    for spec, name in sources:
         if cancelled():
             raise InterruptedError('Run replay cancelled')
         graph = qualify_source_execution_graph(spec, cancelled=cancelled)
@@ -166,9 +173,9 @@ def run_int_replay(configuration, *, data_root, output_root, on_progress=None, s
                 scan.extra['darkcurrent'] = dark
             plan = replace(native_int_reduction_plan(frozen, companion_modes_2d=True,
                 energy_selection=scan.extra['energy_selection']), mask=mask, flat=flat, dark=dark)
-            family = generated_artifact_family(original_output.stem if original_output.suffix else scan.name,
+            family = generated_artifact_family(original_output.stem if original_output.suffix else (name or scan.name),
                                                grazing_incidence=frozen.gi.enabled)
-            directory = destination / relative
+            directory = destination
             target = resolve_finite_output_target(directory, family,
                 operation_token='int-2d' if plan.integration_2d is not None else 'int-1d')
             if target in targets:

@@ -21,9 +21,8 @@ from tests.xdart.scattering.test_live_already_processed import _intent
 from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _labels, _settle, _stop, _wait
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _run_to_terminal, _start
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
-from xdart.gui.tabs.scattering.output_preflight import _name_output_groups
 from xrd_tools.sources.directory_session import DirectoryIndexSession
-from xrd_tools.sources.run_plan import RunCandidatePlan
+from xrd_tools.sources.run_plan import RunCandidatePlan, name_output_groups
 from xrd_tools.sources.selection import DirectorySourceSpec
 
 
@@ -107,11 +106,11 @@ def test_a_live_newcomer_whose_name_differs_only_in_case_is_named_after_its_fold
     finally:
         session.close()
     assigned = {("calibration", "lab6"): "lab6"}  # written by this Live Run before the others appeared
-    named = _name_output_groups(plan, assigned)
+    named = name_output_groups(plan, assigned)
     assert assigned == {("calibration", "lab6"): "lab6", ("sampleA", "LAB6"): "sampleA_LAB6",
                         (".", "Lab6"): "Baniecki_Oct2026_Lab6"}
     assert named.output_names == ((".", "Lab6", "Baniecki_Oct2026_Lab6"), ("sampleA", "LAB6", "sampleA_LAB6"))
-    assert _name_output_groups(named, dict(assigned)).output_names == named.output_names  # the next poll agrees
+    assert name_output_groups(named, dict(assigned)).output_names == named.output_names  # the next poll agrees
 
 
 @pytest.mark.parametrize(("folder", "scan", "expected"), [

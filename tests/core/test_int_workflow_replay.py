@@ -124,6 +124,25 @@ def test_int_replay_directory_uses_native_scan_grouping(tmp_path):
     assert all(len(open_scan(path).frame_indices) == 2 for path in outputs)
 
 
+def test_int_replay_writes_a_recursive_folder_flat_with_the_runs_names(tmp_path):
+    # Maintainer, 2026-10-26, "yes" to the replay writing flat as a directory Run does: a scan name found in two
+    # folders is named after each folder (run_plan.name_output_groups), any other keeps its own.
+    from xrd_tools.notebooks.int_replay import run_int_replay
+    import shutil
+    intent = _fixture(tmp_path / 'project')
+    raw = tmp_path / 'project' / 'inputs'
+    for folder in ('data', 'live_test'):
+        (raw / folder).mkdir(parents=True)
+        shutil.copyfile(intent.source_spec.uri, raw / folder / 'scan1.h5')
+    shutil.copyfile(intent.source_spec.uri, raw / 'other.h5')
+    intent.source_spec = DirectorySourceSpec(raw, recursive=True, suffixes=('.h5',))
+    output_root = Path(intent.project_root) / 'replayed'
+    outputs = run_int_replay(json.loads(dump_run_intent_profile(intent)), data_root=intent.project_root,
+                             output_root=output_root)
+    assert sorted(Path(path).relative_to(output_root).as_posix() for path in outputs) == [
+        'data_scan1_int2d.nexus', 'live_test_scan1_int2d.nexus', 'other_int2d.nexus']
+
+
 def test_legacy_gi_profile_new_run_integrates_current_exit_angle_axes():
     from xdart.gui.tabs.scattering.output_preflight import native_int_reduction_plan
     from xrd_tools.core.containers import PONI
