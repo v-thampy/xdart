@@ -125,3 +125,43 @@ def test_a_fast_directory_run_with_a_norm_channel_ends_with_every_scan_drawn_eac
         _expected(page, stems)
         assert page._last_scientific_projection.norm_channel == "i0"
         _divided(page, "int1d")
+
+
+@pytest.mark.parametrize("gi", (False, True), ids=("int", "gi-total-q"))
+def test_a_held_multiframe_run_keeps_its_current_trace_available_for_analysis(qapp, tmp_path, monkeypatch, gi):
+    """A held multi-scan end must retain current science as well as the view's detached history."""
+    from xrd_tools.session.run_configuration import GIIntent
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for stem in ("a", "b"):
+        for label in (1, 2, 3):
+            _frame(raw, stem, label, "txt", float(label))
+            sidecar = raw / f"{stem}_{label:04d}.txt"
+            sidecar.write_text(sidecar.read_text().replace("# Motors\n", f"# Motors\nth = {label * .2}\n"))
+    intent = _intent(tmp_path, live=False)
+    if gi:
+        intent.gi = GIIntent(enabled=True, incidence_motor="th", mode_1d="q_total")
+    with _page(qapp, intent) as (page, view, _observed):
+        held, actual = [], page._hold_terminal_for_paint
+
+        def hold(*args):
+            result = actual(*args)
+            held.append(result)
+            return result
+
+        monkeypatch.setattr(page, "_hold_terminal_for_paint", hold)
+        _overlay(page)
+        page._shell.run_controls.startButton.click()
+        assert _pump(qapp, lambda: page._lifecycle.active_run_identity is not None, 30.)
+        run = page._run_executor._exact_run(page._lifecycle.active_run_identity)
+        assert _starved_until(lambda: run.terminal_emitted)
+        suffix = "_gi" if gi else ""
+        assert _ended_on_browse(qapp, page, f"b{suffix}"), (page._notice_text, _drawn(page))
+        assert True in held, "the multi-scan terminal never exercised its retained-curve hold"
+        _expected(page, tuple(f"{stem}{suffix}" for stem in ("a", "a", "a", "b", "b", "b")))
+        current = page._context_controller.navigation.current
+        assert current.local_frame_label == 3
+        assert any(trace.frame is current for trace in page._last_scientific_projection.traces)
+        trace, anchor = page._capture_analysis_trace("fit")
+        assert trace is not None and anchor is not None, "the visible current curve is unavailable to analysis"
