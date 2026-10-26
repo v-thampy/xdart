@@ -164,8 +164,14 @@ _CONTAINER_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus", ".cxi"})
 
 def holds_containers(suffixes) -> bool:
     """Whether a Folder whose File Type is *suffixes* can hold HDF5/NeXus containers (an empty File Type can): the
-    folders whose Run outputs could be read back as raw input if they landed among them."""
-    return not suffixes or any(str(value).lower() in _CONTAINER_SUFFIXES for value in suffixes)
+    folders whose Run outputs could be read back as raw input if they landed among them. Discovery keeps a file whose
+    name ends with a suffix, dotted or not (``nexus``, ``_master.h5``), so a suffix that a container name can end with,
+    or that itself ends with a container suffix, counts (Codex N-acb7b192 B-R4)."""
+    if not suffixes:
+        return True
+    typed = [str(value).lower() for value in suffixes if value]
+    return any(container.endswith(value) or value.endswith(container)
+               for value in typed for container in _CONTAINER_SUFFIXES)
 
 
 @dataclass(frozen=True, slots=True)

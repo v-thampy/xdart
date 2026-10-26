@@ -1539,9 +1539,11 @@ def append_source_from_execution_graph(value: PreparedSourceExecutionGraph, *, g
         for item in stamp.external_members)
     if value.descriptor is not None and value.descriptor.kind is SourceKind.EIGER_MASTER and not externals:
         raise ValueError("Eiger Append requires exact external dataset facts")
+    identity = stamp.execution_identity_v1.as_dict()
+    digest, legacy = science_fingerprint(_settled_identity(identity)), science_fingerprint(identity)
     return AppendSource(stamp.path, stamp.adapter_id, stamp.size, stamp.mtime_ns,
-        stamp.frame_count, science_fingerprint(_settled_identity(stamp.execution_identity_v1.as_dict())),
-        value.dataset_paths, images, externals, int(generation))
+        stamp.frame_count, digest, value.dataset_paths, images, externals, int(generation),
+        legacy_digest=None if legacy == digest else legacy)
 def source_graph_payload(value: PreparedSourceExecutionGraph) -> dict:
     policy_options = {
         key: item for key, item in dict(value.execution_source.options).items()

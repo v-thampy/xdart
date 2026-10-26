@@ -1327,6 +1327,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _metadata_from_current(self):
         plan = self._metadata_plan_for_current()
         if plan is None:
+            if self._metadata_held_by_run():  # before a Run's first frame too (Codex N-acb7b192 B-R1)
+                self._explain_metadata_held(self._metadata_operations.dialog_identity("metadata"))
+                return
             self._notice("Select a retained frame first."); return
         from .analysis_mount import analysis_request_facts
         request = analysis_request_facts(plan)
@@ -6658,6 +6661,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                              or getattr(context_2d, "original_path", "") or ""
                              ) if tool is Tool.IMAGE_VIEWER else ""
         projection = self._context_projection.build_shell(
+            browse_open=self._context_controller.browse_lifecycle_admissible(),
             revision=self._shell_revision,
             controls=controls,
             controls_readiness=self._controls_readiness,

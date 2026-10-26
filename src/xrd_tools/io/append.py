@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
 import json
@@ -184,6 +184,10 @@ class AppendSource:
     image_members: tuple[AppendImageMember, ...] = ()
     external_members: tuple[AppendExternalMember, ...] = ()
     generation: int = 0
+    #: In memory only, never recorded or compared: the digest this source had before Live and Append settled a win32
+    #: pathname ctime (execution_graph._settled). An output saved by then records it, so the same scan unchanged since
+    #: is recognized rather than refused at every Append (Codex N-acb7b192 A-R1). None when the two agree (POSIX).
+    legacy_digest: str | None = field(default=None, compare=False, repr=False)
     def __post_init__(self) -> None:
         if not str(self.path).strip() or not str(self.adapter_id).strip():
             raise ValueError("source path and adapter identity are required")
@@ -860,6 +864,8 @@ def _any_changed(
 def _source_extends(
     prior: Mapping[str, Any],
     current: Mapping[str, Any],
+    *,
+    legacy_digest: str | None = None,
 ) -> None:
     for key in ("path", "adapter_id"):
         if prior.get(key) != current.get(key):
@@ -888,6 +894,8 @@ def _source_extends(
         comparable_prior = {
             key: value for key, value in prior.items() if key != "generation"
         }
+        if legacy_digest is not None and prior.get("digest") == legacy_digest:
+            comparable_prior["digest"] = current.get("digest")  # recorded before ctime was settled (AppendSource)
         if ({key: value for key, value in current.items() if key != "generation"}
                 != comparable_prior):
             changes = _identity_changes(prior, current)
@@ -1233,6 +1241,7 @@ def _extension(
     _source_extends(
         prior_source,
         compared,
+        legacy_digest=intent.source.legacy_digest,
     )
     prior_extent = int(prior_source.get("extent", -1))
     if intent.labels[:len(labels)] != labels:
@@ -1293,6 +1302,7 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             _source_extends(
                 _source_dict(observed.source),
                 _source_dict(intent.source),
+                legacy_digest=intent.source.legacy_digest,
             )
         if not target.exists():
             if committed_prefix is not None:

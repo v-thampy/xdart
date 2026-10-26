@@ -3942,7 +3942,8 @@ class StandardRunExecutor:
                     run,
                 )
                 if run.files_discovered
-                else payload.status
+                # a one-scan Append says its new frames as it runs too (Codex N-acb7b192 B-R3)
+                else f"{payload.status}{new_frames_note(_frames_new(run))}"
             ),
             frame_key=key,
             navigation_delta=navigation,

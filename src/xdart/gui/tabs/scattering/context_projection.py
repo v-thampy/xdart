@@ -52,15 +52,12 @@ from .state_machine import RunPhase
 from .scientific_waterfall_policy import waterfall_should_be_active
 
 
-#: The phases a Run keeps Browse shut in (context_controller admits Browse idle, paused, or failed and resettable):
-#: the scan list is grayed out with this tooltip, so the refusal is visible before a click (maintainer, 2026-10-25:
-#: "make it explicit by disabling and graying out the data browser ... until paused"; his pick "Scan list only").
-_BROWSE_SHUT_PHASES = frozenset({
-    RunPhase.PREPARING, RunPhase.STARTING, RunPhase.RUNNING, RunPhase.PAUSING, RunPhase.RESUMING,
-    RunPhase.STOPPING, RunPhase.FINALIZING,
-})
+#: Why the scan list is grayed out while Browse cannot open another scan (maintainer, 2026-10-25: "make it explicit
+#: by disabling and graying out the data browser ... until paused"; his pick "Scan list only"). The page passes
+#: context_controller's own admission, so the lock and Browse agree (Codex N-acb7b192 B-R2).
 _SCANS_LOCKED = ("Other scans open while the Run is paused or after it stops. The running scan's frames stay "
                  "available below.")
+_SCANS_LOCKED_CLEANUP = "Other scans open once the failed Run has finished cleaning up."
 
 
 def _scientific_presentation_mode(processing_mode: str) -> str:
@@ -443,8 +440,10 @@ class ContextProjection:
         source_count_includes_immediate: bool = False,
         norm_aggregate: object = None,
         presentation_background=None,
+        browse_open: bool = True,
     ) -> ShellProjection:
-        """Build the one complete shell value; retain no input or output."""
+        """Build the one complete shell value; retain no input or output. ``browse_open``: whether Browse can open
+        another scan now (context_controller.browse_lifecycle_admissible); the scan list is grayed out otherwise."""
 
         tool = tool_from_mode_text(intent.processing_mode)
         viewer_1d_selected = (selection is not None
@@ -575,7 +574,8 @@ class ContextProjection:
                 ),
                 multi_artifact_selection=viewer_1d_selected or tool is Tool.XYE_VIEWER,
                 show_all_frames=viewer_selected,
-                scans_locked=_SCANS_LOCKED if phase in _BROWSE_SHUT_PHASES else "",
+                scans_locked="" if browse_open else (
+                    _SCANS_LOCKED_CLEANUP if phase is RunPhase.FAILED else _SCANS_LOCKED),
             ),
             scientific,
             viewer_navigation if viewer_selected else navigation,
