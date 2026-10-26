@@ -1916,6 +1916,11 @@ class StandardRunExecutor:
                              "processed without metadata [LIVE]",
                              "answered" if answer is not None else f"no answer within {limit:g} s")
 
+    def kept_curve_ids(self, run_identity: RunIdentity) -> frozenset[int]:
+        """The Run's frames whose curves its display keeps after their output was released (keep_released_1d)."""
+        run = self._exact_run(run_identity)
+        return frozenset() if run is None else run.display.kept_curve_ids()
+
     def pending_metadata_question(self, run_identity: RunIdentity) -> tuple[str, str] | None:
         """The Live Run's open question (:meth:`_settle_metadata_kind`): (image, output name) while it waits for the
         page's answer, else None (also once answered, before the Live loop's next look settles it)."""

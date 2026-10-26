@@ -3965,7 +3965,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or self._batch_terminal.active
                 or self._preferences.plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}):
             return False
-        undrawn = len(self._context_controller.unpainted_trace_frames())
+        undrawn = len(self._undrawn_elsewhere(event))
         if not undrawn:
             return False
         now = time.monotonic()
@@ -3973,6 +3973,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._scientific_repaint_pending = True
         self._ensure_timer()
         return True
+
+    def _undrawn_elsewhere(self, event: StandardRunEvent) -> tuple[DisplayFrameKey, ...]:
+        """The selected frames the view has neither drawn nor refused whose curves the Run kept after their output was
+        released (kept_curve_ids): the end's Browse brings the shown output's frames back itself, and a frame with no
+        kept curve could not be drawn, so only these are waited for."""
+        kept_curve_ids = getattr(self._run_executor, "kept_curve_ids", None)
+        kept = frozenset() if kept_curve_ids is None else kept_curve_ids(event.run_identity)
+        return tuple(frame for frame in self._context_controller.unpainted_trace_frames() if id(frame) in kept)
 
     def _failed_cleanup_pending(self) -> bool:
         """A failed Run whose owners have not closed: its cleanup was still pending at its end."""
@@ -5007,7 +5015,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         hold = self._terminal_hold
         if hold is not None:
             held, undrawn, began, drawn_at = hold
-            now, remaining = time.monotonic(), len(self._context_controller.unpainted_trace_frames())
+            now, remaining = time.monotonic(), len(self._undrawn_elsewhere(held[0]))
             drawn_at = now if remaining < undrawn else drawn_at
             if remaining and now - drawn_at < _TERMINAL_PAINT_STALL_S and now - began < _TERMINAL_PAINT_HOLD_S:
                 self._terminal_hold = (held, remaining, began, drawn_at)

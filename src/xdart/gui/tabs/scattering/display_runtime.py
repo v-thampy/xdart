@@ -1185,6 +1185,11 @@ class RunDisplayState:
                         return 0  # an oversized output leaves whole; do not repopulate just its later rows
             return kept
 
+    def kept_curve_ids(self) -> frozenset[int]:
+        """The frame keys (by identity, as the painting ledger compares them) whose curves keep_released_1d holds."""
+        with self._lock:
+            return frozenset(id(key) for key in self._released_1d)
+
     def _drop_released_1d_locked(self, artifact: str) -> None:
         for key in [key for key in self._released_1d if key.artifact == artifact]:
             self._forget_released_1d_locked(key)
