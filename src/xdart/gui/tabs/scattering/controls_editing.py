@@ -1211,7 +1211,10 @@ def _dotted_folder(intent: RunIntent, value: str) -> str:
     (maintainer, 2026-10-26: "the save path can simply reject a folder name with a dot with a message saying why"; a
     notebook replay reads such a name as an output file name), else "". A dotted name that is no folder names an
     output file and stays allowed; a relative one is the Project's, as the Save Path is, and ``.`` or ``..`` name the
-    folder they lead to (Codex N-2f830f81 DOT-R1: ``.processed`` has a dot but no suffix)."""
+    folder they lead to (Codex N-2f830f81 DOT-R1: ``.processed`` has a dot but no suffix). An empty one names no
+    folder (Codex N-c180484e: clearing the field under a dotted Project stays allowed)."""
+    if not value.strip():
+        return ""
     folder = Path(value).expanduser()
     if not folder.is_absolute() and str(intent.project_root or "").strip():
         folder = Path(str(intent.project_root)).expanduser() / folder

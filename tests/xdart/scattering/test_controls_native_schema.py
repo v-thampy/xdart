@@ -249,3 +249,6 @@ def test_a_save_path_folder_with_a_dot_in_its_name_is_refused_saying_why(tmp_pat
         snapshot = RunIntentStore(RunIntent(project_root=str(owner), save_path=str(owner / "outputs"))).snapshot()
         refused = reduce_control_edit(snapshot, SAVE_PATH, value)
         assert type(refused) is EditRefusal and f"may not contain a dot ({name})" in refused.reason, refused
+    # Clearing the field names no folder, under a dotted Project too (Codex N-c180484e).
+    cleared = RunIntentStore(RunIntent(project_root=str(dotted_project), save_path=str(dotted_project / "outputs")))
+    assert reduce_control_edit(cleared.snapshot(), SAVE_PATH, "").save_path == ""
