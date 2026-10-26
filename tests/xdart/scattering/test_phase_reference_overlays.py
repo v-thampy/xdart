@@ -287,6 +287,11 @@ def test_phase_lines_on_q_and_2theta_axes_in_int_and_stitch(qapp, tmp_path):
         assert q_positions
         assert controller.select_navigation(keys[-1], keys)
         page._refresh_shell(); qapp.processEvents(); _settle(qapp, view)
+        # In q both energies share the scan's one frozen grid (maintainer, 2026-10-10: "q needs each frame reduced at
+        # its own energy on a common grid"), so the Overlay draws every frame (maintainer, 2026-10-26: "we should
+        # still be able to overlay them in 1d with q-axis").
+        assert page._preferences.plot_axis != '2theta'
+        assert len(view.curve.listDataItems()) == 2 and view.trace_history_keys == keys
         _command(page, ShellCommandKind.SET_PLOT_AXIS, '2theta'); _settle(qapp, view)
         # Each frame converts its common-Q grid with its own wavelength. The
         # strict Overlay grid owner keeps only the current 2theta curve, whose
