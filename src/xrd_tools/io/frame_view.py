@@ -3778,6 +3778,20 @@ def read_frame_view(
         return reader.read(int(frame), mode_1d=mode_1d, mode_2d=mode_2d)
 
 
+def read_frame_scalar_catalog(
+    scan_file: str | Path,
+    *,
+    entry: str = "entry",
+) -> FrameScalarCatalog:
+    """Read a saved output's scalar catalog without resolving its sources.
+
+    Like the frame-reading entry points, this owns and closes its reader;
+    consumers receive the detached catalog, never an open HDF5 handle.
+    """
+    with FrameViewReader(scan_file, entry=entry, resolve_source=False) as reader:
+        return reader.read_scalar_catalog()
+
+
 def read_frame_record(
     scan_file: str | Path,
     frame: int,

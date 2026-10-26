@@ -716,8 +716,12 @@ class RunDisplayState:
 
     def retire_artifact_navigation(self, artifact: str) -> int:
         """Take ``artifact``'s frames out of navigation before its output is replaced whole; the replacement's first
-        frame carries them as retired (``DisplayCatalogIndex.retire_artifact``)."""
+        frame carries them as retired (``DisplayCatalogIndex.retire_artifact``). Its normalization rows leave too,
+        while the producer revision remains monotonic for this same artifact identity."""
         with self._lock:
+            owner = self.artifacts.get(str(artifact))
+            if owner is not None and owner.norm_aggregate is not None:
+                owner.norm_aggregate = replace(owner.norm_aggregate, row_count=0, channels={})
             return self.catalog.retire_artifact(str(artifact))
 
     def append_navigation(

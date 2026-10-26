@@ -923,8 +923,8 @@ class _ContextRuntime:
         return payload
 
     def _capture_norm_aggregate(self) -> None:
-        """THE one §25.3 capture: at most ONE candidate from the exact
-        current selection, admitted only through the Q2 acceptance gate.
+        """THE one §25.3 capture: one candidate per selected scan from the
+        exact current selection, admitted only through the Q2 acceptance gate.
 
         A dead, cancelled or stale live-Browse scope and a rescoped
         acquisition owner are capture NO-OPS — a refusal cannot admit a
@@ -1019,11 +1019,12 @@ class _ContextRuntime:
         held = self._norm_aggregate
         if type(held) is NormCoverage:
             held = held.current
-        if held is not None and (
-            expected is None or held.identity != expected
-        ):
-            held = None
-        prior = {**self._norm_partitions, expected: held}
+        # The anchor may move between selected scans without changing their
+        # ownership. Keep each accepted predecessor, including the old anchor,
+        # so that a replay, older revision or refused read cannot replace it.
+        prior = dict(self._norm_partitions)
+        if held is not None:
+            prior[held.identity] = held
         admitted: dict[tuple, ScanNormAggregate] = {}
         for frame, key in reads:
             if store is not None:

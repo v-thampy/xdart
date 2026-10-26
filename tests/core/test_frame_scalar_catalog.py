@@ -156,6 +156,19 @@ def _assert_array_free(value: object) -> None:
     raise AssertionError(f"unexpected catalog object: {type(value)!r}")
 
 
+def test_scalar_catalog_entry_point_returns_detached_rows_and_closes_its_reader(tmp_path):
+    path = tmp_path / "catalog.nexus"
+    _catalog_file(path)
+    catalog = module.read_frame_scalar_catalog(path)
+    assert tuple(row.label for row in catalog.rows) == (2, 5, 9)
+    assert catalog.rows[0].metadata_numeric["monitor"] == 10.
+    # A leaked read-only reader would prevent this writable open. The returned
+    # metadata belongs to the detached catalog, independent of later file edits.
+    with h5py.File(path, "r+") as handle:
+        handle["entry/scan_data/monitor"][0] = 99.
+    assert catalog.rows[0].metadata_numeric["monitor"] == 10.
+
+
 def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
     tmp_path,
 ) -> None:

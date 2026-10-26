@@ -17,7 +17,7 @@ from xdart.modules.frame_publication import (
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
 from xrd_tools.io.append import AppendRefused, saved_energy_selection
-from xrd_tools.io.frame_view import FrameViewReader
+from xrd_tools.io.frame_view import read_frame_scalar_catalog
 from xrd_tools.io.metadata import MetadataSourceChanged, any_auto_sidecar
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
@@ -3432,8 +3432,7 @@ class StandardRunExecutor:
             # Its own normalization record, from its committed scalar rows as Browse folds them: a Norm Channel
             # then covers its frames in an Overlay across the Run's scans (Codex N-f3f77127).
             try:
-                with FrameViewReader(target, resolve_source=False) as reader:
-                    catalog = reader.read_scalar_catalog()
+                catalog = read_frame_scalar_catalog(target)
             except Exception:
                 logger.debug("no scalar catalog for the saved output %s", target, exc_info=True)
             else:
