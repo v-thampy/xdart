@@ -1219,9 +1219,11 @@ def saved_energy_selection(target: str | Path) -> dict[str, Any] | None:
     return value if type(value) is dict else None
 
 
-def committed_image_count(target: str | Path, *, entry: str) -> int | None:
-    """How many images ``target``'s committed Append record holds, as qualification decodes its committed prefix, or
-    None: no output, or none this reader can vouch for. A small metadata read, no image or sidecar."""
+def committed_image_paths(target: str | Path, *, entry: str) -> tuple[str, ...] | None:
+    """The image paths in the decoded committed Append record, or None when it cannot be vouched for.
+
+    This is a conservative membership hint, never permission to append. No image or sidecar is read.
+    """
     try:
         with h5py.File(target, "r") as handle:
             prefix = decode_committed_append_prefix(handle, entry=entry)
@@ -1229,7 +1231,13 @@ def committed_image_count(target: str | Path, *, entry: str) -> int | None:
         raise
     except Exception:  # nothing to undercut: admission and qualification decide, as before
         return None
-    return len(prefix.intent.source.image_members)
+    return tuple(member.path for member in prefix.intent.source.image_members)
+
+
+def committed_image_count(target: str | Path, *, entry: str) -> int | None:
+    """How many images the committed record holds, or None when it cannot be vouched for."""
+    paths = committed_image_paths(target, entry=entry)
+    return None if paths is None else len(paths)
 
 
 def _extension(

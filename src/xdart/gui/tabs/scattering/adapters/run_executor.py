@@ -16,7 +16,7 @@ from xdart.modules.frame_publication import (
     publication_from_frame_view,
 )
 from xrd_tools.core.scan import SourceKind, SourceReadError
-from xrd_tools.io.append import AppendRefused, saved_energy_selection
+from xrd_tools.io.append import AppendRefused, committed_image_paths, saved_energy_selection
 from xrd_tools.io.frame_view import read_frame_scalar_catalog
 from xrd_tools.io.metadata import MetadataSourceChanged, auto_sidecar_format
 from xrd_tools.io.record_writer import MetadataColumnsAbsent
@@ -1755,11 +1755,11 @@ class StandardRunExecutor:
 
     @staticmethod
     def _widened_rebuild(run: _StandardRun, receipt: AdmissionReceipt, session: Any, entry: DeferredDirectoryEntry,
-                         reason: str) -> AdmittedOutput:
+                         reason: str, *, metadata_format: str | None) -> AdmittedOutput:
         """The admission that reduces ``entry``'s scan again whole into its output (a REPLACE, every frame qualified
         afresh, none taken from its record): its new frames widened its energy scan's q grid."""
         decision, _ready, _skipped = materialize_deferred_output(
-            receipt, session, entry, cancelled=lambda: run.stop_requested)
+            receipt, session, entry, cancelled=lambda: run.stop_requested, metadata_format=metadata_format)
         if decision is None:
             raise ValueError("its scan has no READY frames left to reduce again")
         stamp = decision.item.source_stamp
@@ -3160,32 +3160,49 @@ class StandardRunExecutor:
             return entry  # a container's own metadata: sidecars are an image policy
         committed = getattr(entry, "committed_prefix", None)
         start = 0 if committed is None else len(committed.stamp.members)
+        protected = set(range(start))
         limit = _METADATA_WAIT_LIMIT_S["sidecar"]
 
         def missing() -> set[int]:
             listings: dict = {}
             return {index for index in range(start, len(candidates))
-                    if not live_sidecar_observation(candidates[index].path, sidecar_format, listings=listings)}
+                    if index not in protected
+                    and not live_sidecar_observation(candidates[index].path, sidecar_format, listings=listings)}
 
         absent = missing()
+        if absent and committed is None and run.configuration.output_mode == "Append":
+            # Background and other full-qualification paths have no optimized prefix graph. Their saved image
+            # membership still cannot be filtered away. Qualification/target checks remain the write authority.
+            saved = committed_image_paths(entry.target, entry="entry")
+            if saved is not None:
+                saved = set(saved)
+                protected.update(index for index, value in enumerate(candidates)
+                                 if os.path.normcase(os.path.abspath(str(value.path))) in saved)
+                absent.difference_update(protected)
         last = len(candidates) - 1
         written = int(getattr(candidates[last], "mtime_ns", 0) or 0) / 1e9
-        if last in absent and wall_time() - written < limit:
+        remaining = min(limit, max(0., limit - (wall_time() - written)))
+        if last in absent and remaining > 0.:
             log_events.event(logger, logging.INFO, "%s is waiting for the metadata of %s [SCAN]",
                              Path(entry.target).name, Path(candidates[last].path).name)
-            while last in absent and wall_time() - written < limit and not run.stop_requested:
-                run.stop_signal.wait(0.5)
+            deadline = monotonic() + remaining
+            while last in absent and monotonic() < deadline and not run.stop_requested:
+                run.stop_signal.wait(min(0.5, max(0., deadline - monotonic())))
                 absent = missing()
         if not absent:
             return entry
         name = Path(entry.target).name
         for index in sorted(absent):
+            path = str(candidates[index].path)
+            if path in run.left_out:
+                continue  # re-admitting a changed source does not count or announce its omission twice
+            run.left_out.add(path)
             image = Path(candidates[index].path).name
             run.metadata_left_out.append(f"{image} ({name})")
+            run.files_skipped += 1
             log_events.event(logger, logging.WARNING, "%s: %s is left out; it has no metadata sidecar of its own "
                              "[SCAN]", name, image)
         left_out = {Path(candidates[index].path) for index in absent}
-        run.files_skipped += len(absent)
         kept = tuple(value for index, value in enumerate(candidates) if index not in absent)
         if len(kept) <= start:
             return None
@@ -3232,9 +3249,11 @@ class StandardRunExecutor:
         stopped = False
         # The Run's sidecar type, for every folder (maintainer, 2026-10-26, as for Live): an explicit sidecar format,
         # or under Auto the first one this listing holds; a frame without its own is left out (_without_unsidecarred).
-        sidecar_format = live_metadata_format(run.configuration.thaw_source_spec())
+        metadata_format = sidecar_format = live_metadata_format(run.configuration.thaw_source_spec())
         if sidecar_format == "auto":
             sidecar_format = auto_sidecar_format(path for value in deferred.entries for path in value.physical_paths)
+            if sidecar_format is not None:
+                metadata_format = sidecar_format
         elif sidecar_format == "spec":
             sidecar_format = None
         # An entry whose files changed while they were read (a scan still being written) is taken once more; the
@@ -3279,12 +3298,13 @@ class StandardRunExecutor:
                 if committed is not None:
                     start, registry = len(committed.stamp.members), registry_identity()
                     record = observe_live_members(
-                        run.configuration, [value.path for value in entry.candidates[start:]])
+                        run.configuration, [value.path for value in entry.candidates[start:]],
+                        metadata_format=metadata_format)
 
                     def recheck(graph, *, start=start, record=record, registry=registry, proofs=proofs):
                         proofs.append(LivePrefixProof(
                             graph, record=record, registry=registry, start=start,
-                            metadata_format=live_metadata_format(run.configuration.thaw_source_spec())))
+                            metadata_format=metadata_format))
                         return proofs[-1].holds(cancelled=lambda: run.stop_requested)
                 elif all(Path(value.path).suffix.lower() in {".tif", ".tiff"}
                          for value in entry.candidates):
@@ -3293,7 +3313,7 @@ class StandardRunExecutor:
                     # proof is made after its JIT graph exists, then _construct
                     # reuses it instead of validating the graph a second time.
                     registry, record = registry_identity(), observe_live_members(
-                        run.configuration, [value.path for value in entry.candidates])
+                        run.configuration, [value.path for value in entry.candidates], metadata_format=metadata_format)
 
                     def recheck(graph, *, record=record, registry=registry, proofs=proofs):
                         # The inexpensive LivePrefixProof below protects the
@@ -3306,7 +3326,7 @@ class StandardRunExecutor:
                             graph, cancelled=lambda: run.stop_requested)
                         proofs.append(LivePrefixProof(
                             graph, record=record, registry=registry,
-                            metadata_format=live_metadata_format(run.configuration.thaw_source_spec())))
+                            metadata_format=metadata_format))
                         return proofs[-1].holds(cancelled=lambda: run.stop_requested)
                 decision, _ready_files, skipped_files = (
                     materialize_deferred_output(
@@ -3314,7 +3334,7 @@ class StandardRunExecutor:
                         session,
                         entry,
                         cancelled=lambda: run.stop_requested,
-                        prefix=committed, recheck=recheck,
+                        prefix=committed, recheck=recheck, metadata_format=metadata_format,
                     )
                 )
             except RuntimeError as error:
@@ -3403,7 +3423,8 @@ class StandardRunExecutor:
                     # Its new frames widen the q grid its energy scan was reduced on: the whole scan is reduced again
                     # on the wider one, into its output (maintainer, 2026-10-25: "Rebuild it whole"). Construction
                     # refused before it changed anything but its source, which it closed.
-                    decision = self._widened_rebuild(run, receipt, session, entry, str(widened))
+                    decision = self._widened_rebuild(run, admitted_by, session, entry, str(widened),
+                                                     metadata_format=metadata_format)
                     item = decision.item
                     run.rebuild_widened = True
                     self._construct(run, item=item, labels=decision.labels, decision=decision,
