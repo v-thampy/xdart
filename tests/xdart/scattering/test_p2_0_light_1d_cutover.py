@@ -54,7 +54,7 @@ def _terminal_event(executor):
 from tests.xdart.scattering._output_slots import written
 
 
-def _terminal_run(tmp_path: Path, *, frames=1, processing_mode="Int 1D"):
+def _terminal_run(tmp_path: Path, *, frames=1, processing_mode="Int 1D", record_angular_support=False):
     tmp_path.mkdir(parents=True, exist_ok=True)
     source = tmp_path / "source.nxs"
     target = tmp_path / "processed.nexus"
@@ -64,6 +64,8 @@ def _terminal_run(tmp_path: Path, *, frames=1, processing_mode="Int 1D"):
     executor = StandardRunExecutor(join_timeout=3.0)
     intent = _batch_intent(source, target, poni)
     intent.processing_mode = processing_mode
+    if record_angular_support:
+        intent.run_options['record_angular_support'] = True
     identity = _start(executor, intent, request_value=20_000 + frames)
     terminal = _terminal_event(executor)
     run = executor._exact_run(identity)

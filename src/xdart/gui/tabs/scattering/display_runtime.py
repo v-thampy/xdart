@@ -1160,7 +1160,6 @@ class RunDisplayState:
         with self._lock:
             if self._retired or self.artifacts.get(str(owner.artifact)) is not owner:
                 return 0
-            self._drop_released_1d_locked(str(owner.artifact))
             kept = 0
             for key in self.catalog.snapshot().entries:
                 if key.artifact != str(owner.artifact):
@@ -1171,12 +1170,19 @@ class RunDisplayState:
                 payload = self._payload_from_publication(owner, key, publication, closed=True)
                 view = _detached_light_1d_view(payload.view)  # its own arrays, whatever the lease holds
                 payload = replace(payload, view=replace(
-                    view, raw=None, thumbnail=None, intensity_2d=None, sigma_2d=None), extra_views_2d={})
+                    view, raw=None, thumbnail=None, intensity_2d=None, sigma_2d=None,
+                    axis_2d_x=None, axis_2d_y=None), extra_views_2d={})
+                # A resumed generation publishes only its new tail. Preserve the retained prefix, replacing only
+                # frames actually published again; whole replacement retires navigation before reaching here.
+                self._forget_released_1d_locked(key)
                 self._released_1d[key] = payload
                 self._released_1d_bytes += _light_payload_bytes(payload)
                 kept += 1
-            while self._released_1d_bytes > MAX_BROWSE_1D_DETACHED_BYTES and self._released_1d:
-                self._drop_released_1d_locked(next(iter(self._released_1d)).artifact)
+                while self._released_1d_bytes > MAX_BROWSE_1D_DETACHED_BYTES and self._released_1d:
+                    victim = next(iter(self._released_1d)).artifact
+                    self._drop_released_1d_locked(victim)
+                    if victim == key.artifact:
+                        return 0  # an oversized output leaves whole; do not repopulate just its later rows
             return kept
 
     def _drop_released_1d_locked(self, artifact: str) -> None:
@@ -1725,11 +1731,18 @@ def _projection_masks_values(
 
 
 def _light_payload_bytes(payload: StandardDisplayPayload) -> int:
-    """The bytes of a kept curve's 1-D arrays."""
+    """The backing bytes of a kept curve, including its angular-support vector."""
     view = payload.view
     axis = None if view.axis_1d is None else view.axis_1d.values
-    return sum(int(np.asarray(values).nbytes) for values in (axis, view.intensity_1d, view.sigma_1d)
-               if values is not None)
+    support = None if view.angular_support is None else view.angular_support.supported_deg
+    roots = {}
+    for values in (axis, view.intensity_1d, view.sigma_1d, support):
+        if values is not None:
+            values = np.asarray(values)
+            while isinstance(values.base, np.ndarray):
+                values = values.base
+            roots[id(values)] = values
+    return sum(int(values.nbytes) for values in roots.values())
 
 
 def _detached_light_1d_view(view: FrameView) -> FrameView:

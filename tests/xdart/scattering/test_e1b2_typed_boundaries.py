@@ -50,7 +50,7 @@ class _Executor:
     def stop(self, _run_identity) -> None:
         return None
 
-    def close(self, run_identity):
+    def close(self, run_identity, *, background=False):
         if self.close_receipt_factory is None:
             return ExecutorClosed(run_identity, CleanupStatus.CLEANED)
         return self.close_receipt_factory(run_identity)

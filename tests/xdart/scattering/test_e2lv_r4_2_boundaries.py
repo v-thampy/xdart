@@ -40,7 +40,7 @@ class _RaiseFirstExecutor(_SequencedExecutor):
         super().__init__([])
         self._raise_once = True
 
-    def close(self, identity):
+    def close(self, identity, *, background=False):
         self.close_calls.append(identity)
         if self._raise_once:
             self._raise_once = False

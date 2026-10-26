@@ -207,7 +207,7 @@ def test_page_does_not_acknowledge_failed_executor_close(
         def stop(self, _run_identity) -> None:
             return None
 
-        def close(self, _run_identity) -> None:
+        def close(self, _run_identity, *, background=False) -> None:
             self.close_calls += 1
             raise RuntimeError("executor remains open")
 

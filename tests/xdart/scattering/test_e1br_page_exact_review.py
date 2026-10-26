@@ -88,7 +88,7 @@ class _Executor(ImmediateAdmission):
         if self.stop_error is not None:
             raise self.stop_error
 
-    def close(self, identity):
+    def close(self, identity, *, background=False):
         return ExecutorClosed(identity, CleanupStatus.CLEANED)
 
     def pause(self, _identity) -> None:

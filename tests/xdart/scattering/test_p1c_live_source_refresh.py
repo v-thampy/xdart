@@ -70,7 +70,7 @@ class _Executor(ImmediateAdmission):
     def stop(self, _identity) -> None:
         return None
 
-    def close(self, identity):
+    def close(self, identity, *, background=False):
         return ExecutorClosed(identity, CleanupStatus.CLEANED)
 
     def pause(self, _identity) -> None:

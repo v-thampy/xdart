@@ -159,7 +159,7 @@ class _SequencedExecutor(ImmediateAdmission):
         events, self.events = tuple(self.events), []
         return events
 
-    def close(self, identity):
+    def close(self, identity, *, background=False):
         self.close_calls.append(identity)
         if len(self.close_calls) == 1:
             for owner in self.cleaned_substeps:

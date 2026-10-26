@@ -253,7 +253,7 @@ class _RetiringExecutor(_SequencedExecutor):
             identity, CleanupStatus.CLEANUP_PENDING
         )
 
-    def close(self, identity):
+    def close(self, identity, *, background=False):
         if identity is self.first_identity:
             return self._owner().attempt()
         if identity is self.second_identity:
