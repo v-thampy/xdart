@@ -65,6 +65,8 @@ __all__ = [
     "scan_family",
     "GI_FAMILY_MARKER",
     "ARTIFACT_FAMILY_MAX_LENGTH",
+    "ARTIFACT_FAMILY_MAX_BYTES",
+    "FILENAME_MAX_BYTES",
     "family_prefix",
     "is_artifact_family",
     "resolve_finite_output_target",
@@ -125,6 +127,17 @@ FINITE_OPERATION_SLOTS: dict[str, str] = {
 
 #: Appended to the family of an automatically named grazing-incidence result.
 GI_FAMILY_MARKER = "_gi"
+
+#: The most one path component may take, in UTF-8 bytes (ext4, APFS; NTFS counts UTF-16 units, never more).
+FILENAME_MAX_BYTES = 255
+#: What every name built from a family adds to it in the same component: the longest finite operation slot and
+#: ``.nexus``, and the private sibling a writer stages beside that file,
+#: ``.<name>.xdart-candidate-<ordinal>-<32 hex>`` (output_transaction), with room for a 16-digit ordinal.
+_FAMILY_NAME_RESERVE_BYTES = (max(len(slot) for slot in FINITE_OPERATION_SLOTS.values()) + len(".nexus")
+                              + len(".") + len(".xdart-candidate-") + 16 + len("-") + 32)
+#: The most UTF-8 bytes a family may take for every name built from it to fit in one component (Codex
+#: N-40897109 FLAT-R3: a name given in place of a scan's own is bounded by it; the family rule above is not).
+ARTIFACT_FAMILY_MAX_BYTES = FILENAME_MAX_BYTES - _FAMILY_NAME_RESERVE_BYTES
 
 
 def is_readable_output_path(path: "os.PathLike[str] | str") -> bool:

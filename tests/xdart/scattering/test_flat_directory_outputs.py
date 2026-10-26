@@ -149,3 +149,20 @@ def test_renamed_containers_open_the_xye_file_the_run_actually_wrote(qapp, tmp_p
                       and controller.viewer_1d_context.state.value == "ready", 15.)
         assert ready, (sorted(map(str, generated)), page._notice_text)
         assert Path(controller.viewer_1d_context.current_path) in generated
+
+
+def test_a_folder_named_in_many_byte_characters_still_names_an_output_one_component_holds(tmp_path) -> None:
+    # 60 rockets: 240 UTF-8 bytes, a legal folder and family start, but with "_lab6_int1d.nexus" 257 bytes, more than
+    # one component holds on ext4. The folder part gives way in bytes too (Codex N-40897109 FLAT-R3 discriminator).
+    rocket = "\U0001F680"
+    raw = tmp_path / "raw"
+    for name in (rocket * 60, "sample"):
+        (raw / name).mkdir(parents=True)
+        _frame(raw / name, "lab6", 1, "txt", 1.0)
+    executor, identity, events = _run_to_terminal(_recursive(tmp_path, raw, live=False), request_value=10302)
+    executor.close(identity)
+    terminal = [event for event in events if event.kind in _TERMINAL]
+    assert [event.kind.name for event in terminal] == ["FINISHED"] and terminal[0].files_processed == 2
+    written = _written(tmp_path / "processed")
+    assert written == ["sample_lab6_int1d.nexus", f"{rocket * 40}_lab6_int1d.nexus"]
+    assert all(len(name.encode("utf-8")) <= 255 for name in written)

@@ -1030,3 +1030,18 @@ def test_scan_family_names_an_output_as_int_names_its_scans():
     assert scan_family(["a_scan1", "b_scan2"]) == "a_scan1_b_scan2"
     with pytest.raises(ValueError):
         scan_family([])
+
+
+def test_every_name_a_writer_stages_for_the_longest_family_fits_one_component(tmp_path):
+    # ARTIFACT_FAMILY_MAX_BYTES reserves the longest slot, ".nexus" and the writer's private siblings: a real admitted
+    # transaction's backup, candidate and partial names for a family of exactly that many bytes fit 255 bytes.
+    from xrd_tools.io.output_path import ARTIFACT_FAMILY_MAX_BYTES, FILENAME_MAX_BYTES, FINITE_OPERATION_SLOTS
+    from xrd_tools.io.output_transaction import OwnerToken, get_output_transaction_coordinator
+    family = "\U0001F680" * (ARTIFACT_FAMILY_MAX_BYTES // 4)
+    assert len(family.encode("utf-8")) == ARTIFACT_FAMILY_MAX_BYTES
+    target = tmp_path / f"{family}{max(FINITE_OPERATION_SLOTS.values(), key=len)}.nexus"
+    transaction = get_output_transaction_coordinator().admit(
+        target, transaction_owner=OwnerToken("budget"), target_owner=OwnerToken("budget"))
+    staged = (target, transaction.backup, transaction._candidate, transaction._stream_partial)
+    assert all(len(Path(path).name.encode("utf-8")) <= FILENAME_MAX_BYTES for path in staged), [
+        len(Path(path).name.encode("utf-8")) for path in staged]

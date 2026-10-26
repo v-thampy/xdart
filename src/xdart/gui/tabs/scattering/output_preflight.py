@@ -26,6 +26,7 @@ from xrd_tools.io import AppendDisposition, AppendRefused, load_mask
 from xrd_tools.io.append import CommittedAppendCoverage, committed_image_count
 from xrd_tools.io.image import read_detector_image_layout, read_image
 from xrd_tools.io.output_path import (
+    ARTIFACT_FAMILY_MAX_BYTES,
     ARTIFACT_FAMILY_MAX_LENGTH,
     FINITE_OPERATION_SLOTS,
     GI_FAMILY_MARKER,
@@ -1360,21 +1361,31 @@ def _container_output_name(plan: RunCandidatePlan, candidate: Candidate, name: s
 
 
 #: A name given in place of a scan's own leaves room for the marker a GI Run adds to its family, so it is a legal
-#: family in either mode (output_path.is_artifact_family).
+#: family in either mode (output_path.is_artifact_family), and every file named from it fits one path component
+#: (output_path.ARTIFACT_FAMILY_MAX_BYTES).
 _ALLOCATED_NAME_ROOM = ARTIFACT_FAMILY_MAX_LENGTH - len(GI_FAMILY_MARKER)
+_ALLOCATED_NAME_BYTES = ARTIFACT_FAMILY_MAX_BYTES - len(GI_FAMILY_MARKER.encode("utf-8"))
+
+
+def _clip(text: str, chars: int, size: int) -> str:
+    """The longest start of *text* within *chars* characters and *size* UTF-8 bytes."""
+    text = text[:max(chars, 0)]
+    while text and len(text.encode("utf-8")) > size:
+        text = text[:-1]
+    return text
 
 
 def _allocated_name(prefix: str, scan: str, number: int) -> str | None:
     """A scan's output name after its folder: ``<prefix>_<scan>``, numbered ``_2``, ``_3``, ... from ``number`` 2,
-    within a legal family's length. The folder part gives way first, then the scan's; with no folder text left it is
-    the numbered scan name, and None for ``number`` 1 (Codex N-978a0cde FLAT-R1: a legal folder name never makes a
-    scan unprocessable)."""
+    within a legal family's characters and bytes. The folder part gives way first, then the scan's; with no folder
+    text left it is the numbered scan name, and None for ``number`` 1 (Codex N-978a0cde FLAT-R1 and N-40897109
+    FLAT-R3: a legal folder name never makes a scan unprocessable)."""
     suffix = f"_{number}" if number > 1 else ""
-    room = _ALLOCATED_NAME_ROOM - len(suffix)
-    head = re.sub(r"[\s_]+$", "", prefix[:max(room - len(scan) - 1, 0)])
+    room, size = _ALLOCATED_NAME_ROOM - len(suffix), _ALLOCATED_NAME_BYTES - len(suffix)
+    head = re.sub(r"[\s_]+$", "", _clip(prefix, room - len(scan) - 1, size - len(scan.encode("utf-8")) - 1))
     if head:
         return f"{head}_{scan}{suffix}"
-    return f"{scan[:room]}{suffix}" if suffix else None
+    return f"{_clip(scan, room, size)}{suffix}" if suffix else None
 
 
 def _name_output_groups(plan: RunCandidatePlan, assigned: dict[tuple[str, str], str] | None = None
