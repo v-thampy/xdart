@@ -144,8 +144,12 @@ def test_pending_failed_cleanup_keeps_the_gui_heartbeat_running(qapp, tmp_path, 
     with _page(qapp, _intent(tmp_path)) as (page, _view, observed):
         entered, release = threading.Event(), threading.Event()
         actual, callers, beats = page._run_executor._close_run, [], []
+        lock, inflight, overlapped = threading.Lock(), [0], []
 
         def slow_close(identity):
+            with lock:
+                inflight[0] += 1
+                overlapped.append(inflight[0] > 1)
             callers.append(threading.current_thread() is threading.main_thread())
             entered.set()
             gate = threading.Timer(.6, release.set)
@@ -155,6 +159,8 @@ def test_pending_failed_cleanup_keeps_the_gui_heartbeat_running(qapp, tmp_path, 
                 return actual(identity)
             finally:
                 gate.join()
+                with lock:
+                    inflight[0] -= 1
 
         monkeypatch.setattr(page._run_executor, "_close_run", slow_close)
         heartbeat = QtCore.QTimer(page)
@@ -166,7 +172,10 @@ def test_pending_failed_cleanup_keeps_the_gui_heartbeat_running(qapp, tmp_path, 
             terminal = _failed_run(qapp, page, older_output, observed)
             assert terminal.cleanup_status is CleanupStatus.CLEANUP_PENDING
             assert _pump(qapp, lambda: page._start_permitted() == (True, ""), 10.)
-            assert callers == [False], 'failed cleanup ran on the GUI thread or overlapped itself'
+            # The page retries a still-pending cleanup about once a second, so a first attempt that leaves it pending
+            # is followed by another, never alongside it (hosted run 40369372693 recorded two: [False, False]).
+            assert callers and not any(callers), f'failed cleanup ran on the GUI thread: {callers}'
+            assert not any(overlapped), f'failed cleanup overlapped itself: {overlapped}'
             assert len(beats) >= 5, 'cleanup stopped GUI heartbeats while close was pending'
             assert page._context_controller.browse_lifecycle_admissible()
         finally:
