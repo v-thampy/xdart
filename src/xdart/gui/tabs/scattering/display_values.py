@@ -233,6 +233,8 @@ class StandardRunEvent:
     #: An Append Run's frames reduced and saved in this Run so far, apart from those its outputs already held;
     #: None for a Run that is not an Append.
     frames_new: int | None = None
+    #: Current per-output wait/stop notes, separate from the diagnostic detail and file counts.
+    directory_notes: tuple[str, ...] = ()
     #: Terminal-only: (artifact, family) for each output this Run constructed, the family its planned output was
     #: named with (PlannedOutput.artifact_family), which its XYE folder and files are named after. A renamed scan's
     #: source keeps its own name, so the family is never re-derived from it (Codex N-978a0cde FLAT-R2).
@@ -328,6 +330,8 @@ def standard_event_is_valid(value: object, identity: RunIdentity) -> bool:
                 + value.files_skipped
                 + value.files_pending
                 == value.files_discovered
+                and type(value.directory_notes) is tuple
+                and all(type(note) is str for note in value.directory_notes)
                 and (
                     value.terminal_timing is None
                     or type(value.terminal_timing) is StandardTerminalTiming

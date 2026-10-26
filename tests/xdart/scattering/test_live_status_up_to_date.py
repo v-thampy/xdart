@@ -51,7 +51,9 @@ def test_an_empty_live_directory_uses_the_compact_waiting_status(qapp, tmp_path,
         _terminal(qapp, page, observed, StandardEventKind.STOPPED)
 
 
-def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qapp, tmp_path):  # noqa: F811
+def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qapp, tmp_path, monkeypatch):  # noqa: F811
+    from xdart.gui.tabs.scattering.adapters import run_executor
+    monkeypatch.setattr(run_executor, "_METADATA_WAIT_NOTE_S", .1)
     raw = tmp_path / "raw"
     raw.mkdir()
     _frame(raw, "scan", 1, "txt", 1.0)
@@ -72,5 +74,10 @@ def test_a_live_run_that_processed_all_it_found_says_it_waits_for_new_images(qap
         _frame(raw, "scan", 2, "txt", 2.0, sidecar=False)  # a new image, its .txt not yet there: pending again
         assert _pump(qapp, lambda: "1/2 processed" in label.full_text(), 30.), label.full_text()
         assert UP_TO_DATE not in label.full_text()
+        assert _pump(qapp, lambda: "scan_int1d.nexus waits for the metadata of scan_0002.tif" in label.full_text(),
+                     5.), label.full_text()
+        _frame(raw, "scan", 2, "txt", 2.0, image=False)
+        assert _pump(qapp, lambda: "2/2 processed" in label.full_text(), 15.), label.full_text()
+        assert "waits for the metadata" not in label.full_text()
         page._shell.run_controls.stopButton.click()
         _terminal(qapp, page, observed, StandardEventKind.STOPPED)

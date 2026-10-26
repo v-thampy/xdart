@@ -781,7 +781,7 @@ def _directory_event_fields(
     run: _StandardRun,
     *,
     in_flight_processed: int = 0,
-) -> dict[str, int]:
+) -> dict[str, int | None | tuple[str, ...]]:
     processed, skipped, pending, discovered = _directory_counts(
         run,
         in_flight_processed=in_flight_processed,
@@ -792,6 +792,7 @@ def _directory_event_fields(
         "files_pending": pending,
         "files_discovered": discovered,
         "frames_new": _frames_new(run),
+        "directory_notes": (*run.live_blocked.values(), *run.live_waiting.values()),
     }
 
 
@@ -1886,7 +1887,7 @@ class StandardRunExecutor:
         if target_key not in run.live_waiting and now - held[1] >= _METADATA_WAIT_NOTE_S:
             run.live_waiting[target_key] = f"{name} waits for the metadata of {image}"
             logger.debug("%s is waiting for the metadata of %s [LIVE]", name, image)
-        if (kind == "sidecar" and run.live_waiting_long.get(target_key) != image
+        if (kind == "sidecar" and run.metadata_kind != "none" and run.live_waiting_long.get(target_key) != image
                 and now - held[1] >= _METADATA_WAIT_INFO_S):
             run.live_waiting_long[target_key] = image
             log_events.event(logger, logging.INFO, "%s has waited over %g s for the metadata of %s; it is processed "

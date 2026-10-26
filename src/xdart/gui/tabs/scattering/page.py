@@ -375,6 +375,7 @@ def _directory_file_progress(
         event.files_pending,
         event.files_discovered,
         event.frames_new,
+        event.directory_notes,
     )
 
 

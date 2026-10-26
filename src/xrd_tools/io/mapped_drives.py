@@ -6,8 +6,8 @@ this warning? ... if i use the open file dialog, it gives \\ssrl... but if i cop
 get x:. they should point to the same path in xdart"; his pick for how a field shows such a folder: "Drive letter,
 X:\\... (Recommended)".
 
-The mappings come from the local network redirector (``WNetGetConnectionW``), never from the share itself, so a lookup
-is cheap and never waits on a server. Off Windows there are no mappings and every function returns its input.
+The mappings come from ``WNetGetConnectionW``. This is a synchronous provider call; Windows documents no timeout
+guarantee for it. Off Windows there are no mappings and every function returns its input.
 """
 from __future__ import annotations
 

@@ -963,6 +963,7 @@ class DirectoryFileProgress:
     discovered: int
     #: An Append Run's frames saved in this Run, shown as "N processed (M new)"; None for any other Run.
     new: int | None = None
+    notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.new is not None and (type(self.new) is not int or self.new < 0):
@@ -989,9 +990,10 @@ class DirectoryFileProgress:
         skipped = f" · {self.skipped} skipped" if self.skipped else ""
         new = new_frames_note(self.new)
         counts = f"{self.processed}/{self.discovered} processed"
+        notes = "".join(f" · {note}" for note in self.notes)
         if watching and not self.pending:
-            return f"{state} · Waiting for new images · {counts}{new}{skipped}"
-        return f"{state} · {counts}{new}{skipped}"
+            return f"{state} · Waiting for new images · {counts}{new}{skipped}{notes}"
+        return f"{state} · {counts}{new}{skipped}{notes}"
 
 
 @dataclass(frozen=True, slots=True)
