@@ -128,18 +128,14 @@ class SourceFileState:
             raise TypeError("source file state is invalid")
     @classmethod
     def capture(cls, path: Path) -> "SourceFileState":
-        """The file's state now. Its ctime slot goes through the tree-wide win32 seam: on Windows a pathname
-        stat's ctime is the creation time, which a share can settle milliseconds to a third of a second after
-        the file is written, so an unchanged frame read again later looked changed and Live stopped growing
-        (beamline 2026-10-25: only ctime_ns moved, +3 ms to +325 ms; size, mtime, device and inode held)."""
         selected = Path(os.path.abspath(path.expanduser()))
         resolved_before = selected.resolve(strict=True)
         stat = selected.stat(); target_stat = resolved_before.stat()
         resolved_after = selected.resolve(strict=True)
-        revision = (int(stat.st_size), int(stat.st_mtime_ns), identity_ctime_ns(stat.st_ctime_ns),
+        revision = (int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns),
                     int(stat.st_dev), int(stat.st_ino))
         target_revision = (int(target_stat.st_size), int(target_stat.st_mtime_ns),
-                           identity_ctime_ns(target_stat.st_ctime_ns), int(target_stat.st_dev),
+                           int(target_stat.st_ctime_ns), int(target_stat.st_dev),
                            int(target_stat.st_ino))
         if (os.path.normcase(os.path.normpath(resolved_before))
                 != os.path.normcase(os.path.normpath(resolved_after))
@@ -362,6 +358,31 @@ def _resolved(state: SourceFileState) -> str:
     return _absolute(state.path) if state._resolved_path_at_capture is None else state._resolved_path_at_capture
 def _revision(state: SourceFileState) -> tuple[int, ...]:
     return state.size, state.mtime_ns, state.ctime_ns, state.device, state.inode
+
+
+def _settled(revision: tuple[int, ...]) -> tuple[int, ...]:
+    """A (size, mtime_ns, ctime_ns, device, inode) revision as Live and Append compare an already-processed file over
+    time: its ctime slot through the tree-wide win32 seam. On Windows a pathname stat's ctime is the creation time,
+    which a share settles milliseconds to a third of a second after the file is written, so an unchanged frame read
+    again later looked changed and every Live output stopped growing (beamline 2026-10-25: only ctime_ns moved, +3 ms
+    to +325 ms; size, mtime, device and inode held). The capture itself stays exact for its other consumers."""
+    size, mtime_ns, ctime_ns, device, inode = revision
+    return size, mtime_ns, identity_ctime_ns(ctime_ns), device, inode
+
+
+def _same_settled_state(left: SourceFileState | None, right: SourceFileState | None) -> bool:
+    """Two admissions of one metadata file (or of its absence) agree, ctime compared as :func:`_settled` does."""
+    if left is None or right is None:
+        return left is right
+    return left.path == right.path and _settled(_revision(left)) == _settled(_revision(right))
+
+
+def _settled_identity(identity: dict[str, Any]) -> dict[str, Any]:
+    """The execution identity an Append's source digest covers, each target's ctime as :func:`_settled` compares it
+    (unchanged on POSIX)."""
+    return {**identity, "targets": [
+        {**target, "state": {**target["state"], "ctime_ns": identity_ctime_ns(target["state"]["ctime_ns"])}}
+        for target in identity["targets"]]}
 @dataclass(frozen=True, slots=True)
 class SourceExecutionStamp:
     file: SourceFileState; adapter_id: str; frame_count: int; first_label: int
@@ -625,8 +646,7 @@ def _alias_now(binding: SourceAliasBinding, parents: dict[str, str | None]):
         parent = parents.get(os.path.dirname(binding.raw_path))
         if parent is not None and S_ISREG(state.st_mode):
             return (os.path.join(parent, os.path.basename(binding.raw_path)),
-                    (state.st_size, state.st_mtime_ns, identity_ctime_ns(state.st_ctime_ns), state.st_dev,
-                     state.st_ino))
+                    (state.st_size, state.st_mtime_ns, state.st_ctime_ns, state.st_dev, state.st_ino))
         resolved = _resolve_source_alias(binding.raw_path)
         return resolved, _revision(_capture_canonical_source_target(resolved))
     except (OSError, RuntimeError):
@@ -683,7 +703,7 @@ class LivePrefixProof:
             now, expected = _alias_now(binding, parents), targets[binding.target_id]
             if now is None or now[0] != binding.resolved_path and _path_key(now[0]) != _path_key(binding.resolved_path):
                 return False
-            if now[1] != _revision(expected.state):
+            if _settled(now[1]) != _settled(_revision(expected.state)):
                 key = _path_key(expected.resolved_path)
                 if expected.roles != ("image_metadata",) or not grown.get(key):
                     return False
@@ -701,7 +721,7 @@ class LivePrefixProof:
                     after = None if not all(map(spec_extent_holds, grown[key])) else os.stat(path)
                 except OSError:
                     after = None
-                if after is None or (after.st_size, after.st_mtime_ns, identity_ctime_ns(after.st_ctime_ns),
+                if after is None or (after.st_size, after.st_mtime_ns, after.st_ctime_ns,
                                      after.st_dev, after.st_ino) != revision:
                     return False
                 self.spec_revisions[key] = revision
@@ -829,9 +849,7 @@ def record_prefix_graph(execution: Mapping[str, Any], *, directory: str | Path, 
         parent = os.path.dirname(raw)
         if parent not in directories:
             directories[parent] = os.path.realpath(parent)
-        # A record saved before the win32 seam reached sources still carries the raw ctime; compare it as captured.
-        result = SourceFileState(raw, int(value["size"]), int(value["mtime_ns"]), identity_ctime_ns(value["ctime_ns"]),
-                                 int(value["device"]), int(value["inode"]))
+        result = SourceFileState(raw, *(int(value[key]) for key in ("size", "mtime_ns", "ctime_ns", "device", "inode")))
         object.__setattr__(result, "_resolved_path_at_capture", os.path.join(directories[parent], os.path.basename(raw)))
         return result
     members = tuple(state(value) for value in execution["member_stamps"])
@@ -854,7 +872,8 @@ def _metadata_holds(current: AdmittedMetadataSource, admitted: AdmittedMetadataS
     scan whose admitted bytes later rows and scans have only extended.
     """
     if admitted.spec_extent is None or current.spec_extent is None:
-        return current == admitted
+        return current.source_path == admitted.source_path and _same_settled_state(
+            current.metadata_file, admitted.metadata_file)
     return (current.source_path == admitted.source_path
             and current.spec_extent.extends(admitted.spec_extent))
 def _finite_motors(values: dict[str, Any]) -> dict[str, float]:
@@ -1521,7 +1540,7 @@ def append_source_from_execution_graph(value: PreparedSourceExecutionGraph, *, g
     if value.descriptor is not None and value.descriptor.kind is SourceKind.EIGER_MASTER and not externals:
         raise ValueError("Eiger Append requires exact external dataset facts")
     return AppendSource(stamp.path, stamp.adapter_id, stamp.size, stamp.mtime_ns,
-        stamp.frame_count, science_fingerprint(stamp.execution_identity_v1.as_dict()),
+        stamp.frame_count, science_fingerprint(_settled_identity(stamp.execution_identity_v1.as_dict())),
         value.dataset_paths, images, externals, int(generation))
 def source_graph_payload(value: PreparedSourceExecutionGraph) -> dict:
     policy_options = {

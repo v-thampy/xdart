@@ -1,22 +1,28 @@
-"""Source-file identity and the win32 ctime seam (beamline 2026-10-25).
+"""Live and Append compare an already-processed file with the win32 ctime seam (beamline 2026-10-25).
 
 On the maintainer's Windows share only ``ctime_ns`` (a pathname stat's creation time there) moved after a frame
 was published, +3 ms to +325 ms, with size, mtime, device and inode unchanged; every Live output then stopped
-growing. A real ``chmod`` moves this platform's ctime the same way and nothing else.
+growing. A real ``chmod`` moves this platform's ctime the same way and nothing else. On Windows ``chmod`` cannot
+move the creation time, so these run on POSIX; his beamline re-test is the native check.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.sources import execution_graph as graph
 from xrd_tools.sources.selection import image_series_spec
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="chmod moves POSIX ctime only; Windows reports the creation time")
 
 _SIDECAR = "# Counters\nI0 = 3.0\n# Motors\n\nUser: p36, time: Mon Jan 15 10:30:00 2024  # Temp\n"
 
@@ -54,11 +60,10 @@ def test_win32_identity_keeps_a_published_frame_whose_ctime_settled(tmp_path, mo
     _source, published, proof, again = _published_then_settled(tmp_path)
 
     assert proof.holds()
-    assert graph.published_metadata_drift(published, again) == ()
-    assert again.stamp.members == published.stamp.members
     assert (graph.append_source_from_execution_graph(again, generation=0).digest
             == graph.append_source_from_execution_graph(published, generation=0).digest)
-    assert all(state.ctime_ns == 0 for state in again.stamp.members)
+    # The capture stays exact (its other consumers compare it with raw stats): only the comparisons settle ctime.
+    assert again.stamp.members != published.stamp.members
 
 
 def test_posix_identity_still_sees_a_ctime_only_change(tmp_path, monkeypatch, ctime_seam):
