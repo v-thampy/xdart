@@ -1622,12 +1622,21 @@ class StandardRunExecutor:
         output = run.output
         owner = None if output is None else output.current_owner_for_target(target)
         if owner is not None:
+            own = (not run.showing_saved and os.path.normcase(os.path.abspath(str(run.artifact)))
+                   == os.path.normcase(os.path.abspath(str(owner.artifact))))
+            session = run.session if own else None
             result, primary = output.settle_failed_current(owner)
             self._close_scan(run, owner.artifact)
             self._finish_display_projection(run)
             self._project_new_durable(run, output)
             if getattr(result, "failed", False) and not isinstance(primary, SourceReadError):
                 raise RuntimeError(result.error or "scan settlement failed")
+            commit = _session_terminal_commit_identity(session, owner.artifact) if own else None
+            if commit is not None and getattr(result, "n_processed", 0) and run.current_completed:
+                # Its own source failed, but its sink committed the frames before the failure in this Run (a
+                # container's earlier epochs): those durable rows, not the attempted tail, make it the last output
+                # written (Codex N-85413c4d TT-R2). A pending or aborted epoch supplies no commit and is not recorded.
+                run.last_written = (Path(str(owner.artifact)), run.current_completed, run.current_total, commit)
             run.display.mark_hydration_closed(owner)
             if not run.display.release_light_1d(owner, reason="lineage-replaced"):
                 raise RuntimeError("prior light-1D lineage cleanup remains pending")
