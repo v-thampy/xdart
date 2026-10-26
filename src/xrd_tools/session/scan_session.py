@@ -1017,6 +1017,23 @@ class ScanSession:
             self._dynamic_primary_error = self._session._current_failure()
         return self._dynamic_frozen_result
 
+    def _dynamic_integrity_hold(self) -> BaseException | None:
+        """The reason to settle as failed when the dynamic NeXus output's transaction is in integrity-hold before its
+        finalization began (a checkpoint or seal refused mid-stream): the flush a finish would make next requires
+        EXECUTING, so it can never succeed, and finish takes the failed route, whose sink abort closes the file,
+        instead of flushing at every cleanup retry (beamline 2026-10-26: "writer flush incomplete: checkpoint requires
+        EXECUTING, got integrity-hold" at each retry kept the failed Run's cleanup pending, Run disabled and xdart
+        unable to close). A hold met after finalization began keeps its retry: the terminal proof can still succeed
+        (test_no_xye_terminal_verification_failure_preserves_terminal_truth). None otherwise."""
+        sink = self._dynamic_nexus_sink
+        transaction = None if sink is None else getattr(sink, "_transaction", None)
+        if transaction is None or sink.finalization_started:
+            return None
+        phase = getattr(transaction.snapshot(), "phase", None)
+        if getattr(phase, "value", phase) != "integrity-hold":
+            return None
+        return self._dynamic_primary_error or RuntimeError("the output transaction is in integrity-hold")
+
     def _mark_dynamic_failure(self, error: BaseException) -> ReductionResult:
         if self._dynamic_primary_error is None:
             self._dynamic_primary_error = error
@@ -1501,6 +1518,9 @@ class ScanSession:
         boundary = self._dynamic_boundary
         owner = self._dynamic_owner_token
         failed = bool(result.failed)
+        held = None if failed else self._dynamic_integrity_hold()
+        if held is not None:
+            result, failed = self._mark_dynamic_failure(held), True
         stopped = bool(self._dynamic_stop_requested or result.cancelled or _cancel_requested(self._session.cancel_token) and (self._dynamic_nexus_sink is None or self._dynamic_nexus_sink._transaction is None or not self._dynamic_nexus_sink._transaction.snapshot().writer_succeeded))
         if stopped and not result.cancelled: result = replace(result, cancelled=True); self._dynamic_frozen_result = result
 
@@ -1686,6 +1706,9 @@ class ScanSession:
         owner = self._dynamic_owner_token
         stopped = bool(self._dynamic_stop_requested or result.cancelled)
         failed = bool(result.failed)
+        held = None if failed else self._dynamic_integrity_hold()
+        if held is not None:
+            result, failed = self._mark_dynamic_failure(held), True
         if not failed and not stopped and self._dynamic_has_unresolved_attempt():
             result = self._mark_dynamic_failure(RuntimeError(
                 "session finish cannot abandon unresolved dynamic work"
