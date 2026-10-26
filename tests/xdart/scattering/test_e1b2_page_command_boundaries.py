@@ -2027,9 +2027,9 @@ def test_real_batch_click_freezes_active_batch_and_defers_all_frame_science(
             calls["qualify"] += 1
             return real_qualify(event)
 
-        def commit(frames):
+        def commit(frames, **options):
             calls["commit"] += 1
-            return real_commit(frames)
+            return real_commit(frames, **options)
 
         def reconcile(*args, **options):
             calls["reconcile"] += 1
@@ -2209,9 +2209,9 @@ def test_batch_run_projects_only_exact_latest_frame_at_terminal(
             calls["sync_detector"] += 1
             return real_sync_detector()
 
-        def commit(frames):
+        def commit(frames, **options):
             calls["commit"] += 1
-            return real_commit(frames)
+            return real_commit(frames, **options)
 
         def reconcile(*args, **options):
             calls["reconcile"] += 1

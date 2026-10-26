@@ -1382,11 +1382,17 @@ class _ContextRuntime:
     def commit_navigation_projection(
         self,
         presented_frames: tuple[DisplayFrameKey, ...],
+        *,
+        excluded: tuple[DisplayFrameKey, ...] = (),
     ) -> bool:
-        """Acknowledge the exact selected identities accepted by the shell."""
+        """Acknowledge the exact selected identities accepted by the shell.
+
+        ``excluded``: selected identities the shell received and left out, unpainted (an Overlay's other grid, or
+        older history past its display budget). They are acknowledged too, so the same result is not projected again
+        each refresh; a changed scope reseeds every selected frame as before (Codex N-f3f77127 OV-R2)."""
 
         pending = self._pending_trace_projection
-        if pending is None or type(presented_frames) is not tuple:
+        if pending is None or type(presented_frames) is not tuple or type(excluded) is not tuple:
             return False
         target_by_id = {id(frame): frame for frame in pending.target}
         if any(
@@ -1396,6 +1402,8 @@ class _ContextRuntime:
         ):
             return False
         presented_ids = {id(frame) for frame in presented_frames}
+        presented_ids.update(id(frame) for frame in excluded
+                             if type(frame) is DisplayFrameKey and target_by_id.get(id(frame)) is frame)
         committed = tuple(
             frame
             for frame in pending.target

@@ -182,7 +182,7 @@ def test_throwing_shell_apply_is_contained_at_page_boundary(
     monkeypatch.setattr(
         page._context_controller,
         "commit_navigation_projection",
-        lambda frames: commits.append(frames),
+        lambda frames, **_options: commits.append(frames),
     )
     try:
         page._refresh_shell()
@@ -239,7 +239,7 @@ def test_successful_shell_apply_commits_exact_live_projection(
     monkeypatch.setattr(
         page._context_controller,
         "commit_navigation_projection",
-        lambda frames: commits.append(frames),
+        lambda frames, **_options: commits.append(frames),
     )
     monkeypatch.setattr(shell, "apply_state", apply_state)
     try:

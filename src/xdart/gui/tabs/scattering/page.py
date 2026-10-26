@@ -6957,7 +6957,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and heavy.detector_source == "full" else scientific)
             self._context_controller.commit_navigation_projection(
                 tuple(frame for frame in self._shell.scientific.trace_history_keys
-                      if self._context_controller.owns_frame(frame))
+                      if self._context_controller.owns_frame(frame)),
+                excluded=tuple(frame for frame in self._shell.scientific.excluded_trace_keys
+                               if self._context_controller.owns_frame(frame)),
             )
             rendered_axis = self._shell.scientific.rendered_image_axis
             if rendered_axis is not None:

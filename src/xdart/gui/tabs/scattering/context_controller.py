@@ -918,11 +918,13 @@ class ContextController:
     def commit_navigation_projection(
         self,
         presented_frames: tuple[DisplayFrameKey, ...],
+        *,
+        excluded: tuple[DisplayFrameKey, ...] = (),
     ) -> bool:
         if self._closed:
             return False
         return self._runtime.commit_navigation_projection(
-            presented_frames
+            presented_frames, excluded=excluded,
         )
 
     def commit_rebound_navigation_projection(
