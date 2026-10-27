@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Update-on-exit helper — launched DETACHED by the GUI as
-``python -m xdart._updater <parent_pid> <app_root> <update_cmd_json>
-<relaunch_cmd_json> <log_path>``.
+"""Update-on-exit helper (macOS and Linux) — ``python -m xdart._updater <job.json>``.
 
-It waits for the running xdart to exit (its env files are then unlocked — this is
-the one cross-platform-safe moment to upgrade), runs the installer's update
-command, writes a log, and relaunches xdart (the new version on success, the old
-one on failure).  Stdlib only, so it keeps working inside the freshly-updated env.
-See ``docs/design/design_install_and_update_jul2026.md`` section 4.
+The app writes the job (``xdart.modules.updater``) and starts this helper: in a Terminal window on macOS, hidden on
+Linux. Windows uses a PowerShell helper outside the env instead (``xdart._updater_windows``), because the env's own
+python.exe is locked while it runs. Steps: record the handshake (this PID), wait for xdart to close, run the update
+with its output shown and logged as it arrives, stop it at the time limit (child processes first, then pixi after a
+grace period, then the whole process group), relaunch xdart detached once nothing of the update is left running, and
+record the outcome. Stdlib only. See ``docs/design/design_install_and_update_jul2026.md`` section 4.
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+_HEARTBEAT_S = 30.0
 
 
 def _pid_alive(pid):
@@ -62,73 +66,210 @@ def wait_for_exit(pid, *, timeout=60.0, interval=0.5, sleep=time.sleep,
     return not alive(pid)
 
 
-def run_update(update_cmd, relaunch_cmd, log_path, *, runner=None, launcher=None):
-    """Run ``update_cmd``; relaunch via ``relaunch_cmd`` (new version on success,
-    OLD version on failure — the shim launches whatever is installed either way).
-    Always writes a log to ``log_path``.  Returns True iff the update succeeded.
-    ``runner``/``launcher`` are injectable for tests (no real pixi, no real spawn).
-    """
-    runner = runner or (lambda cmd: subprocess.run(  # noqa: E731
-        cmd, capture_output=True, text=True))
-    launcher = launcher or (lambda cmd: subprocess.Popen(cmd))  # noqa: E731
-    lines = ["xdart update-on-exit", f"update_cmd: {update_cmd}"]
-    ok = False
-    if update_cmd:
-        try:
-            proc = runner(list(update_cmd))
-            ok = getattr(proc, "returncode", 1) == 0
-            lines += [f"returncode: {getattr(proc, 'returncode', '?')}",
-                      "--- stdout ---", getattr(proc, "stdout", "") or "",
-                      "--- stderr ---", getattr(proc, "stderr", "") or ""]
-        except Exception as exc:                       # pragma: no cover - defensive
-            lines.append(f"update FAILED to run: {exc!r}")
-    else:
-        lines.append("no update_cmd — nothing to do")
-    lines.append("RESULT: " + ("success" if ok else "FAILED — relaunching old version"))
+def _write_json(path, data):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+class _Output:
+    """Echo to the window (stdout, when there is one) and append to the log as each line arrives."""
+
+    def __init__(self, log_path):
+        self._log = open(log_path, "a", encoding="utf-8")
+
+    def line(self, text):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        for part in str(text).splitlines() or [""]:
+            self._log.write(f"{stamp} {part}\n")
+            if sys.stdout is not None:
+                try:
+                    sys.stdout.write(part + "\n")
+                    sys.stdout.flush()
+                except (OSError, ValueError):
+                    pass
+        self._log.flush()
+
+    def close(self):
+        self._log.close()
+
+
+def _group_members(pgid):
+    """PIDs in process group ``pgid`` (POSIX), from ``ps``; empty when it cannot be read."""
     try:
-        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(log_path).write_text("\n".join(str(ln) for ln in lines))
-    except OSError:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    members = []
+    for row in out.splitlines():
+        fields = row.split()
+        if len(fields) == 2 and fields[1] == str(pgid) and fields[0].isdigit():
+            members.append(int(fields[0]))
+    return members
+
+
+def _group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_group(pgid, sig):
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
         pass
-    if relaunch_cmd:
+
+
+def _wait_until(predicate, timeout, drain):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        drain()
+        if predicate():
+            return True
+        time.sleep(0.2)
+    drain()
+    return predicate()
+
+
+def run_update(job, out, result=None):
+    """Run the update command; returns ``(exit_code_or_None, timed_out, tree_gone)``."""
+    env = dict(os.environ)
+    env.update({str(k): str(v) for k, v in (job.get("update_env") or {}).items()})
+    proc = subprocess.Popen(list(job["update_cmd"]), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    pgid = proc.pid
+    if result is not None:
+        result["update_pid"] = proc.pid
+    lines = queue.Queue()
+
+    def read():
+        for raw in iter(proc.stdout.readline, b""):
+            lines.put(raw.decode("utf-8", "replace").rstrip("\r\n"))
+        proc.stdout.close()
+
+    reader = threading.Thread(target=read, name="xdart-update-output", daemon=True)
+    reader.start()
+
+    def drain():
+        while True:
+            try:
+                out.line(lines.get_nowait())
+            except queue.Empty:
+                return
+
+    started = time.monotonic()
+    limit = float(job.get("time_limit_s") or 1200)
+    beat = started + _HEARTBEAT_S
+    timed_out = False
+    while proc.poll() is None:
+        drain()
+        now = time.monotonic()
+        if now >= beat:
+            out.line(f"Still updating… {int((now - started) // 60)} min {int((now - started) % 60)} s")
+            beat = now + _HEARTBEAT_S
+        if now - started >= limit:
+            timed_out = True
+            out.line(f"The update is still running after {int(limit // 60)} min; stopping it.")
+            children = [pid for pid in _group_members(pgid) if pid != proc.pid]
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            out.line(f"Stopped {len(children)} child process(es) of the update; waiting for pixi to finish.")
+            if not _wait_until(lambda: proc.poll() is not None, float(job.get("grace_s") or 30), drain):
+                out.line("pixi did not finish; stopping the whole update.")
+                _signal_group(pgid, signal.SIGTERM)
+                if not _wait_until(lambda: proc.poll() is not None, 5.0, drain):
+                    _signal_group(pgid, signal.SIGKILL)
+            break
+        time.sleep(0.2)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    reader.join(timeout=5)
+    drain()
+    tree_gone = _wait_until(lambda: not _group_alive(pgid), float(job.get("tree_wait_s") or 10), drain)
+    if not tree_gone and timed_out:
+        _signal_group(pgid, signal.SIGKILL)
+        tree_gone = _wait_until(lambda: not _group_alive(pgid), 5.0, drain)
+    return proc.returncode, timed_out, tree_gone
+
+
+def relaunch(cmd):
+    """Start xdart detached: its own session and no terminal, so closing the update window cannot end it."""
+    subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def run_job(job):
+    state_dir = Path(job["state_dir"])
+    helper_file = state_dir / job.get("helper_file", "xdart-update-helper.json")
+    started_at = time.time()
+    _write_json(helper_file, {"pid": os.getpid(), "state": "running", "started_at": started_at})
+    out = _Output(job["log"])
+    result = {"pid": os.getpid(), "state": "completed", "started_at": started_at, "exit": None,
+              "timed_out": False, "relaunched": False}
+    try:
+        out.line(f"Updating xdart from {job.get('from')} to {job.get('target')}. Keep this window open; xdart reopens "
+                 "when the update has finished.")
+        out.line("Command: " + " ".join(str(part) for part in job["update_cmd"]))
+        parent = int(job.get("parent_pid") or 0)
+        if parent > 0 and not wait_for_exit(parent, timeout=float(job.get("parent_wait_s") or 60)):
+            out.line("xdart did not close, so nothing was changed. You can close this window.")
+            result["refused"] = "xdart did not close"
+            return 1
+        code, timed_out, tree_gone = run_update(job, out, result)
+        result.update(exit=code, timed_out=timed_out)
+        if not tree_gone:
+            out.line("Part of the update is still running, so xdart was not reopened (it could find the environment "
+                     f"half-changed). Open it once this window shows nothing new for a while. Log: {job['log']}")
+            result["refused"] = "update still running"
+            return 1
+        if code == 0 and not timed_out:
+            out.line("pixi finished. Reopening xdart; it confirms the new version when it starts.")
+        else:
+            out.line(f"The update did not finish (exit {code}). Reopening xdart; what it opens depends on how far the "
+                     f"update got. Log: {job['log']}")
         try:
-            launcher(list(relaunch_cmd))
-        except Exception:                              # pragma: no cover - defensive
-            pass
-    return ok
+            relaunch(job["relaunch_cmd"])
+            result["relaunched"] = True
+        except Exception as exc:                         # noqa: BLE001 - recorded for the user
+            out.line(f"Could not reopen xdart ({exc!r}); open it yourself.")
+        out.line("You can close this window.")
+        return 0 if code == 0 and not timed_out else 1
+    finally:
+        result["finished_at"] = time.time()
+        try:
+            _write_json(helper_file, result)
+        finally:
+            out.close()
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if len(argv) < 4:
+    if len(argv) != 1:
         if sys.stderr is not None:   # None under pythonw (detached from the GUI)
-            sys.stderr.write(
-                "usage: python -m xdart._updater PARENT_PID APP_ROOT "
-                "UPDATE_CMD_JSON RELAUNCH_CMD_JSON [LOG_PATH]\n")
+            sys.stderr.write("usage: python -m xdart._updater JOB_JSON\n")
         return 2
     try:
-        parent_pid = int(argv[0])
-    except ValueError:
-        parent_pid = -1
-    app_root = argv[1]
-    update_cmd = json.loads(argv[2]) if argv[2] else []
-    relaunch_cmd = json.loads(argv[3]) if argv[3] else []
-    log_path = argv[4] if len(argv) > 4 and argv[4] else str(
-        Path(app_root or ".") / "update.log")
-    if parent_pid > 0 and not wait_for_exit(parent_pid):
-        # S1: the app is still alive after the timeout -- do NOT run the update
-        # (its env files are in use; updating under it corrupts the running app).
-        # Log and bail; the app keeps running on the old version.
-        try:
-            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(log_path).write_text(
-                f"xdart update-on-exit ABORTED: parent pid {parent_pid} still "
-                "alive after timeout; environment left untouched.")
-        except OSError:
-            pass
-        return 1
-    run_update(update_cmd, relaunch_cmd, log_path)
-    return 0
+        with open(argv[0], "r", encoding="utf-8") as fh:
+            job = json.load(fh)
+    except (OSError, ValueError) as exc:
+        if sys.stderr is not None:
+            sys.stderr.write(f"xdart updater: cannot read the job file: {exc}\n")
+        return 2
+    return run_job(job)
 
 
 if __name__ == "__main__":                             # pragma: no cover

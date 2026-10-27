@@ -52,8 +52,10 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 ## Updating an installer workspace
 
 The **one-line installer** creates a private Pixi workspace, so it is updated
-separately from global environments. Use **Help → Check for Updates…**, or close
-xdart and update the workspace directly (default installation paths shown):
+separately from global environments. Use **Help → Check for Updates…** (xdart
+closes, a window shows the update, and xdart reopens; at startup xdart also offers
+newer 1.x releases after a 10 s notice), or close xdart and update the workspace
+directly (default installation paths shown):
 
 ```bash
 # macOS / Linux
@@ -488,3 +490,17 @@ the package publication workflows succeed**. A commit on `main`, or a local tag,
 does not update the published package. Pixi global installs use the conda channel;
 the installer scripts use PyPI. If an install was pinned to an older
 version, its version constraint must also be updated.
+
+**In-app updates.** Help → Check for Updates… asks the source the install updates from
+(the conda channels in a Pixi global environment's manifest, or PyPI). For a Pixi
+install, xdart closes and the update runs in a visible window (Terminal on macOS,
+PowerShell on Windows), then xdart reopens. The window, and the `update.log` beside the
+install (`~/.pixi/xdart-update/<env>/` for a global environment), show what pixi did.
+An update still running after 20 minutes is stopped. When xdart next starts it says
+whether the update reached the new version; a version that did not install is not
+offered again at startup, though Help → Check for Updates… can retry it. If the xdart
+app itself does not open after a failed update on macOS, run `pixi global sync` in
+Terminal. The automatic startup update acts only on a Pixi global environment that asks
+for xdart without a version pin (as the README's install command does), or on an
+installer workspace within 1.x; other setups get the command to run by hand. pip and
+conda installs always get a command to copy.

@@ -33,7 +33,10 @@ This README describes **xdart 1.2.3**.
 
 3. Launch the xdart app/shortcut, or run `xdart` in a terminal.
 
-To update a global installation, close xdart and run `pixi global update xdart`.
+To update a global installation, use **Help → Check for Updates…**: xdart closes, a window shows the
+update, and xdart reopens. xdart also checks when it starts and updates after a 10 s notice that offers
+**Not now**; **Help → Check for Updates at Startup** turns that off. You can also close xdart and run
+`pixi global update xdart`.
 To work from source, follow the [source-checkout setup](#development).
 Global installation and source-checkout installation are separate environments.
 

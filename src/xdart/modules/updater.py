@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -140,21 +142,50 @@ def pixi_global_meta(prefix=None, *, platform=None):
     On Windows both ``.exe`` files must exist, else None (the caller shows the copyable command)."""
     import shutil
     platform = sys.platform if platform is None else platform
-    windows = platform.startswith("win")
-    exe = ".exe" if windows else ""
+    exe = ".exe" if platform.startswith("win") else ""
     home = pixi_global_home(prefix)
     env = pixi_global_env_name(prefix)
     pixi = home / "bin" / f"pixi{exe}"
     if not pixi.exists():
         found = shutil.which("pixi")
         pixi = Path(found) if found else Path(_pixi_home()) / "bin" / f"pixi{exe}"
-    trampoline = home / "bin" / f"xdart{exe}"
-    if windows and not (pixi.exists() and trampoline.exists()):
+    # The relaunch command is the one this env's manifest exposes for xdart; an unreadable manifest, no exposed xdart
+    # or a missing executable is an unknown state, so the caller shows the copyable command instead.
+    name = exposed_xdart_command(pixi_global_entry(env, home))
+    trampoline = home / "bin" / f"{name}{exe}" if name else None
+    if trampoline is None or not trampoline.exists() or not pixi.exists():
         return None
-    return {"flavor": "pixi-global", "app_root": str(home), "env_name": env,
+    return {"flavor": "pixi-global", "app_root": str(home), "env_name": env, "env_prefix": str(home / "envs" / env),
             "update_cmd": [str(pixi), "global", "update", env],
             "update_env": {"PIXI_HOME": str(home)},
             "relaunch_cmd": [str(trampoline)]}
+
+
+def pixi_global_command(words, *, prefix=None):
+    """A ``pixi global …`` command line for this install's home, with ``PIXI_HOME`` when it is not the default."""
+    home, default = pixi_global_home(prefix), Path(_pixi_home())
+    command = f"pixi global {words}"
+    try:
+        same_home = home == default.resolve()
+    except OSError:
+        same_home = home == default
+    if same_home:
+        return command
+    if sys.platform.startswith("win"):
+        return f"$env:PIXI_HOME = '{home}'; {command}"
+    return f'PIXI_HOME="{home}" {command}'
+
+
+def copyable_update_command(kind, *, prefix=None):
+    """The command a user can run by hand for this install: never pip for a pixi install."""
+    if kind == "pixi-global":
+        return pixi_global_command(f"update {pixi_global_env_name(prefix)}", prefix=prefix)
+    if kind == "pixi":
+        meta = find_install_meta() or {}
+        cmd = meta.get("update_cmd")
+        if isinstance(cmd, list) and cmd:
+            return " ".join(f'"{part}"' if " " in str(part) else str(part) for part in cmd)
+    return 'pip install -U "xdart[gui]"'
 
 
 def install_kind(meta=None):
@@ -237,51 +268,149 @@ def latest_from_repodata(data, *, include_prereleases=False):
     return None if best is None else best[1]
 
 
-def pixi_global_channels(env_name, home):
-    """The URL channels (``https://…``, ``file://…``) a pixi-global env installs from, in manifest order.  Bare names
-    such as ``conda-forge`` are skipped (no xdart; a very large index).  Falls back to :data:`DEFAULT_CONDA_CHANNEL`."""
+def pixi_global_entry(env_name, home):
+    """The ``[envs.<env>]`` table of ``<home>/manifests/pixi-global.toml``, or None when it cannot be read."""
     try:
         import tomllib
         with open(Path(home) / "manifests" / "pixi-global.toml", "rb") as fh:
-            channels = tomllib.load(fh)["envs"][env_name]["channels"]
+            entry = tomllib.load(fh)["envs"][env_name]
     except Exception:
-        return [DEFAULT_CONDA_CHANNEL]
-    urls = []
-    for channel in channels if isinstance(channels, list) else ():
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def _is_conda_forge(channel):
+    return channel == "conda-forge" or channel.rstrip("/").endswith("/conda-forge")
+
+
+def manifest_channels(entry):
+    """``(urls, plain)``: the URL channels (``https://…``, ``file://…``) in priority order, skipping conda-forge (no
+    xdart, a very large index); ``plain`` is False when a channel is neither a URL nor conda-forge, i.e. an authority
+    this check cannot read."""
+    channels = entry.get("channels") if isinstance(entry, dict) else None
+    if not isinstance(channels, list) or not channels:
+        return [], False
+    urls, plain = [], True
+    for channel in channels:
         if isinstance(channel, dict):
             channel = channel.get("channel")
-        if isinstance(channel, str) and "://" in channel:
+        if not isinstance(channel, str) or not channel:
+            plain = False
+        elif _is_conda_forge(channel):
+            continue
+        elif "://" in channel:
             urls.append(channel.rstrip("/"))
+        else:
+            plain = False
+    return urls, plain
+
+
+def pixi_global_channels(env_name, home):
+    """The URL channels a pixi-global env installs from, in manifest order; :data:`DEFAULT_CONDA_CHANNEL` when the
+    manifest cannot be read (Help's manual check only; the automatic update requires a readable manifest)."""
+    urls, _plain = manifest_channels(pixi_global_entry(env_name, home))
     return urls or [DEFAULT_CONDA_CHANNEL]
 
 
-def fetch_latest_conda(channels, *, timeout=3.0, opener=None, include_prereleases=False):
-    """The latest xdart in the first of ``channels`` whose noarch index lists it, or None on any failure (never
-    raises)."""
+def xdart_spec_is_plain(entry):
+    """True when the env asks for xdart without a version pin (``xdart = "*"``, or a table without a version)."""
+    deps = entry.get("dependencies") if isinstance(entry, dict) else None
+    spec = deps.get("xdart") if isinstance(deps, dict) else None
+    if isinstance(spec, dict):
+        spec = spec.get("version", "*")
+    return isinstance(spec, str) and spec.strip() in ("", "*")
+
+
+def exposed_xdart_command(entry):
+    """The exposed command name that runs xdart (``exposed = { xdart = "xdart" }``), preferring ``xdart``; None when
+    the env exposes none, so there is no trampoline to relaunch through."""
+    exposed = entry.get("exposed") if isinstance(entry, dict) else None
+    if not isinstance(exposed, dict):
+        return None
+    names = sorted(name for name, target in exposed.items() if target == "xdart" and isinstance(name, str) and name)
+    return "xdart" if "xdart" in names else (names[0] if names else None)
+
+
+def query_conda_channels(channels, *, timeout=3.0, opener=None, include_prereleases=False):
+    """``(status, latest)`` from the first channel whose noarch index lists xdart: ``("ok", version)``,
+    ``("absent", None)`` when a channel answered but none lists xdart, ``("unreachable", None)`` when none answered.
+    Never raises."""
+    answered = False
     for channel in channels:
         try:
             data = json.loads(_fetch(f"{channel.rstrip('/')}/noarch/repodata.json", timeout, opener))
         except Exception:
             continue
+        answered = True
         latest = latest_from_repodata(data, include_prereleases=include_prereleases)
         if latest is not None:
-            return latest
-    return None
+            return "ok", latest
+    return ("absent" if answered else "unreachable"), None
+
+
+def fetch_latest_conda(channels, *, timeout=3.0, opener=None, include_prereleases=False):
+    """The latest xdart in the first of ``channels`` whose noarch index lists it, or None."""
+    return query_conda_channels(channels, timeout=timeout, opener=opener,
+                                include_prereleases=include_prereleases)[1]
+
+
+def _running_prerelease():
+    try:
+        from packaging.version import Version
+        current = current_version()
+        return bool(current) and Version(current).is_prerelease
+    except Exception:
+        return False
 
 
 def fetch_latest_for(kind, *, timeout=3.0, opener=None, prefix=None):
     """The latest version for this install: a pixi-global install asks the conda channels it installs from (they may
     lag PyPI, and ``pixi global update`` can only reach what they hold); every other kind asks PyPI."""
+    return check_for_update(kind, timeout=timeout, opener=opener, prefix=prefix).latest
+
+
+@dataclass(frozen=True)
+class UpdateCheck:
+    """One update check. ``status``: ``ok``, ``absent`` (the channels answered without xdart), ``unreachable``, or
+    ``unsupported`` (an install layout this updater does not read). ``automatic`` is True only when the startup
+    update may act on it unattended: a validated plain pixi-global manifest, or the script installer's workspace
+    within its major version (its manifest asks for ``>=1,<2``)."""
+
+    status: str
+    latest: str | None = None
+    automatic: bool = False
+    reason: str = ""
+
+
+def check_for_update(kind, *, timeout=3.0, opener=None, prefix=None, meta=None):
+    """Check the source this install updates from (see :class:`UpdateCheck`). Never raises."""
     if kind == "pixi-global":
-        current = current_version()
+        home, env = pixi_global_home(prefix), pixi_global_env_name(prefix)
+        entry = pixi_global_entry(env, home)
+        if entry is None:
+            return UpdateCheck("unsupported", reason=f"cannot read {Path(home) / 'manifests' / 'pixi-global.toml'}")
+        urls, plain_channels = manifest_channels(entry)
+        if not urls:
+            return UpdateCheck("unsupported", reason="the manifest names no channel URL for xdart")
+        status, latest = query_conda_channels(urls, timeout=timeout, opener=opener,
+                                              include_prereleases=_running_prerelease())
+        plain = plain_channels and xdart_spec_is_plain(entry) and exposed_xdart_command(entry) is not None
+        reason = "" if plain else "the manifest pins xdart, names another channel, or exposes no xdart command"
+        return UpdateCheck(status, latest, status == "ok" and plain, reason)
+    latest = fetch_latest_pypi(timeout=timeout, opener=opener)
+    if latest is None:
+        return UpdateCheck("unreachable")
+    automatic = False
+    if kind == "pixi":
+        resolved = meta if meta is not None else find_install_meta()
         try:
             from packaging.version import Version
-            include = bool(current) and Version(current).is_prerelease
+            automatic = (isinstance(resolved, dict) and isinstance(resolved.get("update_cmd"), list)
+                         and isinstance(resolved.get("relaunch_cmd"), list)
+                         and Version(latest).major == Version(current_version() or "0").major)
         except Exception:
-            include = False
-        channels = pixi_global_channels(pixi_global_env_name(prefix), pixi_global_home(prefix))
-        return fetch_latest_conda(channels, timeout=timeout, opener=opener, include_prereleases=include)
-    return fetch_latest_pypi(timeout=timeout, opener=opener)
+            automatic = False
+    return UpdateCheck("ok", latest, automatic)
 
 
 def update_available(current, latest):
@@ -302,3 +431,142 @@ def update_available(current, latest):
     if new.is_prerelease and not cur.is_prerelease:
         return False
     return new > cur
+
+
+# ── Per-install update state (attempts, the helper's handshake, failed targets) ──────────────────────────────────
+#
+# The app writes STATE_FILE before it starts the helper; only the helper writes HELPER_FILE (its PID, then the
+# outcome).  A second xdart start reads both: a live helper means "being updated, quit"; a finished or dead helper
+# settles the attempt by comparing versions (never exit codes: a pinned manifest exits 0 with nothing done).
+
+STATE_FILE = "xdart-update-state.json"
+HELPER_FILE = "xdart-update-helper.json"
+JOB_FILE = "xdart-update-job.json"
+LOG_FILE = "update.log"
+#: The helper stops an update still running after this long (agreed with Codex N-2b0787f9).
+UPDATE_TIME_LIMIT_S = 1200
+#: How long the helper waits for xdart to close, and for pixi to finish after its child processes are stopped.
+PARENT_WAIT_S = 60
+STOP_GRACE_S = 30
+
+
+def install_identity(prefix=None):
+    """This install's identity for the state files: the resolved ``sys.prefix``."""
+    try:
+        return str(Path(prefix if prefix is not None else sys.prefix).resolve())
+    except OSError:
+        return str(prefix if prefix is not None else sys.prefix)
+
+
+def update_state_dir(meta):
+    """Where this install's update files live: ``<home>/xdart-update/<env>`` for pixi global (one home can hold
+    several envs), ``<app_root>/xdart-update`` for the script installer's workspace."""
+    if meta.get("flavor") == "pixi-global" and meta.get("env_name"):
+        return Path(meta["app_root"]) / "xdart-update" / meta["env_name"]
+    return Path(meta.get("app_root") or ".") / "xdart-update"
+
+
+def write_json_atomic(path, data):
+    """Write JSON through a temporary file, flushed to disk, then renamed over ``path``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_update_state(state_dir, install):
+    """This install's state: ``{"install", "failed": [versions], "attempt": {...} | None}``."""
+    data = read_json(Path(state_dir) / STATE_FILE)
+    if data is None or data.get("install") != install:
+        return {"install": install, "failed": [], "attempt": None}
+    failed = data.get("failed")
+    attempt = data.get("attempt")
+    return {"install": install,
+            "failed": sorted({str(v) for v in failed}) if isinstance(failed, list) else [],
+            "attempt": attempt if isinstance(attempt, dict) else None}
+
+
+def version_reached(current, target):
+    """True when the running version is the target or newer (a newer manual install is not a failed attempt)."""
+    try:
+        from packaging.version import Version
+        return Version(str(current)) >= Version(str(target))
+    except Exception:
+        return False
+
+
+def begin_attempt(state_dir, *, install, current, target, log):
+    """Record an attempt before the helper starts; returns the previous state for :func:`abandon_attempt`."""
+    state = load_update_state(state_dir, install)
+    previous = {**state, "failed": list(state["failed"])}
+    state["attempt"] = {"from": current, "to": target, "log": str(log), "launched_at": time.time()}
+    write_json_atomic(Path(state_dir) / STATE_FILE, state)
+    try:
+        (Path(state_dir) / HELPER_FILE).unlink()
+    except OSError:
+        pass
+    return previous
+
+
+def abandon_attempt(state_dir, previous):
+    """Undo :func:`begin_attempt` when the helper could not be started."""
+    write_json_atomic(Path(state_dir) / STATE_FILE, previous)
+
+
+def settle_previous_attempt(state_dir, *, install, current, alive):
+    """At startup: ``("none" | "active" | "updated" | "incomplete", attempt)``.  ``active``: the helper is still
+    running (the caller quits without touching the attempt).  Otherwise the attempt is settled by version, a missed
+    target joins the failed targets the startup update never retries, and the attempt is cleared."""
+    state = load_update_state(state_dir, install)
+    attempt = state["attempt"]
+    if attempt is None:
+        return "none", None
+    helper = read_json(Path(state_dir) / HELPER_FILE) or {}
+    if helper.get("state") != "completed":
+        pid = helper.get("pid")
+        try:
+            recent = time.time() - float(attempt.get("launched_at", 0)) < UPDATE_TIME_LIMIT_S + 300
+        except (TypeError, ValueError):
+            recent = False
+        if recent and isinstance(pid, int) and pid > 0 and alive(pid):
+            return "active", attempt
+    reached = version_reached(current, attempt.get("to"))
+    if not reached and attempt.get("to"):
+        state["failed"] = sorted(set(state["failed"]) | {str(attempt["to"])})
+    state["attempt"] = None
+    write_json_atomic(Path(state_dir) / STATE_FILE, state)
+    try:
+        (Path(state_dir) / HELPER_FILE).unlink()
+    except OSError:
+        pass
+    return ("updated" if reached else "incomplete"), {**attempt, "helper": helper}
+
+
+def target_failed(state_dir, install, version):
+    """True when an earlier attempt at ``version`` did not complete (the startup update skips it)."""
+    return str(version) in load_update_state(state_dir, install)["failed"]
+
+
+def state_dir_for(kind, *, prefix=None):
+    """This install's update folder (see :func:`update_state_dir`) without building the launch meta; None for kinds
+    the in-app updater never runs."""
+    if kind == "pixi-global":
+        return pixi_global_home(prefix) / "xdart-update" / pixi_global_env_name(prefix)
+    if kind == "pixi":
+        meta = find_install_meta(prefix=prefix) if prefix is not None else find_install_meta()
+        if isinstance(meta, dict) and meta.get("app_root"):
+            return Path(meta["app_root"]) / "xdart-update"
+    return None

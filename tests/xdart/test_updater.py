@@ -6,6 +6,7 @@ Spec: docs/design/design_install_and_update_jul2026.md section 4.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 
 from xdart.modules import updater
 from xdart import _updater as helper
+from xdart.modules import update_launch
 
 
 # ── install_meta discovery ────────────────────────────────────────────────────
@@ -108,36 +110,114 @@ def test_install_kind_prefers_install_meta_over_the_path_probe(monkeypatch):
     assert updater.install_kind(meta={"app_root": "x"}) == "pixi"
 
 
+def _pixi_home(tmp_path, *, env="xdart-test", exposed='{ xdart = "xdart" }', spec='"*"',
+               channels='["https://prefix.dev/xrd-tools", "conda-forge"]', exe=""):
+    """A pixi home with one global env, its manifest entry, and the pixi and trampoline executables."""
+    home = tmp_path / ".pixi"
+    env_dir = home / "envs" / env
+    env_dir.mkdir(parents=True)
+    (home / "manifests").mkdir()
+    (home / "bin").mkdir()
+    (home / "manifests" / "pixi-global.toml").write_text(
+        f'version = 1\n\n[envs.{env}]\nchannels = {channels}\ndependencies = {{ xdart = {spec} }}\n'
+        f'exposed = {exposed}\n', encoding="utf-8")
+    for name in ("pixi", "xdart"):
+        (home / "bin" / f"{name}{exe}").write_bytes(b"")
+    return home.resolve(), env_dir
+
+
 def test_pixi_global_meta_builds_update_command(monkeypatch, tmp_path):
     # The home comes from the running env, not $PIXI_HOME: an install under another home updates that home.
     monkeypatch.setenv("PIXI_HOME", str(tmp_path / "elsewhere"))
-    home = tmp_path / ".pixi"
-    env = home / "envs" / "xdart-test"
-    env.mkdir(parents=True)
+    home, env = _pixi_home(tmp_path)
     meta = updater.pixi_global_meta(prefix=str(env), platform="darwin")
     assert meta["flavor"] == "pixi-global"
-    assert meta["update_cmd"][-3:] == ["global", "update", "xdart-test"]
-    assert meta["update_env"] == {"PIXI_HOME": str(home.resolve())}
-    assert meta["relaunch_cmd"] == [str(home.resolve() / "bin" / "xdart")]  # the trampoline, not the env's script
+    assert meta["update_cmd"] == [str(home / "bin" / "pixi"), "global", "update", "xdart-test"]
+    assert meta["update_env"] == {"PIXI_HOME": str(home)}
+    assert meta["relaunch_cmd"] == [str(home / "bin" / "xdart")]  # the trampoline, not the env's script
+    assert meta["env_prefix"] == str(home / "envs" / "xdart-test")
+    assert updater.update_state_dir(meta) == home / "xdart-update" / "xdart-test"
+
+
+def test_pixi_global_meta_relaunches_the_exposed_command_or_refuses(tmp_path):
+    home, env = _pixi_home(tmp_path, exposed='{ xd = "xdart", py = "python" }')
+    (home / "bin" / "xd").write_bytes(b"")
+    assert updater.pixi_global_meta(prefix=str(env), platform="darwin")["relaunch_cmd"] == [str(home / "bin" / "xd")]
+    (home / "manifests" / "pixi-global.toml").write_text(
+        'version = 1\n\n[envs.xdart-test]\nchannels = ["https://prefix.dev/xrd-tools"]\nexposed = { py = "python" }\n')
+    assert updater.pixi_global_meta(prefix=str(env), platform="darwin") is None   # nothing exposed runs xdart
+    (home / "manifests" / "pixi-global.toml").write_text("not toml [")
+    assert updater.pixi_global_meta(prefix=str(env), platform="darwin") is None   # unreadable: unknown state
 
 
 def test_pixi_global_meta_on_windows_needs_both_executables(tmp_path, monkeypatch):
     import shutil
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     monkeypatch.setenv("PIXI_HOME", str(tmp_path / "no-default-home"))
-    home = tmp_path / ".pixi"
-    env = home / "envs" / "xdart"
-    env.mkdir(parents=True)
-    (home / "bin").mkdir()
-    (home / "bin" / "xdart.exe").write_bytes(b"")
-    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None  # no pixi.exe anywhere
-    pixi = home / "bin" / "pixi.exe"
-    pixi.write_bytes(b"")
+    home, env = _pixi_home(tmp_path, env="xdart", exe=".exe")
     meta = updater.pixi_global_meta(prefix=str(env), platform="win32")
-    assert meta["update_cmd"] == [str(pixi.resolve()), "global", "update", "xdart"]
-    assert meta["relaunch_cmd"] == [str(home.resolve() / "bin" / "xdart.exe")]
+    assert meta["update_cmd"] == [str(home / "bin" / "pixi.exe"), "global", "update", "xdart"]
+    assert meta["relaunch_cmd"] == [str(home / "bin" / "xdart.exe")]
+    (home / "bin" / "pixi.exe").unlink()
+    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None   # no pixi.exe anywhere
+    (home / "bin" / "pixi.exe").write_bytes(b"")
     (home / "bin" / "xdart.exe").unlink()
-    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None
+    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None   # no trampoline
+
+
+def test_copyable_command_never_offers_pip_for_a_pixi_install(tmp_path, monkeypatch):
+    home, env = _pixi_home(tmp_path, env="xdart")
+    monkeypatch.setenv("PIXI_HOME", str(home))
+    assert updater.copyable_update_command("pixi-global", prefix=str(env)) == "pixi global update xdart"
+    monkeypatch.setenv("PIXI_HOME", str(tmp_path / "default-home"))
+    assert updater.copyable_update_command("pixi-global", prefix=str(env)) == (
+        f'PIXI_HOME="{home}" pixi global update xdart')
+    assert updater.pixi_global_command("sync", prefix=str(env)) == f'PIXI_HOME="{home}" pixi global sync'
+    assert updater.copyable_update_command("managed") == 'pip install -U "xdart[gui]"'
+
+
+def test_check_for_update_reads_the_install_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "current_version", lambda: "1.2.5")
+    payload = _REPODATA.read_bytes()
+
+    def check(**manifest):
+        root = tmp_path / str(len(list(tmp_path.iterdir())))
+        root.mkdir()
+        _home, env = _pixi_home(root, **manifest)
+        return updater.check_for_update("pixi-global", prefix=str(env), opener=lambda url, _t: payload)
+
+    plain = check()
+    assert (plain.status, plain.latest, plain.automatic) == ("ok", "1.2.6", True)
+    assert check(spec='">=1.2,<1.3"').automatic is False                       # pinned: Help only
+    assert check(channels='["https://prefix.dev/xrd-tools", "my-mirror"]').automatic is False  # unknown authority
+    assert check(exposed='{ py = "python" }').automatic is False                # no trampoline for xdart
+    assert check(channels='["conda-forge"]').status == "unsupported"            # no channel URL for xdart
+
+
+def test_check_for_update_tells_unreachable_from_absent(tmp_path):
+    _home, env = _pixi_home(tmp_path)
+
+    def down(_url, _timeout):
+        raise OSError("offline")
+
+    assert updater.check_for_update("pixi-global", prefix=str(env), opener=down).status == "unreachable"
+    empty = updater.check_for_update("pixi-global", prefix=str(env), opener=lambda _u, _t: b'{"packages": {}}')
+    assert (empty.status, empty.latest) == ("absent", None)
+    (tmp_path / ".pixi" / "manifests" / "pixi-global.toml").unlink()
+    assert updater.check_for_update("pixi-global", prefix=str(env), opener=down).status == "unsupported"
+
+
+def test_check_for_update_workspace_is_automatic_within_its_major(monkeypatch):
+    # The script installer's workspace asks for xdart ">=1,<2" from PyPI.
+    monkeypatch.setattr(updater, "current_version", lambda: "1.2.6")
+    meta = {"app_root": "x", "update_cmd": ["pixi", "update"], "relaunch_cmd": ["xdart"]}
+
+    def pypi(version):
+        return lambda _url, _t: json.dumps({"info": {"version": version}}).encode()
+
+    assert updater.check_for_update("pixi", meta=meta, opener=pypi("1.2.7")).automatic is True
+    assert updater.check_for_update("pixi", meta=meta, opener=pypi("2.0.0")).automatic is False
+    assert updater.check_for_update("managed", opener=pypi("1.2.7")).automatic is False
 
 
 def test_resolve_update_meta_by_kind(monkeypatch):
@@ -310,80 +390,235 @@ def test_wait_for_exit_times_out():
         alive=lambda pid: True, sleep=lambda s: None) is False
 
 
-def test_run_update_success_relaunches_new(tmp_path):
-    launched = []
-    log = tmp_path / "update.log"
+# ── the update helper (real processes: stand-in update commands, a real relaunch) ──────────────────────────────
 
-    class _Ok:
-        returncode = 0
-        stdout = "updated"
-        stderr = ""
-
-    ok = helper.run_update(
-        ["pixi", "update"], ["xdart"], str(log),
-        runner=lambda cmd: _Ok(), launcher=launched.append)
-    assert ok is True
-    assert launched == [["xdart"]]                     # relaunched
-    assert "success" in log.read_text()
+posix_only = pytest.mark.skipif(sys.platform.startswith("win"), reason="the POSIX helper; Windows runs PowerShell")
 
 
-def test_run_update_failure_still_relaunches_old(tmp_path):
-    launched = []
-    log = tmp_path / "update.log"
+def _script(body):
+    return [sys.executable, "-c", body]
 
-    class _Fail:
-        returncode = 1
-        stdout = ""
-        stderr = "boom"
 
-    ok = helper.run_update(
-        ["pixi", "update"], ["xdart"], str(log),
-        runner=lambda cmd: _Fail(), launcher=launched.append)
-    assert ok is False
-    assert launched == [["xdart"]]                     # OLD version relaunched anyway
-    assert "FAILED" in log.read_text()
+def _job(state, update_cmd, *, marker, parent_pid=0, limit=60, grace=2, tree_wait=10, parent_wait=5):
+    state.mkdir(parents=True, exist_ok=True)
+    job = {"parent_pid": parent_pid, "install": "test-install", "from": "1.2.6", "target": "1.2.7",
+           "update_cmd": update_cmd, "update_env": {"XDART_TEST_UPDATE_ENV": "set"},
+           "relaunch_cmd": _script(f"open({str(marker)!r}, 'w').write('relaunched')"),
+           "env_prefix": str(state), "log": str(state / "update.log"), "time_limit_s": limit, "grace_s": grace,
+           "tree_wait_s": tree_wait, "parent_wait_s": parent_wait}
+    return update_launch.write_job(state, job)
+
+
+def _await(path, seconds=10.0):
+    import time
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not path.exists():
+        time.sleep(0.05)
+    return path.exists()
+
+
+def _helper_result(state):
+    return json.loads((state / updater.HELPER_FILE).read_text())
+
+
+@posix_only
+def test_helper_streams_the_update_and_relaunches_after_success(tmp_path):
+    state, marker = tmp_path / "state", tmp_path / "relaunched"
+    job = _job(state, _script("import os, time; print('step 1', flush=True); time.sleep(0.3); "
+                              "print('env', os.environ['XDART_TEST_UPDATE_ENV'], flush=True)"), marker=marker)
+    assert helper.main([str(job)]) == 0
+    log = (state / "update.log").read_text()
+    assert "Updating xdart from 1.2.6 to 1.2.7" in log and " step 1\n" in log and " env set\n" in log
+    result = _helper_result(state)
+    assert (result["state"], result["exit"], result["timed_out"], result["relaunched"]) == ("completed", 0, False, True)
+    assert _await(marker)                                   # the detached relaunch ran
+
+
+@posix_only
+def test_helper_time_limit_stops_children_first_then_relaunches(tmp_path):
+    state, marker = tmp_path / "state", tmp_path / "relaunched"
+    pixi = ("import subprocess, sys, time; "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print('child started', flush=True); rc = child.wait(); "
+            "print(f'child ended rc={rc}', flush=True); sys.exit(3)")
+    job = _job(state, _script(pixi), marker=marker, limit=1, grace=10)
+    assert helper.main([str(job)]) == 1
+    log = (state / "update.log").read_text()
+    lines = [line.split(" ", 2)[2] for line in log.splitlines()]   # drop the timestamp; the command echo is one line
+
+    def at(prefix):
+        return next(i for i, line in enumerate(lines) if line.startswith(prefix))
+
+    order = [at("child started"), at("The update is still running"), at("Stopped 1 child process"),
+             at("child ended rc=")]
+    assert order == sorted(order) and "pixi did not finish" not in log
+    result = _helper_result(state)
+    assert (result["exit"], result["timed_out"], result["relaunched"]) == (3, True, True)
+    assert _await(marker)
+
+
+@posix_only
+def test_helper_escalates_when_pixi_ignores_the_stop(tmp_path):
+    state, marker = tmp_path / "state", tmp_path / "relaunched"
+    pixi = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('busy', flush=True); time.sleep(60)"
+    job = _job(state, _script(pixi), marker=marker, limit=1, grace=1)
+    assert helper.main([str(job)]) == 1
+    log = (state / "update.log").read_text()
+    assert "pixi did not finish; stopping the whole update." in log
+    result = _helper_result(state)
+    assert result["timed_out"] is True and result["relaunched"] is True and result["exit"] == -9
+    assert _await(marker)
+
+
+@posix_only
+def test_helper_leaves_xdart_closed_while_part_of_the_update_still_runs(tmp_path):
+    import os
+    import signal
+    state, marker = tmp_path / "state", tmp_path / "relaunched"
+    pixi = ("import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            "print('done, leaving a child', flush=True)")
+    job = _job(state, _script(pixi), marker=marker, tree_wait=1)
+    try:
+        assert helper.main([str(job)]) == 1
+        result = _helper_result(state)
+        assert result["exit"] == 0 and result["relaunched"] is False and result["refused"] == "update still running"
+        assert "xdart was not reopened" in (state / "update.log").read_text()
+        assert not marker.exists()
+    finally:
+        try:
+            os.killpg(_helper_result(state)["update_pid"], signal.SIGKILL)
+        except (ProcessLookupError, KeyError, PermissionError):
+            pass
+
+
+@posix_only
+def test_helper_changes_nothing_when_xdart_does_not_close(tmp_path):
+    import subprocess
+    state, marker, ran = tmp_path / "state", tmp_path / "relaunched", tmp_path / "update-ran"
+    xdart = subprocess.Popen(_script("import time; time.sleep(30)"))
+    try:
+        job = _job(state, _script(f"open({str(ran)!r}, 'w').write('ran')"), marker=marker,
+                   parent_pid=xdart.pid, parent_wait=1)
+        assert helper.main([str(job)]) == 1
+        assert _helper_result(state)["refused"] == "xdart did not close"
+        assert not ran.exists() and not marker.exists()
+    finally:
+        xdart.kill()
+        xdart.wait()
+
+
+@posix_only
+def test_command_wrapper_passes_a_hard_path_to_the_helper(tmp_path):
+    # The Terminal wrapper's only argument is the job path: spaces, an apostrophe and non-ASCII must survive a real sh.
+    import subprocess
+    state, marker = tmp_path / "Jane O'Neil ü" / "xdart-update", tmp_path / "relaunched"
+    job = _job(state, _script("print('ok', flush=True)"), marker=marker)
+    wrapper = update_launch.write_command_wrapper(state, sys.executable, job)
+    assert os.access(wrapper, os.X_OK)
+    env = {**os.environ, "PYTHONPATH": str(Path(updater.__file__).resolve().parents[2])}
+    done = subprocess.run(["/bin/sh", str(wrapper)], capture_output=True, text=True, timeout=60, env=env)
+    assert done.returncode == 0, done.stderr
+    assert _helper_result(state)["exit"] == 0 and _await(marker)
+
+
+def test_launch_macos_opens_the_wrapper_in_terminal(tmp_path):
+    seen = []
+
+    class _Done:
+        returncode, stderr = 0, ""
+
+    job = tmp_path / "job.json"
+    wrapper = update_launch.launch_macos(tmp_path, "/env/bin/python", job, runner=lambda argv, **_k: seen.append(argv) or _Done())
+    assert seen == [["/usr/bin/open", "-a", "Terminal", str(wrapper)]]
+    assert wrapper.read_text().endswith(f"exec '/env/bin/python' -m xdart._updater '{job}'\n")
+    _Done.returncode, _Done.stderr = 1, "no Terminal"
+    with pytest.raises(update_launch.UpdateLaunchRefused, match="no Terminal"):
+        update_launch.launch_macos(tmp_path, "/env/bin/python", job, runner=lambda argv, **_k: _Done())
+
+
+def test_windows_launch_breaks_away_from_the_job_or_refuses(tmp_path):
+    seen = []
+    job = tmp_path / "Jane O'Neil ü" / "job.json"
+    update_launch.launch_windows(job, popen=lambda argv, **kwargs: seen.append((argv, kwargs)))
+    (argv, kwargs), = seen
+    assert argv[1:5] == ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]
+    assert kwargs["creationflags"] & update_launch.CREATE_BREAKAWAY_FROM_JOB
+    assert kwargs["creationflags"] & update_launch.CREATE_NEW_CONSOLE
+    import base64
+    script = base64.b64decode(argv[5]).decode("utf-16-le")
+    assert script == update_launch.powershell_script(job)
+    assert script.count(update_launch.ps_literal(job)) == 1 and "__JOB__" not in script
+    assert update_launch.ps_literal("C:\\Users\\Jane O'Neil\\ü\\job.json") == "'C:\\Users\\Jane O''Neil\\ü\\job.json'"
+
+    def refuse(_argv, **_kwargs):
+        raise PermissionError(5, "Access is denied")
+
+    with pytest.raises(update_launch.UpdateLaunchRefused, match="outside xdart"):
+        update_launch.launch_windows(job, popen=refuse)
+
+
+# ── per-install update state ──────────────────────────────────────────────────────────────────────────────────
+
+def test_an_attempt_settles_by_version(tmp_path):
+    def attempt(current_at_settle, helper=None):
+        state = tmp_path / current_at_settle
+        updater.begin_attempt(state, install="I", current="1.2.6", target="1.2.7", log=state / "update.log")
+        if helper is not None:
+            updater.write_json_atomic(state / updater.HELPER_FILE, helper)
+        return state, updater.settle_previous_attempt(state, install="I", current=current_at_settle,
+                                                     alive=lambda _pid: False)
+
+    state, (outcome, record) = attempt("1.2.7", {"pid": 1, "state": "completed", "exit": 0})
+    assert outcome == "updated" and record["to"] == "1.2.7"
+    assert updater.load_update_state(state, "I")["attempt"] is None and not (state / updater.HELPER_FILE).exists()
+    assert attempt("1.2.8")[1][0] == "updated"              # a newer install is not a failure of the older target
+    state, (outcome, _record) = attempt("1.2.6", {"pid": 1, "state": "completed", "exit": 0})
+    assert outcome == "incomplete" and updater.target_failed(state, "I", "1.2.7")  # exit 0, version unchanged
+    assert attempt("1.2.6-dead", {"pid": 99999999, "state": "running"})[1][0] == "incomplete"
+    assert updater.settle_previous_attempt(tmp_path / "none", install="I", current="1", alive=bool) == ("none", None)
+
+
+def test_a_running_helper_keeps_the_attempt(tmp_path):
+    updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log=tmp_path / "update.log")
+    updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": os.getpid(), "state": "running"})
+    outcome, record = updater.settle_previous_attempt(tmp_path, install="I", current="1.2.6", alive=lambda pid: True)
+    assert outcome == "active" and record["to"] == "1.2.7"
+    assert updater.load_update_state(tmp_path, "I")["attempt"]["to"] == "1.2.7"   # untouched
+
+
+def test_abandon_restores_the_state_and_installs_do_not_share_it(tmp_path):
+    previous = updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log="l")
+    updater.abandon_attempt(tmp_path, previous)
+    assert updater.load_update_state(tmp_path, "I")["attempt"] is None
+    updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log="l")
+    assert updater.load_update_state(tmp_path, "another install")["attempt"] is None
 
 
 def test_update_check_runs_off_the_gui_thread():
-    # The PyPI fetch must never run on the GUI thread: the check worker is a
-    # QThread subclass carrying its result back over a signal (spec section 4).
-    from pyqtgraph.Qt import QtCore
-    from xdart._gui_main import _UpdateCheckThread
-    assert issubclass(_UpdateCheckThread, QtCore.QThread)
-    assert hasattr(_UpdateCheckThread, "result_ready")
-
-
-def test_helper_main_parses_args_and_runs(tmp_path, monkeypatch):
-    # end-to-end arg parsing with the wait + update injected out.
-    seen = {}
-
-    def fake_wait(pid, **k):
-        seen["pid"] = pid
-        return True                                    # parent exited
-
-    monkeypatch.setattr(helper, "wait_for_exit", fake_wait)
-    monkeypatch.setattr(helper, "run_update",
-                        lambda uc, rc, lp, **k: seen.update(uc=uc, rc=rc, lp=lp))
-    rc = helper.main([str(4321), str(tmp_path),
-                      json.dumps(["pixi", "update"]), json.dumps(["xdart"]),
-                      str(tmp_path / "u.log")])
-    assert rc == 0
-    assert seen["pid"] == 4321
-    assert seen["uc"] == ["pixi", "update"] and seen["rc"] == ["xdart"]
-
-
-def test_helper_main_aborts_update_if_parent_survives(tmp_path, monkeypatch):
-    # S1: if the app does NOT exit within the timeout, the helper must NOT update
-    # (its env files are in use) -- log + bail, leave the app running.
-    ran = {"update": False}
-    monkeypatch.setattr(helper, "wait_for_exit", lambda pid, **k: False)  # timed out
-    monkeypatch.setattr(helper, "run_update",
-                        lambda *a, **k: ran.__setitem__("update", True))
-    log = tmp_path / "u.log"
-    rc = helper.main([str(999999), str(tmp_path), "[]", "[]", str(log)])
-    assert rc == 1
-    assert ran["update"] is False                      # update was NOT run
-    assert "ABORTED" in log.read_text()
+    # The network check never runs on the GUI thread; its result crosses back through a queued signal.
+    import threading
+    from pyqtgraph.Qt import QtCore, QtWidgets
+    from xdart import _gui_main
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    threads, delivered = [], []
+    relay = _gui_main._UpdateCheckRelay()
+    relay.result_ready.connect(lambda result, generation: delivered.append((result.status, generation,
+                                                                              threading.current_thread())))
+    original = updater.check_for_update
+    updater.check_for_update = lambda kind: threads.append(threading.current_thread()) or updater.UpdateCheck("ok", "9")
+    try:
+        worker = threading.Thread(target=_gui_main._run_update_check, args=(relay, "pixi-global", 7), daemon=True)
+        worker.start()
+        worker.join(5)
+        for _ in range(100):
+            app.processEvents()
+            if delivered:
+                break
+    finally:
+        updater.check_for_update = original
+    assert threads and threads[0] is not threading.main_thread()
+    assert delivered == [("ok", 7, threading.main_thread())]
+    assert not isinstance(relay, QtCore.QThread)
 
 
 def test_updater_helper_imports_no_qt():
