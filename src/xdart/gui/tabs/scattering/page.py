@@ -142,6 +142,7 @@ from .display_values import (
 )
 from .display_retirement import DisplayRetirementReceipt
 from .events import (
+    BrowseCleanupPending,
     CleanupStatus,
     DurableFinal,
     ExecutionEnded,
@@ -299,6 +300,24 @@ class _DeferredBrowseSelection:
             or type(self.is_directory) is not bool
         ):
             raise ValueError("deferred Browse selection is invalid")
+
+
+# A scan opened while the shown scan's Browse cleanup is still settling (a preview, 1-D or slice read in flight) is
+# refused by the controller (BrowseCleanupPending); the page keeps that click and opens it once the cleanup settles
+# (ledger BROWSE-REOPEN-CLEANUP-PENDING; maintainer 2026-10-27, "Yes fix the refusal in 1.2.7"). Retries wait for the
+# reads to finish, never come faster than the doubling interval, and give up with the refusal after the time limit.
+_BROWSE_REOPEN_LIMIT_S = 10.0
+_BROWSE_REOPEN_FIRST_RETRY_S = 0.25
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredBrowseReopen:
+    value: str
+    reopen: bool
+    deadline: float
+    next_attempt: float
+    retry_interval: float
+    refusal: str
 
 
 def _live_plot_interval_ms() -> int:
@@ -690,6 +709,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             clock=browse_clock,
         )
         self._deferred_browse_selection: _DeferredBrowseSelection | None = None
+        self._deferred_browse_reopen: _DeferredBrowseReopen | None = None
         self._pending_viewer_2d_path: str | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
@@ -2619,6 +2639,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return self._abandon_reintegrate_successor() or changed
 
     def _reintegrate_action(self, dimension) -> None:
+        self._deferred_browse_reopen = None  # Reintegrate replaces a scan kept for opening
         operations = self._workspace_operations
         active = operations.reintegrate_identity
         if (
@@ -2898,6 +2919,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._closing = True
             self._pending_viewer_2d_path = None
             self._deferred_browse_selection = None
+            self._deferred_browse_reopen = None
             self._abandon_reintegrate_display_owner()
             self._retire_native_plot_axis_transition()
             self._retire_batch_presentation(force=True)
@@ -3391,6 +3413,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.REFRESH_BROWSER:
             self._deferred_browse_selection = None
+            self._deferred_browse_reopen = None
             self._abandon_reintegrate_display_owner()
             self._processed_browser.clear_directory_cache()
             self._request_browser_catalog()
@@ -3940,6 +3963,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._reconcile_snapshot(prior, result.snapshot)
 
     def _begin_run(self) -> None:
+        self._deferred_browse_reopen = None  # a Run replaces a scan kept for opening
         self.point_images.finish_run()
         pipeline = self._pipeline
         if self._closing or self._closed or pipeline is None:
@@ -4719,11 +4743,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _select_scan(
         self, value: object, *, is_directory: bool = False, reopen: bool = False,
+        retry: _DeferredBrowseReopen | None = None,
     ) -> None:
         if type(value) is not str or not value:
             return
         if type(is_directory) is not bool or type(reopen) is not bool:
             return
+        # A newer selection replaces a click kept for retry (a retry re-arms itself below if refused again).
+        self._deferred_browse_reopen = None
         self._abandon_reintegrate_display_owner()
         successor = self._processed_browser.pending_reintegrate_successor
         if (
@@ -4747,6 +4774,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and normalized == terminal_request.source_path
         )
         if not self._release_browse_1d_debt():
+            if retry is not None:
+                # A kept click is not lost to this separate debt: it tries again on a later tick.
+                self._keep_browse_reopen(value, reopen, retry.refusal, retry)
+                return
             self._notice("Browse 1-D cache release remains pending.")
             # QListWidget highlights the clicked row before dispatching this
             # command.  Debt refusal has not changed display custody, so
@@ -4771,14 +4802,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 ),
             )
         except Exception as error:
-            if self._context_controller.browse_lifecycle_admissible():
-                self._error_notice("Browse refused", error)
-            else:
+            if not self._context_controller.browse_lifecycle_admissible():
                 # A Run that is running keeps Browse closed: say so, without a traceback, and keep the row the
                 # Browser shows (beamline 2026-10-25: a click during Live logged "Browse refused" with one).
                 self._notice("Browse is unavailable while a Run is running; pause or stop it to open another scan.")
                 if not self._closed:
                     self._refresh_shell()  # as _error_notice replays the Browser after any other refusal
+            elif isinstance(error, BrowseCleanupPending) and not (self._closing or self._closed):
+                self._keep_browse_reopen(
+                    value, reopen,
+                    f"Browse refused: {detached_exception_strings(error)[2]}", retry,
+                )
+            else:
+                self._error_notice("Browse refused", error)
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
@@ -4793,6 +4829,50 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # new artifact early.
         self._refresh_shell(preserve_scientific=True)
         self._ensure_timer()
+
+    def _keep_browse_reopen(
+        self, value: str, reopen: bool, refusal: str, retry: _DeferredBrowseReopen | None,
+    ) -> None:
+        """Keep a click refused only while an earlier Browse cleanup settles; _replay_browse_reopen opens it then."""
+        now = time.monotonic()
+        if retry is None:
+            deadline, interval = now + _BROWSE_REOPEN_LIMIT_S, _BROWSE_REOPEN_FIRST_RETRY_S
+        else:
+            deadline, interval = retry.deadline, retry.retry_interval * 2.0
+        if now >= deadline:
+            self._give_up_browse_reopen(refusal)
+            return
+        self._deferred_browse_reopen = _DeferredBrowseReopen(
+            value, reopen, deadline, now + interval, interval, refusal,
+        )
+        if retry is None:
+            self._notice(f"Opening {os.path.basename(value) or value} once the current scan finishes loading.")
+        # As after the 1-D debt refusal: the Browser highlighted the clicked row, so show what is still selected.
+        self._refresh_shell(preserve_scientific=True)
+        self._ensure_timer()
+
+    def _give_up_browse_reopen(self, refusal: str) -> None:
+        self._deferred_browse_reopen = None
+        _LOG.warning("%s; stopped waiting after %.0f s to open the selected scan", refusal, _BROWSE_REOPEN_LIMIT_S)
+        self._notice(refusal)
+        if not self._closed:
+            self._refresh_shell()
+
+    def _replay_browse_reopen(self) -> bool:
+        """Open a kept click once the shown scan's reads and any cancelled open have settled; give up at the limit."""
+        deferred = self._deferred_browse_reopen
+        if deferred is None:
+            return False
+        controller = self._context_controller
+        now = time.monotonic()
+        if now >= deferred.deadline:
+            self._give_up_browse_reopen(deferred.refusal)
+            return True
+        if (now < deferred.next_attempt or controller.browse_pending
+                or controller.browse_preview_polling_needed):
+            return False
+        self._select_scan(deferred.value, reopen=deferred.reopen, retry=deferred)
+        return True
 
     def _select_frames(self, command: ShellCommand) -> None:
         frame = command.frame
@@ -5023,6 +5103,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._processed_browser.retire_terminal(
                 presentation.request
             )
+            changed = True
+        if self._replay_browse_reopen():
             changed = True
 
         force_scientific = changed
@@ -6297,6 +6379,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             or self._pending_viewer_2d_path is not None
             or self._context_controller.browse_pending
             or self._context_controller.browse_preview_polling_needed
+            or self._deferred_browse_reopen is not None
             or self._browse_1d_release_debt is not None
             or self._processed_browser.polling_needed
             or self._scientific_repaint_pending
@@ -7568,6 +7651,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 or any(type(path) is not str or not path for path in selected)
                 or len(set(selected)) != len(selected)):
             return
+        self._deferred_browse_reopen = None  # a Viewer replaces a scan kept for opening
         current_path = selected[0] if current_path is None else current_path
         if type(current_path) is not str or current_path not in selected:
             return
@@ -7667,6 +7751,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _open_viewer_2d_path(self, selected: str) -> None:
         if type(selected) is not str or not selected:
             return
+        self._deferred_browse_reopen = None  # a Viewer replaces a scan kept for opening
         self._retire_batch_presentation()
         self._retain_outgoing_display = False
         if (getattr(self._context_controller, "viewer_1d_owned", False)
@@ -8621,6 +8706,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         *,
         explicit: bool,
     ) -> None:
+        if explicit:
+            self._deferred_browse_reopen = None  # another folder replaces a scan kept for opening
         self._apply_processed_browser_transition(
             self._processed_browser.set_directory(
                 selected,

@@ -42,6 +42,13 @@ class CleanupStatus(str, Enum):
     CLEANUP_PENDING = "cleanup_pending"
 
 
+class BrowseCleanupPending(RuntimeError):
+    """Browse refused to open a scan only because an earlier Browse cleanup has not settled yet (a read of the
+    scan shown, or a cancelled open, still in flight). The same open is admitted once that cleanup settles, so the
+    page keeps the click and retries it (ledger BROWSE-REOPEN-CLEANUP-PENDING). Every other refusal stays a plain
+    RuntimeError."""
+
+
 @dataclass(frozen=True, slots=True)
 class DetachedDiagnostic:
     """A total, Qt-free projection of one executor or cleanup exception."""
@@ -200,6 +207,7 @@ class LifecycleResult:
 
 
 __all__ = [
+    "BrowseCleanupPending",
     "CleanupStatus",
     "DetachedDiagnostic",
     "detached_diagnostic_is_valid",

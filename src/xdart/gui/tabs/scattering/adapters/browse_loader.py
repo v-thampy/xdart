@@ -44,7 +44,7 @@ from ..browse_values import (
     BrowseLoadTiming,
     canonical_browse_scan_key,
 )
-from ..events import CleanupStatus, DetachedDiagnostic, detach_exception
+from ..events import BrowseCleanupPending, CleanupStatus, DetachedDiagnostic, detach_exception
 
 
 _CLEANUP_PENDING = "pending"
@@ -339,7 +339,7 @@ class BrowseLoader:
                 ):
                     return request
                 if queued.cancelled.is_set():
-                    raise RuntimeError("browse cleanup remains pending")
+                    raise BrowseCleanupPending("browse cleanup remains pending")
                 # Queued operations have no worker, reader, cache or context.
                 # Supersede only this intent; the active operation retains all
                 # real cleanup until _progress can launch the latest selection.
@@ -350,11 +350,11 @@ class BrowseLoader:
                 launch = True
             elif operation.request is request:
                 if operation.cancelled.is_set():
-                    raise RuntimeError("browse cleanup remains pending")
+                    raise BrowseCleanupPending("browse cleanup remains pending")
                 return request
             else:
                 if operation.cancelled.is_set():
-                    raise RuntimeError("browse cleanup remains pending")
+                    raise BrowseCleanupPending("browse cleanup remains pending")
                 self._queued = _BrowseOperation(
                     request, Event(), self._perf_requested()
                 )

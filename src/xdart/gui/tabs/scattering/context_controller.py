@@ -59,6 +59,7 @@ from .display_values import (
     StandardRunEvent,
 )
 from .events import (
+    BrowseCleanupPending,
     CleanupStatus, DurablePaused, FatalExecution, PauseFailed, PauseRequested,
     ResumeFailed, ResumeRequested, Resumed, RunIdentity, StopRequested,
     detach_exception,
@@ -1590,7 +1591,7 @@ class ContextController:
                 or receipt.cleanup_status is not CleanupStatus.CLEANED
             ):
                 self._retain_cancel(request)
-                raise RuntimeError("previous Browse cleanup is pending")
+                raise BrowseCleanupPending("previous Browse cleanup is pending")
             if hold_presentation:
                 self._runtime.begin_replacement(request)
             else:
@@ -1623,9 +1624,9 @@ class ContextController:
         if self.viewer_2d_owned:
             raise RuntimeError("2D Viewer cleanup remains pending")
         if self._cleanup_receipt is not None:
-            raise RuntimeError("Browse cleanup remains pending")
+            raise BrowseCleanupPending("Browse cleanup remains pending")
         if self._retired_browse_cleanup is not None:
-            raise RuntimeError("retired Browse cleanup remains pending")
+            raise BrowseCleanupPending("retired Browse cleanup remains pending")
         if (
             self._closed
             or self._close is not None
