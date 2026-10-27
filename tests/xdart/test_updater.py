@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -94,16 +95,49 @@ def test_detect_pixi_global_env_honors_pixi_home(tmp_path, monkeypatch):
 
 def test_install_kind_pixi_global(monkeypatch):
     monkeypatch.setattr(updater, "is_editable_install", lambda: False)
+    monkeypatch.setattr(updater, "find_install_meta", lambda: None)
     monkeypatch.setattr(updater, "detect_pixi_global_env", lambda: True)
     assert updater.install_kind() == "pixi-global"
 
 
+def test_install_kind_prefers_install_meta_over_the_path_probe(monkeypatch):
+    # The script installer's workspace env lives under <APP_ROOT>/.pixi/envs/default, which the pixi-global path
+    # probe also accepts; its install_meta.json decides.
+    monkeypatch.setattr(updater, "is_editable_install", lambda: False)
+    monkeypatch.setattr(updater, "detect_pixi_global_env", lambda: True)
+    assert updater.install_kind(meta={"app_root": "x"}) == "pixi"
+
+
 def test_pixi_global_meta_builds_update_command(monkeypatch, tmp_path):
-    monkeypatch.setenv("PIXI_HOME", str(tmp_path))
-    meta = updater.pixi_global_meta()
+    # The home comes from the running env, not $PIXI_HOME: an install under another home updates that home.
+    monkeypatch.setenv("PIXI_HOME", str(tmp_path / "elsewhere"))
+    home = tmp_path / ".pixi"
+    env = home / "envs" / "xdart-test"
+    env.mkdir(parents=True)
+    meta = updater.pixi_global_meta(prefix=str(env), platform="darwin")
     assert meta["flavor"] == "pixi-global"
-    assert meta["update_cmd"][-3:] == ["global", "update", "xdart"]
-    assert meta["relaunch_cmd"]                      # a launch command exists
+    assert meta["update_cmd"][-3:] == ["global", "update", "xdart-test"]
+    assert meta["update_env"] == {"PIXI_HOME": str(home.resolve())}
+    assert meta["relaunch_cmd"] == [str(home.resolve() / "bin" / "xdart")]  # the trampoline, not the env's script
+
+
+def test_pixi_global_meta_on_windows_needs_both_executables(tmp_path, monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setenv("PIXI_HOME", str(tmp_path / "no-default-home"))
+    home = tmp_path / ".pixi"
+    env = home / "envs" / "xdart"
+    env.mkdir(parents=True)
+    (home / "bin").mkdir()
+    (home / "bin" / "xdart.exe").write_bytes(b"")
+    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None  # no pixi.exe anywhere
+    pixi = home / "bin" / "pixi.exe"
+    pixi.write_bytes(b"")
+    meta = updater.pixi_global_meta(prefix=str(env), platform="win32")
+    assert meta["update_cmd"] == [str(pixi.resolve()), "global", "update", "xdart"]
+    assert meta["relaunch_cmd"] == [str(home.resolve() / "bin" / "xdart.exe")]
+    (home / "bin" / "xdart.exe").unlink()
+    assert updater.pixi_global_meta(prefix=str(env), platform="win32") is None
 
 
 def test_resolve_update_meta_by_kind(monkeypatch):
@@ -130,6 +164,115 @@ def test_fetch_latest_pypi_offline_returns_none():
 
 def test_fetch_latest_pypi_malformed_returns_none():
     assert updater.fetch_latest_pypi(opener=lambda url, t: b"<html>nope") is None
+
+
+# ── conda channel (pixi-global): its own channel, a named User-Agent ─────────────
+
+_REPODATA = Path(__file__).with_name("prefix_dev_repodata_sample.json")  # trimmed prefix.dev index, 2026-10-27
+
+
+def test_latest_from_repodata_reads_the_saved_prefix_dev_index():
+    assert updater.latest_from_repodata(json.loads(_REPODATA.read_text())) == "1.2.6"
+
+
+def test_latest_from_repodata_skips_other_names_prereleases_and_bad_versions():
+    data = json.loads(_REPODATA.read_text())
+    data["packages.conda"]["xdart-1.3.0rc1-0.conda"] = {"name": "xdart", "version": "1.3.0rc1"}
+    data["packages.conda"]["other-9.0-0.conda"] = {"name": "other", "version": "9.0"}
+    data["packages.conda"]["xdart-bad-0.conda"] = {"name": "xdart", "version": "not a version"}
+    data["packages"]["xdart-1.2.7-0.tar.bz2"] = {"name": "xdart", "version": "1.2.7"}  # the legacy key counts
+    assert updater.latest_from_repodata(data) == "1.2.7"
+    assert updater.latest_from_repodata(data, include_prereleases=True) == "1.3.0rc1"
+    assert updater.latest_from_repodata({"packages": {}}) is None
+    assert updater.latest_from_repodata("not a dict") is None
+
+
+def test_fetch_latest_conda_asks_channels_in_order_and_never_raises():
+    seen, payload = [], _REPODATA.read_bytes()
+
+    def opener(url, _timeout):
+        seen.append(url)
+        if "down" in url:
+            raise OSError("offline")
+        return json.dumps({"packages": {}}).encode() if "empty" in url else payload
+
+    channels = ["https://down.example/a", "https://empty.example/b/", "https://prefix.dev/xrd-tools"]
+    assert updater.fetch_latest_conda(channels, opener=opener) == "1.2.6"
+    assert seen == [f"{channel.rstrip('/')}/noarch/repodata.json" for channel in channels]
+    assert updater.fetch_latest_conda(["https://down.example/a"], opener=opener) is None
+
+
+def test_pixi_global_channels_come_from_the_manifest(tmp_path):
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "manifests" / "pixi-global.toml").write_text(
+        'version = 1\n\n[envs.xdart]\nchannels = ["conda-forge", "https://prefix.dev/xrd-tools/", "file:///tmp/ch"]\n'
+        'dependencies = { xdart = "*" }\n')
+    assert updater.pixi_global_channels("xdart", tmp_path) == ["https://prefix.dev/xrd-tools", "file:///tmp/ch"]
+    assert updater.pixi_global_channels("other", tmp_path) == [updater.DEFAULT_CONDA_CHANNEL]
+    assert updater.pixi_global_channels("xdart", tmp_path / "missing") == [updater.DEFAULT_CONDA_CHANNEL]
+
+
+def test_fetch_latest_for_routes_pixi_global_to_its_own_channel(tmp_path, monkeypatch):
+    home = tmp_path / ".pixi"
+    env = home / "envs" / "xdart"
+    env.mkdir(parents=True)
+    (home / "manifests").mkdir()
+    (home / "manifests" / "pixi-global.toml").write_text(
+        'version = 1\n\n[envs.xdart]\nchannels = ["file:///chan", "conda-forge"]\n')
+    monkeypatch.setattr(updater, "current_version", lambda: "1.2.5")
+    urls = []
+
+    def opener(url, _timeout):
+        urls.append(url)
+        return _REPODATA.read_bytes() if url.endswith("repodata.json") else b'{"info": {"version": "1.2.9"}}'
+
+    assert updater.fetch_latest_for("pixi-global", opener=opener, prefix=str(env)) == "1.2.6"
+    assert updater.fetch_latest_for("pixi", opener=opener) == "1.2.9"
+    assert updater.fetch_latest_for("managed", opener=opener) == "1.2.9"
+    assert urls == ["file:///chan/noarch/repodata.json", updater.PYPI_JSON_URL, updater.PYPI_JSON_URL]
+
+
+def test_conda_fetch_follows_the_signed_redirect_with_a_named_agent():
+    # prefix.dev answers 303 to a signed packages.prefix.dev URL that refuses Python's default agent (HTTP 403,
+    # measured 2026-10-27). A local server reproduces both; the real urllib path runs.
+    import http.server
+    import threading
+    import urllib.error
+    import urllib.request
+    payload, agents = _REPODATA.read_bytes(), []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            agent = self.headers.get("User-Agent", "")
+            agents.append(agent)
+            if self.path == "/xrd-tools/noarch/repodata.json":
+                self.send_response(303)
+                self.send_header("Location", "/signed/repodata.json?verify=token")
+                self.end_headers()
+            elif agent.startswith("Python-urllib"):
+                self.send_response(403)
+                self.end_headers()
+            else:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        def log_message(self, format, *args):  # noqa: A002 - the base signature
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/xrd-tools"
+    try:
+        with pytest.raises(urllib.error.HTTPError, match="403"):
+            urllib.request.urlopen(f"{base}/noarch/repodata.json", timeout=3)  # Python's default agent
+        agents.clear()
+        assert updater.fetch_latest_conda([base]) == "1.2.6"
+        assert len(agents) == 2 and all(agent.startswith("xdart/") for agent in agents)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 # ── version comparison ────────────────────────────────────────────────────────
