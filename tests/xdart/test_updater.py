@@ -634,3 +634,61 @@ def test_updater_helper_imports_no_qt():
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]", "helper pulled Qt: " + out.stdout
+
+
+# ── the Windows helper, run for real where PowerShell exists (the windows-pixi-native job) ─────────────────────
+
+windows_only = pytest.mark.skipif(not sys.platform.startswith("win"), reason="runs the real Windows PowerShell helper")
+
+
+def _windows_job(tmp_path, update_cmd, *, env_prefix=None, limit=60, grace=10):
+    state, marker = tmp_path / "Jane O'Neil ü" / "xdart-update", tmp_path / "relaunched"
+    job = _job(state, update_cmd, marker=marker, limit=limit, grace=grace)
+    data = json.loads(job.read_text(encoding="utf-8"))
+    data.update(pause_at_end=False, env_prefix=env_prefix or str(tmp_path / "no-env"))
+    job.write_text(json.dumps(data), encoding="utf-8")
+    return job, state, marker
+
+
+def _run_powershell(job):
+    import subprocess
+    return subprocess.run(update_launch.powershell_argv(job), capture_output=True, text=True, timeout=180)
+
+
+@windows_only
+def test_powershell_helper_runs_the_update_and_relaunches(tmp_path):
+    job, state, marker = _windows_job(tmp_path, _script(
+        "import os; print('step 1', flush=True); print('env', os.environ['XDART_TEST_UPDATE_ENV'], flush=True)"))
+    done = _run_powershell(job)
+    assert done.returncode == 0, done.stdout + done.stderr
+    result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
+    assert (result["state"], result["exit"], result["relaunched"]) == ("completed", 0, True)
+    log = (state / "update.log").read_text(encoding="utf-8-sig")
+    assert "step 1" in log and "env set" in log
+    assert _await(marker, 30)
+
+
+@windows_only
+def test_powershell_helper_time_limit_stops_the_child_then_relaunches(tmp_path):
+    pixi = ("import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print('child started', flush=True); rc = child.wait(); print('child ended', flush=True); sys.exit(3)")
+    job, state, marker = _windows_job(tmp_path, _script(pixi), limit=3, grace=20)
+    done = _run_powershell(job)
+    assert done.returncode == 1, done.stdout + done.stderr
+    result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
+    assert (result["exit"], result["timed_out"], result["relaunched"]) == (3, True, True)
+    log = (state / "update.log").read_text(encoding="utf-8-sig")
+    assert "Stopped 1 child process" in log and "child ended" in log and "pixi did not finish" not in log
+    assert _await(marker, 30)
+
+
+@windows_only
+def test_powershell_helper_refuses_while_the_environment_is_in_use(tmp_path):
+    ran = tmp_path / "update-ran"
+    job, state, marker = _windows_job(tmp_path, _script(f"open({str(ran)!r}, 'w').write('ran')"),
+                                      env_prefix=sys.prefix)        # this pytest process runs from that env
+    done = _run_powershell(job)
+    assert done.returncode == 1, done.stdout + done.stderr
+    result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
+    assert result["refused"] == "environment in use" and not ran.exists()
+    assert "use xdart's environment" in (state / "update.log").read_text(encoding="utf-8-sig")

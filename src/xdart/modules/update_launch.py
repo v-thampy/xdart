@@ -93,7 +93,7 @@ function Descendants([int]$root) {
 }
 function Start-Xdart {
   $exe = [string]$job.relaunch_cmd[0]
-  $rest = @($job.relaunch_cmd | Select-Object -Skip 1)
+  $rest = @($job.relaunch_cmd | Select-Object -Skip 1 | ForEach-Object { $a = [string]$_; if ($a -match '\s') { '"' + $a + '"' } else { $a } })
   # Its own console (not this window's) and no job: closing this window cannot end xdart. Not hidden: a hidden start
   # can pass SW_HIDE on to xdart's first window.
   if ($rest.Count -gt 0) { Start-Process -FilePath $exe -ArgumentList $rest | Out-Null }
@@ -174,7 +174,9 @@ Save-Helper @{ pid = $PID; state = 'running'; started_at = $started }
 $code = 1
 try { $code = Invoke-Update } catch { Say ("The updater failed: {0}" -f $_.Exception.Message) }
 finally { $result.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0; Save-Helper $result }
-if ($code -eq 0) { Write-Host 'This window closes in 10 s.'; Start-Sleep -Seconds 10 } else { Read-Host 'Press Enter to close this window' | Out-Null }
+if ($job.pause_at_end -ne $false) {
+  if ($code -eq 0) { Write-Host 'This window closes in 10 s.'; Start-Sleep -Seconds 10 } else { Read-Host 'Press Enter to close this window' | Out-Null }
+}
 exit $code
 """
 
