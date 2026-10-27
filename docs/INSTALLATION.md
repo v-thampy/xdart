@@ -504,3 +504,8 @@ Terminal. The automatic startup update acts only on a Pixi global environment th
 for xdart without a version pin (as the README's install command does), or on an
 installer workspace within 1.x; other setups get the command to run by hand. pip and
 conda installs always get a command to copy.
+
+Only one update can start per installation. Closing xdart before its update window is
+ready cancels that attempt. xdart checks for an active updater before loading its GUI.
+If an updater cannot confirm that its child processes stopped, xdart stays closed and
+shows recovery instructions rather than opening a possibly half-updated environment.

@@ -2,7 +2,7 @@
 """Update-on-exit helper (macOS and Linux) — ``python -m xdart._updater <job.json>``.
 
 The app writes the job (``xdart.modules.updater``) and starts this helper: in a Terminal window on macOS, hidden on
-Linux. Windows uses a PowerShell helper outside the env instead (``xdart._updater_windows``), because the env's own
+Linux. Windows uses the PowerShell helper from ``xdart.modules.update_launch`` outside the env, because the env's own
 python.exe is locked while it runs. Steps: record the handshake (this PID), wait for xdart to close, run the update
 with its output shown and logged as it arrives, stop it at the time limit (child processes first, then pixi after a
 grace period, then the whole process group), relaunch xdart detached once nothing of the update is left running, and
@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from xdart.modules import updater as update_state
 
 _HEARTBEAT_S = 30.0
 
@@ -149,6 +150,27 @@ def run_update(job, out, result=None):
     pgid = proc.pid
     if result is not None:
         result["update_pid"] = proc.pid
+    try:
+        return _monitor_update(job, out, proc)
+    except BaseException:
+        # Cleanup cannot depend on the output sink that may have just failed.
+        _signal_group(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=.5)
+        except subprocess.TimeoutExpired:
+            pass
+        if _group_alive(proc.pid):
+            _signal_group(proc.pid, signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        _wait_until(lambda: not _group_alive(proc.pid), 2, lambda: None)
+        raise
+
+
+def _monitor_update(job, out, proc):
+    pgid = proc.pid
     lines = queue.Queue()
 
     def read():
@@ -206,21 +228,6 @@ def run_update(job, out, result=None):
     return proc.returncode, timed_out, tree_gone
 
 
-def _take_lock(path):
-    """Hold this install's update lock for the helper's whole life (released when the process ends, whatever ends it).
-    Returns the open file to keep, or False when another helper holds it."""
-    import fcntl
-    fh = open(path, "a+b")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        fh.close()
-        return False
-    except OSError:
-        pass                                             # no locking on this file system: carry on without it
-    return fh
-
-
 def relaunch(cmd):
     """Start xdart detached: its own session and no terminal, so closing the update window cannot end it."""
     subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -230,22 +237,42 @@ def relaunch(cmd):
 def run_job(job):
     state_dir = Path(job["state_dir"])
     helper_file = state_dir / job.get("helper_file", "xdart-update-helper.json")
-    lock = _take_lock(state_dir / job.get("lock_file", "xdart-update.lock"))
-    if lock is False:
+    lock = update_state.take_file_lock(state_dir / job.get("lock_file", "xdart-update.lock"))
+    if lock is None:
         if sys.stdout is not None:
             print("Another xdart update is running for this install, so nothing was changed.", flush=True)
         return 2
+    if update_state.job_attempt(job) is None:
+        lock.close()
+        return 2
     started_at = time.time()
-    _write_json(helper_file, {"pid": os.getpid(), "state": "running", "started_at": started_at})
+    _write_json(helper_file, {"pid": os.getpid(), "state": "running", "started_at": started_at,
+                              "attempt_id": job["attempt_id"]})
     out = _Output(job["log"])
     result = {"pid": os.getpid(), "state": "completed", "started_at": started_at, "exit": None,
-              "timed_out": False, "relaunched": False}
+              "timed_out": False, "relaunched": False, "attempt_id": job["attempt_id"]}
+    old_signals = {}
+    if threading.current_thread() is threading.main_thread():
+        def interrupted(sig, _frame):
+            raise SystemExit(128 + sig)
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            old_signals[sig] = signal.signal(sig, interrupted)
     try:
         out.line(f"Updating xdart from {job.get('from')} to {job.get('target')}. Keep this window open; xdart reopens "
                  "when the update has finished.")
         out.line("Command: " + " ".join(str(part) for part in job["update_cmd"]))
         parent = int(job.get("parent_pid") or 0)
-        if parent > 0 and not wait_for_exit(parent, timeout=float(job.get("parent_wait_s") or 60)):
+        deadline = time.monotonic() + float(job.get("parent_wait_s") or 60)
+        while parent > 0 and _pid_alive(parent) and time.monotonic() < deadline:
+            if update_state.job_attempt(job) is None:
+                result["refused"] = "attempt cancelled"
+                return 1
+            time.sleep(.1)
+        attempt = update_state.job_attempt(job)
+        if attempt is None or not attempt.get("authorized"):
+            result["refused"] = "attempt not authorized"
+            return 1
+        if parent > 0 and _pid_alive(parent):
             out.line("xdart did not close, so nothing was changed. You can close this window.")
             result["refused"] = "xdart did not close"
             return 1
@@ -253,14 +280,18 @@ def run_job(job):
         result.update(exit=code, timed_out=timed_out)
         if not tree_gone:
             out.line("Part of the update is still running, so xdart was not reopened (it could find the environment "
-                     f"half-changed). Open it once this window shows nothing new for a while. Log: {job['log']}")
+                     f"half-changed). Recovery is required after those processes stop. Log: {job['log']}")
             result["refused"] = "update still running"
+            result["state"] = "blocked"
             return 1
         if code == 0 and not timed_out:
             out.line("pixi finished. Reopening xdart; it confirms the new version when it starts.")
         else:
             out.line(f"The update did not finish (exit {code}). Reopening xdart; what it opens depends on how far the "
                      f"update got. Log: {job['log']}")
+        # A fast relaunch must observe quiescent completion rather than the running handshake.
+        result["finished_at"] = time.time()
+        _write_json(helper_file, result)
         try:
             relaunch(job["relaunch_cmd"])
             result["relaunched"] = True
@@ -269,11 +300,19 @@ def run_job(job):
         out.line("You can close this window.")
         return 0 if code == 0 and not timed_out else 1
     finally:
+        if "update_pid" in result and _group_alive(result["update_pid"]):
+            result["state"] = "blocked"
+            result["refused"] = "update still running"
         result["finished_at"] = time.time()
         try:
             _write_json(helper_file, result)
         finally:
-            out.close()
+            try:
+                out.close()
+            finally:
+                lock.close()
+                for sig, handler in old_signals.items():
+                    signal.signal(sig, handler)
 
 
 def main(argv=None):

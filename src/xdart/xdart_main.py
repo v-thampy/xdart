@@ -11,6 +11,11 @@ import sys
 
 
 def main():
+    from xdart.modules.updater import startup_update_blocked
+    if startup_update_blocked():
+        if sys.stderr is not None:
+            print("xdart's update is still active or needs recovery; see its update window and log.", file=sys.stderr)
+        return 0
     try:
         import PySide6   # noqa: F401  -- probe the GUI stack cheaply
         import pyqtgraph  # noqa: F401

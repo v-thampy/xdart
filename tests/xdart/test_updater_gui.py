@@ -149,13 +149,20 @@ def _admission(window, monkeypatch, tmp_path, launch):
 
 def test_admission_records_the_attempt_and_closes_once_the_helper_reports(window, qapp, monkeypatch, tmp_path):
     jobs = []
+    holders = []
 
     def launch(state_dir, job):
         jobs.append(job)
-        updater.write_json_atomic(state_dir / updater.HELPER_FILE, {"pid": 4242, "state": "running"})
+        holders.append(updater.take_file_lock(state_dir / updater.LOCK_FILE))
+        updater.write_json_atomic(state_dir / updater.HELPER_FILE,
+                                  {"pid": 4242, "state": "running", "attempt_id": job["attempt_id"]})
 
-    exits, copyable = _admission(window, monkeypatch, tmp_path, launch)
-    assert _pump(qapp, lambda: exits == [True], 3) and copyable == []
+    try:
+        exits, copyable = _admission(window, monkeypatch, tmp_path, launch)
+        assert _pump(qapp, lambda: exits == [True], 3) and copyable == []
+    finally:
+        for holder in holders:
+            holder.close()
     job, = jobs
     assert job["target"] == "9.9.9" and job["update_env"] == {"PIXI_HOME": str(tmp_path)}
     assert job["time_limit_s"] == updater.UPDATE_TIME_LIMIT_S and job["parent_wait_s"] == updater.PARENT_WAIT_S

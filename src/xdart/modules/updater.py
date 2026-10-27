@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.metadata import version as _pkg_version
@@ -293,6 +294,7 @@ def manifest_channels(entry):
     urls, plain = [], True
     for channel in channels:
         if isinstance(channel, dict):
+            plain = False
             channel = channel.get("channel")
         if not isinstance(channel, str) or not channel:
             plain = False
@@ -317,6 +319,8 @@ def xdart_spec_is_plain(entry):
     deps = entry.get("dependencies") if isinstance(entry, dict) else None
     spec = deps.get("xdart") if isinstance(deps, dict) else None
     if isinstance(spec, dict):
+        if set(spec) - {"version"}:
+            return False
         spec = spec.get("version", "*")
     return isinstance(spec, str) and spec.strip() in ("", "*")
 
@@ -335,17 +339,19 @@ def query_conda_channels(channels, *, timeout=3.0, opener=None, include_prerelea
     """``(status, latest)`` from the first channel whose noarch index lists xdart: ``("ok", version)``,
     ``("absent", None)`` when a channel answered but none lists xdart, ``("unreachable", None)`` when none answered.
     Never raises."""
-    answered = False
+    answered, unavailable = False, False
     for channel in channels:
         try:
             data = json.loads(_fetch(f"{channel.rstrip('/')}/noarch/repodata.json", timeout, opener))
         except Exception:
+            # An unavailable higher-priority channel is unknown authority, not proof of package absence.
+            unavailable = True
             continue
         answered = True
         latest = latest_from_repodata(data, include_prereleases=include_prereleases)
         if latest is not None:
-            return "ok", latest
-    return ("absent" if answered else "unreachable"), None
+            return ("unreachable" if unavailable else "ok"), latest
+    return ("unreachable" if unavailable or not answered else "absent"), None
 
 
 def fetch_latest_conda(channels, *, timeout=3.0, opener=None, include_prereleases=False):
@@ -443,6 +449,7 @@ STATE_FILE = "xdart-update-state.json"
 HELPER_FILE = "xdart-update-helper.json"
 JOB_FILE = "xdart-update-job.json"
 LOCK_FILE = "xdart-update.lock"
+ADMISSION_LOCK_FILE = "xdart-update-admission.lock"
 LOG_FILE = "update.log"
 #: The helper stops an update still running after this long (agreed with Codex N-2b0787f9).
 UPDATE_TIME_LIMIT_S = 1200
@@ -453,31 +460,83 @@ STOP_GRACE_S = 30
 _HELPER_MAX_RUN_S = PARENT_WAIT_S + UPDATE_TIME_LIMIT_S + STOP_GRACE_S + 60
 
 
+class UpdateInProgress(RuntimeError):
+    """This install already has an app admission or update helper."""
+
+
+class _FileLock:
+    def __init__(self, close):
+        self._close = close
+
+    def close(self):
+        close, self._close = self._close, None
+        if close is not None:
+            close()
+
+
+def take_file_lock(path):
+    """Acquire one nonblocking OS lock, or None if owned. Unknown locking fails closed."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("win"):
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.CreateFileW(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.get_last_error()
+            if error in (32, 33):
+                return None
+            raise ctypes.WinError(error)
+        return _FileLock(lambda: kernel.CloseHandle(handle))
+    import fcntl
+    fh = open(path, "a+b")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    except BaseException:
+        fh.close()
+        raise
+    return _FileLock(fh.close)
+
+
+def _file_lock_held(path):
+    if not Path(path).exists():
+        return False
+    try:
+        lock = take_file_lock(path)
+        if lock is None:
+            return True
+        lock.close()
+        return False
+    except OSError:
+        return None
+
+
+def reserve_update(state_dir):
+    """Bridge app admission to the exact helper handshake without another app overwriting it."""
+    lock = take_file_lock(Path(state_dir) / ADMISSION_LOCK_FILE)
+    if lock is None:
+        raise UpdateInProgress("Another xdart update is starting for this install.")
+    if helper_lock_held(state_dir) is not False:
+        lock.close()
+        raise UpdateInProgress("Another xdart update is running for this install.")
+    if (read_json(Path(state_dir) / HELPER_FILE) or {}).get("state") == "blocked":
+        lock.close()
+        raise UpdateInProgress("The previous update could not prove cleanup; recover that update before retrying.")
+    return lock
+
+
 def helper_lock_held(state_dir):
     """True while an update helper for this install runs: the helper holds LOCK_FILE exclusively for its whole life,
     and the lock dies with the process, so a reused PID cannot fake it. None when the lock cannot be tested here."""
-    path = Path(state_dir) / LOCK_FILE
-    if not path.exists():
-        return False
-    if sys.platform.startswith("win"):
-        try:
-            with open(path, "a+b"):          # the PowerShell helper opens it with FileShare.None
-                return False
-        except PermissionError:
-            return True
-        except OSError:
-            return None
-    try:
-        import fcntl
-        with open(path, "a+b") as fh:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            return False
-    except OSError:
-        return None
+    return _file_lock_held(Path(state_dir) / LOCK_FILE)
 
 
 def install_identity(prefix=None):
@@ -542,7 +601,8 @@ def begin_attempt(state_dir, *, install, current, target, log):
     """Record an attempt before the helper starts; returns the previous state for :func:`abandon_attempt`."""
     state = load_update_state(state_dir, install)
     previous = {**state, "failed": list(state["failed"])}
-    state["attempt"] = {"from": current, "to": target, "log": str(log), "launched_at": time.time()}
+    state["attempt"] = {"from": current, "to": target, "log": str(log), "launched_at": time.time(),
+                        "id": uuid.uuid4().hex, "authorized": False}
     write_json_atomic(Path(state_dir) / STATE_FILE, state)
     try:
         (Path(state_dir) / HELPER_FILE).unlink()
@@ -551,20 +611,56 @@ def begin_attempt(state_dir, *, install, current, target, log):
     return previous
 
 
-def abandon_attempt(state_dir, previous):
+def abandon_attempt(state_dir, previous, attempt_id=None):
     """Undo :func:`begin_attempt` when the helper could not be started."""
-    write_json_atomic(Path(state_dir) / STATE_FILE, previous)
+    current = read_json(Path(state_dir) / STATE_FILE) or {}
+    if attempt_id is None or (current.get("attempt") or {}).get("id") == attempt_id:
+        write_json_atomic(Path(state_dir) / STATE_FILE, previous)
+
+
+def job_attempt(job):
+    if not isinstance(job.get("attempt_id"), str) or not job["attempt_id"]:
+        return None
+    state = load_update_state(job["state_dir"], job["install"])
+    attempt = state["attempt"]
+    return attempt if attempt is not None and attempt.get("id") == job.get("attempt_id") else None
+
+
+def authorize_attempt(state_dir, install, attempt_id):
+    state = load_update_state(state_dir, install)
+    attempt = state["attempt"]
+    if attempt is None or attempt.get("id") != attempt_id:
+        raise UpdateInProgress("The update attempt was cancelled or replaced.")
+    attempt["authorized"] = True
+    write_json_atomic(Path(state_dir) / STATE_FILE, state)
 
 
 def settle_previous_attempt(state_dir, *, install, current, alive):
     """At startup: ``("none" | "active" | "updated" | "incomplete", attempt)``.  ``active``: the helper is still
     running (the caller quits without touching the attempt).  Otherwise the attempt is settled by version, a missed
     target joins the failed targets the startup update never retries, and the attempt is cleared."""
+    if (load_update_state(state_dir, install)["attempt"] is None
+            and _file_lock_held(Path(state_dir) / ADMISSION_LOCK_FILE) is False):
+        return "none", None
+    reservation = take_file_lock(Path(state_dir) / ADMISSION_LOCK_FILE)
+    if reservation is None:
+        return "active", load_update_state(state_dir, install)["attempt"]
+    try:
+        return _settle_attempt(state_dir, install, current, alive)
+    finally:
+        reservation.close()
+
+
+def _settle_attempt(state_dir, install, current, alive):
     state = load_update_state(state_dir, install)
     attempt = state["attempt"]
     if attempt is None:
         return "none", None
     helper = read_json(Path(state_dir) / HELPER_FILE) or {}
+    if helper.get("attempt_id") not in (None, attempt.get("id")):
+        helper = {}
+    if helper.get("state") == "blocked":
+        return "active", {**attempt, "helper": helper}   # lost custody is never proof of quiescence
     if helper.get("state") != "completed":
         held = helper_lock_held(state_dir)
         if held is None:      # no lock here (an unusual file system): the PID within the longest legitimate run
@@ -603,3 +699,19 @@ def state_dir_for(kind, *, prefix=None):
         if isinstance(meta, dict) and meta.get("app_root"):
             return Path(meta["app_root"]) / "xdart-update"
     return None
+
+
+def startup_update_blocked():
+    """Read-only bootstrap gate before loading Qt/native GUI libraries into an updating environment."""
+    try:
+        root = state_dir_for(install_kind())
+        if root is None:
+            return False
+        if _file_lock_held(root / ADMISSION_LOCK_FILE) is not False:
+            return True
+        helper = read_json(root / HELPER_FILE) or {}
+        if helper.get("state") == "blocked":
+            return True
+        return helper.get("state") != "completed" and helper_lock_held(root) is not False
+    except Exception:
+        return False   # discovery failure never prevents an ordinary/editable installation from starting

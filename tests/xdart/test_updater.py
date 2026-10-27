@@ -401,7 +401,11 @@ def _script(body):
 
 def _job(state, update_cmd, *, marker, parent_pid=0, limit=60, grace=2, tree_wait=10, parent_wait=5):
     state.mkdir(parents=True, exist_ok=True)
+    updater.begin_attempt(state, install="test-install", current="1.2.6", target="1.2.7", log=state / "update.log")
+    attempt = updater.load_update_state(state, "test-install")["attempt"]
+    updater.authorize_attempt(state, "test-install", attempt["id"])
     job = {"parent_pid": parent_pid, "install": "test-install", "from": "1.2.6", "target": "1.2.7",
+           "attempt_id": attempt["id"],
            "update_cmd": update_cmd, "update_env": {"XDART_TEST_UPDATE_ENV": "set"},
            "relaunch_cmd": _script(f"open({str(marker)!r}, 'w').write('relaunched')"),
            "env_prefix": str(state), "log": str(state / "update.log"), "time_limit_s": limit, "grace_s": grace,
@@ -545,7 +549,9 @@ def test_windows_launch_breaks_away_from_the_job_or_refuses(tmp_path):
     assert kwargs["creationflags"] & update_launch.CREATE_BREAKAWAY_FROM_JOB
     assert kwargs["creationflags"] & update_launch.CREATE_NEW_CONSOLE
     import base64
-    script = base64.b64decode(argv[5]).decode("utf-16-le")
+    bootstrap = base64.b64decode(argv[5]).decode("utf-16-le")
+    assert bootstrap == "& " + update_launch.ps_literal(job.with_suffix(".ps1"))
+    script = job.with_suffix(".ps1").read_text(encoding="utf-8-sig")
     assert script == update_launch.powershell_script(job)
     assert script.count(update_launch.ps_literal(job)) == 1 and "__JOB__" not in script
     assert update_launch.ps_literal("C:\\Users\\Jane O'Neil\\ü\\job.json") == "'C:\\Users\\Jane O''Neil\\ü\\job.json'"

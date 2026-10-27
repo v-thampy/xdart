@@ -420,9 +420,13 @@ def _settle_update_at_startup():
         return None
     if outcome == "active":
         logger.info("[UPDATE] this install is being updated; this start quits")
+        blocked = ((attempt or {}).get("helper") or {}).get("state") == "blocked"
+        text = ("The previous update could not confirm that all its processes stopped. xdart stays closed to protect "
+                f"the environment. See {attempt.get('log')}. After those update processes have ended, move "
+                f"{state_dir} to a different name and start xdart again." if blocked else
+                "xdart is being updated in another window. It reopens by itself when the update has finished.")
         QtWidgets.QMessageBox.information(
-            None, "xdart is updating",
-            "xdart is being updated in another window. It reopens by itself when the update has finished.")
+            None, "xdart update needs recovery" if blocked else "xdart is updating", text)
         return "active"
     return (outcome, attempt, kind) if outcome in ("updated", "incomplete") else None
 
@@ -472,6 +476,10 @@ class Main(QMainWindow):
         self._update_skipped = set()       # Not now: skipped until xdart next starts
         self._update_countdown = None
         self._update_busy = False
+        self._update_reservation = None
+        self._update_attempt_id = None
+        self._update_authorized = False
+        self._update_context = None
         self._tool_handles = {}
         self._tool_actions = {}
         self._page_handles = {}
@@ -822,6 +830,8 @@ class Main(QMainWindow):
 
     def _set_update_check_at_startup(self, enabled):
         _app_settings().setValue(_UPDATES_AT_STARTUP_KEY, bool(enabled))
+        if not enabled:
+            self._invalidate_update_check()
 
     def _check_for_updates(self):
         from xdart.modules import updater
@@ -876,6 +886,11 @@ class Main(QMainWindow):
             if from_help:
                 QtWidgets.QMessageBox.information(
                     self, "Check for Updates", f"xdart is up to date (version {current}).")
+            return
+        if kind in ("pixi", "pixi-global") and not result.automatic:
+            if from_help:
+                self._show_copyable_update(kind, latest, current,
+                                           result.reason or "The install's constraints need a manual update.")
             return
         meta = updater.resolve_update_meta(kind) if kind in ("pixi", "pixi-global") else None
         if meta is None:
@@ -984,11 +999,17 @@ class Main(QMainWindow):
         state_dir = updater.update_state_dir(meta)
         log = state_dir / updater.LOG_FILE
         try:
+            self._update_reservation = updater.reserve_update(state_dir)
             previous = updater.begin_attempt(state_dir, install=install, current=current, target=target, log=log)
-        except OSError as exc:
+        except (OSError, updater.UpdateInProgress) as exc:
+            self._release_update_reservation()
             self._show_copyable_update(kind, target, current, f"The update could not be recorded ({exc}).")
             return
+        attempt = updater.load_update_state(state_dir, install)["attempt"]
+        self._update_attempt_id = attempt["id"]
+        self._update_context = state_dir, previous
         job = {"parent_pid": os.getpid(), "install": install, "from": current, "target": target,
+               "attempt_id": attempt["id"],
                "update_cmd": list(meta["update_cmd"]), "update_env": dict(meta.get("update_env") or {}),
                "relaunch_cmd": list(meta["relaunch_cmd"]), "env_prefix": meta.get("env_prefix") or sys.prefix,
                "log": str(log), "time_limit_s": updater.UPDATE_TIME_LIMIT_S, "grace_s": updater.STOP_GRACE_S,
@@ -996,7 +1017,8 @@ class Main(QMainWindow):
         try:
             update_launch.launch_helper(state_dir, job)
         except (update_launch.UpdateLaunchRefused, OSError) as exc:
-            updater.abandon_attempt(state_dir, previous)
+            updater.abandon_attempt(state_dir, previous, self._update_attempt_id)
+            self._release_update_reservation()
             logger.warning("[UPDATE] the update window could not be started: %s", exc)
             self._show_copyable_update(kind, target, current, f"The update window could not be started: {exc}")
             return
@@ -1009,20 +1031,55 @@ class Main(QMainWindow):
 
     def _await_update_handshake(self, state_dir, previous, kind, target, current, deadline):
         from xdart.modules import updater
+        if not self._update_busy:
+            return
+        if self._close_accepted or self._run_active(require_known=True) or updater.install_kind() != kind:
+            updater.abandon_attempt(state_dir, previous, self._update_attempt_id)
+            self._update_busy = False
+            self._release_update_reservation()
+            self.statusBar().showMessage("The update was cancelled because xdart's activity changed.", 10000)
+            return
         helper = updater.read_json(state_dir / updater.HELPER_FILE) or {}
-        if isinstance(helper.get("pid"), int):
+        if (helper.get("attempt_id") == self._update_attempt_id and helper.get("state") == "running"
+                and updater.helper_lock_held(state_dir) is True):
+            try:
+                updater.authorize_attempt(state_dir, updater.install_identity(), self._update_attempt_id)
+            except (OSError, updater.UpdateInProgress):
+                self._cancel_update_admission()
+                self._show_copyable_update(kind, target, current, "The update could not be authorized.")
+                return
+            self._update_authorized = True
+            self._release_update_reservation()
             logger.info("[UPDATE] helper %s runs; closing xdart for the update", helper["pid"])
             self.exit()
             return
         if time.monotonic() >= deadline:
             self._update_busy = False
-            updater.abandon_attempt(state_dir, previous)
+            updater.abandon_attempt(state_dir, previous, self._update_attempt_id)
+            self._release_update_reservation()
             logger.warning("[UPDATE] the update window did not report within %.0f s", _UPDATE_HANDSHAKE_S)
             self.statusBar().clearMessage()
             self._show_copyable_update(kind, target, current, "The update window did not start.")
             return
         QtCore.QTimer.singleShot(200, self, lambda: self._await_update_handshake(
             state_dir, previous, kind, target, current, deadline))
+
+    def _release_update_reservation(self):
+        reservation, self._update_reservation = self._update_reservation, None
+        if reservation is not None:
+            reservation.close()
+
+    def _cancel_update_admission(self):
+        from xdart.modules import updater
+        context, self._update_context = self._update_context, None
+        try:
+            if context is not None:
+                updater.abandon_attempt(*context, attempt_id=self._update_attempt_id)
+        except OSError:
+            pass   # unarmed helpers still cannot update; closing must remain available
+        finally:
+            self._update_busy = False
+            self._release_update_reservation()
 
     def start_startup_updates(self, note=None):
         """After the window shows (the real app only): the previous attempt's note, then the startup check."""
@@ -1055,7 +1112,8 @@ class Main(QMainWindow):
         QtCore.QTimer.singleShot(_STARTUP_CHECK_DELAY_MS, self, lambda: self._startup_update_check(kind))
 
     def _startup_update_check(self, kind):
-        if self._close_accepted or self._update_busy or self._run_active():
+        if (self._close_accepted or self._update_busy or self._run_active()
+                or not _app_settings().value(_UPDATES_AT_STARTUP_KEY, True, type=bool)):
             return
         self._begin_update_check(kind, "startup")
 
@@ -1503,6 +1561,8 @@ class Main(QMainWindow):
                 end_process()
             self._close_deadline_thread = Thread(target=expire, name="xdart-close-deadline", daemon=True)
             self._close_deadline_thread.start()
+        if not self._update_authorized:
+            self._cancel_update_admission()
         receipts = self._close_page_and_tools()
         pending = [receipt for receipt in receipts if receipt.status is PageCleanup.PENDING]
         if pending:
