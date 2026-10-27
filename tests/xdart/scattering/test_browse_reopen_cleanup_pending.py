@@ -209,3 +209,36 @@ def test_a_kept_click_lapses_quietly_once_browse_is_not_admissible(tmp_path, mon
         assert _shows(page, first, 1)
     finally:
         _close(page, qapp, *(() if stuck is None else (stuck,)))
+
+
+def test_refresh_cancels_the_kept_click_and_its_waiting_notice(tmp_path, monkeypatch, qapp):
+    page, (first, second) = _int_page(tmp_path, monkeypatch, ("first", "second"))
+    hold = threading.Event()
+    real_read = Browse1DHydrationLane._open_and_read
+
+    def held_read(self, task, labels):
+        assert hold.wait(10)
+        return real_read(self, task, labels)
+
+    try:
+        _click_scan(page, first)
+        _wait(lambda: _shows(page, first, 1))
+        monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
+        _click_frame(qapp, page._shell, 1, settle=False)
+        _wait(lambda: True if page._context_controller.browse_preview_polling_needed else None)
+        _click_scan(page, second)
+        waiting = page._notice_text
+        assert page._deferred_browse_reopen is not None and waiting.startswith("Opening ")
+
+        page._handle_shell_command(ShellCommand(ShellCommandKind.REFRESH_BROWSER))
+
+        assert page._deferred_browse_reopen is None
+        assert page._notice_text != waiting
+        hold.set()
+        controller = page._context_controller
+        _wait(lambda: True if not controller.browse_pending and not controller.browse_preview_polling_needed else None)
+        assert controller.navigation.current.artifact == str(first)
+        assert page._deferred_browse_reopen is None
+    finally:
+        hold.set()
+        _close(page, qapp)

@@ -3417,7 +3417,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         if kind is ShellCommandKind.REFRESH_BROWSER:
             self._deferred_browse_selection = None
+            deferred = self._deferred_browse_reopen
             self._deferred_browse_reopen = None
+            if deferred is not None and self._notice_text == _browse_reopen_notice(deferred.value):
+                self._notice("")
             self._abandon_reintegrate_display_owner()
             self._processed_browser.clear_directory_cache()
             self._request_browser_catalog()
