@@ -112,6 +112,8 @@ def _page(qapp, intent):
         yield page, page.findChild(ScatteringWorkspaceShell).scientific, observed
     finally:
         page.close()
+        if page.isVisible():  # its cleanup still pending (a given-up Run's quarantine): off screen for later rows
+            page.hide()
         page.deleteLater()
         qapp.processEvents()
 
