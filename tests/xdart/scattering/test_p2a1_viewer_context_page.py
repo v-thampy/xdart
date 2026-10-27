@@ -394,6 +394,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _sync_metadata_question=lambda _executor: None,  # Live Auto's question, since 204651e8
         _failed_cleanup_pending=lambda: False,  # a failed Run's pending cleanup retried, since 703753b1
         _terminal_hold=None,  # a Run's end held for the view's paint, since 404e17b2
+        _replay_browse_reopen=lambda: False,  # a scan click kept while Browse cleanup settles, since 1254f8f2
         _batch_ready_to_paint=lambda: None,
         _advance_authored_asset_confirmation=lambda: None,
         _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
