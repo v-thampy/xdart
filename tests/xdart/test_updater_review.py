@@ -188,6 +188,17 @@ def test_editable_bootstrap_remains_available(monkeypatch):
     assert updater.startup_update_blocked() is False
 
 
+def test_startup_probe_accepts_an_unheld_readonly_lock_file(tmp_path):
+    path = tmp_path / updater.LOCK_FILE
+    path.write_bytes(b"existing lock")
+    path.chmod(0o444)
+    try:
+        assert updater.helper_lock_held(tmp_path) is False
+        assert path.read_bytes() == b"existing lock"
+    finally:
+        path.chmod(0o644)
+
+
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX helper race")
 def test_closing_during_handshake_revokes_a_late_helper(window, monkeypatch, tmp_path):
     jobs = []

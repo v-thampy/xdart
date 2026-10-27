@@ -474,10 +474,11 @@ class _FileLock:
             close()
 
 
-def take_file_lock(path):
+def take_file_lock(path, *, create=True):
     """Acquire one nonblocking OS lock, or None if owned. Unknown locking fails closed."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform.startswith("win"):
         import ctypes
         from ctypes import wintypes
@@ -486,7 +487,8 @@ def take_file_lock(path):
                                       ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         kernel.CreateFileW.restype = wintypes.HANDLE
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = kernel.CreateFileW(str(path), 0xC0000000, 0, None, 4, 0x80, None)
+        handle = kernel.CreateFileW(str(path), 0xC0000000 if create else 0x80000000,
+                                    0, None, 4 if create else 3, 0x80, None)
         if handle == ctypes.c_void_p(-1).value:
             error = ctypes.get_last_error()
             if error in (32, 33):
@@ -494,9 +496,9 @@ def take_file_lock(path):
             raise ctypes.WinError(error)
         return _FileLock(lambda: kernel.CloseHandle(handle))
     import fcntl
-    fh = open(path, "a+b")
+    fh = open(path, "a+b" if create else "rb")
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), (fcntl.LOCK_EX if create else fcntl.LOCK_SH) | fcntl.LOCK_NB)
     except BlockingIOError:
         fh.close()
         return None
@@ -510,10 +512,12 @@ def _file_lock_held(path):
     if not Path(path).exists():
         return False
     try:
-        lock = take_file_lock(path)
+        lock = take_file_lock(path, create=False)
         if lock is None:
             return True
         lock.close()
+        return False
+    except FileNotFoundError:
         return False
     except OSError:
         return None
