@@ -206,6 +206,21 @@ def run_update(job, out, result=None):
     return proc.returncode, timed_out, tree_gone
 
 
+def _take_lock(path):
+    """Hold this install's update lock for the helper's whole life (released when the process ends, whatever ends it).
+    Returns the open file to keep, or False when another helper holds it."""
+    import fcntl
+    fh = open(path, "a+b")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return False
+    except OSError:
+        pass                                             # no locking on this file system: carry on without it
+    return fh
+
+
 def relaunch(cmd):
     """Start xdart detached: its own session and no terminal, so closing the update window cannot end it."""
     subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -215,6 +230,11 @@ def relaunch(cmd):
 def run_job(job):
     state_dir = Path(job["state_dir"])
     helper_file = state_dir / job.get("helper_file", "xdart-update-helper.json")
+    lock = _take_lock(state_dir / job.get("lock_file", "xdart-update.lock"))
+    if lock is False:
+        if sys.stdout is not None:
+            print("Another xdart update is running for this install, so nothing was changed.", flush=True)
+        return 2
     started_at = time.time()
     _write_json(helper_file, {"pid": os.getpid(), "state": "running", "started_at": started_at})
     out = _Output(job["log"])

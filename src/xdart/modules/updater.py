@@ -442,12 +442,42 @@ def update_available(current, latest):
 STATE_FILE = "xdart-update-state.json"
 HELPER_FILE = "xdart-update-helper.json"
 JOB_FILE = "xdart-update-job.json"
+LOCK_FILE = "xdart-update.lock"
 LOG_FILE = "update.log"
 #: The helper stops an update still running after this long (agreed with Codex N-2b0787f9).
 UPDATE_TIME_LIMIT_S = 1200
 #: How long the helper waits for xdart to close, and for pixi to finish after its child processes are stopped.
 PARENT_WAIT_S = 60
 STOP_GRACE_S = 30
+#: The longest a helper can legitimately run (used only where the lock cannot be tested).
+_HELPER_MAX_RUN_S = PARENT_WAIT_S + UPDATE_TIME_LIMIT_S + STOP_GRACE_S + 60
+
+
+def helper_lock_held(state_dir):
+    """True while an update helper for this install runs: the helper holds LOCK_FILE exclusively for its whole life,
+    and the lock dies with the process, so a reused PID cannot fake it. None when the lock cannot be tested here."""
+    path = Path(state_dir) / LOCK_FILE
+    if not path.exists():
+        return False
+    if sys.platform.startswith("win"):
+        try:
+            with open(path, "a+b"):          # the PowerShell helper opens it with FileShare.None
+                return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+    try:
+        import fcntl
+        with open(path, "a+b") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return None
 
 
 def install_identity(prefix=None):
@@ -536,12 +566,15 @@ def settle_previous_attempt(state_dir, *, install, current, alive):
         return "none", None
     helper = read_json(Path(state_dir) / HELPER_FILE) or {}
     if helper.get("state") != "completed":
-        pid = helper.get("pid")
-        try:
-            recent = time.time() - float(attempt.get("launched_at", 0)) < UPDATE_TIME_LIMIT_S + 300
-        except (TypeError, ValueError):
-            recent = False
-        if recent and isinstance(pid, int) and pid > 0 and alive(pid):
+        held = helper_lock_held(state_dir)
+        if held is None:      # no lock here (an unusual file system): the PID within the longest legitimate run
+            pid = helper.get("pid")
+            try:
+                recent = time.time() - float(attempt.get("launched_at", 0)) < _HELPER_MAX_RUN_S
+            except (TypeError, ValueError):
+                recent = False
+            held = recent and isinstance(pid, int) and pid > 0 and alive(pid)
+        if held:
             return "active", attempt
     reached = version_reached(current, attempt.get("to"))
     if not reached and attempt.get("to"):

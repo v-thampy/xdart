@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from xdart.modules.updater import HELPER_FILE, JOB_FILE, write_json_atomic
+from xdart.modules.updater import HELPER_FILE, JOB_FILE, LOCK_FILE, write_json_atomic
 
 
 class UpdateLaunchRefused(RuntimeError):
@@ -23,7 +23,7 @@ class UpdateLaunchRefused(RuntimeError):
 
 def write_job(state_dir, job):
     path = Path(state_dir) / JOB_FILE
-    write_json_atomic(path, {**job, "state_dir": str(state_dir), "helper_file": HELPER_FILE})
+    write_json_atomic(path, {**job, "state_dir": str(state_dir), "helper_file": HELPER_FILE, "lock_file": LOCK_FILE})
     return path
 
 
@@ -170,6 +170,10 @@ function Invoke-Update {
   Say ("The update did not finish (exit {0}). Reopening xdart; what it opens depends on how far the update got. Log: {1}" -f $p.ExitCode, $job.log)
   Start-Xdart; return 1
 }
+$lockPath = Join-Path ([string]$job.state_dir) ([string]$job.lock_file)
+# Held unshared for this helper's life; xdart treats an open lock as an update still running.
+try { $lockStream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+catch { Write-Host 'Another xdart update is running for this install, so nothing was changed.'; exit 2 }
 Save-Helper @{ pid = $PID; state = 'running'; started_at = $started }
 $code = 1
 try { $code = Invoke-Update } catch { Say ("The updater failed: {0}" -f $_.Exception.Message) }

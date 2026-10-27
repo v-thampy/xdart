@@ -578,12 +578,64 @@ def test_an_attempt_settles_by_version(tmp_path):
     assert updater.settle_previous_attempt(tmp_path / "none", install="I", current="1", alive=bool) == ("none", None)
 
 
+def hold_update_lock(state_dir):
+    """A stand-in helper: another process holding this install's update lock (POSIX flock), as the helper does."""
+    import subprocess
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import fcntl, sys, time; f = open(sys.argv[1], 'a+b'); fcntl.flock(f, fcntl.LOCK_EX); "
+         "print('locked', flush=True); time.sleep(60)", str(Path(state_dir) / updater.LOCK_FILE)],
+        stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "locked"
+    return holder
+
+
+@posix_only
 def test_a_running_helper_keeps_the_attempt(tmp_path):
     updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log=tmp_path / "update.log")
+    holder = hold_update_lock(tmp_path)
+    try:
+        updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": holder.pid, "state": "running"})
+        assert updater.helper_lock_held(tmp_path) is True
+        outcome, record = updater.settle_previous_attempt(tmp_path, install="I", current="1.2.6", alive=lambda _p: True)
+        assert outcome == "active" and record["to"] == "1.2.7"
+        assert updater.load_update_state(tmp_path, "I")["attempt"]["to"] == "1.2.7"   # untouched
+    finally:
+        holder.kill()
+        holder.wait()
+    assert updater.helper_lock_held(tmp_path) is False                              # the lock dies with it
+
+
+@posix_only
+def test_a_reused_pid_does_not_fake_a_running_helper(tmp_path):
+    # The helper died without a record; its PID now belongs to a live process. Only the lock decides.
+    updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log=tmp_path / "update.log")
+    (tmp_path / updater.LOCK_FILE).write_bytes(b"")
     updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": os.getpid(), "state": "running"})
-    outcome, record = updater.settle_previous_attempt(tmp_path, install="I", current="1.2.6", alive=lambda pid: True)
-    assert outcome == "active" and record["to"] == "1.2.7"
-    assert updater.load_update_state(tmp_path, "I")["attempt"]["to"] == "1.2.7"   # untouched
+    outcome, _record = updater.settle_previous_attempt(tmp_path, install="I", current="1.2.6", alive=lambda _p: True)
+    assert outcome == "incomplete"
+
+
+def test_a_late_helper_after_an_abandoned_attempt_is_ignored(tmp_path):
+    # The handshake timed out and the attempt was undone; the helper started late and wrote its record anyway.
+    previous = updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log="l")
+    updater.abandon_attempt(tmp_path, previous)
+    updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": os.getpid(), "state": "running"})
+    assert updater.settle_previous_attempt(tmp_path, install="I", current="1.2.6", alive=lambda _p: True) == (
+        "none", None)
+
+
+@posix_only
+def test_helper_changes_nothing_while_another_helper_holds_the_lock(tmp_path):
+    state, marker, ran = tmp_path / "state", tmp_path / "relaunched", tmp_path / "update-ran"
+    job = _job(state, _script(f"open({str(ran)!r}, 'w').write('ran')"), marker=marker)
+    holder = hold_update_lock(state)
+    try:
+        assert helper.main([str(job)]) == 2
+        assert not (state / updater.HELPER_FILE).exists() and not ran.exists() and not marker.exists()
+    finally:
+        holder.kill()
+        holder.wait()
 
 
 def test_abandon_restores_the_state_and_installs_do_not_share_it(tmp_path):

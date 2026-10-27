@@ -4,7 +4,7 @@ now, a Run starting during the countdown, Quit during a check, the one admission
 start of a second xdart while an update runs. Settings and update state are isolated (rule 10)."""
 from __future__ import annotations
 
-import os
+import sys
 import threading
 import time
 
@@ -12,6 +12,7 @@ import pytest
 from pyqtgraph.Qt import QtWidgets
 
 from tests.xdart.pages.test_synthetic_page_host import _descriptor, _services
+from tests.xdart.test_updater import hold_update_lock
 from xdart import _gui_main
 from xdart.gui.pages.values import PageCapability
 from xdart.modules import update_launch, updater
@@ -178,6 +179,7 @@ def test_a_helper_that_never_reports_is_abandoned(window, qapp, monkeypatch, tmp
     assert updater.load_update_state(updater.update_state_dir(_meta(tmp_path)), "test-install")["attempt"] is None
 
 
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="the stand-in lock holder uses POSIX flock")
 def test_a_second_start_during_an_update_quits(monkeypatch, tmp_path, qapp):
     shown = []
     monkeypatch.setattr(updater, "install_kind", lambda meta=None: "pixi-global")
@@ -186,8 +188,13 @@ def test_a_second_start_during_an_update_quits(monkeypatch, tmp_path, qapp):
     monkeypatch.setattr(updater, "current_version", lambda: "1.2.6")
     monkeypatch.setattr(QtWidgets.QMessageBox, "information", lambda *args: shown.append(args[2]))
     updater.begin_attempt(tmp_path, install="test-install", current="1.2.6", target="1.2.7", log="l")
-    updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": os.getpid(), "state": "running"})
-    assert _gui_main._settle_update_at_startup() == "active"
+    holder = hold_update_lock(tmp_path)               # a helper still running for this install
+    try:
+        updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": holder.pid, "state": "running"})
+        assert _gui_main._settle_update_at_startup() == "active"
+    finally:
+        holder.kill()
+        holder.wait()
     assert shown and "being updated" in shown[0]
     assert updater.load_update_state(tmp_path, "test-install")["attempt"]["to"] == "1.2.7"   # untouched
 
