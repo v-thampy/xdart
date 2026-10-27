@@ -320,6 +320,10 @@ class _DeferredBrowseReopen:
     refusal: str
 
 
+def _browse_reopen_notice(value: str) -> str:
+    return f"Opening {os.path.basename(value) or value} once the current scan finishes loading."
+
+
 def _live_plot_interval_ms() -> int:
     try:
         value = int(os.environ.get(
@@ -4808,7 +4812,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._notice("Browse is unavailable while a Run is running; pause or stop it to open another scan.")
                 if not self._closed:
                     self._refresh_shell()  # as _error_notice replays the Browser after any other refusal
-            elif isinstance(error, BrowseCleanupPending) and not (self._closing or self._closed):
+            elif type(error) is BrowseCleanupPending and not (self._closing or self._closed):
                 self._keep_browse_reopen(
                     value, reopen,
                     f"Browse refused: {detached_exception_strings(error)[2]}", retry,
@@ -4846,7 +4850,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             value, reopen, deadline, now + interval, interval, refusal,
         )
         if retry is None:
-            self._notice(f"Opening {os.path.basename(value) or value} once the current scan finishes loading.")
+            self._notice(_browse_reopen_notice(value))
         # As after the 1-D debt refusal: the Browser highlighted the clicked row, so show what is still selected.
         self._refresh_shell(preserve_scientific=True)
         self._ensure_timer()
@@ -4864,6 +4868,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if deferred is None:
             return False
         controller = self._context_controller
+        if not controller.browse_lifecycle_admissible():
+            # A Run resumed or started: Browse waits for it, so the kept click lapses quietly.
+            self._deferred_browse_reopen = None
+            if self._notice_text == _browse_reopen_notice(deferred.value):
+                self._notice("")
+            return True
         now = time.monotonic()
         if now >= deferred.deadline:
             self._give_up_browse_reopen(deferred.refusal)
@@ -5075,7 +5085,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
                 if not successor_settled:
                     detail = getattr(outcome, "detail", "")
-                    if detail or not self._progress.terminal or not self._notice_text:
+                    # A cancelled open settling while a click is kept leaves that click's waiting notice up.
+                    if (detail or self._deferred_browse_reopen is None) and (
+                            detail or not self._progress.terminal or not self._notice_text):
                         self._notice(detail)
                 current = self._context_controller.navigation.current
                 if current is not None:

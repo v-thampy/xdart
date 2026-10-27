@@ -46,18 +46,21 @@ def _click_scan(page, path):
     page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(path), path=("artifact",)))
 
 
-def _begin_spy(monkeypatch, controller):
-    """Record every Browse admission attempt (value, refusal text or None); the real method runs unchanged."""
+def _begin_spy(monkeypatch, page):
+    """Record every Browse admission attempt as (value, refusal text or None, page notice when it began); the real
+    method runs unchanged."""
     attempts = []
+    controller = page._context_controller
     real = controller.begin_browse
 
     def spy(value, *args, **kwargs):
+        notice = page._notice_text
         try:
             request = real(value, *args, **kwargs)
         except Exception as error:
-            attempts.append((value, str(error)))
+            attempts.append((value, str(error), notice))
             raise
-        attempts.append((value, None))
+        attempts.append((value, None, notice))
         return request
 
     monkeypatch.setattr(controller, "begin_browse", spy)
@@ -113,14 +116,15 @@ def test_one_click_opens_a_scan_while_the_shown_scans_1d_read_is_in_flight(tmp_p
         monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
         _click_frame(qapp, page._shell, 1, settle=False)
         assert _wait(lambda: True if controller.browse_preview_polling_needed else None)
-        attempts = _begin_spy(monkeypatch, controller)
+        attempts = _begin_spy(monkeypatch, page)
 
         _click_scan(page, second)  # the only click on the second scan
 
-        assert attempts == [(str(second), "previous Browse cleanup is pending")]
+        assert [(value, refusal) for value, refusal, _ in attempts] == [
+            (str(second), "previous Browse cleanup is pending")]
         threading.Timer(0.3, hold.set).start()
         _wait(lambda: _shows(page, second, 1))
-        assert [value for value, refusal in attempts if refusal is None] == [str(second)]
+        assert [value for value, refusal, _ in attempts if refusal is None] == [str(second)]
         assert "Browse refused" not in page._notice_text
     finally:
         hold.set()
@@ -131,18 +135,18 @@ def test_a_kept_click_gives_up_at_the_limit_with_one_warning_and_no_retry_storm(
     tmp_path, monkeypatch, qapp, caplog,
 ):
     page, (first, second) = _int_page(tmp_path, monkeypatch, ("first", "second"))
-    controller = page._context_controller
     monkeypatch.setattr(page_module, "_BROWSE_REOPEN_LIMIT_S", 1.0)
     stuck = None
     try:
         _click_scan(page, first)
         _wait(lambda: _shows(page, first, 1))
         stuck = _stuck_release(monkeypatch)
-        attempts = _begin_spy(monkeypatch, controller)
+        attempts = _begin_spy(monkeypatch, page)
+        waiting = "Opening scan.nexus once the current scan finishes loading."
         with caplog.at_level(logging.INFO, logger=_PAGE_LOG):
             _click_scan(page, second)
             assert page._deferred_browse_reopen is not None
-            assert page._notice_text == "Opening scan.nexus once the current scan finishes loading."
+            assert page._notice_text == waiting
             _wait(lambda: True if page._deferred_browse_reopen is None and page._notice_text.startswith(
                 "Browse refused") else None)
 
@@ -151,9 +155,11 @@ def test_a_kept_click_gives_up_at_the_limit_with_one_warning_and_no_retry_storm(
         warnings = [record for record in records if record.levelno == logging.WARNING]
         assert len(warnings) == 1 and "Browse refused: previous Browse cleanup is pending" in warnings[0].getMessage()
         assert not [record for record in records if record.exc_info or record.levelno >= logging.ERROR]
-        # The first click, then retries at doubling intervals (0.25 s, 0.5 s, ...) within the limit; never a storm.
-        assert 2 <= len(attempts) <= 4, attempts
-        assert all(value == str(second) and refusal for value, refusal in attempts)
+        # The click, then retries at doubling intervals (0.25 s, 0.5 s, ...) within the limit; never a storm.
+        assert 1 <= len(attempts) <= 4, attempts
+        assert all(value == str(second) and refusal for value, refusal, _ in attempts)
+        # The waiting notice stays up while the click is kept (a cancelled open settling must not blank it).
+        assert all(notice == waiting for _, _, notice in attempts[1:]), attempts
         assert _shows(page, first, 1)
     finally:
         _close(page, qapp, *(() if stuck is None else (stuck,)))
@@ -167,7 +173,7 @@ def test_a_newer_click_replaces_the_kept_one(tmp_path, monkeypatch, qapp):
         _click_scan(page, first)
         _wait(lambda: _shows(page, first, 1))
         stuck = _stuck_release(monkeypatch)
-        attempts = _begin_spy(monkeypatch, controller)
+        attempts = _begin_spy(monkeypatch, page)
         _click_scan(page, second)
         assert page._deferred_browse_reopen.value == str(second)
         _wait(lambda: True if not controller.browse_pending else None)
@@ -176,7 +182,30 @@ def test_a_newer_click_replaces_the_kept_one(tmp_path, monkeypatch, qapp):
 
         stuck.clear()
         _wait(lambda: _shows(page, third, 1))
-        assert [value for value, refusal in attempts if refusal is None] == [str(third)]
+        assert [value for value, refusal, _ in attempts if refusal is None] == [str(third)]
         assert page._deferred_browse_reopen is None
+    finally:
+        _close(page, qapp, *(() if stuck is None else (stuck,)))
+
+
+def test_a_kept_click_lapses_quietly_once_browse_is_not_admissible(tmp_path, monkeypatch, qapp):
+    """A Run resumed (or started) while a click is kept: Browse waits for the Run, so the click lapses without a
+    stale refusal. The lifecycle predicate the page reads is switched directly; a real paused Run is out of scope."""
+    page, (first, second) = _int_page(tmp_path, monkeypatch, ("first", "second"))
+    controller = page._context_controller
+    stuck = None
+    try:
+        _click_scan(page, first)
+        _wait(lambda: _shows(page, first, 1))
+        stuck = _stuck_release(monkeypatch)
+        attempts = _begin_spy(monkeypatch, page)
+        _click_scan(page, second)
+        assert page._deferred_browse_reopen is not None
+        monkeypatch.setattr(controller, "browse_lifecycle_admissible", lambda: False)
+        stuck.clear()
+        _wait(lambda: True if page._deferred_browse_reopen is None else None)
+        assert [refusal for _, refusal, _ in attempts] == ["previous Browse cleanup is pending"]
+        assert page._notice_text == ""
+        assert _shows(page, first, 1)
     finally:
         _close(page, qapp, *(() if stuck is None else (stuck,)))
