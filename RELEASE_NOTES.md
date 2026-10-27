@@ -1,5 +1,75 @@
 # Release notes
 
+## 1.2.6 (2026-10-27)
+
+### Added
+
+- **The footer names the output file:** under Int's plots, the image shown is
+  followed by the NeXus file it is saved in, by file name only, for example
+  "LaB6_0001.tif [Output: LaB6_int2d.nexus]". Int 1D (XYE), which writes no
+  NeXus file, shows the image alone. A footer too long for the window is cut at
+  its right edge, and its tooltip shows it whole.
+- **A failed Run's cleanup that keeps failing is given up:** when the same
+  cleanup failure repeats for about 10 s, Run and the Data Browser's scans
+  unlock, and a notice names the output still held, for example "Run unlocked:
+  the failed Run's cleanup did not finish in 10 s. scan_int1d.nexus stays as
+  the failure left it (Replace rebuilds it); until xdart restarts, a new Run
+  skips it." Until xdart restarts, a Live or Folder Run skips that one output,
+  saying why, and processes the others; a Run of that scan alone fails.
+  Quitting waits at most about 10 s for a cleanup still pending, then closes
+  xdart.
+
+### Changed
+
+- **A compact Run status:** a Live or Folder Run shows its processed files out
+  of those discovered, its skipped files only when there are some, and an
+  Append's new frames, for example "Running · 40/65 processed (10 new) ·
+  2 skipped". A running Live Run that has caught up reads "Running · Waiting
+  for new images · 65/65 processed (15 new)", where 1.2.5 read "Running · Up to
+  date, waiting for new images · 65 processed (15 new) · 0 skipped ·
+  65 discovered". An image waiting for its metadata is still named in the
+  status, and the status at the Run's end is unchanged.
+- **Skipped and reprocessed scans say why in plain words:** for example
+  "scan_int1d.nexus stops growing: it was made with different integration
+  settings; its frames so far are kept and its later frames are skipped in this
+  Run (Replace reprocesses it)", and at the Run's end "Append skipped
+  scan_int1d.nexus: it was made with different integration settings". Other
+  reasons read as plainly: different results (1-D, 2-D or GI maps), another
+  Project folder, a different source (another folder, path spelling or file
+  type), a reintegrated output, changed images (naming the first, as "image 2,
+  scan_0001.tif"), fewer images than the output holds, an earlier Append that
+  did not finish, another program holding the output open, a file that cannot
+  be read, or an output Append cannot continue. The "Scans reprocessed" list
+  uses the same words. The technical reason is a debug line (Config ▸ Debug ▸
+  Debug Logging).
+- **A quieter log:** a Live image's short wait for its .txt sidecar is a debug
+  line. An image still waiting after 30 s is told once ("… has waited over 30 s
+  for the metadata of <image>; it is processed once its metadata arrives"), and
+  so is the end of its wait. The lz4 compression note at each session's first
+  write is a debug line too; disabled or unavailable compression still warns.
+
+### Fixes
+
+- **A failed Live Append no longer leaves Run disabled:** on the beamline's
+  network share, a Live Append failed when the share reported an older time for
+  its open output, and every cleanup retry then failed too ("Standard cleanup
+  remains pending"): Run stayed disabled, and closing xdart retried until it
+  was killed. Such a Run still fails, but its cleanup now ends and Run unlocks.
+  Its output is left as any interrupted Append leaves it, so the next Append
+  skips it and says to use Replace.
+- **The status counts frames as they are shown:** a scan already on disk read
+  0 processed until all its frames were saved; it now counts up frame by frame.
+- **Windows mapped drives:** a network folder picked in a dialog
+  (`\\server\share\...`) and the same folder pasted from Explorer with its drive
+  letter (`X:\...`) are now one place. Dialogs give the drive letter, as
+  Explorer does. A source on the share inside a Project folder spelled the other
+  way no longer warns that it "is outside the project root", and its outputs
+  record its path relative to the Project. The Save Path follows the Project
+  folder whichever spelling either uses.
+- **The skip of an Append onto an output written before 1.2.5** (no
+  `epoch_local` column) says "Replace reprocesses it", as the button reads,
+  where it said Overwrite.
+
 ## 1.2.5 (2026-10-26)
 
 ### Added
