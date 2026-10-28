@@ -53,8 +53,8 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 
 The **one-line installer** creates a private Pixi workspace, so it is updated
 separately from global environments. Use **Help → Check for Updates…** (xdart
-closes, a window shows the update, and xdart reopens showing the new version; at
-startup xdart also offers newer 1.x releases after a 10 s notice), or close xdart
+closes, a progress window shows the update, and **Restart xdart** opens the new version; at
+startup a scrollable changelog offers **Update** or **Cancel**, with no countdown), or close xdart
 and update the workspace directly (default installation paths shown):
 
 ```bash
@@ -493,14 +493,17 @@ version, its version constraint must also be updated.
 
 **In-app updates.** Help → Check for Updates… asks the source the install updates from
 (the conda channels in a Pixi global environment's manifest, or PyPI). For a Pixi
-install, xdart closes and the update runs in a visible window (Terminal on macOS,
-PowerShell on Windows), then xdart reopens. The window, and the `update.log` beside the
-install (`~/.pixi/xdart-update/<env>/` for a global environment), show what pixi did.
-An update still running after 20 minutes is stopped. When xdart next starts it says
-whether the update reached the new version; a version that did not install is not
+install on macOS or Windows, xdart closes and a native progress window shows the update without opening
+Terminal or a console. Its scrollable details and the `update.log` beside the installation keep the output.
+Choose **Restart xdart** after successful completion; the window stays open with details on failure.
+At startup and from Help, the same offer shows installed/available versions and a scrollable summary of newer
+releases. **Update** starts installation; **Cancel** keeps the installed version. There is no countdown or
+unattended installation. An unavailable changelog still leaves both choices and a link to the full release notes.
+Linux currently shows the manual update command because an independent progress host is not shipped there.
+The helper still limits installation to 20 minutes and retains its existing cleanup protections. A failed target is not
 offered again at startup, though Help → Check for Updates… can retry it. If the xdart
 app itself does not open after a failed update on macOS, run `pixi global sync` in
-Terminal. The automatic startup update acts only on a Pixi global environment that asks
+Terminal. The startup offer acts only on a Pixi global environment that asks
 for xdart without a version pin (as the README's install command does), or on an
 installer workspace within 1.x; other setups get the command to run by hand. pip and
 conda installs always get a command to copy.

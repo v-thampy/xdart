@@ -87,6 +87,7 @@ function logTail() {
 }
 function tick() {
     if (!started) {
+        if (!window.visible) throw Error('The update window is not visible.');
         started = true;
         // First timer callback after makeKeyAndOrderFront: app may now require both host and engine custody.
         save(job.host_file, {attempt_id: job.attempt_id, pid: Number($.NSProcessInfo.processInfo.processIdentifier), ready: true});
@@ -144,7 +145,7 @@ ObjC.registerSubclass({name: 'XdartUpdateActions', superclass: 'NSObject', metho
 }});
 var actions = $.XdartUpdateActions.alloc.init;
 restart.target = actions; closeButton.target = actions; window.delegate = actions; app.delegate = actions;
-app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
+if (!app.setActivationPolicy($.NSApplicationActivationPolicyRegular)) throw Error('Cannot show the update window.');
 window.center; window.makeKeyAndOrderFront(null); app.activateIgnoringOtherApps(true);
 var timer = $.NSTimer.timerWithTimeIntervalTargetSelectorUserInfoRepeats(.25, actions, 'tick:', null, true);
 $.NSRunLoop.mainRunLoop.addTimerForMode(timer, $.NSRunLoopCommonModes);
