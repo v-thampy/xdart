@@ -456,8 +456,11 @@ UPDATE_TIME_LIMIT_S = 1200
 #: How long the helper waits for xdart to close, and for pixi to finish after its child processes are stopped.
 PARENT_WAIT_S = 60
 STOP_GRACE_S = 30
+#: Windows: how long programs still using the environment get to close once xdart has (pixi's xdart.exe launcher
+#: exits just after xdart) before the update is refused.
+ENV_WAIT_S = 10
 #: The longest a helper can legitimately run (used only where the lock cannot be tested).
-_HELPER_MAX_RUN_S = PARENT_WAIT_S + UPDATE_TIME_LIMIT_S + STOP_GRACE_S + 60
+_HELPER_MAX_RUN_S = PARENT_WAIT_S + ENV_WAIT_S + UPDATE_TIME_LIMIT_S + STOP_GRACE_S + 60
 
 
 class UpdateInProgress(RuntimeError):

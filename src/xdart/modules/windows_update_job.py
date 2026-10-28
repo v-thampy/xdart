@@ -58,6 +58,8 @@ public sealed class XdartUpdateJob : IDisposable {
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
   [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool IsProcessInJob(IntPtr process,IntPtr job,out bool inside);
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  static extern bool QueryFullProcessImageName(IntPtr process,int flags,StringBuilder name,ref int size);
 
   IntPtr job, process; public int Id { get; private set; }
   static void Check(bool ok) { if (!ok) throw new Win32Exception(Marshal.GetLastWin32Error()); }
@@ -95,18 +97,30 @@ public sealed class XdartUpdateJob : IDisposable {
   public uint ActiveCount {
     get { Accounting a; Check(QueryAccounting(job,1,out a,(uint)Marshal.SizeOf(typeof(Accounting)),IntPtr.Zero)); return a.active; }
   }
-  public void StopChildren() {
-    IntPtr buffer=Marshal.AllocHGlobal(65536);
+  // The hidden console's conhost.exe joins the job and leaves with its last client; it is never stopped or counted.
+  static bool IsConsoleHost(IntPtr process) {
+    StringBuilder name=new StringBuilder(1024); int size=name.Capacity;
+    return QueryFullProcessImageName(process,0,name,ref size)
+      && System.IO.Path.GetFileName(name.ToString()).Equals("conhost.exe",StringComparison.OrdinalIgnoreCase);
+  }
+  // Best effort, returning how many stopped: one that exits meanwhile needs no stopping, and Stop() is the backstop.
+  public int StopChildren() {
+    IntPtr buffer=Marshal.AllocHGlobal(65536); int stopped=0;
     try {
       Check(QueryMembers(job,3,buffer,65536,IntPtr.Zero));
       int count=Marshal.ReadInt32(buffer,4);
       for(int i=0;i<count;i++) {
         int pid=Marshal.ReadIntPtr(buffer,8+i*IntPtr.Size).ToInt32(); if(pid==Id) continue;
         IntPtr child=OpenProcess(0x101001,false,pid); if(child==IntPtr.Zero) continue;
-        try { bool inside; Check(IsProcessInJob(child,job,out inside)); if(inside) Check(TerminateProcess(child,1)); }
+        try {
+          bool inside;
+          if(IsProcessInJob(child,job,out inside) && inside && !IsConsoleHost(child)
+             && TerminateProcess(child,1)) stopped++;
+        }
         finally { CloseHandle(child); }
       }
     } finally { Marshal.FreeHGlobal(buffer); }
+    return stopped;
   }
   public void Stop() { Check(TerminateJobObject(job,1)); }
   public void Dispose() {

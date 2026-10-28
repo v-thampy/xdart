@@ -697,13 +697,17 @@ def test_updater_helper_imports_no_qt():
 # ── the Windows helper, run for real where PowerShell exists (the windows-pixi-native job) ─────────────────────
 
 windows_only = pytest.mark.skipif(not sys.platform.startswith("win"), reason="runs the real Windows PowerShell helper")
+#: Stands in for pixi's xdart.exe launcher, which the helper waits for; never the interpreter running these tests.
+_PYTHONW = str(Path(sys.executable).with_name("pythonw.exe"))
 
 
-def _windows_job(tmp_path, update_cmd, *, env_prefix=None, limit=60, grace=10):
+def _windows_job(tmp_path, update_cmd, *, env_prefix=None, limit=60, grace=10, env_wait=10):
     state, marker = tmp_path / "Jane O'Neil ü" / "xdart-update", tmp_path / "relaunched"
     job = _job(state, update_cmd, marker=marker, limit=limit, grace=grace)
     data = json.loads(job.read_text(encoding="utf-8"))
-    data.update(pause_at_end=False, env_prefix=env_prefix or str(tmp_path / "no-env"))
+    assert Path(_PYTHONW).is_file(), _PYTHONW
+    data["relaunch_cmd"][0] = _PYTHONW
+    data.update(pause_at_end=False, env_prefix=env_prefix or str(tmp_path / "no-env"), env_wait_s=env_wait)
     job.write_text(json.dumps(data), encoding="utf-8")
     return job, state, marker
 
@@ -722,7 +726,7 @@ def test_powershell_helper_runs_the_update_and_relaunches(tmp_path):
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
     assert (result["state"], result["exit"], result["relaunched"]) == ("completed", 0, True)
     log = (state / "update.log").read_text(encoding="utf-8-sig")
-    assert "step 1" in log and "env set" in log
+    assert " step 1\n" in log and " env set\n" in log          # whole lines: the logged command holds "step 1"
     assert _await(marker, 30)
 
 
@@ -736,7 +740,7 @@ def test_powershell_helper_time_limit_stops_the_child_then_relaunches(tmp_path):
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
     assert (result["exit"], result["timed_out"], result["relaunched"]) == (3, True, True)
     log = (state / "update.log").read_text(encoding="utf-8-sig")
-    assert "Stopped 1 child process" in log and "child ended" in log and "pixi did not finish" not in log
+    assert "Stopped 1 child process" in log and " child ended\n" in log and "pixi did not finish" not in log
     assert _await(marker, 30)
 
 
@@ -744,12 +748,41 @@ def test_powershell_helper_time_limit_stops_the_child_then_relaunches(tmp_path):
 def test_powershell_helper_refuses_while_the_environment_is_in_use(tmp_path):
     ran = tmp_path / "update-ran"
     job, state, marker = _windows_job(tmp_path, _script(f"open({str(ran)!r}, 'w').write('ran')"),
-                                      env_prefix=sys.prefix)        # this pytest process runs from that env
+                                      env_prefix=sys.prefix, env_wait=1)   # this pytest process runs from that env
     done = _run_powershell(job)
     assert done.returncode == 1, done.stdout + done.stderr
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
     assert result["refused"] == "environment in use" and not ran.exists()
-    assert "use xdart's environment" in (state / "update.log").read_text(encoding="utf-8-sig")
+    log = (state / "update.log").read_text(encoding="utf-8-sig")
+    assert "Waiting up to 1 s for python" in log and "use xdart's environment" in log
+
+
+@windows_only
+def test_powershell_helper_waits_for_a_launcher_that_outlives_xdart(tmp_path):
+    import subprocess
+    job, state, marker = _windows_job(tmp_path, _script("print('updated', flush=True)"), env_wait=60)
+    log, launcher_py = state / "update.log", tmp_path / "launcher.py"
+    # Exits once the helper has seen it running, as pixi's xdart.exe does just after xdart.
+    launcher_py.write_text(
+        "import pathlib, sys, time\n"
+        "log, end = pathlib.Path(sys.argv[1]), time.monotonic() + 60\n"
+        "def seen():\n"
+        "    try:\n"
+        "        return 'Waiting up to' in log.read_text('utf-8', 'replace')\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "while time.monotonic() < end and not seen():\n"
+        "    time.sleep(0.2)\n", encoding="utf-8")
+    launcher = subprocess.Popen([_PYTHONW, str(launcher_py), str(log)])
+    try:
+        done = _run_powershell(job)
+    finally:
+        launcher.kill()
+        launcher.wait(10)
+    assert done.returncode == 0, done.stdout + done.stderr
+    text = log.read_text(encoding="utf-8-sig")
+    assert "Waiting up to 60 s for pythonw.exe" in text and " updated\n" in text and "use xdart's environment" not in text
+    assert _await(marker, 30)
 
 
 # ── a start refused during an update says why (an app or Start-menu launch has no terminal) ─────────────────────

@@ -166,6 +166,7 @@ def test_admission_records_the_attempt_and_closes_once_the_helper_reports(window
     job, = jobs
     assert job["target"] == "9.9.9" and job["update_env"] == {"PIXI_HOME": str(tmp_path)}
     assert job["time_limit_s"] == updater.UPDATE_TIME_LIMIT_S and job["parent_wait_s"] == updater.PARENT_WAIT_S
+    assert job["env_wait_s"] == updater.ENV_WAIT_S
     attempt = updater.load_update_state(updater.update_state_dir(_meta(tmp_path)), "test-install")["attempt"]
     assert attempt["from"] == "1.2.6" and attempt["to"] == "9.9.9"
 

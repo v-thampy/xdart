@@ -1013,7 +1013,7 @@ class Main(QMainWindow):
                "update_cmd": list(meta["update_cmd"]), "update_env": dict(meta.get("update_env") or {}),
                "relaunch_cmd": list(meta["relaunch_cmd"]), "env_prefix": meta.get("env_prefix") or sys.prefix,
                "log": str(log), "time_limit_s": updater.UPDATE_TIME_LIMIT_S, "grace_s": updater.STOP_GRACE_S,
-               "parent_wait_s": updater.PARENT_WAIT_S}
+               "parent_wait_s": updater.PARENT_WAIT_S, "env_wait_s": updater.ENV_WAIT_S}
         try:
             update_launch.launch_helper(state_dir, job)
         except (update_launch.UpdateLaunchRefused, OSError) as exc:

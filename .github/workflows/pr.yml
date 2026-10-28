@@ -108,6 +108,7 @@ jobs:
           tests/xdart/test_updater.py::test_powershell_helper_runs_the_update_and_relaunches
           tests/xdart/test_updater.py::test_powershell_helper_time_limit_stops_the_child_then_relaunches
           tests/xdart/test_updater.py::test_powershell_helper_refuses_while_the_environment_is_in_use
+          tests/xdart/test_updater.py::test_powershell_helper_waits_for_a_launcher_that_outlives_xdart
           tests/xdart/test_updater_review.py::test_windows_job_tracks_a_late_child_after_its_parent_exits
           tests/xdart/test_updater_review.py::test_windows_job_preserves_empty_quoted_and_trailing_slash_arguments
           -q -ra --timeout=300

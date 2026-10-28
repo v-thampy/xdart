@@ -122,16 +122,26 @@ function Invoke-Update {
   }
   $prefix = ([string]$job.env_prefix).TrimEnd('\') + '\'
   $tramp = [string]$job.relaunch_cmd[0]
-  try {
-    $holders = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.ExecutablePath -and ($_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or $_.ExecutablePath -ieq $tramp) })
-  } catch {
-    Say ("Could not list the programs using xdart's environment ({0}), so nothing was changed." -f $_.Exception.Message)
-    $result.refused = 'environment check failed'; Start-Xdart; return 1
-  }
-  if ($holders.Count -gt 0) {
+  # pixi's xdart.exe waits for xdart and exits just after it, so a program here gets env_wait_s to close, timed from
+  # when it is first seen (the first process query in a fresh PowerShell can take seconds).
+  $envDeadline = $null
+  while ($true) {
+    try {
+      $holders = @(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.ExecutablePath -and ($_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or $_.ExecutablePath -ieq $tramp) })
+    } catch {
+      Say ("Could not list the programs using xdart's environment ({0}), so nothing was changed." -f $_.Exception.Message)
+      $result.refused = 'environment check failed'; Start-Xdart; return 1
+    }
+    if ($holders.Count -eq 0) { break }
     $names = ($holders | ForEach-Object { "{0} (PID {1})" -f $_.Name, $_.ProcessId }) -join ', '
-    Say ("Not updating: these programs use xdart's environment: {0}. Close them and update again." -f $names)
-    $result.refused = 'environment in use'; Start-Xdart; return 1
+    if ($null -eq $envDeadline) {
+      Say ("Waiting up to {0} s for {1} to close." -f [double]$job.env_wait_s, $names)
+      $envDeadline = (Get-Date).AddSeconds([double]$job.env_wait_s)
+    } elseif ((Get-Date) -ge $envDeadline) {
+      Say ("Not updating: these programs use xdart's environment: {0}. Close them and update again." -f $names)
+      $result.refused = 'environment in use'; Start-Xdart; return 1
+    }
+    Start-Sleep -Milliseconds 500
   }
   foreach ($k in @($job.update_env.PSObject.Properties)) { Set-Item -LiteralPath ("Env:" + $k.Name) -Value ([string]$k.Value) }
   $out = [string]$job.log + '.stdout'; $err = [string]$job.log + '.stderr'
@@ -140,11 +150,12 @@ function Invoke-Update {
   $p = New-Object XdartUpdateJob -ArgumentList $exe, ([string]$job.update_command_line), $out, $err
   $script:updateProcess = $p
   $offsets = @{ $out = [long]0; $err = [long]0 }
+  # Resume where the read stopped (Position): output written after it is read next time.
   $pump = {
     foreach ($f in @($out, $err)) {
       if (-not (Test-Path -LiteralPath $f)) { continue }
       $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
-      try { $null = $fs.Seek($offsets[$f], 'Begin'); $text = (New-Object IO.StreamReader($fs)).ReadToEnd(); $offsets[$f] = $fs.Length } finally { $fs.Dispose() }
+      try { $null = $fs.Seek($offsets[$f], 'Begin'); $text = (New-Object IO.StreamReader($fs)).ReadToEnd(); $offsets[$f] = $fs.Position } finally { $fs.Dispose() }
       foreach ($line in ($text -split "`r?`n")) { if ($line) { Say $line } }
     }
   }
@@ -156,8 +167,7 @@ function Invoke-Update {
     if (($now - $t0).TotalSeconds -ge [double]$job.time_limit_s) {
       $timedOut = $true; $result.timed_out = $true
       Say ("The update is still running after {0} min; stopping it." -f [int]([double]$job.time_limit_s / 60))
-      $kidCount = [math]::Max(0, [int]$p.ActiveCount - 1)
-      $p.StopChildren()
+      $kidCount = $p.StopChildren()
       Say ("Stopped {0} child process(es) of the update; waiting for pixi to finish." -f $kidCount)
       if (-not $p.WaitForExit([int]([double]$job.grace_s * 1000))) {
         Say 'pixi did not finish; stopping the whole update.'
