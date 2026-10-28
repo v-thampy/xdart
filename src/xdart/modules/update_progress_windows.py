@@ -30,7 +30,8 @@ _SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName PresentationFramework
 $job = Get-Content -LiteralPath __JOB__ -Raw -Encoding UTF8 | ConvertFrom-Json
-Add-Type -TypeDefinition @'
+# Compiled only when Restart needs it, so the window and the helper start without waiting for a compile.
+$nativeJob = @'
 __NATIVE_JOB__
 '@
 $helperPath = Join-Path ([string]$job.state_dir) ([string]$job.helper_file)
@@ -62,8 +63,10 @@ function Read-Tail {
   $fs = $null
   try {
     $fs = [IO.File]::Open([string]$job.log, 'Open', 'Read', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-    $count = [int][Math]::Min(131072, $fs.Length)
-    $null = $fs.Seek(-$count, [IO.SeekOrigin]::End)
+    # This update's output only: from where the log ended when the window opened, at most its last 128 KiB.
+    $from = [Math]::Min($fs.Length, [Math]::Max([long]$script:logStart, $fs.Length - 131072))
+    $count = [int]($fs.Length - $from)
+    $null = $fs.Seek($from, [IO.SeekOrigin]::Begin)
     $bytes = New-Object byte[] $count
     $read = $fs.Read($bytes, 0, $count)
     return [Text.Encoding]::UTF8.GetString($bytes, 0, $read)
@@ -101,8 +104,10 @@ $version.Text = "xdart $($job.from) → $($job.target)"
 $stage.Text = 'Preparing the update window…'
 $details.ToolTip = "Recent output (up to 128 KiB). Full log: $($job.log)"
 $script:worker = $null; $script:started = $false; $script:terminal = $false
-$script:failure = ''; $script:hostLock = $null
+$script:failure = ''; $script:hostLock = $null; $script:logStart = [long]0
+try { $script:logStart = (Get-Item -LiteralPath ([string]$job.log)).Length } catch { }  # it holds earlier updates too
 function Refresh-Progress {
+  $exitedBefore = ($null -ne $script:worker -and $script:worker.HasExited)
   $tail = Read-Tail
   if ($null -ne $tail -and $details.Text -cne $tail) { $details.Text = $tail; $details.ScrollToEnd() }
   if ($null -eq $script:worker) { return }
@@ -134,6 +139,7 @@ function Refresh-Progress {
     $stage.Text = 'The updater exited without a matching completion report. See the log.'
   } else { $stage.Text = "The update did not finish successfully. Restart is unavailable. Log: $($job.log)" }
   if ($script:failure) { $stage.Text = $script:failure }
+  if ($exitedBefore) { $timer.Stop() }  # this read followed the helper's exit, so the output and outcome are final
 }
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(500)
@@ -156,6 +162,7 @@ $restart.Add_Click({
     $exe = [string]$job.relaunch_cmd[0]
     $line = '"' + $exe + '"'
     if ([string]$job.relaunch_arguments) { $line += ' ' + [string]$job.relaunch_arguments }
+    if (-not ('XdartUpdateJob' -as [type])) { Add-Type -TypeDefinition $nativeJob }
     [void][XdartUpdateJob]::Launch($exe, $line)
     $script:failure = ''
     $window.Close()

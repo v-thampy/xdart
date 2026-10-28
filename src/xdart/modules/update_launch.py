@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Start the update helper in a visible window (maintainer's pick 2026-10-27, "Visible window").
+"""Start the update in its own progress window, outside xdart's environment.
 
-Qt-free. The app writes one JSON job file and passes only its path to the helper, so the only value quoted onto a
-command line is that path: macOS runs ``xdart._updater`` in a Terminal window through a ``.command`` wrapper, Linux
-runs it hidden, and Windows runs a PowerShell helper outside the env (the env's python.exe is locked while xdart
-runs), started with CREATE_BREAKAWAY_FROM_JOB or not at all.
+Qt-free. The app writes one JSON job file and passes only its path on, so the only value quoted onto a command line is
+that path. On macOS and Windows the app starts a progress window that does not use the environment being updated
+(osascript's JavaScript with AppKit; Windows PowerShell with WPF, started with CREATE_BREAKAWAY_FROM_JOB or not at
+all); that window starts the helper once it shows (``xdart._updater`` on macOS; on Windows a PowerShell helper, as the
+env's python.exe is locked while xdart runs), and the user restarts xdart from it. Each window writes its own errors
+to ``<job>.host.log``. Linux has no progress window, so Help gives the update command. The older launchers below (a
+Terminal ``.command`` wrapper, a visible console, a hidden Linux helper, each reopening xdart by itself) run only a job
+without ``manual_restart``, which the app no longer writes.
 """
 from __future__ import annotations
 
@@ -167,16 +171,22 @@ function Start-Xdart {
   $result.relaunched = $true
 }
 function Invoke-Update {
-  Say ("Updating xdart from {0} to {1}. Keep this window open; xdart reopens when the update has finished." -f $job.from, $job.target)
+  $next = 'Keep this window open; xdart reopens when the update has finished.'
+  if ($job.manual_restart -eq $true) { $next = 'Choose Restart xdart when the update finishes.' }
+  Say ("Updating xdart from {0} to {1}. {2}" -f $job.from, $job.target, $next)
   Say ("Command: " + (@($job.update_cmd) -join ' '))
   $deadline = (Get-Date).AddSeconds([double]$job.parent_wait_s)
   $parent = [int]$job.parent_pid
   while ($parent -gt 0 -and (Get-Process -Id $parent -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
-    if ($null -eq (Read-Attempt)) { $result.refused = 'attempt cancelled'; return 1 }
+    if ($null -eq (Read-Attempt)) {
+      Say 'The update was cancelled in xdart, so nothing was changed.'; $result.refused = 'attempt cancelled'; return 1
+    }
     Start-Sleep -Milliseconds 100
   }
   $attempt = Read-Attempt
-  if ($null -eq $attempt -or -not $attempt.authorized) { $result.refused = 'attempt not authorized'; return 1 }
+  if ($null -eq $attempt -or -not $attempt.authorized) {
+    Say 'xdart did not confirm this update, so nothing was changed.'; $result.refused = 'attempt not authorized'; return 1
+  }
   if ($parent -gt 0 -and (Get-Process -Id $parent -ErrorAction SilentlyContinue)) {
     Say 'xdart did not close, so nothing was changed.'; $result.refused = 'xdart did not close'; return 1
   }
@@ -206,11 +216,13 @@ function Invoke-Update {
   if ($job.require_progress_host -eq $true) {
     $hostState = Get-Content -LiteralPath ([string]$job.host_file) -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($hostState.attempt_id -ne $job.attempt_id -or $hostState.ready -ne $true) {
+      Say 'The update progress window was not ready, so nothing was changed.'
       $result.refused = 'progress window is not ready'; return 1
     }
     try {
       $probe = [IO.File]::Open([string]$job.host_lock, 'Open', 'Read', 'None')
-      $probe.Dispose(); $result.refused = 'progress window closed before installation'; return 1
+      $probe.Dispose(); Say 'The update progress window closed before installation, so nothing was changed.'
+      $result.refused = 'progress window closed before installation'; return 1
     } catch [IO.IOException] {
       if (($_.Exception.HResult -band 65535) -notin @(32, 33)) { throw }
     } # only a sharing/lock violation proves a live host
@@ -344,35 +356,45 @@ def launch_windows(job_path, *, popen=subprocess.Popen):
         raise UpdateLaunchRefused(f"the update window could not be started outside xdart ({exc})") from exc
 
 
+def has_progress_window(platform=None):
+    """True where an update runs in its own progress window (macOS, Windows); elsewhere Help gives the command."""
+    platform = sys.platform if platform is None else platform
+    return platform == "darwin" or platform.startswith("win")
+
+
 def launch_helper(state_dir, job, *, platform=None, python=None):
     """Prepare one immutable job and start its independent progress host (legacy jobs retain their old launcher)."""
     platform = sys.platform if platform is None else platform
     python = python or sys.executable
     if job.get("manual_restart"):
-        if platform != "darwin" and not platform.startswith("win"):
+        if not has_progress_window(platform):
             raise UpdateLaunchRefused("This platform has no independent update progress window. Use the manual command.")
         suffix = job["attempt_id"]
         base = Path(state_dir) / f"xdart-update-job-{suffix}"
         base.parent.mkdir(parents=True, exist_ok=True)
-        job.update(host_file=str(base.with_suffix(".host.json")), host_lock=str(base.with_suffix(".host.lock")))
+        job.update(host_file=str(base.with_suffix(".host.json")), host_lock=str(base.with_suffix(".host.lock")),
+                   host_log=str(base.with_suffix(".host.log")))
         Path(job["host_lock"]).touch(exist_ok=True)
         job_path = write_job(state_dir, job)
-        if platform.startswith("win"):
-            from . import update_progress_windows
-            # Engine and host live in separate processes, both outside the mutable environment.
-            engine = Path(job_path).with_suffix(".ps1")
-            engine.write_text(powershell_script(job_path), encoding="utf-8-sig")
-            host = Path(job_path).with_suffix(".host.ps1")
-            host.write_text(update_progress_windows.script(job_path, engine), encoding="utf-8-sig")
-            subprocess.Popen(update_progress_windows.argv(host),
-                             creationflags=CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
-        else:
-            from . import update_progress_macos
-            host = Path(job_path).with_suffix(".js")
-            host.write_text(update_progress_macos.script(job_path, python), encoding="utf-8")
-            subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", str(host)],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True, close_fds=True)
+        # The window's own errors (a script that fails before it shows) go to host_log, which the app names on timeout.
+        with open(job["host_log"], "ab") as host_log:
+            if platform.startswith("win"):
+                from . import update_progress_windows
+                # Engine and host live in separate processes, both outside the mutable environment.
+                engine = Path(job_path).with_suffix(".ps1")
+                engine.write_text(powershell_script(job_path), encoding="utf-8-sig")
+                host = Path(job_path).with_suffix(".host.ps1")
+                host.write_text(update_progress_windows.script(job_path, engine), encoding="utf-8-sig")
+                subprocess.Popen(update_progress_windows.argv(host), stdin=subprocess.DEVNULL, stdout=host_log,
+                                 stderr=host_log, creationflags=CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+                                 close_fds=True)
+            else:
+                from . import update_progress_macos
+                host = Path(job_path).with_suffix(".js")
+                host.write_text(update_progress_macos.script(job_path, python), encoding="utf-8")
+                subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", str(host)],
+                                 stdin=subprocess.DEVNULL, stdout=host_log, stderr=host_log,
+                                 start_new_session=True, close_fds=True)
         return job_path
     if platform == "darwin":
         job = {**job, "close_window_s": CLOSE_WINDOW_S}

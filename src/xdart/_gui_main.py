@@ -375,9 +375,11 @@ def _xdart_excepthook(exc_type, exc, tb):
 
 
 #: Help ▸ Check for Updates at Startup (default on); the explicit startup offer; how long the app waits for the
-#: update helper to report that it runs before it closes; how long after the window shows the startup check starts.
+#: progress window and the update helper to report that they run before it closes (Windows PowerShell loads WPF and
+#: compiles the helper's job code first, slowly on a cold or busy PC); how long after the window shows the startup check
+#: starts.
 _UPDATES_AT_STARTUP_KEY = "updates.check_at_startup"
-_UPDATE_HANDSHAKE_S = 20.0
+_UPDATE_HANDSHAKE_S = 60.0
 _STARTUP_CHECK_DELAY_MS = 2000
 
 
@@ -868,7 +870,7 @@ class Main(QMainWindow):
     def _on_update_check(self, result, generation):
         if generation != self._update_generation or self._close_accepted:
             return
-        from xdart.modules import updater
+        from xdart.modules import update_launch, updater
         kind, from_help = self._update_kind, self._update_source == "help"
         current = updater.current_version()
         logger.info("[UPDATE] check: status=%s latest=%s current=%s automatic=%s %s",
@@ -898,9 +900,11 @@ class Main(QMainWindow):
             if from_help:
                 self._show_copyable_update(kind, latest, current, "")
             return
-        # The startup offer appears only on a validated install, never on a target that failed before for
-        # this install, one skipped with Cancel this session, or while anything is running.
-        if not from_help and (not result.automatic or latest in self._update_skipped or self._run_active()
+        # The startup offer appears only on a validated install that can update in a progress window, never on a
+        # target that failed before for this install, one skipped with Cancel this session, or while anything is
+        # running.
+        if not from_help and (not result.automatic or not update_launch.has_progress_window()
+                or latest in self._update_skipped or self._run_active()
                 or updater.target_failed(updater.update_state_dir(meta), updater.install_identity(), latest)):
             return
         self._show_update_dialog(kind, meta, latest)
@@ -927,14 +931,16 @@ class Main(QMainWindow):
             self._update_dialog.set_notes(notes)
 
     def _show_update_dialog(self, kind, meta, target):
-        """Explicit consent, shared by startup and Help; there is no automatic-update timer."""
+        """Explicit consent, shared by startup and Help; there is no automatic-update timer. Without a progress
+        window (Linux) its button shows the update command instead."""
         from xdart.gui.widgets.update_dialog import UpdateDialog
-        from xdart.modules import updater, update_notes
+        from xdart.modules import update_launch, updater, update_notes
         if self._update_dialog is not None:
             self._update_dialog.close()
         generation = self._update_generation
         current = updater.current_version()
-        box = UpdateDialog(current, target, self)
+        manual = not update_launch.has_progress_window()
+        box = UpdateDialog(current, target, self, manual=manual)
         self._update_dialog = box
         timer = QtCore.QTimer(box)
         timer.setInterval(250)
@@ -956,7 +962,9 @@ class Main(QMainWindow):
             self._update_dialog = None
             if generation != self._update_generation:
                 return
-            if result == QtWidgets.QDialog.DialogCode.Accepted and not self._run_active(require_known=True):
+            if result == QtWidgets.QDialog.DialogCode.Accepted and manual:
+                self._show_copyable_update(kind, target, current, "")
+            elif result == QtWidgets.QDialog.DialogCode.Accepted and not self._run_active(require_known=True):
                 self._admit_update(kind, meta, target)
             else:
                 self._update_skipped.add(target)
@@ -1051,9 +1059,12 @@ class Main(QMainWindow):
             self._update_busy = False
             updater.abandon_attempt(state_dir, previous, self._update_attempt_id)
             self._release_update_reservation()
-            logger.warning("[UPDATE] the update window did not report within %.0f s", _UPDATE_HANDSHAKE_S)
+            host_log = (getattr(self, "_update_host_job", None) or {}).get("host_log")
+            logger.warning("[UPDATE] the update window did not report within %.0f s (its log: %s)",
+                           _UPDATE_HANDSHAKE_S, host_log)
             self.statusBar().clearMessage()
-            self._show_copyable_update(kind, target, current, "The update window did not start.")
+            self._show_copyable_update(kind, target, current, "The update window did not start."
+                                       + (f" Its log: {host_log}" if host_log else ""))
             return
         QtCore.QTimer.singleShot(200, self, lambda: self._await_update_handshake(
             state_dir, previous, kind, target, current, deadline))

@@ -111,6 +111,8 @@ jobs:
           tests/xdart/test_updater.py::test_powershell_helper_waits_for_a_launcher_that_outlives_xdart
           tests/xdart/test_updater_review.py::test_windows_job_tracks_a_late_child_after_its_parent_exits
           tests/xdart/test_updater_review.py::test_windows_job_preserves_empty_quoted_and_trailing_slash_arguments
+          tests/xdart/test_update_progress.py::test_windows_progress_window_script_parses_and_its_layout_loads
+          tests/xdart/test_update_progress.py::test_windows_helper_needs_its_progress_window_and_never_reopens_xdart
           -q -ra --timeout=300
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-updater-session.json

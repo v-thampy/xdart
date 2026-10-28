@@ -8,7 +8,7 @@ import threading
 import time
 
 import pytest
-from pyqtgraph.Qt import QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 from tests.xdart.pages.test_synthetic_page_host import _descriptor, _services
 from tests.xdart.test_updater import hold_update_lock
@@ -223,3 +223,23 @@ def test_the_next_start_reports_how_the_update_went(window, qapp, monkeypatch):
     assert boxes == ["xdart was updated from 1.2.6 to 1.2.7."]
     window.start_startup_updates(("incomplete", {"to": "1.2.8", "log": "/x/update.log"}, "pixi-global"))
     assert boxes[1].startswith("The update to xdart 1.2.8 did not complete; see /x/update.log.")
+
+
+def test_without_a_progress_window_help_gives_the_command_and_startup_stays_quiet(window, qapp, monkeypatch, tmp_path):
+    from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
+    monkeypatch.setattr(update_launch, "has_progress_window", lambda platform=None: False)
+    shown = []
+    monkeypatch.setattr(window, "_show_copyable_update", lambda *args: shown.append(args))
+    admitted = _startup_result(window, monkeypatch, tmp_path)
+    assert window._update_dialog is None                          # Linux: no offer at startup
+    window._update_source = "help"
+    window._update_generation += 1
+    window._on_update_check(updater.UpdateCheck("ok", "9.9.9", True), window._update_generation)
+    box = window._update_dialog
+    assert isinstance(box, ReadOnlyTextWindow) and box.notes is box.pane      # the shared read-only window (rule 14)
+    assert box.versions.textFormat() == QtCore.Qt.TextFormat.PlainText
+    assert box.update_button.text() == "Show Update Command" and box.update_button.toolTip()
+    assert "terminal" in box.explanation.text() and box.explanation.toolTip()
+    box.update_button.click()
+    assert _pump(qapp, lambda: shown == [("pixi-global", "9.9.9", "1.2.6", "")], 2)
+    assert admitted == [] and window._update_dialog is None

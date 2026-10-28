@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Update-on-exit helper (macOS and Linux) — ``python -m xdart._updater <job.json>``.
+"""Update-on-exit helper (POSIX) — ``python -m xdart._updater <job.json>``.
 
-The app writes the job (``xdart.modules.updater``) and starts this helper: in a Terminal window on macOS, hidden on
-Linux. Windows uses the PowerShell helper from ``xdart.modules.update_launch`` outside the env, because the env's own
-python.exe is locked while it runs. Steps: record the handshake (this PID), wait for xdart to close, run the update
-with its output shown and logged as it arrives, stop it at the time limit (child processes first, then pixi after a
-grace period, then the whole process group), relaunch xdart detached once nothing of the update is left running, and
-record the outcome. Stdlib only. See ``docs/design/design_install_and_update_jul2026.md`` section 4.
+The app writes the job (``xdart.modules.updater``); on macOS its progress window (``update_progress_macos``) starts
+this helper once it shows. Windows uses the PowerShell helper from ``xdart.modules.update_launch`` outside the env,
+because the env's own python.exe is locked while it runs. Steps: record the handshake (this PID), wait for xdart to
+close, refuse unless the progress window still runs, run the update with its output logged as it arrives, stop it at
+the time limit (child processes first, then pixi after a grace period, then the whole process group), and record the
+outcome; the user restarts xdart from the progress window. A job without ``manual_restart`` (the older launchers)
+instead relaunches xdart detached once nothing of the update is left running. Stdlib only. See
+``docs/design/design_install_and_update_jul2026.md`` section 4.
 """
 from __future__ import annotations
 
@@ -275,11 +277,13 @@ def run_job(job):
         deadline = time.monotonic() + float(job.get("parent_wait_s") or 60)
         while parent > 0 and _pid_alive(parent) and time.monotonic() < deadline:
             if update_state.job_attempt(job) is None:
+                out.line("The update was cancelled in xdart, so nothing was changed.")
                 result["refused"] = "attempt cancelled"
                 return 1
             time.sleep(.1)
         attempt = update_state.job_attempt(job)
         if attempt is None or not attempt.get("authorized"):
+            out.line("xdart did not confirm this update, so nothing was changed.")
             result["refused"] = "attempt not authorized"
             return 1
         if parent > 0 and _pid_alive(parent):
@@ -287,6 +291,7 @@ def run_job(job):
             result["refused"] = "xdart did not close"
             return 1
         if not update_state.progress_host_ready(job):
+            out.line("The update progress window closed before installation, so nothing was changed.")
             result["refused"] = "the update progress window closed before installation"
             return 1
         _write_json(helper_file, {**result, "state": "running", "phase": "updating"})

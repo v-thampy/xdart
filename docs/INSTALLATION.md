@@ -483,6 +483,10 @@ Release preflight is a focused check; it does not replace the CI suites or nativ
 platform testing. Publishing is performed by the release workflows when a
 maintainer pushes a version tag.
 
+To try the update offer with a development build, which has no release tag, set
+`XDART_RELEASE_NOTES_FILE` to a local file in the `RELEASE_NOTES.md` format; xdart
+summarizes that file instead of the tag's release notes.
+
 ## Published releases and updates
 
 A release becomes available after the maintainer pushes its version tag **and
@@ -499,7 +503,8 @@ Choose **Restart xdart** after successful completion; the window stays open with
 At startup and from Help, the same offer shows installed/available versions and a scrollable summary of newer
 releases. **Update** starts installation; **Cancel** keeps the installed version. There is no countdown or
 unattended installation. An unavailable changelog still leaves both choices and a link to the full release notes.
-Linux currently shows the manual update command because an independent progress host is not shipped there.
+Linux has no progress window: there Help → Check for Updates… shows the same summary with **Show Update Command**,
+which gives the command to run in a terminal, and xdart offers no update at startup.
 The helper still limits installation to 20 minutes and retains its existing cleanup protections. A failed target is not
 offered again at startup, though Help → Check for Updates… can retry it. If the xdart
 app itself does not open after a failed update on macOS, run `pixi global sync` in
