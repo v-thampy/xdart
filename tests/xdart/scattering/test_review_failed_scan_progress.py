@@ -2,7 +2,7 @@
 import pytest
 
 from tests.xdart.scattering.test_live_never_waits import (
-    test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_on as _corrupt_container,
+    _output, test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_on as _corrupt_container,
 )
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 
@@ -22,4 +22,5 @@ def test_retained_container_frames_stay_in_the_run_total(tmp_path, caplog, monke
     assert len(observed) == 1
     run = observed[0]
     print("FAILED-SCAN-PROGRESS", live, run.completed, run.total)
-    assert run.completed == run.total == 5, (run.completed, run.total)
+    kept = len(_output(tmp_path, "bad")[0])   # the failed scan's committed frames, as many as its epochs reached
+    assert run.completed == run.total == kept + 3, (run.completed, run.total, kept)

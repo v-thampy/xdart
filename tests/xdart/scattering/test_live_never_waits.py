@@ -402,7 +402,7 @@ def _stack(path, frames, corrupt=None):
 @pytest.mark.parametrize("live", [True, False])
 def test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_on(tmp_path, caplog, live):
     """A container's frames are read by the executor's producer (Codex N-69301b5f NW-R2): its third frame cannot be
-    decoded; the frames before it are kept, and the next container is processed."""
+    decoded; the frames committed before it are kept, and the next container is processed."""
     caplog.set_level(logging.INFO)
     raw = tmp_path / "raw"
     raw.mkdir()
@@ -432,7 +432,9 @@ def test_a_container_frame_that_cannot_be_read_stops_its_scan_and_the_run_goes_o
     assert any("bad_int1d.nexus" in message and "could not be processed" in message  # HDF5's own words vary by OS
                and "SourceReadError: its next frames of bad.nxs could not be read: OSError" in message
                for message in _messages(caplog))
-    assert _output(tmp_path, "bad")[0] == (0, 1) and _output(tmp_path, "good")[0] == (0, 1, 2)
+    # The failed scan keeps its committed epochs and drops the pending one (settle_failed_current), so a frame read
+    # but not yet committed goes with it: a slow host kept (0,) (hosted run 40652929271). Never the corrupt frame.
+    assert _output(tmp_path, "bad")[0] in ((), (0,), (0, 1)) and _output(tmp_path, "good")[0] == (0, 1, 2)
 
 
 @pytest.mark.parametrize("live", [True, False])
