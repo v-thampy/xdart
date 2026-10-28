@@ -52,12 +52,12 @@ def test_help_keeps_a_constrained_install_on_the_manual_command(window, monkeypa
     assert shown == [("pixi-global", "1.2.7", "1.2.6", "pinned manifest")]
 
 
-def test_disabling_startup_updates_cancels_the_live_countdown(window, qapp, monkeypatch, tmp_path):
+def test_disabling_startup_updates_cancels_the_live_offer(window, qapp, monkeypatch, tmp_path):
     from tests.xdart.test_updater_gui import _startup_result
     admitted = _startup_result(window, monkeypatch, tmp_path)
-    assert window._update_countdown is not None
+    assert window._update_dialog is not None
     window.actionCheckUpdatesAtStartup.setChecked(False)
-    assert window._update_countdown is None
+    assert window._update_dialog is None
     assert not _pump(qapp, lambda: bool(admitted), 2.5)
 
 

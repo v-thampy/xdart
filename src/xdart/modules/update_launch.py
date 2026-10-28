@@ -151,6 +151,7 @@ function Read-Attempt {
 function Start-Xdart {
   $result.finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
   Save-Helper $result  # quiescent completion precedes a fast restarted app's state check
+  if ($job.manual_restart -eq $true) { return }
   $exe = [string]$job.relaunch_cmd[0]
   $rest = [string]$job.relaunch_arguments
   # Its own console without a window and no job: closing this window cannot end xdart, and no console window opens
@@ -202,6 +203,19 @@ function Invoke-Update {
     }
     Start-Sleep -Milliseconds 500
   }
+  if ($job.require_progress_host -eq $true) {
+    $hostState = Get-Content -LiteralPath ([string]$job.host_file) -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($hostState.attempt_id -ne $job.attempt_id -or $hostState.ready -ne $true) {
+      $result.refused = 'progress window is not ready'; return 1
+    }
+    try {
+      $probe = [IO.File]::Open([string]$job.host_lock, 'Open', 'Read', 'None')
+      $probe.Dispose(); $result.refused = 'progress window closed before installation'; return 1
+    } catch [IO.IOException] {
+      if (($_.Exception.HResult -band 65535) -notin @(32, 33)) { throw }
+    } # only a sharing/lock violation proves a live host
+  }
+  Save-Helper @{ pid = $PID; state = 'running'; started_at = $started; phase = 'updating' }
   foreach ($k in @($job.update_env.PSObject.Properties)) { Set-Item -LiteralPath ("Env:" + $k.Name) -Value ([string]$k.Value) }
   $out = [string]$job.log + '.stdout'; $err = [string]$job.log + '.stderr'
   Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue
@@ -249,8 +263,12 @@ function Invoke-Update {
     Say ("Part of the update is still running, so xdart was not reopened (it could find the environment half-changed). Log: {0}" -f $job.log)
     $result.refused = 'update still running'; $result.state = 'blocked'; return 1
   }
-  if ($p.ExitCode -eq 0 -and -not $timedOut) { Say 'pixi finished. Reopening xdart; it confirms the new version when it starts.'; Start-Xdart; return 0 }
-  Say ("The update did not finish (exit {0}). Reopening xdart; what it opens depends on how far the update got. Log: {1}" -f $p.ExitCode, $job.log)
+  if ($p.ExitCode -eq 0 -and -not $timedOut) {
+    if ($job.manual_restart -eq $true) { Say 'Update complete. Choose Restart xdart in the progress window.' }
+    else { Say 'pixi finished. Reopening xdart; it confirms the new version when it starts.' }
+    Start-Xdart; return 0
+  }
+  Say ("The update did not finish (exit {0}). See the update details and log: {1}" -f $p.ExitCode, $job.log)
   Start-Xdart; return 1
 }
 $lockPath = Join-Path ([string]$job.state_dir) ([string]$job.lock_file)
@@ -327,9 +345,35 @@ def launch_windows(job_path, *, popen=subprocess.Popen):
 
 
 def launch_helper(state_dir, job, *, platform=None, python=None):
-    """Write the job and start the helper for this platform; raises :class:`UpdateLaunchRefused`."""
+    """Prepare one immutable job and start its independent progress host (legacy jobs retain their old launcher)."""
     platform = sys.platform if platform is None else platform
     python = python or sys.executable
+    if job.get("manual_restart"):
+        if platform != "darwin" and not platform.startswith("win"):
+            raise UpdateLaunchRefused("This platform has no independent update progress window. Use the manual command.")
+        suffix = job["attempt_id"]
+        base = Path(state_dir) / f"xdart-update-job-{suffix}"
+        base.parent.mkdir(parents=True, exist_ok=True)
+        job.update(host_file=str(base.with_suffix(".host.json")), host_lock=str(base.with_suffix(".host.lock")))
+        Path(job["host_lock"]).touch(exist_ok=True)
+        job_path = write_job(state_dir, job)
+        if platform.startswith("win"):
+            from . import update_progress_windows
+            # Engine and host live in separate processes, both outside the mutable environment.
+            engine = Path(job_path).with_suffix(".ps1")
+            engine.write_text(powershell_script(job_path), encoding="utf-8-sig")
+            host = Path(job_path).with_suffix(".host.ps1")
+            host.write_text(update_progress_windows.script(job_path, engine), encoding="utf-8-sig")
+            subprocess.Popen(update_progress_windows.argv(host),
+                             creationflags=CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
+        else:
+            from . import update_progress_macos
+            host = Path(job_path).with_suffix(".js")
+            host.write_text(update_progress_macos.script(job_path, python), encoding="utf-8")
+            subprocess.Popen(["/usr/bin/osascript", "-l", "JavaScript", str(host)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+        return job_path
     if platform == "darwin":
         job = {**job, "close_window_s": CLOSE_WINDOW_S}
     job_path = write_job(state_dir, job)

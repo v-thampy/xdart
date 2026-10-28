@@ -267,8 +267,9 @@ def run_job(job):
         for sig in (signal.SIGTERM, signal.SIGHUP):
             old_signals[sig] = signal.signal(sig, interrupted)
     try:
-        out.line(f"Updating xdart from {job.get('from')} to {job.get('target')}. Keep this window open; xdart reopens "
-                 "when the update has finished.")
+        out.line(f"Updating xdart from {job.get('from')} to {job.get('target')}. "
+                 + ("Choose Restart xdart when the update finishes." if job.get("manual_restart")
+                    else "Keep this window open; xdart reopens when the update has finished."))
         out.line("Command: " + " ".join(str(part) for part in job["update_cmd"]))
         parent = int(job.get("parent_pid") or 0)
         deadline = time.monotonic() + float(job.get("parent_wait_s") or 60)
@@ -285,6 +286,10 @@ def run_job(job):
             out.line("xdart did not close, so nothing was changed. You can close this window.")
             result["refused"] = "xdart did not close"
             return 1
+        if not update_state.progress_host_ready(job):
+            result["refused"] = "the update progress window closed before installation"
+            return 1
+        _write_json(helper_file, {**result, "state": "running", "phase": "updating"})
         code, timed_out, tree_gone = run_update(job, out, result)
         result.update(exit=code, timed_out=timed_out)
         if not tree_gone:
@@ -293,6 +298,10 @@ def run_job(job):
             result["refused"] = "update still running"
             result["state"] = "blocked"
             return 1
+        if job.get("manual_restart"):
+            out.line("Update complete. Choose Restart xdart in the progress window." if code == 0 and not timed_out
+                     else f"Update failed. Read the details in the progress window or {job['log']}.")
+            return 0 if code == 0 and not timed_out else 1
         if code == 0 and not timed_out:
             out.line("pixi finished. Reopening xdart; it confirms the new version when it starts.")
         else:

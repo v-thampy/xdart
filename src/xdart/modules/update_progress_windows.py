@@ -151,7 +151,8 @@ $restart.Add_Click({
     if ($null -eq $script:worker -or -not $script:worker.HasExited -or $script:worker.ExitCode -ne 0 -or
         -not (Current-Attempt) -or -not (Successful (Current-Helper))) { throw 'This update is no longer ready to restart.' }
     $probe = Open-Lock $lockPath
-    $probe.Dispose(); $probe = $null
+    # Keep the helper lock through launch to exclude another update; release admission so the new app can start.
+    $admission.Dispose(); $admission = $null
     $exe = [string]$job.relaunch_cmd[0]
     $line = '"' + $exe + '"'
     if ([string]$job.relaunch_arguments) { $line += ' ' + [string]$job.relaunch_arguments }

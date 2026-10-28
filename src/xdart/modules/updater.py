@@ -546,6 +546,17 @@ def helper_lock_held(state_dir):
     return _file_lock_held(Path(state_dir) / LOCK_FILE)
 
 
+def progress_host_ready(job):
+    """An exact visible native host must hold its own OS lock before the app closes or the engine mutates."""
+    if not job.get("require_progress_host"):
+        return True
+    if not job.get("host_file") or not job.get("host_lock"):
+        return False
+    host = read_json(job["host_file"]) or {}
+    return (host.get("attempt_id") == job.get("attempt_id") and host.get("ready") is True
+            and _file_lock_held(Path(job["host_lock"])) is True)
+
+
 def install_identity(prefix=None):
     """This install's identity for the state files: the resolved ``sys.prefix``."""
     try:
@@ -717,7 +728,7 @@ def startup_update_notice():
         if root is None:
             return None
         updating = ("xdart is updating",
-                    "xdart is being updated in another window. It reopens by itself when the update has finished.")
+                    "xdart is being updated. Use Restart xdart in the update progress window when it finishes.")
         if _file_lock_held(root / ADMISSION_LOCK_FILE) is not False:
             return updating
         helper = read_json(root / HELPER_FILE) or {}

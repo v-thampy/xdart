@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The in-app updater's GUI flow on a real main window (synthetic page): the startup notice and its countdown, Not
-now, a Run starting during the countdown, Quit during a check, the one admission with the helper's handshake, and the
+"""The in-app updater's GUI flow on a real main window (synthetic page): the startup notice and its offer, Cancel, a Run starting during the offer, Quit during a check, the one admission with the helper's handshake, and the
 start of a second xdart while an update runs. Settings and update state are isolated (rule 10)."""
 from __future__ import annotations
 
@@ -29,7 +28,9 @@ def window(qapp, monkeypatch):
     page = _descriptor("updater-page", [], capabilities=frozenset({PageCapability.RUN_ACTIVITY}), activity=activity)
     main = _gui_main.Main(page_descriptors=(page,), host_services=_services([]), selected_page_key=page.key)
     main.activity = activity
-    monkeypatch.setattr(_gui_main, "_UPDATE_NOTICE_S", 2)
+    from xdart.modules import update_notes
+    monkeypatch.setattr(update_notes, "fetch_release_notes", lambda *a: update_notes.ReleaseNotes(
+        "Version 9.9.9\nNew\n• Clearer update controls", update_notes.RELEASES_URL))
     yield main
     main._update_generation += 1
     main.close()
@@ -65,45 +66,48 @@ def _startup_result(window, monkeypatch, tmp_path, *, automatic=True, latest="9.
     return admitted
 
 
-def test_startup_notice_counts_down_then_admits_the_update(window, qapp, monkeypatch, tmp_path):
+def test_startup_offer_waits_for_explicit_update(window, qapp, monkeypatch, tmp_path):
     admitted = _startup_result(window, monkeypatch, tmp_path)
-    box = window._update_countdown
+    box = window._update_dialog
     assert box is not None and box.isVisible()
-    assert box.text() == "Updating xdart to 9.9.9: it will close, update and reopen."
-    not_now, = box.buttons()
-    assert not_now.text() == "Not now" and not_now.toolTip() and box.toolTip()
-    assert _pump(qapp, lambda: admitted == ["9.9.9"], 6)
-    assert window._update_countdown is None
+    assert "Installed: 1.2.6" in box.versions.text() and "Available: 9.9.9" in box.versions.text()
+    assert box.update_button.text() == "Update" and box.cancel_button.text() == "Cancel"
+    assert box.update_button.toolTip() and box.notes.toolTip()
+    assert _pump(qapp, lambda: "Clearer update controls" in box.notes.toPlainText(), 2)
+    assert not _pump(qapp, lambda: bool(admitted), 2.5)
+    box.update_button.click()
+    assert _pump(qapp, lambda: admitted == ["9.9.9"], 2)
+    assert window._update_dialog is None
 
 
-def test_not_now_skips_the_version_until_the_next_start(window, qapp, monkeypatch, tmp_path):
+def test_cancel_skips_the_version_until_the_next_start(window, qapp, monkeypatch, tmp_path):
     admitted = _startup_result(window, monkeypatch, tmp_path)
-    window._update_countdown.buttons()[0].click()
-    assert _pump(qapp, lambda: window._update_countdown is None, 2)
+    window._update_dialog.cancel_button.click()
+    assert _pump(qapp, lambda: window._update_dialog is None, 2)
     qapp.processEvents()
     time.sleep(2.5)
     qapp.processEvents()
     assert admitted == [] and "9.9.9" in window._update_skipped
     _startup_result(window, monkeypatch, tmp_path)
-    assert window._update_countdown is None                 # the same version is not offered again this session
+    assert window._update_dialog is None                 # the same version is not offered again this session
 
 
-def test_a_run_starting_during_the_countdown_postpones_the_update(window, qapp, monkeypatch, tmp_path):
+def test_a_run_starting_during_the_offer_postpones_the_update(window, qapp, monkeypatch, tmp_path):
     admitted = _startup_result(window, monkeypatch, tmp_path)
     window.activity[0] = True
-    assert _pump(qapp, lambda: window._update_countdown is None, 4)
+    assert _pump(qapp, lambda: window._update_dialog is None, 4)
     assert admitted == [] and "postponed" in window.statusBar().currentMessage()
 
 
 def test_the_startup_update_never_acts_on_an_unvalidated_install_or_a_failed_target(window, monkeypatch, tmp_path):
     _startup_result(window, monkeypatch, tmp_path, automatic=False)
-    assert window._update_countdown is None
+    assert window._update_dialog is None
     updater.begin_attempt(updater.update_state_dir(_meta(tmp_path)), install="test-install", current="1.2.6",
                           target="9.9.9", log="l")
     updater.settle_previous_attempt(updater.update_state_dir(_meta(tmp_path)), install="test-install",
                                     current="1.2.6", alive=lambda _pid: False)    # 9.9.9 failed before
     _startup_result(window, monkeypatch, tmp_path)
-    assert window._update_countdown is None
+    assert window._update_dialog is None
 
 
 def test_quit_during_a_check_ignores_its_late_result(window, qapp, monkeypatch):
@@ -116,7 +120,7 @@ def test_quit_during_a_check_ignores_its_late_result(window, qapp, monkeypatch):
 
     monkeypatch.setattr(updater, "check_for_update", slow_check)
     seen = []
-    monkeypatch.setattr(window, "_show_update_countdown", lambda *args: seen.append(args))
+    monkeypatch.setattr(window, "_show_update_dialog", lambda *args: seen.append(args))
     window._begin_update_check("pixi-global", "startup")
     window.close()                                           # closing bumps the generation
     release.set()
@@ -154,6 +158,9 @@ def test_admission_records_the_attempt_and_closes_once_the_helper_reports(window
     def launch(state_dir, job):
         jobs.append(job)
         holders.append(updater.take_file_lock(state_dir / updater.LOCK_FILE))
+        job.update(host_file=str(state_dir / "test.host.json"), host_lock=str(state_dir / "test.host.lock"))
+        holders.append(updater.take_file_lock(job["host_lock"]))
+        updater.write_json_atomic(job["host_file"], {"attempt_id": job["attempt_id"], "ready": True})
         updater.write_json_atomic(state_dir / updater.HELPER_FILE,
                                   {"pid": 4242, "state": "running", "attempt_id": job["attempt_id"]})
 
