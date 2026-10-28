@@ -152,10 +152,16 @@ function Start-Xdart {
   Save-Helper $result  # quiescent completion precedes a fast restarted app's state check
   $exe = [string]$job.relaunch_cmd[0]
   $rest = [string]$job.relaunch_arguments
-  # Its own console (not this window's) and no job: closing this window cannot end xdart. Not hidden: a hidden start
-  # can pass SW_HIDE on to xdart's first window.
-  if ($rest.Length -gt 0) { Start-Process -FilePath $exe -ArgumentList $rest | Out-Null }
-  else { Start-Process -FilePath $exe | Out-Null }
+  # Its own console without a window and no job: closing this window cannot end xdart, and no console window opens
+  # beside it (pixi's xdart.exe is a console program). Not -WindowStyle Hidden: that passes SW_HIDE on to xdart.
+  $line = '"' + $exe + '"'
+  if ($rest.Length -gt 0) { $line += ' ' + $rest }
+  try { [void][XdartUpdateJob]::Launch($exe, $line) }
+  catch {
+    Say ("Reopening xdart with a console window instead ({0})." -f $_.Exception.Message)
+    if ($rest.Length -gt 0) { Start-Process -FilePath $exe -ArgumentList $rest | Out-Null }
+    else { Start-Process -FilePath $exe | Out-Null }
+  }
   $result.relaunched = $true
 }
 function Invoke-Update {

@@ -728,6 +728,7 @@ def test_powershell_helper_runs_the_update_and_relaunches(tmp_path):
     assert (result["state"], result["exit"], result["relaunched"]) == ("completed", 0, True)
     log = (state / "update.log").read_text(encoding="utf-8-sig")
     assert " step 1\n" in log and " env set\n" in log          # whole lines: the logged command holds "step 1"
+    assert "with a console window instead" not in log           # reopened without a console window
     assert _await(marker, 30)
 
 

@@ -122,6 +122,16 @@ public sealed class XdartUpdateJob : IDisposable {
     } finally { Marshal.FreeHGlobal(buffer); }
     return stopped;
   }
+  // The reopened xdart: a console of its own without a window (the trampoline's python inherits it), and neither the
+  // job nor any handle of this helper. Unlike a hidden start, nothing passes SW_HIDE on to xdart's first window.
+  public static int Launch(string exe,string command) {
+    Startup startup=new Startup(); startup.cb=Marshal.SizeOf(startup);
+    ProcessInfo info;
+    Check(CreateProcess(exe,new StringBuilder(command),IntPtr.Zero,IntPtr.Zero,false,0x08000000,
+                        IntPtr.Zero,null,ref startup,out info)); // CREATE_NO_WINDOW
+    CloseHandle(info.thread); CloseHandle(info.process);
+    return info.pid;
+  }
   public void Stop() { Check(TerminateJobObject(job,1)); }
   public void Dispose() {
     if(job!=IntPtr.Zero) { CloseHandle(job); job=IntPtr.Zero; }
