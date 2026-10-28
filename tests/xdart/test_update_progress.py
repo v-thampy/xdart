@@ -230,7 +230,8 @@ $watch = Set-PSBreakpoint -Command Add-Type -Action {
   } finally { $gate.Dispose() }
 }
 try { $null = $callback.Invoke() } finally { Remove-PSBreakpoint -Breakpoint $watch }
-if (-not $script:settled -or $stage.Text -notlike 'xdart could not be restarted:*') {
+if (-not $script:settled -or $null -eq ('XdartUpdateJob' -as [type]) -or
+    $stage.Text -notlike '*This update is no longer ready to restart.*') {
   'Restart did not reject an attempt settled during compilation'; exit 5
 }
 'ok'
