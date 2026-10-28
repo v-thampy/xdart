@@ -424,7 +424,7 @@ def _settle_update_at_startup():
         text = ("The previous update could not confirm that all its processes stopped. xdart stays closed to protect "
                 f"the environment. See {attempt.get('log')}. After those update processes have ended, move "
                 f"{state_dir} to a different name and start xdart again." if blocked else
-                "xdart is being updated in another window. It reopens by itself when the update has finished.")
+                "xdart is being updated. Use Restart xdart in the progress window when it finishes.")
         QtWidgets.QMessageBox.information(
             None, "xdart update needs recovery" if blocked else "xdart is updating", text)
         return "active"
@@ -474,7 +474,7 @@ class Main(QMainWindow):
         self._update_relay.notes_ready.connect(self._on_update_notes)
         self._update_generation = 0
         self._update_kind = self._update_source = None
-        self._update_skipped = set()       # Not now: skipped until xdart next starts
+        self._update_skipped = set()       # Cancel: skipped until xdart next starts
         self._update_dialog = None
         self._update_busy = False
         self._update_reservation = None
@@ -671,8 +671,8 @@ class Main(QMainWindow):
         self.actionCheckUpdatesAtStartup.setChecked(
             _app_settings().value(_UPDATES_AT_STARTUP_KEY, True, type=bool))
         self.actionCheckUpdatesAtStartup.setToolTip(
-            "When xdart starts, look for a newer version; a pixi install then updates after a 10 s notice that "
-            "offers Not now.")
+            "When xdart starts, show newer versions and their release notes. Choose Update or Cancel; nothing "
+            "installs automatically.")
         self.actionCheckUpdatesAtStartup.toggled.connect(self._set_update_check_at_startup)
         self.actionOpenLogLocation = QtGui.QAction("Open Log Location", self)
         self.actionOpenLogLocation.triggered.connect(self._open_log_location)
