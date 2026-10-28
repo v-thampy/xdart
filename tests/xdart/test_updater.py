@@ -838,3 +838,79 @@ def test_main_shows_the_notice_instead_of_starting(monkeypatch):
     monkeypatch.setattr(updater, "startup_update_notice", lambda: ("xdart is updating", "busy"))
     monkeypatch.setattr(update_launch, "show_native_notice", lambda title, text: shown.append((title, text)))
     assert xdart_main.main() == 0 and shown == [("xdart is updating", "busy")]
+
+
+# ── the macOS update window closes after a successful update (osascript is never run here) ──────────────────────
+
+def test_terminal_close_finds_the_window_of_this_tab_then_closes_it_detached():
+    from types import SimpleNamespace
+    calls = []
+    runner = lambda argv, **kwargs: calls.append((argv, kwargs)) or SimpleNamespace(returncode=0, stdout="4242\n")
+    popen = lambda argv, **kwargs: calls.append((argv, kwargs))
+    assert update_launch.schedule_terminal_close("/dev/ttys009", 10.0, runner=runner, popen=popen) is True
+    (lookup, lookup_kwargs), (closer, closer_kwargs) = calls
+    assert lookup[:2] == ["/usr/bin/osascript", "-e"] and lookup[3:] == ["/dev/ttys009"] and lookup_kwargs["timeout"]
+    assert "(count of tabs of w) is 1 and tty of tab 1 of w" in lookup[2]
+    assert closer[:2] == ["/usr/bin/osascript", "-e"] and closer[3:] == ["4242", "10"]
+    assert "not (busy of tab 1 of window id wid)" in closer[2] and "close window id wid" in closer[2]
+    assert closer_kwargs["start_new_session"] is True and closer_kwargs["stdout"] is update_launch.subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("found", [(0, ""), (1, "4242"), "timeout", "missing"])
+def test_terminal_close_leaves_the_window_open_when_it_cannot_find_it(found):
+    from types import SimpleNamespace
+
+    def runner(argv, **kwargs):
+        if found == "timeout":
+            raise update_launch.subprocess.TimeoutExpired(argv, 10)
+        if found == "missing":
+            raise FileNotFoundError(argv[0])
+        return SimpleNamespace(returncode=found[0], stdout=found[1])
+    started = []
+    assert update_launch.schedule_terminal_close("/dev/ttys009", 10, runner=runner,
+                                                 popen=lambda *args, **kwargs: started.append(args)) is False
+    assert started == []
+
+
+def test_window_close_needs_the_macos_terminal_the_app_opened(monkeypatch):
+    import io
+    called = []
+    monkeypatch.setattr(update_launch, "schedule_terminal_close", lambda tty, s: called.append((tty, s)) or True)
+    assert helper._schedule_window_close({"close_window_s": 10}) is False     # pytest's stdout is no terminal
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 1
+    monkeypatch.setattr(sys, "stdout", Terminal())
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys009")
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert helper._schedule_window_close({"close_window_s": 10}) is False
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert helper._schedule_window_close({}) is False                          # not opened by the app's Terminal launch
+    assert helper._schedule_window_close({"close_window_s": 10}) is True and called == [("/dev/ttys009", 10.0)]
+
+
+@posix_only
+@pytest.mark.parametrize("closes", [True, False])
+def test_helper_says_whether_its_window_closes(tmp_path, monkeypatch, closes):
+    monkeypatch.setattr(helper, "_schedule_window_close", lambda job: closes)
+    state, marker = tmp_path / "state", tmp_path / "relaunched"
+    job = json.loads(_job(state, _script("pass"), marker=marker).read_text())
+    path = update_launch.write_job(state, {**job, "close_window_s": 10})
+    assert helper.main([str(path)]) == 0 and _await(marker)
+    log = (state / "update.log").read_text()
+    assert (" This window closes in 10 s.\n" in log) is closes
+    assert (" You can close this window.\n" in log) is not closes
+
+
+def test_only_the_macos_launch_asks_the_helper_to_close_its_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(update_launch, "launch_macos", lambda *args, **kwargs: None)
+    monkeypatch.setattr(update_launch, "launch_linux", lambda *args, **kwargs: None)
+    job = {"update_cmd": ["pixi"], "relaunch_cmd": ["xdart"]}
+    mac = update_launch.launch_helper(tmp_path, {**job, "attempt_id": "mac"}, platform="darwin", python="py")
+    linux = update_launch.launch_helper(tmp_path, {**job, "attempt_id": "linux"}, platform="linux", python="py")
+    assert json.loads(mac.read_text())["close_window_s"] == update_launch.CLOSE_WINDOW_S
+    assert "close_window_s" not in json.loads(linux.read_text())

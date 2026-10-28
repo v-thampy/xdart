@@ -58,6 +58,58 @@ def launch_macos(state_dir, python, job_path, *, runner=subprocess.run):
     return wrapper
 
 
+#: Seconds after a successful update before the macOS update window closes (the Windows console says the same).
+CLOSE_WINDOW_S = 10
+
+_TERMINAL_WINDOW_OF_TTY = """on run argv
+  tell application "Terminal"
+    repeat with w in windows
+      try
+        if (count of tabs of w) is 1 and tty of tab 1 of w is item 1 of argv then return id of w
+      end try
+    end repeat
+  end tell
+  return ""
+end run"""
+
+_CLOSE_TERMINAL_WINDOW = """on run argv
+  set wid to (item 1 of argv) as integer
+  delay (item 2 of argv) as number
+  repeat 20 times
+    try
+      tell application "Terminal"
+        if not (exists window id wid) then return
+        if (count of tabs of window id wid) is not 1 then return
+        if not (busy of tab 1 of window id wid) then
+          close window id wid
+          return
+        end if
+      end tell
+    end try
+    delay 0.5
+  end repeat
+end run"""
+
+
+def schedule_terminal_close(tty, delay_s, *, runner=subprocess.run, popen=subprocess.Popen):
+    """Close the Terminal window showing this helper ``delay_s`` after it ends, when the window holds this tab alone
+    (Terminal's AppleScript cannot close one tab of several). The window is found while this process still owns the
+    tty; the closer runs detached and closes the window only once its tab runs nothing, so Terminal never asks to
+    stop a process. Best effort: False leaves the window open."""
+    try:
+        found = runner(["/usr/bin/osascript", "-e", _TERMINAL_WINDOW_OF_TTY, str(tty)], capture_output=True,
+                       text=True, timeout=10)
+        window_id = (getattr(found, "stdout", "") or "").strip()
+        if getattr(found, "returncode", 1) != 0 or not window_id.isdigit():
+            return False
+        popen(["/usr/bin/osascript", "-e", _CLOSE_TERMINAL_WINDOW, window_id, f"{delay_s:g}"],
+              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              start_new_session=True, close_fds=True)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def launch_linux(python, job_path, *, popen=subprocess.Popen):
     popen([str(python), "-m", "xdart._updater", str(job_path)], stdin=subprocess.DEVNULL,
           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
@@ -271,6 +323,8 @@ def launch_helper(state_dir, job, *, platform=None, python=None):
     """Write the job and start the helper for this platform; raises :class:`UpdateLaunchRefused`."""
     platform = sys.platform if platform is None else platform
     python = python or sys.executable
+    if platform == "darwin":
+        job = {**job, "close_window_s": CLOSE_WINDOW_S}
     job_path = write_job(state_dir, job)
     if platform.startswith("win"):
         launch_windows(job_path)

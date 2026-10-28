@@ -234,6 +234,15 @@ def relaunch(cmd):
                      start_new_session=True, close_fds=True)
 
 
+def _schedule_window_close(job):
+    """macOS: the app opened this helper in its own Terminal window (``close_window_s``); close it after success."""
+    delay = job.get("close_window_s")
+    if not delay or sys.platform != "darwin" or sys.stdout is None or not sys.stdout.isatty():
+        return False
+    from xdart.modules import update_launch
+    return update_launch.schedule_terminal_close(os.ttyname(sys.stdout.fileno()), float(delay))
+
+
 def run_job(job):
     state_dir = Path(job["state_dir"])
     helper_file = state_dir / job.get("helper_file", "xdart-update-helper.json")
@@ -297,7 +306,10 @@ def run_job(job):
             result["relaunched"] = True
         except Exception as exc:                         # noqa: BLE001 - recorded for the user
             out.line(f"Could not reopen xdart ({exc!r}); open it yourself.")
-        out.line("You can close this window.")
+        if code == 0 and not timed_out and result["relaunched"] and _schedule_window_close(job):
+            out.line(f"This window closes in {float(job['close_window_s']):g} s.")
+        else:
+            out.line("You can close this window.")
         return 0 if code == 0 and not timed_out else 1
     finally:
         if "update_pid" in result and _group_alive(result["update_pid"]):

@@ -53,9 +53,9 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 
 The **one-line installer** creates a private Pixi workspace, so it is updated
 separately from global environments. Use **Help → Check for Updates…** (xdart
-closes, a window shows the update, and xdart reopens; at startup xdart also offers
-newer 1.x releases after a 10 s notice), or close xdart and update the workspace
-directly (default installation paths shown):
+closes, a window shows the update, and xdart reopens showing the new version; at
+startup xdart also offers newer 1.x releases after a 10 s notice), or close xdart
+and update the workspace directly (default installation paths shown):
 
 ```bash
 # macOS / Linux

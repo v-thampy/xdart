@@ -1087,9 +1087,16 @@ class Main(QMainWindow):
         if isinstance(note, tuple):
             outcome, attempt, kind = note
             if outcome == "updated":
-                message = f"Updated to xdart {updater.current_version()}."
+                current, previous = updater.current_version(), attempt.get("from")
+                message = (f"xdart was updated from {previous} to {current}." if previous
+                           else f"Updated to xdart {current}.")
                 logger.info("[UPDATE] %s", message)
-                self.statusBar().showMessage(message, 15000)
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle("xdart updated")
+                box.setIcon(QtWidgets.QMessageBox.Icon.Information)
+                box.setText(message)
+                box.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+                box.open()
             else:
                 text = f"The update to xdart {attempt.get('to')} did not complete; see {attempt.get('log')}."
                 logger.warning("[UPDATE] %s", text)

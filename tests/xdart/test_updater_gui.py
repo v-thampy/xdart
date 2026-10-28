@@ -210,9 +210,9 @@ def test_a_second_start_during_an_update_quits(monkeypatch, tmp_path, qapp):
 def test_the_next_start_reports_how_the_update_went(window, qapp, monkeypatch):
     monkeypatch.setattr(updater, "current_version", lambda: "1.2.7")
     monkeypatch.setattr(updater, "install_kind", lambda meta=None: "managed")   # no startup check afterwards
-    window.start_startup_updates(("updated", {"to": "1.2.7"}, "pixi-global"))
-    assert window.statusBar().currentMessage() == "Updated to xdart 1.2.7."
     boxes = []
-    monkeypatch.setattr(QtWidgets.QMessageBox, "open", lambda self: boxes.append(self.text()))
+    monkeypatch.setattr(QtWidgets.QMessageBox, "open", lambda self: boxes.append(self.text()))   # macOS drops titles
+    window.start_startup_updates(("updated", {"from": "1.2.6", "to": "1.2.7"}, "pixi-global"))
+    assert boxes == ["xdart was updated from 1.2.6 to 1.2.7."]
     window.start_startup_updates(("incomplete", {"to": "1.2.8", "log": "/x/update.log"}, "pixi-global"))
-    assert boxes and boxes[0].startswith("The update to xdart 1.2.8 did not complete; see /x/update.log.")
+    assert boxes[1].startswith("The update to xdart 1.2.8 did not complete; see /x/update.log.")
