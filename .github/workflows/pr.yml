@@ -101,6 +101,19 @@ jobs:
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-finite-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-finite-settings.json
+      # The in-app updater's Windows helper run for real: Windows PowerShell 5.1, its Job Object and argv.
+      - name: Run the Windows update helper
+        run: >-
+          pixi run --locked python -m pytest
+          tests/xdart/test_updater.py::test_powershell_helper_runs_the_update_and_relaunches
+          tests/xdart/test_updater.py::test_powershell_helper_time_limit_stops_the_child_then_relaunches
+          tests/xdart/test_updater.py::test_powershell_helper_refuses_while_the_environment_is_in_use
+          tests/xdart/test_updater_review.py::test_windows_job_tracks_a_late_child_after_its_parent_exits
+          tests/xdart/test_updater_review.py::test_windows_job_preserves_empty_quoted_and_trailing_slash_arguments
+          -q -ra --timeout=300
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-updater-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-updater-settings.ini
 
   architecture-guards:
     runs-on: ubuntu-latest
