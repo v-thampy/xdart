@@ -105,8 +105,8 @@ jobs:
       - name: Run the Windows update helper
         run: >-
           pixi run --locked python -m pytest
-          tests/xdart/test_updater.py::test_powershell_helper_runs_the_update_and_relaunches
-          tests/xdart/test_updater.py::test_powershell_helper_time_limit_stops_the_child_then_relaunches
+          tests/xdart/test_updater.py::test_powershell_helper_runs_the_update_and_leaves_the_restart_to_its_window
+          tests/xdart/test_updater.py::test_powershell_helper_time_limit_stops_the_child
           tests/xdart/test_updater.py::test_powershell_helper_refuses_while_the_environment_is_in_use
           tests/xdart/test_updater.py::test_powershell_helper_waits_for_a_launcher_that_outlives_xdart
           tests/xdart/test_updater_review.py::test_windows_job_tracks_a_late_child_after_its_parent_exits

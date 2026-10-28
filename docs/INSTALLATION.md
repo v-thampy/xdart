@@ -53,8 +53,8 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/v-t
 
 The **one-line installer** creates a private Pixi workspace, so it is updated
 separately from global environments. Use **Help → Check for Updates…** (xdart
-closes, a progress window shows the update, and **Restart xdart** opens the new version; at
-startup a scrollable changelog offers **Update** or **Cancel**, with no countdown), or close xdart
+closes, a progress window shows the update, and **Restart xdart** opens the new version; on Linux xdart
+reopens itself. At startup a scrollable changelog offers **Update** or **Cancel**, with no countdown), or close xdart
 and update the workspace directly (default installation paths shown):
 
 ```bash
@@ -503,10 +503,10 @@ Choose **Restart xdart** after successful completion; the window stays open with
 At startup and from Help, the same offer shows installed/available versions and a scrollable summary of newer
 releases. **Update** starts installation; **Cancel** keeps the installed version. There is no countdown or
 unattended installation. An unavailable changelog still leaves both choices and a link to the full release notes.
-Linux has no progress window: there Help → Check for Updates… shows the same summary with **Show Update Command**,
-which gives the command to run in a terminal, and xdart offers no update at startup.
-The helper still limits installation to 20 minutes and retains its existing cleanup protections. A failed target is not
-offered again at startup, though Help → Check for Updates… can retry it. If the xdart
+Linux has no progress window: there **Update** closes xdart, the update runs with nothing on screen, and xdart
+reopens itself when it finishes; `update.log` keeps the output.
+The helper still limits installation to 20 minutes and retains its existing cleanup protections. After an update that
+did not complete, Help → Check for Updates… can retry it at once, and the next start offers it again. If the xdart
 app itself does not open after a failed update on macOS, run `pixi global sync` in
 Terminal. The startup offer acts only on a Pixi global environment that asks
 for xdart without a version pin (as the README's install command does), or on an

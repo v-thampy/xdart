@@ -512,56 +512,12 @@ def test_helper_changes_nothing_when_xdart_does_not_close(tmp_path):
         xdart.wait()
 
 
-@posix_only
-def test_command_wrapper_passes_a_hard_path_to_the_helper(tmp_path):
-    # The Terminal wrapper's only argument is the job path: spaces, an apostrophe and non-ASCII must survive a real sh.
-    import subprocess
-    state, marker = tmp_path / "Jane O'Neil ü" / "xdart-update", tmp_path / "relaunched"
-    job = _job(state, _script("print('ok', flush=True)"), marker=marker)
-    wrapper = update_launch.write_command_wrapper(state, sys.executable, job)
-    assert os.access(wrapper, os.X_OK)
-    env = {**os.environ, "PYTHONPATH": str(Path(updater.__file__).resolve().parents[2])}
-    done = subprocess.run(["/bin/sh", str(wrapper)], capture_output=True, text=True, timeout=60, env=env)
-    assert done.returncode == 0, done.stderr
-    assert _helper_result(state)["exit"] == 0 and _await(marker)
-
-
-def test_launch_macos_opens_the_wrapper_in_terminal(tmp_path):
-    seen = []
-
-    class _Done:
-        returncode, stderr = 0, ""
-
-    job = tmp_path / "job.json"
-    wrapper = update_launch.launch_macos(tmp_path, "/env/bin/python", job, runner=lambda argv, **_k: seen.append(argv) or _Done())
-    assert seen == [["/usr/bin/open", "-a", "Terminal", str(wrapper)]]
-    assert wrapper.read_text().endswith(f"exec '/env/bin/python' -m xdart._updater '{job}'\n")
-    _Done.returncode, _Done.stderr = 1, "no Terminal"
-    with pytest.raises(update_launch.UpdateLaunchRefused, match="no Terminal"):
-        update_launch.launch_macos(tmp_path, "/env/bin/python", job, runner=lambda argv, **_k: _Done())
-
-
-def test_windows_launch_breaks_away_from_the_job_or_refuses(tmp_path):
-    seen = []
+def test_windows_helper_script_embeds_only_its_job_path_and_never_starts_xdart(tmp_path):
     job = tmp_path / "Jane O'Neil ü" / "job.json"
-    update_launch.launch_windows(job, popen=lambda argv, **kwargs: seen.append((argv, kwargs)))
-    (argv, kwargs), = seen
-    assert argv[1:5] == ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand"]
-    assert kwargs["creationflags"] & update_launch.CREATE_BREAKAWAY_FROM_JOB
-    assert kwargs["creationflags"] & update_launch.CREATE_NEW_CONSOLE
-    import base64
-    bootstrap = base64.b64decode(argv[5]).decode("utf-16-le")
-    assert bootstrap == "& " + update_launch.ps_literal(job.with_suffix(".ps1"))
-    script = job.with_suffix(".ps1").read_text(encoding="utf-8-sig")
-    assert script == update_launch.powershell_script(job)
-    assert script.count(update_launch.ps_literal(job)) == 1 and "__JOB__" not in script
+    script = update_launch.powershell_script(job)
+    assert script.count(update_launch.ps_literal(job)) == 1 and "__JOB__" not in script and "__NATIVE_JOB__" not in script
     assert update_launch.ps_literal("C:\\Users\\Jane O'Neil\\ü\\job.json") == "'C:\\Users\\Jane O''Neil\\ü\\job.json'"
-
-    def refuse(_argv, **_kwargs):
-        raise PermissionError(5, "Access is denied")
-
-    with pytest.raises(update_launch.UpdateLaunchRefused, match="outside xdart"):
-        update_launch.launch_windows(job, popen=refuse)
+    assert "::Launch(" not in script and "Start-Process" not in script     # Restart belongs to the progress window
 
 
 # ── per-install update state ──────────────────────────────────────────────────────────────────────────────────
@@ -580,7 +536,7 @@ def test_an_attempt_settles_by_version(tmp_path):
     assert updater.load_update_state(state, "I")["attempt"] is None and not (state / updater.HELPER_FILE).exists()
     assert attempt("1.2.8")[1][0] == "updated"              # a newer install is not a failure of the older target
     state, (outcome, _record) = attempt("1.2.6", {"pid": 1, "state": "completed", "exit": 0})
-    assert outcome == "incomplete" and updater.target_failed(state, "I", "1.2.7")  # exit 0, version unchanged
+    assert outcome == "incomplete" and updater.load_update_state(state, "I")["attempt"] is None  # exit 0, unchanged
     assert attempt("1.2.6-dead", {"pid": 99999999, "state": "running"})[1][0] == "incomplete"
     assert updater.settle_previous_attempt(tmp_path / "none", install="I", current="1", alive=bool) == ("none", None)
 
@@ -707,43 +663,50 @@ def _windows_job(tmp_path, update_cmd, *, env_prefix=None, limit=60, grace=10, e
     job = _job(state, update_cmd, marker=marker, limit=limit, grace=grace)
     data = json.loads(job.read_text(encoding="utf-8"))
     assert Path(_PYTHONW).is_file(), _PYTHONW
-    data["relaunch_cmd"][0] = _PYTHONW
-    data.update(pause_at_end=False, env_prefix=env_prefix or str(tmp_path / "no-env"), env_wait_s=env_wait)
+    data["relaunch_cmd"][0] = _PYTHONW      # the launcher the helper waits for; only the window's Restart starts it
+    data.update(manual_restart=True, env_prefix=env_prefix or str(tmp_path / "no-env"), env_wait_s=env_wait)
     job.write_text(json.dumps(data), encoding="utf-8")
     return job, state, marker
 
 
 def _run_powershell(job):
+    # As the progress window starts it: the helper script beside its job, run by path through -EncodedCommand.
     import subprocess
-    return subprocess.run(update_launch.powershell_argv(job), capture_output=True, text=True, timeout=180)
+    from xdart.modules import update_progress_windows
+    script = job.with_suffix(".ps1")
+    script.write_text(update_launch.powershell_script(job), encoding="utf-8-sig")
+    exe = update_progress_windows.argv(script)[0]
+    argv = [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand",
+            update_launch.encoded_command("& " + update_launch.ps_literal(script))]
+    return subprocess.run(argv, capture_output=True, text=True, timeout=180)
 
 
 @windows_only
-def test_powershell_helper_runs_the_update_and_relaunches(tmp_path):
+def test_powershell_helper_runs_the_update_and_leaves_the_restart_to_its_window(tmp_path):
     job, state, marker = _windows_job(tmp_path, _script(
         "import os; print('step 1', flush=True); print('env', os.environ['XDART_TEST_UPDATE_ENV'], flush=True)"))
     done = _run_powershell(job)
     assert done.returncode == 0, done.stdout + done.stderr
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
-    assert (result["state"], result["exit"], result["relaunched"]) == ("completed", 0, True)
+    assert (result["state"], result["exit"]) == ("completed", 0) and "relaunched" not in result
     log = (state / "update.log").read_text(encoding="utf-8-sig")
     assert " step 1\n" in log and " env set\n" in log          # whole lines: the logged command holds "step 1"
-    assert "with a console window instead" not in log           # reopened without a console window
-    assert _await(marker, 30)
+    assert "Update complete. Choose Restart xdart in the progress window." in log
+    assert not _await(marker, 2)                                # the helper never starts xdart
 
 
 @windows_only
-def test_powershell_helper_time_limit_stops_the_child_then_relaunches(tmp_path):
+def test_powershell_helper_time_limit_stops_the_child(tmp_path):
     pixi = ("import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
             "print('child started', flush=True); rc = child.wait(); print('child ended', flush=True); sys.exit(3)")
     job, state, marker = _windows_job(tmp_path, _script(pixi), limit=3, grace=20)
     done = _run_powershell(job)
     assert done.returncode == 1, done.stdout + done.stderr
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
-    assert (result["exit"], result["timed_out"], result["relaunched"]) == (3, True, True)
+    assert (result["exit"], result["timed_out"]) == (3, True)
     log = (state / "update.log").read_text(encoding="utf-8-sig")
     assert "Stopped 1 child process" in log and " child ended\n" in log and "pixi did not finish" not in log
-    assert _await(marker, 30)
+    assert not marker.exists()
 
 
 @windows_only
@@ -784,7 +747,7 @@ def test_powershell_helper_waits_for_a_launcher_that_outlives_xdart(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
     text = log.read_text(encoding="utf-8-sig")
     assert "Waiting up to 60 s for pythonw.exe" in text and " updated\n" in text and "use xdart's environment" not in text
-    assert _await(marker, 30)
+    assert "Update complete." in text
 
 
 # ── a start refused during an update says why (an app or Start-menu launch has no terminal) ─────────────────────
@@ -818,6 +781,21 @@ def test_startup_notice_while_this_installs_helper_runs(tmp_path, monkeypatch):
     assert updater.startup_update_notice() is None                 # the lock died with the helper
 
 
+def test_the_startup_gate_imports_nothing_else_from_the_environment(tmp_path, monkeypatch):
+    # The gate runs while an update may be replacing files, and it lets xdart start if it fails: it needs updater.py
+    # alone. A module it imported could be missing at that moment.
+    import xdart.modules
+    _notice_install(monkeypatch, tmp_path)
+    monkeypatch.setitem(sys.modules, "xdart.modules.update_launch", None)      # any import of it now fails
+    monkeypatch.delattr(xdart.modules, "update_launch", raising=False)
+    reservation = updater.reserve_update(tmp_path)
+    try:
+        title, text = updater.startup_update_notice()
+    finally:
+        reservation.close()
+    assert title == "xdart is updating" and text == updater.updating_text()
+
+
 def test_native_notice_comes_from_a_detached_system_program():
     import base64
     seen = []
@@ -840,79 +818,3 @@ def test_main_shows_the_notice_instead_of_starting(monkeypatch):
     monkeypatch.setattr(updater, "startup_update_notice", lambda: ("xdart is updating", "busy"))
     monkeypatch.setattr(update_launch, "show_native_notice", lambda title, text: shown.append((title, text)))
     assert xdart_main.main() == 0 and shown == [("xdart is updating", "busy")]
-
-
-# ── the macOS update window closes after a successful update (osascript is never run here) ──────────────────────
-
-def test_terminal_close_finds_the_window_of_this_tab_then_closes_it_detached():
-    from types import SimpleNamespace
-    calls = []
-    runner = lambda argv, **kwargs: calls.append((argv, kwargs)) or SimpleNamespace(returncode=0, stdout="4242\n")
-    popen = lambda argv, **kwargs: calls.append((argv, kwargs))
-    assert update_launch.schedule_terminal_close("/dev/ttys009", 10.0, runner=runner, popen=popen) is True
-    (lookup, lookup_kwargs), (closer, closer_kwargs) = calls
-    assert lookup[:2] == ["/usr/bin/osascript", "-e"] and lookup[3:] == ["/dev/ttys009"] and lookup_kwargs["timeout"]
-    assert "(count of tabs of w) is 1 and tty of tab 1 of w" in lookup[2]
-    assert closer[:2] == ["/usr/bin/osascript", "-e"] and closer[3:] == ["4242", "10", "/dev/ttys009"]
-    assert "not (busy of tab 1 of window id wid)" in closer[2] and "close window id wid" in closer[2]
-    assert closer_kwargs["start_new_session"] is True and closer_kwargs["stdout"] is update_launch.subprocess.DEVNULL
-
-
-@pytest.mark.parametrize("found", [(0, ""), (1, "4242"), "timeout", "missing"])
-def test_terminal_close_leaves_the_window_open_when_it_cannot_find_it(found):
-    from types import SimpleNamespace
-
-    def runner(argv, **kwargs):
-        if found == "timeout":
-            raise update_launch.subprocess.TimeoutExpired(argv, 10)
-        if found == "missing":
-            raise FileNotFoundError(argv[0])
-        return SimpleNamespace(returncode=found[0], stdout=found[1])
-    started = []
-    assert update_launch.schedule_terminal_close("/dev/ttys009", 10, runner=runner,
-                                                 popen=lambda *args, **kwargs: started.append(args)) is False
-    assert started == []
-
-
-def test_window_close_needs_the_macos_terminal_the_app_opened(monkeypatch):
-    import io
-    called = []
-    monkeypatch.setattr(update_launch, "schedule_terminal_close", lambda tty, s: called.append((tty, s)) or True)
-    assert helper._schedule_window_close({"close_window_s": 10}) is False     # pytest's stdout is no terminal
-
-    class Terminal(io.StringIO):
-        def isatty(self):
-            return True
-
-        def fileno(self):
-            return 1
-    monkeypatch.setattr(sys, "stdout", Terminal())
-    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys009", raising=False)   # Windows has no ttyname
-    monkeypatch.setattr(sys, "platform", "linux")
-    assert helper._schedule_window_close({"close_window_s": 10}) is False
-    monkeypatch.setattr(sys, "platform", "darwin")
-    assert helper._schedule_window_close({}) is False                          # not opened by the app's Terminal launch
-    assert helper._schedule_window_close({"close_window_s": 10}) is True and called == [("/dev/ttys009", 10.0)]
-
-
-@posix_only
-@pytest.mark.parametrize("closes", [True, False])
-def test_helper_says_whether_its_window_closes(tmp_path, monkeypatch, closes):
-    monkeypatch.setattr(helper, "_schedule_window_close", lambda job: closes)
-    state, marker = tmp_path / "state", tmp_path / "relaunched"
-    job = json.loads(_job(state, _script("pass"), marker=marker).read_text())
-    path = update_launch.write_job(state, {**job, "close_window_s": 10})
-    assert helper.main([str(path)]) == 0 and _await(marker)
-    log = (state / "update.log").read_text()
-    assert (" This window closes in 10 s.\n" in log) is closes
-    assert (" You can close this window.\n" in log) is not closes
-
-
-def test_only_the_macos_launch_asks_the_helper_to_close_its_window(tmp_path, monkeypatch):
-    monkeypatch.setattr(update_launch, "launch_macos", lambda *args, **kwargs: None)
-    monkeypatch.setattr(update_launch, "launch_linux", lambda *args, **kwargs: None)
-    job = {"update_cmd": ["pixi"], "relaunch_cmd": ["xdart"]}
-    mac = update_launch.launch_helper(tmp_path, {**job, "attempt_id": "mac"}, platform="darwin", python="py")
-    linux = update_launch.launch_helper(tmp_path, {**job, "attempt_id": "linux"}, platform="linux", python="py")
-    assert json.loads(mac.read_text())["close_window_s"] == update_launch.CLOSE_WINDOW_S
-    assert "close_window_s" not in json.loads(linux.read_text())

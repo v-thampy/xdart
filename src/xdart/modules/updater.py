@@ -439,7 +439,7 @@ def update_available(current, latest):
     return new > cur
 
 
-# ── Per-install update state (attempts, the helper's handshake, failed targets) ──────────────────────────────────
+# ── Per-install update state (attempts and the helper's handshake) ──────────────────────────────────────────────────
 #
 # The app writes STATE_FILE before it starts the helper; only the helper writes HELPER_FILE (its PID, then the
 # outcome).  A second xdart start reads both: a live helper means "being updated, quit"; a finished or dead helper
@@ -461,6 +461,20 @@ STOP_GRACE_S = 30
 ENV_WAIT_S = 10
 #: The longest a helper can legitimately run (used only where the lock cannot be tested).
 _HELPER_MAX_RUN_S = PARENT_WAIT_S + ENV_WAIT_S + UPDATE_TIME_LIMIT_S + STOP_GRACE_S + 60
+
+
+def has_progress_window(platform=None):
+    """True where an update runs in its own progress window and the user restarts xdart from it (macOS, Windows); on
+    Linux a hidden helper updates and reopens xdart."""
+    platform = sys.platform if platform is None else platform
+    return platform == "darwin" or platform.startswith("win")
+
+
+def updating_text(platform=None):
+    """What a start refused while this install updates says."""
+    if has_progress_window(platform):
+        return "xdart is being updated. Use Restart xdart in the update progress window when it finishes."
+    return "xdart is being updated and reopens when the update finishes."
 
 
 class UpdateInProgress(RuntimeError):
@@ -595,15 +609,12 @@ def read_json(path):
 
 
 def load_update_state(state_dir, install):
-    """This install's state: ``{"install", "failed": [versions], "attempt": {...} | None}``."""
+    """This install's state: ``{"install", "attempt": {...} | None}``."""
     data = read_json(Path(state_dir) / STATE_FILE)
     if data is None or data.get("install") != install:
-        return {"install": install, "failed": [], "attempt": None}
-    failed = data.get("failed")
+        return {"install": install, "attempt": None}
     attempt = data.get("attempt")
-    return {"install": install,
-            "failed": sorted({str(v) for v in failed}) if isinstance(failed, list) else [],
-            "attempt": attempt if isinstance(attempt, dict) else None}
+    return {"install": install, "attempt": attempt if isinstance(attempt, dict) else None}
 
 
 def version_reached(current, target):
@@ -618,7 +629,7 @@ def version_reached(current, target):
 def begin_attempt(state_dir, *, install, current, target, log):
     """Record an attempt before the helper starts; returns the previous state for :func:`abandon_attempt`."""
     state = load_update_state(state_dir, install)
-    previous = {**state, "failed": list(state["failed"])}
+    previous = dict(state)
     state["attempt"] = {"from": current, "to": target, "log": str(log), "launched_at": time.time(),
                         "id": uuid.uuid4().hex, "authorized": False}
     write_json_atomic(Path(state_dir) / STATE_FILE, state)
@@ -655,8 +666,8 @@ def authorize_attempt(state_dir, install, attempt_id):
 
 def settle_previous_attempt(state_dir, *, install, current, alive):
     """At startup: ``("none" | "active" | "updated" | "incomplete", attempt)``.  ``active``: the helper is still
-    running (the caller quits without touching the attempt).  Otherwise the attempt is settled by version, a missed
-    target joins the failed targets the startup update never retries, and the attempt is cleared."""
+    running (the caller quits without touching the attempt).  Otherwise the attempt is settled by version and
+    cleared."""
     if (load_update_state(state_dir, install)["attempt"] is None
             and _file_lock_held(Path(state_dir) / ADMISSION_LOCK_FILE) is False):
         return "none", None
@@ -691,8 +702,6 @@ def _settle_attempt(state_dir, install, current, alive):
         if held:
             return "active", attempt
     reached = version_reached(current, attempt.get("to"))
-    if not reached and attempt.get("to"):
-        state["failed"] = sorted(set(state["failed"]) | {str(attempt["to"])})
     state["attempt"] = None
     write_json_atomic(Path(state_dir) / STATE_FILE, state)
     try:
@@ -700,11 +709,6 @@ def _settle_attempt(state_dir, install, current, alive):
     except OSError:
         pass
     return ("updated" if reached else "incomplete"), {**attempt, "helper": helper}
-
-
-def target_failed(state_dir, install, version):
-    """True when an earlier attempt at ``version`` did not complete (the startup update skips it)."""
-    return str(version) in load_update_state(state_dir, install)["failed"]
 
 
 def state_dir_for(kind, *, prefix=None):
@@ -727,8 +731,7 @@ def startup_update_notice():
         root = state_dir_for(install_kind())
         if root is None:
             return None
-        updating = ("xdart is updating",
-                    "xdart is being updated. Use Restart xdart in the update progress window when it finishes.")
+        updating = ("xdart is updating", updating_text())
         if _file_lock_held(root / ADMISSION_LOCK_FILE) is not False:
             return updating
         helper = read_json(root / HELPER_FILE) or {}

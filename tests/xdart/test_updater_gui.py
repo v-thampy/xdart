@@ -3,6 +3,7 @@
 start of a second xdart while an update runs. Settings and update state are isolated (rule 10)."""
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
@@ -99,15 +100,23 @@ def test_a_run_starting_during_the_offer_postpones_the_update(window, qapp, monk
     assert admitted == [] and "postponed" in window.statusBar().currentMessage()
 
 
-def test_the_startup_update_never_acts_on_an_unvalidated_install_or_a_failed_target(window, monkeypatch, tmp_path):
+def test_the_startup_offer_skips_an_unvalidated_install_and_offers_a_failed_version_from_the_next_start(
+        window, monkeypatch, tmp_path):
     _startup_result(window, monkeypatch, tmp_path, automatic=False)
     assert window._update_dialog is None
-    updater.begin_attempt(updater.update_state_dir(_meta(tmp_path)), install="test-install", current="1.2.6",
-                          target="9.9.9", log="l")
-    updater.settle_previous_attempt(updater.update_state_dir(_meta(tmp_path)), install="test-install",
-                                    current="1.2.6", alive=lambda _pid: False)    # 9.9.9 failed before
+    state = updater.update_state_dir(_meta(tmp_path))
+    updater.begin_attempt(state, install="test-install", current="1.2.6", target="9.9.9", log="l")
+    note = updater.settle_previous_attempt(state, install="test-install", current="1.2.6",
+                                           alive=lambda _pid: False)              # 9.9.9 did not install
+    assert note[0] == "incomplete" and "failed" not in json.loads((state / updater.STATE_FILE).read_text())
+    monkeypatch.setattr(updater, "install_kind", lambda meta=None: "managed")   # this test runs the check itself
+    monkeypatch.setattr(QtWidgets.QMessageBox, "open", lambda self: None)
+    window.start_startup_updates((*note, "pixi-global"))
     _startup_result(window, monkeypatch, tmp_path)
-    assert window._update_dialog is None
+    assert window._update_dialog is None                      # not on the start that reports the failure
+    window._update_skipped.clear()                            # the next start: nothing on disk holds it back
+    _startup_result(window, monkeypatch, tmp_path)
+    assert window._update_dialog is not None
 
 
 def test_quit_during_a_check_ignores_its_late_result(window, qapp, monkeypatch):
@@ -157,6 +166,7 @@ def test_admission_records_the_attempt_and_closes_once_the_helper_reports(window
 
     def launch(state_dir, job):
         jobs.append(job)
+        job.update(manual_restart=True, require_progress_host=True)   # as launch_helper sets on macOS and Windows
         holders.append(updater.take_file_lock(state_dir / updater.LOCK_FILE))
         job.update(host_file=str(state_dir / "test.host.json"), host_lock=str(state_dir / "test.host.lock"))
         holders.append(updater.take_file_lock(job["host_lock"]))
@@ -180,7 +190,7 @@ def test_admission_records_the_attempt_and_closes_once_the_helper_reports(window
 
 def test_a_refused_launch_keeps_xdart_open_with_the_copyable_command(window, qapp, monkeypatch, tmp_path):
     def refuse(state_dir, job):
-        raise update_launch.UpdateLaunchRefused("the job refuses breakaway")
+        raise PermissionError(5, "the job refuses breakaway")
 
     exits, copyable = _admission(window, monkeypatch, tmp_path, refuse)
     assert exits == [] and "breakaway" in copyable[0][3]
@@ -225,21 +235,14 @@ def test_the_next_start_reports_how_the_update_went(window, qapp, monkeypatch):
     assert boxes[1].startswith("The update to xdart 1.2.8 did not complete; see /x/update.log.")
 
 
-def test_without_a_progress_window_help_gives_the_command_and_startup_stays_quiet(window, qapp, monkeypatch, tmp_path):
+def test_without_a_progress_window_the_offer_updates_in_the_background(window, qapp, monkeypatch, tmp_path):
     from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
     monkeypatch.setattr(update_launch, "has_progress_window", lambda platform=None: False)
-    shown = []
-    monkeypatch.setattr(window, "_show_copyable_update", lambda *args: shown.append(args))
     admitted = _startup_result(window, monkeypatch, tmp_path)
-    assert window._update_dialog is None                          # Linux: no offer at startup
-    window._update_source = "help"
-    window._update_generation += 1
-    window._on_update_check(updater.UpdateCheck("ok", "9.9.9", True), window._update_generation)
-    box = window._update_dialog
+    box = window._update_dialog                                   # Linux: offered at startup as elsewhere
     assert isinstance(box, ReadOnlyTextWindow) and box.notes is box.pane      # the shared read-only window (rule 14)
     assert box.versions.textFormat() == QtCore.Qt.TextFormat.PlainText
-    assert box.update_button.text() == "Show Update Command" and box.update_button.toolTip()
-    assert "terminal" in box.explanation.text() and box.explanation.toolTip()
+    assert box.update_button.text() == "Update" and "reopen" in box.update_button.toolTip()
+    assert "reopens it when the update finishes" in box.explanation.text() and box.explanation.toolTip()
     box.update_button.click()
-    assert _pump(qapp, lambda: shown == [("pixi-global", "9.9.9", "1.2.6", "")], 2)
-    assert admitted == [] and window._update_dialog is None
+    assert _pump(qapp, lambda: admitted == ["9.9.9"], 2) and window._update_dialog is None

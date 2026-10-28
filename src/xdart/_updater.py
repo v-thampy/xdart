@@ -6,9 +6,9 @@ this helper once it shows. Windows uses the PowerShell helper from ``xdart.modul
 because the env's own python.exe is locked while it runs. Steps: record the handshake (this PID), wait for xdart to
 close, refuse unless the progress window still runs, run the update with its output logged as it arrives, stop it at
 the time limit (child processes first, then pixi after a grace period, then the whole process group), and record the
-outcome; the user restarts xdart from the progress window. A job without ``manual_restart`` (the older launchers)
-instead relaunches xdart detached once nothing of the update is left running. Stdlib only. See
-``docs/design/design_install_and_update_jul2026.md`` section 4.
+outcome; the user restarts xdart from the progress window. On Linux, which has no progress window, the app starts this
+helper hidden with a job without ``manual_restart``: it relaunches xdart detached once nothing of the update is left
+running. Stdlib only. See ``docs/design/design_install_and_update_jul2026.md`` section 4.
 """
 from __future__ import annotations
 
@@ -231,18 +231,9 @@ def _monitor_update(job, out, proc):
 
 
 def relaunch(cmd):
-    """Start xdart detached: its own session and no terminal, so closing the update window cannot end it."""
+    """Start xdart detached: its own session and no terminal, so it outlives this helper."""
     subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)
-
-
-def _schedule_window_close(job):
-    """macOS: the app opened this helper in its own Terminal window (``close_window_s``); close it after success."""
-    delay = job.get("close_window_s")
-    if not delay or sys.platform != "darwin" or sys.stdout is None or not sys.stdout.isatty():
-        return False
-    from xdart.modules import update_launch
-    return update_launch.schedule_terminal_close(os.ttyname(sys.stdout.fileno()), float(delay))
 
 
 def run_job(job):
@@ -271,7 +262,7 @@ def run_job(job):
     try:
         out.line(f"Updating xdart from {job.get('from')} to {job.get('target')}. "
                  + ("Choose Restart xdart when the update finishes." if job.get("manual_restart")
-                    else "Keep this window open; xdart reopens when the update has finished."))
+                    else "xdart reopens when the update has finished."))
         out.line("Command: " + " ".join(str(part) for part in job["update_cmd"]))
         parent = int(job.get("parent_pid") or 0)
         deadline = time.monotonic() + float(job.get("parent_wait_s") or 60)
@@ -287,7 +278,7 @@ def run_job(job):
             result["refused"] = "attempt not authorized"
             return 1
         if parent > 0 and _pid_alive(parent):
-            out.line("xdart did not close, so nothing was changed. You can close this window.")
+            out.line("xdart did not close, so nothing was changed.")
             result["refused"] = "xdart did not close"
             return 1
         if not update_state.progress_host_ready(job):
@@ -320,10 +311,6 @@ def run_job(job):
             result["relaunched"] = True
         except Exception as exc:                         # noqa: BLE001 - recorded for the user
             out.line(f"Could not reopen xdart ({exc!r}); open it yourself.")
-        if code == 0 and not timed_out and result["relaunched"] and _schedule_window_close(job):
-            out.line(f"This window closes in {float(job['close_window_s']):g} s.")
-        else:
-            out.line("You can close this window.")
         return 0 if code == 0 and not timed_out else 1
     finally:
         if "update_pid" in result and _group_alive(result["update_pid"]):

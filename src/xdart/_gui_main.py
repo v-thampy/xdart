@@ -426,7 +426,7 @@ def _settle_update_at_startup():
         text = ("The previous update could not confirm that all its processes stopped. xdart stays closed to protect "
                 f"the environment. See {attempt.get('log')}. After those update processes have ended, move "
                 f"{state_dir} to a different name and start xdart again." if blocked else
-                "xdart is being updated. Use Restart xdart in the progress window when it finishes.")
+                updater.updating_text())
         QtWidgets.QMessageBox.information(
             None, "xdart update needs recovery" if blocked else "xdart is updating", text)
         return "active"
@@ -870,7 +870,7 @@ class Main(QMainWindow):
     def _on_update_check(self, result, generation):
         if generation != self._update_generation or self._close_accepted:
             return
-        from xdart.modules import update_launch, updater
+        from xdart.modules import updater
         kind, from_help = self._update_kind, self._update_source == "help"
         current = updater.current_version()
         logger.info("[UPDATE] check: status=%s latest=%s current=%s automatic=%s %s",
@@ -900,12 +900,9 @@ class Main(QMainWindow):
             if from_help:
                 self._show_copyable_update(kind, latest, current, "")
             return
-        # The startup offer appears only on a validated install that can update in a progress window, never on a
-        # target that failed before for this install, one skipped with Cancel this session, or while anything is
-        # running.
-        if not from_help and (not result.automatic or not update_launch.has_progress_window()
-                or latest in self._update_skipped or self._run_active()
-                or updater.target_failed(updater.update_state_dir(meta), updater.install_identity(), latest)):
+        # The startup offer appears only on a validated install, never for a version skipped this session (Cancel, or
+        # an update to it reported as incomplete at this start) or while anything is running.
+        if not from_help and (not result.automatic or latest in self._update_skipped or self._run_active()):
             return
         self._show_update_dialog(kind, meta, latest)
 
@@ -931,16 +928,14 @@ class Main(QMainWindow):
             self._update_dialog.set_notes(notes)
 
     def _show_update_dialog(self, kind, meta, target):
-        """Explicit consent, shared by startup and Help; there is no automatic-update timer. Without a progress
-        window (Linux) its button shows the update command instead."""
+        """Explicit consent, shared by startup and Help; there is no automatic-update timer."""
         from xdart.gui.widgets.update_dialog import UpdateDialog
         from xdart.modules import update_launch, updater, update_notes
         if self._update_dialog is not None:
             self._update_dialog.close()
         generation = self._update_generation
         current = updater.current_version()
-        manual = not update_launch.has_progress_window()
-        box = UpdateDialog(current, target, self, manual=manual)
+        box = UpdateDialog(current, target, self, progress_window=update_launch.has_progress_window())
         self._update_dialog = box
         timer = QtCore.QTimer(box)
         timer.setInterval(250)
@@ -962,9 +957,7 @@ class Main(QMainWindow):
             self._update_dialog = None
             if generation != self._update_generation:
                 return
-            if result == QtWidgets.QDialog.DialogCode.Accepted and manual:
-                self._show_copyable_update(kind, target, current, "")
-            elif result == QtWidgets.QDialog.DialogCode.Accepted and not self._run_active(require_known=True):
+            if result == QtWidgets.QDialog.DialogCode.Accepted and not self._run_active(require_known=True):
                 self._admit_update(kind, meta, target)
             else:
                 self._update_skipped.add(target)
@@ -1012,12 +1005,11 @@ class Main(QMainWindow):
                "update_cmd": list(meta["update_cmd"]), "update_env": dict(meta.get("update_env") or {}),
                "relaunch_cmd": list(meta["relaunch_cmd"]), "env_prefix": meta.get("env_prefix") or sys.prefix,
                "log": str(log), "time_limit_s": updater.UPDATE_TIME_LIMIT_S, "grace_s": updater.STOP_GRACE_S,
-               "parent_wait_s": updater.PARENT_WAIT_S, "env_wait_s": updater.ENV_WAIT_S,
-               "manual_restart": True, "require_progress_host": True, "pause_at_end": False}
+               "parent_wait_s": updater.PARENT_WAIT_S, "env_wait_s": updater.ENV_WAIT_S}
         try:
-            update_launch.launch_helper(state_dir, job)
+            update_launch.launch_helper(state_dir, job)   # sets the job's mode: progress window, or hidden on Linux
             self._update_host_job = job
-        except (update_launch.UpdateLaunchRefused, OSError) as exc:
+        except OSError as exc:
             updater.abandon_attempt(state_dir, previous, self._update_attempt_id)
             self._release_update_reservation()
             logger.warning("[UPDATE] the update window could not be started: %s", exc)
@@ -1105,6 +1097,8 @@ class Main(QMainWindow):
             else:
                 text = f"The update to xdart {attempt.get('to')} did not complete; see {attempt.get('log')}."
                 logger.warning("[UPDATE] %s", text)
+                if attempt.get("to"):
+                    self._update_skipped.add(str(attempt["to"]))   # Help can retry now; the next start offers it
                 if kind == "pixi-global" and sys.platform == "darwin":
                     text += ("\n\nIf the xdart app does not open, run this in Terminal:\n\n    "
                              + updater.pixi_global_command("sync"))
@@ -1113,7 +1107,8 @@ class Main(QMainWindow):
                 box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
                 box.setText(text)
                 box.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-                box.setToolTip("xdart is still the version it was before; Help ▸ Check for Updates can try again.")
+                box.setToolTip("xdart is still the version it was before. Help ▸ Check for Updates can try again now; "
+                               "the next start offers the update again.")
                 box.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
                 box.open()
         if not _app_settings().value(_UPDATES_AT_STARTUP_KEY, True, type=bool):

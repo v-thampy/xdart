@@ -52,9 +52,11 @@ def test_native_progress_launch_uses_immutable_files_and_no_terminal(tmp_path, m
     calls = []
     monkeypatch.setattr(update_launch.subprocess, 'Popen', lambda *a, **k: calls.append((a,k)))
     path = _job(tmp_path/"O'Neil ü", ['pixi','global','update','xdart'], marker=tmp_path/'reopened')
-    job = json.loads(path.read_text()); job.update(manual_restart=True, require_progress_host=True)
+    job = json.loads(path.read_text())
     result = update_launch.launch_helper(path.parent, job, platform='darwin', python='/test/python')
     assert calls[0][0][0][:3] == ['/usr/bin/osascript','-l','JavaScript']
+    assert job['manual_restart'] is True and job['require_progress_host'] is True     # set by the launch
+    assert json.loads(path.read_text())['manual_restart'] is True
     assert job['host_file'] and Path(job['host_lock']).exists() and result == path
     source = path.with_suffix('.js').read_text()
     assert 'xdart._updater' in source and 'app.run' in source and 'Restart xdart' in source
@@ -83,10 +85,20 @@ def test_live_progress_host_allows_manual_update_and_released_host_refuses(tmp_p
     assert _updater.main([str(path)]) == 1 and not ran.exists()
 
 
-def test_native_launch_refuses_unsupported_host_before_closing_xdart(tmp_path):
-    job = {'attempt_id':'one','manual_restart':True}
-    with pytest.raises(update_launch.UpdateLaunchRefused, match='manual command'):
-        update_launch.launch_helper(tmp_path, job, platform='linux')
+def test_linux_starts_the_hidden_helper_that_reopens_xdart(tmp_path, monkeypatch):
+    calls = []
+    real = update_launch.launch_linux        # its popen default is bound at definition, so pass the stand-in in
+    monkeypatch.setattr(update_launch, 'launch_linux',
+                        lambda python, path: real(python, path, popen=lambda *a, **k: calls.append((a,k))))
+    job = {'attempt_id':'one', 'update_cmd':['pixi','global','update','xdart'], 'relaunch_cmd':['xdart']}
+    path = update_launch.launch_helper(tmp_path, job, platform='linux', python='/env/bin/python')
+    (argv,), kwargs = calls[0]
+    assert argv == ['/env/bin/python', '-m', 'xdart._updater', str(path)] and len(calls) == 1
+    assert kwargs['start_new_session'] is True and kwargs['stdout'] is update_launch.subprocess.DEVNULL
+    written = json.loads(path.read_text())
+    assert written['manual_restart'] is False and written['require_progress_host'] is False   # the helper reopens xdart
+    assert 'host_file' not in written and not list(tmp_path.glob('*.host.*'))
+    assert 'reopens' in updater.updating_text('linux') and 'Restart xdart' in updater.updating_text('darwin')
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='headless system Foundation bridge on macOS')
@@ -260,7 +272,7 @@ def test_windows_helper_needs_its_progress_window_and_never_reopens_xdart(tmp_pa
         lock.close()
     assert done.returncode == 0 and ran.exists(), done.stdout + done.stderr
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding='utf-8-sig'))
-    assert (result['state'], result['exit'], result['relaunched']) == ('completed', 0, False)
+    assert (result['state'], result['exit']) == ('completed', 0) and 'relaunched' not in result
     assert not _await(marker, seconds=2)
     ran.unlink()
     done = _run_powershell(job_path)                              # the window has gone: nothing changes

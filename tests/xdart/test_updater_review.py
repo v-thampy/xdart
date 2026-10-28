@@ -71,7 +71,7 @@ def test_another_live_helper_cannot_have_its_attempt_overwritten(window, monkeyp
     monkeypatch.setattr(updater, "install_identity", lambda: "test-install")
     monkeypatch.setattr(window, "_show_copyable_update", lambda *a: None)
     real_launch = update_launch.launch_helper
-    # Exercise the real helper without opening a native Terminal during an offscreen test.
+    # Should admission ever reach the launch, the hidden Linux helper opens no native window in an offscreen test.
     monkeypatch.setattr(update_launch, "launch_helper", lambda root, job: real_launch(root, job, platform="linux"))
     try:
         window._admit_update("pixi-global", _meta(tmp_path), "1.2.8")
@@ -223,10 +223,9 @@ def test_windows_job_tracks_a_late_child_after_its_parent_exits(tmp_path):
     command = ("import subprocess,sys,time; time.sleep(.7); "
                "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
                f"open({str(child)!r},'w').write(str(p.pid))")
-    job, state, marker = _windows_job(tmp_path, _script(command))
+    job, _state, _marker = _windows_job(tmp_path, _script(command))
     done = _run_powershell(job)
     assert done.returncode in (0, 1), done.stdout + done.stderr
-    assert _await(marker, 30)
     assert not _updater._pid_alive(int(child.read_text()))
 
 
@@ -236,8 +235,7 @@ def test_windows_job_preserves_empty_quoted_and_trailing_slash_arguments(tmp_pat
     received = tmp_path / "argv.json"
     arguments = ["", 'a"quoted value', "space with trailing\\", "Jane O'Neil ü"]
     command = _script(f"import json,sys; open({str(received)!r},'w',encoding='utf-8').write(json.dumps(sys.argv[1:]))")
-    job, _state, marker = _windows_job(tmp_path, command + arguments)
+    job, _state, _marker = _windows_job(tmp_path, command + arguments)
     done = _run_powershell(job)
     assert done.returncode == 0, done.stdout + done.stderr
     assert json.loads(received.read_text(encoding="utf-8")) == arguments
-    assert _await(marker, 30)
