@@ -80,6 +80,7 @@ _CLOSE_TERMINAL_WINDOW = """on run argv
       tell application "Terminal"
         if not (exists window id wid) then return
         if (count of tabs of window id wid) is not 1 then return
+        if tty of tab 1 of window id wid is not item 3 of argv then return
         if not (busy of tab 1 of window id wid) then
           close window id wid
           return
@@ -102,7 +103,7 @@ def schedule_terminal_close(tty, delay_s, *, runner=subprocess.run, popen=subpro
         window_id = (getattr(found, "stdout", "") or "").strip()
         if getattr(found, "returncode", 1) != 0 or not window_id.isdigit():
             return False
-        popen(["/usr/bin/osascript", "-e", _CLOSE_TERMINAL_WINDOW, window_id, f"{delay_s:g}"],
+        popen(["/usr/bin/osascript", "-e", _CLOSE_TERMINAL_WINDOW, window_id, f"{delay_s:g}", str(tty)],
               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
               start_new_session=True, close_fds=True)
         return True

@@ -853,7 +853,7 @@ def test_terminal_close_finds_the_window_of_this_tab_then_closes_it_detached():
     (lookup, lookup_kwargs), (closer, closer_kwargs) = calls
     assert lookup[:2] == ["/usr/bin/osascript", "-e"] and lookup[3:] == ["/dev/ttys009"] and lookup_kwargs["timeout"]
     assert "(count of tabs of w) is 1 and tty of tab 1 of w" in lookup[2]
-    assert closer[:2] == ["/usr/bin/osascript", "-e"] and closer[3:] == ["4242", "10"]
+    assert closer[:2] == ["/usr/bin/osascript", "-e"] and closer[3:] == ["4242", "10", "/dev/ttys009"]
     assert "not (busy of tab 1 of window id wid)" in closer[2] and "close window id wid" in closer[2]
     assert closer_kwargs["start_new_session"] is True and closer_kwargs["stdout"] is update_launch.subprocess.DEVNULL
 
