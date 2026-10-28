@@ -168,14 +168,19 @@ def test_each_attempt_keeps_its_own_immutable_job(tmp_path):
 
 def test_entrypoint_refuses_an_active_update_before_importing_qt(tmp_path):
     reservation = updater.reserve_update(tmp_path)
-    code = ("import sys; from pathlib import Path; from xdart.modules import updater; "
+    # The notice's system program is stubbed: a real one leaves a dialog on the screen of whoever runs the tests.
+    code = ("import sys; from pathlib import Path; from xdart.modules import updater, update_launch; "
             "updater.install_kind=lambda:'pixi-global'; "
             f"updater.state_dir_for=lambda kind:Path({str(tmp_path)!r}); "
+            "show=update_launch.show_native_notice; "
+            "update_launch.show_native_notice=lambda title, text: show(title, text, "
+            "popen=lambda argv, **kwargs: print('notice program', argv[0])); "
             "from xdart.xdart_main import main; rc=main(); "
             "assert not any(k.startswith(('PySide6','pyqtgraph')) for k in sys.modules); sys.exit(rc)")
     try:
         done = subprocess.run(_script(code), capture_output=True, text=True, timeout=10)
         assert done.returncode == 0 and "update" in done.stderr, done.stdout + done.stderr
+        assert ("notice program" in done.stdout) == (sys.platform == "darwin" or sys.platform.startswith("win"))
     finally:
         reservation.close()
 
