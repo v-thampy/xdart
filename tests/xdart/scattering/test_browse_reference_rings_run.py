@@ -141,7 +141,9 @@ def _run(qapp, page, observed):
 def _browsing(qapp, page):
     """Wait for the real terminal or reopen handoff into Browse, and return its context."""
     controller = page._context_controller
-    assert _pump(qapp, lambda: not controller.browse_pending and controller.browse_context is not None
+    # A reopen that waits for the shown scan's cleanup leaves that scan loaded meanwhile.
+    assert _pump(qapp, lambda: not controller.browse_pending and page._deferred_browse_reopen is None
+                 and controller.browse_context is not None
                  and controller.browse_context.loaded), 'Browse never adopted the output'
     page._refresh_shell()
     qapp.processEvents()

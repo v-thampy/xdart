@@ -54,7 +54,8 @@ def _wait(page, qapp, timeout=30, *, catalog=False):
 
 def _dispose(page, qapp, timeout=30):
     """Shut the page down, wait for its workers, then delete it: a page left alive keeps its widgets in the
-    process, and every later theme or font change restyles them (QT-TEST-LIFECYCLE)."""
+    process, and every later theme or font change restyles them (QT-TEST-LIFECYCLE). Shutdown stays pending while
+    the result browser closes (hosted run 40636668726), so it is retried until clean."""
     until = time.monotonic() + timeout
     receipt = page.shutdown()
     while receipt.status is PageCleanup.PENDING and time.monotonic() < until:
@@ -98,8 +99,7 @@ def test_native_preview_displays_conditional_affine_warning_and_keeps_run_availa
         assert "stacked calibration" in text
         assert not list(Path(form.output_path).parent.glob("*.nexus"))
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -483,8 +483,7 @@ def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_sel
         stored = read_analysis_artifact(paths[0], expected_kind=AnalysisArtifactKind.STITCH_1D)
         np.testing.assert_array_equal(stored.intensity, payloads[0].intensity)  # display only
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
 
 
 def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_path):
@@ -538,8 +537,7 @@ def test_average_sum_and_waterfall_show_the_selected_results_as_ints(qapp, tmp_p
             np.testing.assert_allclose(curve.yData, expected, rtol=1e-6)
             assert "one axis" not in view.status.text()
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
 
 
 def test_frame_progress_text_reports_the_frame_count_and_named_stage():
@@ -654,8 +652,7 @@ def test_native_preview_run_repeat_reopen_and_overlay_use_real_owners(qapp, tmp_
         assert len(reopened.browser.selected_results()) == 1
         assert len(reopened.curve.listDataItems()) == 1
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         if reopened is not None:
             assert reopened.shutdown().status is PageCleanup.CLEAN
             reopened.deleteLater()
@@ -675,8 +672,7 @@ def test_reopen_corrupt_file_cannot_grant_run_or_replace_display(qapp, tmp_path)
         assert malformed.read_bytes() == before
         assert page._owner.prepared is None
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -720,8 +716,7 @@ def test_selecting_existing_result_fences_pending_reopen(qapp, tmp_path, monkeyp
     finally:
         release.set()
         _wait(page, qapp)
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -760,8 +755,7 @@ def test_native_xu_displays_admitted_mapping_and_rotation_read_only(qapp, tmp_pa
         assert page._rows["source_motors"].isEnabled()
         assert page._rows["camera"].isEnabled()
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -786,8 +780,7 @@ def test_stop_while_run_checks_the_inputs_stitches_nothing(qapp, tmp_path):
         assert page._owner.prepared is not None  # the check itself finished
         assert target.read_bytes() == before and len(set(page.browser.listed_results()) & set(page._listed)) == 1  # nothing replaced
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -806,8 +799,7 @@ def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(q
         assert page._owner.prepared is not None and not page._owner.prepared.requests
         assert page.results.count() == 0 and not page.preview_dialog.isVisible()
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -843,8 +835,7 @@ def test_an_xu_preview_registers_no_edit_of_its_own(qapp, tmp_path):
             XuStitchCalibrationInput(xu_calibration_path(str(resaved), tmp_path)), project_root=tmp_path))
         assert page._value("source_motors") == "del=gamma, nu=delta" and page._revision == revision + 1
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -910,8 +901,7 @@ def test_native_group_queue_skips_unimaged_scan_and_stops_before_next_output(qap
         assert not page._queued_jobs
         assert not second_target.exists()
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -957,8 +947,7 @@ def test_native_group_queue_continues_after_a_worker_failure(qapp, tmp_path, mon
         assert Path(targets[0]).name in status and "first Stitch output failed" in status
         assert not page._queued_jobs
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -988,8 +977,7 @@ def test_append_on_a_blank_page_displays_the_existing_result(qapp, tmp_path, mod
         assert page.run_bar.readinessLabel.full_text().startswith("Up to date")
         assert (target.stat().st_ino, target.stat().st_mtime_ns, target.read_bytes()) == before
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1063,8 +1051,7 @@ def test_stitch_run_exports_stored_profile_and_empty_click_keeps_it(qapp, tmp_pa
             xye.unlink()
     finally:
         _wait(page, qapp)
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1146,8 +1133,7 @@ def test_append_skips_the_outputs_already_stitched_and_replace_stitches_them_aga
         _wait(page, qapp)  # applying the settings re-checks the SPEC source on the page's worker
     finally:
         page.run_bar.set_readiness_summary = summary
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1176,8 +1162,7 @@ def test_a_result_is_shown_once_when_it_is_mounted(qapp, tmp_path):
         _wait(page, qapp)
         assert (len(rebuilds), len(draws)) == (2, 2)
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1240,8 +1225,7 @@ def test_directory_mask_picker_retains_the_declared_raw_decoder(qapp, tmp_path):
         assert fabio.open(staged).data.shape == (195, 1475)
         np.testing.assert_array_equal(fabio.open(staged).data, np.full((195, 1475), 11))
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1265,8 +1249,7 @@ def test_changed_original_frame_is_labelled_thumbnail_in_popup(qapp, tmp_path):
         assert "Thumbnail · raw source changed since processing" in page.scientific.raw_popup_status.text()
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, original_y)
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1337,8 +1320,7 @@ def test_a_gi_result_opens_on_its_cut_and_offers_its_cuts_beside_q_and_two_theta
         assert {"q_ip", "q_oop"} <= {axis.itemData(index) for index in range(axis.count())}
         np.testing.assert_array_equal(state.traces[0].intensity, cuts["q_oop"].intensity)
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1372,8 +1354,7 @@ def test_background_does_not_show_old_values_when_the_same_output_is_replaced(qa
         np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, replacement.intensity)
     finally:
         page._release_background()
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
 
 
 def test_clean_shutdown_releases_the_background(qapp, tmp_path):
@@ -1415,8 +1396,7 @@ def test_a_pending_result_keeps_its_retry_clickable(qapp, monkeypatch):
         assert retried == [True]
     finally:
         monkeypatch.undo()
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1480,8 +1460,7 @@ def test_stitch_opens_the_shared_calibration_window_with_its_context(qapp, tmp_p
         assert type(dialog) is CalibrationDialog and dialog.context.page == "Stitch"
         assert dialog.project_root == tmp_path.resolve() and dialog.windowTitle() == "Stitch calibration"
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()
 
 
@@ -1514,6 +1493,5 @@ def test_stitch_project_change_moves_only_the_default_save_path(qapp, tmp_path, 
         page.set_field("project_root", str(later))
         assert page._value("output_path") == chosen
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)
         qapp.processEvents()

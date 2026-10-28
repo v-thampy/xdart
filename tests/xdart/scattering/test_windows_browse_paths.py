@@ -98,7 +98,9 @@ def test_mixed_case_run_and_reopened_browse_keep_all_frames(tmp_path):
         pytest.fail(page._notice_text or "Run/Browse did not settle")
 
     def ready():
+        # A reopen that waits for the shown scan's cleanup leaves that scan loaded meanwhile (hosted run 40644203195).
         return (page._capture_current_loaded_browse() is not None
+                and page._deferred_browse_reopen is None
                 and not page._context_controller.browse_pending
                 and page._shell.browser.frame_model.rowCount() == 16
                 and not page._scientific_repaint_pending)
