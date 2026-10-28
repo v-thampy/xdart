@@ -417,7 +417,10 @@ class _BrowseHydrationOwner:
             preserve_pending_repaint=preserve_pending_repaint,
         ):
             return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
-        if not self._one_d_lane.release(
+        # Settle, not close: a release still pending below keeps this Browse
+        # current, and a closed 1-D lane would drop the rows an overlay carries
+        # into the next file (hosted run 40636668726).
+        if not self._one_d_lane.settle(
             preserve_pending_repaint=preserve_pending_repaint,
         ):
             return BrowseCleanupReceipt(
@@ -439,6 +442,12 @@ class _BrowseHydrationOwner:
             # Replacement release only: hold B and its owner current until the
             # normal page poll consumes the wake.  A terminal/discarding
             # command never waits — its presentation timer is already stopped.
+            return BrowseCleanupReceipt(
+                request, CleanupStatus.CLEANUP_PENDING
+            )
+        if not self._one_d_lane.release(
+            preserve_pending_repaint=preserve_pending_repaint,
+        ):
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )

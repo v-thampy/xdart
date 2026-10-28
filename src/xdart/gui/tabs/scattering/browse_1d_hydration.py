@@ -1074,8 +1074,8 @@ class Browse1DHydrationLane:
                 or not self._completions.empty()
             )
 
-    def release(self, *, preserve_pending_repaint: bool = False) -> bool:
-        """Cancel/settle exact lane custody before cache/context cleanup."""
+    def settle(self, *, preserve_pending_repaint: bool = False) -> bool:
+        """Cancel this lane's work and say whether none is left; its rows stay until :meth:`release` closes it."""
 
         with self._lock:
             if self._closed:
@@ -1091,6 +1091,16 @@ class Browse1DHydrationLane:
                 self._queued = None
         self._progress()
         with self._lock:
+            return self._active is None
+
+    def release(self, *, preserve_pending_repaint: bool = False) -> bool:
+        """Cancel/settle exact lane custody before cache/context cleanup."""
+
+        if not self.settle(preserve_pending_repaint=preserve_pending_repaint):
+            return False
+        with self._lock:
+            if self._closed:
+                return True
             if self._active is not None:
                 return False
             self._ready_pending = False
