@@ -162,8 +162,10 @@ $restart.Add_Click({
     $exe = [string]$job.relaunch_cmd[0]
     $line = '"' + $exe + '"'
     if ([string]$job.relaunch_arguments) { $line += ' ' + [string]$job.relaunch_arguments }
-    if (-not ('XdartUpdateJob' -as [type])) { Add-Type -TypeDefinition $nativeJob }
-    [void][XdartUpdateJob]::Launch($exe, $line)
+    # Looked up by name: a type literal here could fail when this handler compiles, before Add-Type has run.
+    $native = 'XdartUpdateJob' -as [type]
+    if ($null -eq $native) { Add-Type -TypeDefinition $nativeJob; $native = 'XdartUpdateJob' -as [type] }
+    [void]$native::Launch($exe, $line)
     $script:failure = ''
     $window.Close()
   } catch {

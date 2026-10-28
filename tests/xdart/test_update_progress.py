@@ -149,7 +149,7 @@ def test_macos_host_lock_is_what_the_app_waits_for(tmp_path):
         assert state['fd'] >= 0 and state['again'] == -1          # a second window cannot take it
         assert updater.progress_host_ready(job)
     finally:
-        proc.kill()
+        proc.kill()      # always: a sleeping host would keep host.lock for 20 s into the next test
         proc.wait(10)
     assert not updater.progress_host_ready(job)
 
