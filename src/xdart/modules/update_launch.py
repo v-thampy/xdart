@@ -269,3 +269,40 @@ def launch_helper(state_dir, job, *, platform=None, python=None):
     else:
         launch_linux(python, job_path)
     return job_path
+
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def applescript_string(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def show_native_notice(title, text, *, popen=subprocess.Popen, platform=None):
+    """Tell the user why xdart did not start, through a system program started detached (osascript; Windows
+    PowerShell), so this process exits at once and keeps no file of an environment an update may be changing open.
+    A launch from the app or Start menu has no terminal; stderr alone would show nothing."""
+    platform = sys.platform if platform is None else platform
+    if sys.stderr is not None:
+        try:
+            print(text, file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+    try:
+        if platform == "darwin":
+            script = (f"display dialog {applescript_string(text)} with title {applescript_string(title)} "
+                      'buttons {"OK"} default button "OK" with icon caution')
+            popen(["/usr/bin/osascript", "-e", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        elif platform.startswith("win"):
+            root = os.environ.get("SystemRoot") or r"C:\Windows"
+            command = ("Add-Type -AssemblyName PresentationFramework; "
+                       f"[void][System.Windows.MessageBox]::Show({ps_literal(text)}, {ps_literal(title)})")
+            argv = [os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"), "-NoProfile",
+                    "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded_command(command)]
+            try:
+                popen(argv, creationflags=CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, close_fds=True)
+            except OSError:
+                popen(argv, creationflags=CREATE_NO_WINDOW, close_fds=True)
+    except Exception:
+        pass   # the stderr line stays; never let the notice itself fail startup handling

@@ -11,10 +11,13 @@ import sys
 
 
 def main():
-    from xdart.modules.updater import startup_update_blocked
-    if startup_update_blocked():
-        if sys.stderr is not None:
-            print("xdart's update is still active or needs recovery; see its update window and log.", file=sys.stderr)
+    from xdart.modules.updater import startup_update_notice
+    notice = startup_update_notice()
+    if notice is not None:
+        # Before any Qt/native GUI library loads into an environment an update may be changing; the notice comes
+        # from a system program, so this process exits at once.
+        from xdart.modules.update_launch import show_native_notice
+        show_native_notice(*notice)
         return 0
     try:
         import PySide6   # noqa: F401  -- probe the GUI stack cheaply

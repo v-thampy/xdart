@@ -750,3 +750,58 @@ def test_powershell_helper_refuses_while_the_environment_is_in_use(tmp_path):
     result = json.loads((state / updater.HELPER_FILE).read_text(encoding="utf-8-sig"))
     assert result["refused"] == "environment in use" and not ran.exists()
     assert "use xdart's environment" in (state / "update.log").read_text(encoding="utf-8-sig")
+
+
+# ── a start refused during an update says why (an app or Start-menu launch has no terminal) ─────────────────────
+
+def _notice_install(monkeypatch, state_dir):
+    monkeypatch.setattr(updater, "install_kind", lambda meta=None: "pixi-global")
+    monkeypatch.setattr(updater, "state_dir_for", lambda kind, prefix=None: state_dir)
+    monkeypatch.setattr(updater, "install_identity", lambda prefix=None: "I")
+
+
+def test_startup_notice_names_the_recovery_step_when_cleanup_is_unproven(tmp_path, monkeypatch):
+    _notice_install(monkeypatch, tmp_path)
+    assert updater.startup_update_notice() is None and updater.startup_update_blocked() is False
+    updater.begin_attempt(tmp_path, install="I", current="1.2.6", target="1.2.7", log=tmp_path / "update.log")
+    updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": 1, "state": "blocked"})
+    title, text = updater.startup_update_notice()
+    assert title == "xdart update needs recovery" and f"rename the folder {tmp_path}" in text
+    assert str(tmp_path / "update.log") in text and updater.startup_update_blocked() is True
+
+
+@posix_only
+def test_startup_notice_while_this_installs_helper_runs(tmp_path, monkeypatch):
+    _notice_install(monkeypatch, tmp_path)
+    holder = hold_update_lock(tmp_path)
+    try:
+        updater.write_json_atomic(tmp_path / updater.HELPER_FILE, {"pid": holder.pid, "state": "running"})
+        assert updater.startup_update_notice()[0] == "xdart is updating"
+    finally:
+        holder.kill()
+        holder.wait()
+    assert updater.startup_update_notice() is None                 # the lock died with the helper
+
+
+def test_native_notice_comes_from_a_detached_system_program():
+    import base64
+    seen = []
+    update_launch.show_native_notice("T", 'He said "hi" \\ there', platform="darwin",
+                                     popen=lambda argv, **kwargs: seen.append((argv, kwargs)))
+    (argv, kwargs), = seen
+    assert argv[:2] == ["/usr/bin/osascript", "-e"] and kwargs["start_new_session"] is True
+    assert 'display dialog "He said \\"hi\\" \\\\ there" with title "T"' in argv[2]
+    seen.clear()
+    update_launch.show_native_notice("T", "it's busy", platform="win32",
+                                     popen=lambda argv, **kwargs: seen.append((argv, kwargs)))
+    (argv, kwargs), = seen
+    assert argv[0].endswith("powershell.exe") and kwargs["creationflags"] & update_launch.CREATE_NO_WINDOW
+    assert "[System.Windows.MessageBox]::Show('it''s busy', 'T')" in base64.b64decode(argv[-1]).decode("utf-16-le")
+
+
+def test_main_shows_the_notice_instead_of_starting(monkeypatch):
+    from xdart import xdart_main
+    shown = []
+    monkeypatch.setattr(updater, "startup_update_notice", lambda: ("xdart is updating", "busy"))
+    monkeypatch.setattr(update_launch, "show_native_notice", lambda title, text: shown.append((title, text)))
+    assert xdart_main.main() == 0 and shown == [("xdart is updating", "busy")]

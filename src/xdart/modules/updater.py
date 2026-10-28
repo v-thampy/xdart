@@ -705,17 +705,33 @@ def state_dir_for(kind, *, prefix=None):
     return None
 
 
-def startup_update_blocked():
-    """Read-only bootstrap gate before loading Qt/native GUI libraries into an updating environment."""
+def startup_update_notice():
+    """Read-only bootstrap gate before loading Qt/native GUI libraries into an updating environment: None when xdart
+    may start, else ``(title, text)`` saying why it does not (an update is starting or running, or the last update
+    could not prove that its processes stopped and needs the recovery step the text names)."""
     try:
         root = state_dir_for(install_kind())
         if root is None:
-            return False
+            return None
+        updating = ("xdart is updating",
+                    "xdart is being updated in another window. It reopens by itself when the update has finished.")
         if _file_lock_held(root / ADMISSION_LOCK_FILE) is not False:
-            return True
+            return updating
         helper = read_json(root / HELPER_FILE) or {}
         if helper.get("state") == "blocked":
-            return True
-        return helper.get("state") != "completed" and helper_lock_held(root) is not False
+            attempt = load_update_state(root, install_identity())["attempt"] or {}
+            log = attempt.get("log") or root / LOG_FILE
+            return ("xdart update needs recovery",
+                    "The last xdart update could not confirm that all its processes stopped, so xdart stays closed to "
+                    f"protect its environment. See {log}. Once those processes have ended, rename the folder {root} "
+                    "and start xdart again.")
+        if helper.get("state") != "completed" and helper_lock_held(root) is not False:
+            return updating
+        return None
     except Exception:
-        return False   # discovery failure never prevents an ordinary/editable installation from starting
+        return None   # discovery failure never prevents an ordinary/editable installation from starting
+
+
+def startup_update_blocked():
+    """True when :func:`startup_update_notice` keeps xdart from starting."""
+    return startup_update_notice() is not None
