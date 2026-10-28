@@ -64,8 +64,9 @@ function Read-Tail {
   try {
     $fs = [IO.File]::Open([string]$job.log, 'Open', 'Read', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     # This update's output only: from where the log ended when the window opened, at most its last 128 KiB.
-    $from = [Math]::Min($fs.Length, [Math]::Max([long]$script:logStart, $fs.Length - 131072))
-    $count = [int]($fs.Length - $from)
+    $end = $fs.Length  # one snapshot: appends between offset and count must not exceed the cap
+    $from = [Math]::Min($end, [Math]::Max([long]$script:logStart, $end - 131072))
+    $count = [int]($end - $from)
     $null = $fs.Seek($from, [IO.SeekOrigin]::Begin)
     $bytes = New-Object byte[] $count
     $read = $fs.Read($bytes, 0, $count)
@@ -153,6 +154,10 @@ $timer.Add_Tick({
 $restart.Add_Click({
   $admission = $null; $probe = $null
   try {
+    # Compile before taking admission: a manual startup during compilation must be seen by the fresh checks below.
+    # Looked up by name: a type literal here could fail when this handler compiles, before Add-Type has run.
+    $native = 'XdartUpdateJob' -as [type]
+    if ($null -eq $native) { Add-Type -TypeDefinition $nativeJob; $native = 'XdartUpdateJob' -as [type] }
     $admission = Open-Lock $admissionPath
     if ($null -eq $script:worker -or -not $script:worker.HasExited -or $script:worker.ExitCode -ne 0 -or
         -not (Current-Attempt) -or -not (Successful (Current-Helper))) { throw 'This update is no longer ready to restart.' }
@@ -162,9 +167,6 @@ $restart.Add_Click({
     $exe = [string]$job.relaunch_cmd[0]
     $line = '"' + $exe + '"'
     if ([string]$job.relaunch_arguments) { $line += ' ' + [string]$job.relaunch_arguments }
-    # Looked up by name: a type literal here could fail when this handler compiles, before Add-Type has run.
-    $native = 'XdartUpdateJob' -as [type]
-    if ($null -eq $native) { Add-Type -TypeDefinition $nativeJob; $native = 'XdartUpdateJob' -as [type] }
     [void]$native::Launch($exe, $line)
     $script:failure = ''
     $window.Close()

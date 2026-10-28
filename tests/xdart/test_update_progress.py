@@ -157,14 +157,18 @@ def test_macos_host_lock_is_what_the_app_waits_for(tmp_path):
 @pytest.mark.skipif(not sys.platform.startswith('win'), reason='Windows PowerShell 5.1 and WPF')
 def test_windows_progress_window_script_parses_and_its_layout_loads(tmp_path):
     # Parses the generated host and builds its WPF window without showing it; nothing starts an update.
+    # Exercise its real tail/Restart code with file changes at the two fallible boundaries too.
     from xdart.modules import update_progress_windows
+    from tests.xdart.test_updater import _windows_job
+    job_path, state, marker = _windows_job(tmp_path / 'callback', _script('pass'))
     host = tmp_path / "host O'Neil ü.ps1"
-    host.write_text(update_progress_windows.script(tmp_path / 'job.json', tmp_path / 'engine.ps1'),
+    host.write_text(update_progress_windows.script(job_path, tmp_path / 'engine.ps1'),
                     encoding='utf-8-sig')
     check = tmp_path / 'check.ps1'
-    check.write_text(r'''param([string]$path)
+    check.write_text(r'''param([string]$path, [string]$jobPath)
+$ErrorActionPreference = 'Stop'
 $errors = $null
-$null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
 if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }
 Add-Type -AssemblyName PresentationFramework
 $source = Get-Content -LiteralPath $path -Raw -Encoding UTF8
@@ -174,12 +178,68 @@ $window = [Windows.Markup.XamlReader]::Load((New-Object Xml.XmlNodeReader ([xml]
 foreach ($name in 'Version', 'Stage', 'Progress', 'Details', 'Restart', 'Close') {
   if ($null -eq $window.FindName($name)) { "missing $name"; exit 3 }
 }
+# Extract the actual product functions/callback. Do not run the host's ContentRendered or ShowDialog.
+foreach ($name in 'Read-Tail', 'Open-Lock', 'Read-Json', 'Current-Attempt', 'Current-Helper', 'Successful') {
+  $definition = $ast.Find({ param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name
+  }, $true)
+  Invoke-Expression $definition.Extent.Text
+}
+$job = Get-Content -LiteralPath $jobPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$script:logStart = [long]0
+[IO.File]::WriteAllText([string]$job.log, ('a' * 140000))
+$script:grew = $false
+# Append after the offset is calculated, before the read's count is calculated.
+$watch = Set-PSBreakpoint -Variable from -Mode Write -Action {
+  if (-not $script:grew) {
+    $script:grew = $true
+    [IO.File]::AppendAllText([string]$job.log, ('b' * 200000))
+  }
+}
+try { $tail = Read-Tail } finally { Remove-PSBreakpoint -Breakpoint $watch }
+if (-not $script:grew -or $null -eq $tail -or $tail.Length -ne 131072 -or $tail.Contains('b')) {
+  'tail did not stay within its captured 128 KiB window'; exit 4
+}
+$helperPath = Join-Path ([string]$job.state_dir) ([string]$job.helper_file)
+$statePath = Join-Path ([string]$job.state_dir) 'xdart-update-state.json'
+$lockPath = Join-Path ([string]$job.state_dir) ([string]$job.lock_file)
+$admissionPath = Join-Path ([string]$job.state_dir) 'xdart-update-admission.lock'
+$script:worker = [pscustomobject]@{ HasExited = $true; ExitCode = 0; Id = 42 }
+@{ attempt_id = $job.attempt_id; pid = 42; state = 'completed'; exit = 0 } |
+  ConvertTo-Json | Set-Content -LiteralPath $helperPath -Encoding UTF8
+$stage = $window.FindName('Stage')
+$nativeAssignment = $ast.Find({ param($n)
+  $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+  $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+  $n.Left.VariablePath.UserPath -eq 'nativeJob'
+}, $true)
+Invoke-Expression $nativeAssignment.Extent.Text
+$callback = $ast.Find({ param($n)
+  $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+  $n.Expression -is [System.Management.Automation.Language.VariableExpressionAst] -and
+  $n.Expression.VariablePath.UserPath -eq 'restart' -and $n.Member.Value -eq 'Add_Click'
+}, $true).Arguments[0].ScriptBlock.GetScriptBlock()
+# Simulate a manual startup settling this completed attempt during deferred compilation, under admission.
+$script:settled = $false
+$watch = Set-PSBreakpoint -Command Add-Type -Action {
+  $gate = Open-Lock $admissionPath
+  try {
+    $state = Read-Json $statePath; $state.attempt = $null
+    $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+    $script:settled = $true
+  } finally { $gate.Dispose() }
+}
+try { $null = $callback.Invoke() } finally { Remove-PSBreakpoint -Breakpoint $watch }
+if (-not $script:settled -or $stage.Text -notlike 'xdart could not be restarted:*') {
+  'Restart did not reject an attempt settled during compilation'; exit 5
+}
 'ok'
 ''', encoding='utf-8-sig')
     exe = update_progress_windows.argv(host)[0]
-    done = subprocess.run([exe, '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', str(check), str(host)],
+    done = subprocess.run([exe, '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', str(check), str(host), str(job_path)],
                           capture_output=True, text=True, timeout=120, creationflags=update_launch.CREATE_NO_WINDOW)
     assert done.returncode == 0 and done.stdout.strip().endswith('ok'), done.stdout + done.stderr
+    assert not _await(marker, seconds=2)     # only a stale Restart could launch this harmless marker child
 
 
 @pytest.mark.skipif(not sys.platform.startswith('win'), reason='Windows PowerShell helper')
