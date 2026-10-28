@@ -1,5 +1,63 @@
 # Release notes
 
+## 1.2.7 (2026-10-28)
+
+### Added
+
+- **Updates show what changed, and wait for you:** at startup and from
+  **Help → Check for Updates…**, xdart shows the installed and available
+  versions and a scrollable summary of the changes in each newer release, with
+  **Update** and **Cancel**; **Open release notes** opens the full notes.
+  Nothing installs until you choose Update, and there is no countdown. Cancel
+  skips that version until xdart next starts, and a Run starting while the
+  offer is open postpones it. **Help → Check for Updates at Startup** turns the
+  check off. An install pinned to a version, a pip or conda install, or a
+  source checkout is never offered an update at startup; **Help → Check for
+  Updates…** says how to update it.
+- **Updates in their own window on macOS and Windows:** xdart closes and a
+  progress window shows the update as it runs, without opening Terminal or a
+  console, and it cannot be closed while the update runs. When the update
+  finishes, **Restart xdart** opens the new version, which says "xdart was
+  updated from <old> to <new>." A failed update keeps its details on screen
+  and offers no restart. On Linux, xdart closes, updates with nothing on
+  screen, and reopens itself. The output is also kept in `update.log` beside
+  the installation.
+- **Updates on Windows:** **Help → Check for Updates…** now updates a
+  `pixi global` install or the one-line installer's workspace on Windows too,
+  where 1.2.6 gave a command to copy. The update waits up to 10 s for programs
+  still using xdart's environment, such as Pixi's launcher; if they stay, it
+  names them, changes nothing, and you start xdart again yourself.
+- **A failed update is offered again:** the next start says "The update to
+  xdart <version> did not complete; see <log>." **Help → Check for Updates…**
+  can retry it at once, and the start after that offers it again. An update
+  still running after 20 min is stopped.
+- **A second start during an update says so:** opening xdart while it is being
+  updated shows "xdart is being updated. Use Restart xdart in the update
+  progress window when it finishes." (on Linux, "xdart is being updated and
+  reopens when the update finishes.") instead of starting.
+- **Pixi updates check their own channel:** a `pixi global` install looks for a
+  newer xdart in the conda channel it updates from rather than on PyPI.
+
+These updates work from 1.2.7 on. Updating from 1.2.6 to 1.2.7 uses 1.2.6's
+updater: on macOS and Linux it updates in the background once you accept, and
+on Windows it gives the command to run.
+
+### Fixes
+
+- **A scan clicked while the shown scan is still loading opens:** clicking
+  another scan in the Data Browser while the shown scan's reads were finishing
+  was refused ("Browse refused: previous Browse cleanup is pending"). xdart now
+  shows "Opening <file> once the current scan finishes loading." and opens it
+  then. A newer click replaces it; starting a Run, Reintegrate, a Viewer,
+  Refresh, another folder or closing drops it; after 10 s it shows the old
+  message.
+- **Overlay keeps the first file's trace:** in Overlay, the trace kept from the
+  first file could be lost when the second file opened while the first file's
+  reads were still finishing.
+- **Slices stay shown while another scan waits to open:** the shown scan's
+  slice plot and its pinned slices could empty when another scan was clicked
+  while the shown scan's reads were still finishing.
+
 ## 1.2.6 (2026-10-27)
 
 ### Added
