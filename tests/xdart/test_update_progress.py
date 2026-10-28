@@ -87,3 +87,18 @@ def test_native_launch_refuses_unsupported_host_before_closing_xdart(tmp_path):
     job = {'attempt_id':'one','manual_restart':True}
     with pytest.raises(update_launch.UpdateLaunchRefused, match='manual command'):
         update_launch.launch_helper(tmp_path, job, platform='linux')
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='headless system Foundation bridge on macOS')
+def test_macos_foundation_tail_handles_utf8_and_bounds_bytes(tmp_path):
+    # Executes the product's file-reading functions, with Foundation only: no AppKit, NSApplication or window.
+    from xdart.modules.update_progress_macos import FOUNDATION
+    path, missing = tmp_path/'unicode.log', tmp_path/'missing'
+    path.write_text('x' + '€' * 60000, encoding='utf-8')
+    code = FOUNDATION + '\nJSON.stringify({tail:logTail(' + json.dumps(str(path)) + '),missing:logTail(' + json.dumps(str(missing)) + '),text:text(' + json.dumps(str(missing)) + ')})'
+    done = subprocess.run(['/usr/bin/osascript','-l','JavaScript','-e',code], capture_output=True, text=True, timeout=10)
+    assert done.returncode == 0, done.stderr
+    result = json.loads(done.stdout)
+    assert result['missing'] is None and result['text'] == ''
+    assert result['tail'] and set(result['tail']) == {'€'}
+    assert len(result['tail'].encode('utf-8')) <= 131072

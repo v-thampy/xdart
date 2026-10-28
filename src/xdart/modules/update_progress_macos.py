@@ -2,21 +2,43 @@
 import json
 
 
-SOURCE = r'''
-ObjC.import('Cocoa');
+FOUNDATION = r'''
 ObjC.import('Foundation');
 ObjC.bindFunction('open', ['int', ['char *', 'int']]);
 ObjC.bindFunction('flock', ['int', ['int', 'int']]);
 ObjC.bindFunction('close', ['int', ['int']]);
 function text(path) {
     var s = $.NSString.stringWithContentsOfFileEncodingError($(path), $.NSUTF8StringEncoding, null);
-    return s ? ObjC.unwrap(s) : '';
+    return s.isNil() ? '' : ObjC.unwrap(s);
 }
 function read(path) { try { return JSON.parse(text(path)); } catch (_) { return {}; } }
 function save(path, value) {
     if (!$(JSON.stringify(value)).writeToFileAtomicallyEncodingError($(path), true, $.NSUTF8StringEncoding, null))
         throw Error('Could not record the progress window readiness.');
 }
+function logTail(path) {
+    try {
+        var h = $.NSFileHandle.fileHandleForReadingAtPath($(path));
+        if (h.isNil()) return null;
+        try {
+            var end = Number(h.seekToEndOfFile);
+            h.seekToFileOffset(Math.max(0, end - 131072));
+            var data = h.readDataOfLength(131072);
+            // A bounded tail may start in a UTF-8 continuation byte; try the next complete character.
+            for (var skip = 0; skip <= 3 && skip <= Number(data.length); skip++) {
+                var bytes = data.subdataWithRange($.NSMakeRange(skip, Number(data.length) - skip));
+                var value = $.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding);
+                if (!value.isNil()) return ObjC.unwrap(value);
+            }
+            return null;
+        } finally { h.closeFile; }
+    } catch (_) { return null; }
+}
+'''
+
+
+SOURCE = r'''
+ObjC.import('Cocoa');
 var job = read(jobPath), app = $.NSApplication.sharedApplication;
 // No O_CREAT: launcher prepared these files. CLOEXEC keeps host custody out of its engine/restart children.
 var hostFd = $.open($(job.host_lock).UTF8String, 0x01000002);
@@ -43,6 +65,11 @@ var scroll = $.NSScrollView.alloc.initWithFrame($.NSMakeRect(20, 73, 620, 253));
 scroll.hasVerticalScroller = true; scroll.autoresizingMask = 18;
 var details = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, 600, 253));
 details.editable = false; details.selectable = true;
+details.verticallyResizable = true; details.horizontallyResizable = false;
+details.minSize = $.NSMakeSize(0, 253); details.maxSize = $.NSMakeSize(10000000, 10000000);
+details.autoresizingMask = 2;
+details.textContainer.containerSize = $.NSMakeSize(600, 10000000);
+details.textContainer.widthTracksTextView = true;
 details.font = $.NSFont.userFixedPitchFontOfSize(11);
 details.toolTip = $('Recent update output. Scroll, select and copy details if the update fails.');
 scroll.documentView = details; content.addSubview(scroll);
@@ -67,24 +94,6 @@ function completed() {
         state.attempt.authorized === true && h.attempt_id === job.attempt_id && h.state === 'completed' &&
         h.exit === 0 && !h.timed_out && !h.refused;
 }
-function logTail() {
-    try {
-        var h = $.NSFileHandle.fileHandleForReadingAtPath($(job.log));
-        if (!h) return '';
-        try {
-            var end = Number(h.seekToEndOfFile);
-            h.seekToFileOffset(Math.max(0, end - 131072));
-            var data = h.readDataToEndOfFile;
-            // A bounded tail may start in a UTF-8 continuation byte; try the next complete character.
-            for (var skip = 0; skip <= 3 && skip <= Number(data.length); skip++) {
-                var bytes = data.subdataWithRange($.NSMakeRange(skip, Number(data.length) - skip));
-                var value = $.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding);
-                if (value) return ObjC.unwrap(value);
-            }
-            return null;
-        } finally { h.closeFile; }
-    } catch (_) { return null; }
-}
 function tick() {
     if (!started) {
         if (!window.visible) throw Error('The update window is not visible.');
@@ -99,7 +108,7 @@ function tick() {
         engine.standardError = $.NSFileHandle.fileHandleWithNullDevice;
         engine.launch;
     }
-    var output = logTail();
+    var output = logTail(job.log);
     if (output !== null && ObjC.unwrap(details.string) !== output) { details.string = $(output); details.scrollRangeToVisible($.NSMakeRange(output.length, 0)); }
     if (!terminal && engine && !engine.running) {
         terminal = true;
@@ -154,4 +163,4 @@ try { app.run; } finally { timer.invalidate; $.close(hostFd); }
 
 
 def script(job_path, python):
-    return 'var jobPath = ' + json.dumps(str(job_path)) + ', python = ' + json.dumps(str(python)) + ';\n' + SOURCE
+    return 'var jobPath = ' + json.dumps(str(job_path)) + ', python = ' + json.dumps(str(python)) + ';\n' + FOUNDATION + SOURCE

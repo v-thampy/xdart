@@ -67,7 +67,7 @@ function Read-Tail {
     $bytes = New-Object byte[] $count
     $read = $fs.Read($bytes, 0, $count)
     return [Text.Encoding]::UTF8.GetString($bytes, 0, $read)
-  } catch { return '' } finally { if ($null -ne $fs) { $fs.Dispose() } }
+  } catch { return $null } finally { if ($null -ne $fs) { $fs.Dispose() } }
 }
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" Title="Updating xdart"
@@ -104,7 +104,7 @@ $script:worker = $null; $script:started = $false; $script:terminal = $false
 $script:failure = ''; $script:hostLock = $null
 function Refresh-Progress {
   $tail = Read-Tail
-  if ($details.Text -cne $tail) { $details.Text = $tail; $details.ScrollToEnd() }
+  if ($null -ne $tail -and $details.Text -cne $tail) { $details.Text = $tail; $details.ScrollToEnd() }
   if ($null -eq $script:worker) { return }
   $h = Current-Helper
   $dead = $script:worker.HasExited
@@ -112,7 +112,7 @@ function Refresh-Progress {
   $close.IsEnabled = $dead; $restart.IsEnabled = $false; $bar.IsIndeterminate = -not $dead
   if (-not $dead) {
     if ($null -ne $h -and $h.state -eq 'running') {
-      $latest = ($tail.TrimEnd() -split "`r?`n")[-1]
+      $latest = if ($tail) { ($tail.TrimEnd() -split "`r?`n")[-1] } else { '' }
       $stage.Text = 'Updating xdart. Keep this window open.'
       if ($latest) { $stage.Text = $latest.Substring(0, [Math]::Min(240, $latest.Length)) }
     }
