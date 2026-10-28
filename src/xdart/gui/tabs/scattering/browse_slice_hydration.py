@@ -172,6 +172,8 @@ class BrowseSliceLane:
             return BrowseSliceResult(diagnostic=self._diagnostic(error))
         with self._lock:
             if self._retiring:
+                if request.key == self._wanted and self._result is not None:
+                    return self._result
                 return BrowseSliceResult(diagnostic="Browse slice lane is released")
             if request.key != self._wanted:
                 self._wanted = request.key
@@ -376,14 +378,26 @@ class BrowseSliceLane:
                 self._active.cancelled.set()
         self._progress()
 
-    def release(self, *, preserve_pending_repaint=False) -> bool:
+    def settle(self, *, preserve_pending_repaint=False) -> bool:
+        """Cancel work but retain completed cuts while the current Browse still owns them."""
         with self._lock:
             if preserve_pending_repaint and self._repaint:
                 return False
             self._retiring = True
-        self.cancel()
+            self._queued = None
+            self._repaint = False
+            if self._active is not None:
+                self._active.cancelled.set()
+        self._progress()
         with self._lock:
             return self._active is None
+
+    def release(self, *, preserve_pending_repaint=False) -> bool:
+        """Close settled custody after the owner can release the current Browse."""
+        if not self.settle(preserve_pending_repaint=preserve_pending_repaint):
+            return False
+        self.cancel()
+        return True
 
 
 __all__ = ["BrowseSliceLane", "BrowseSliceResult"]

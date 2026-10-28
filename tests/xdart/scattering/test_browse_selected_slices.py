@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 
 import numpy as np
 import pytest
@@ -129,6 +130,64 @@ def test_browse_pin_keeps_its_cut_across_settings_and_selection(tmp_path, monkey
         _wait(app, lambda: _ready(page, 1), page)
         assert not page._preferences.slice_pins
     finally:
+        _close(page, app)
+
+
+def test_pending_browse_cleanup_keeps_completed_slice_and_pin(tmp_path, monkeypatch):
+    """A real preview reader holds cleanup while the current page still presents its cuts."""
+    from tests.xdart.scattering.test_e4_preview_transport import (
+        _demote_browse_publication, _transport_api,
+    )
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    from xdart.modules.display_context import HydrationRequest
+    from xrd_tools.session.hydration import HydrationPurpose, HydrationReadKey, HydrationScope, HydrationToken
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    path, _ = _write_processed(tmp_path / "source", schema_version=3, labels=(1, 2))
+    page, _ = _page(tmp_path, monkeypatch)
+    controller, view = page._context_controller, page._shell.scientific
+    entered, finish = Event(), Event()
+    try:
+        controller.begin_browse(str(path.resolve()))
+        _wait(app, controller.poll_browse, page)
+        _wait(app, lambda: _ready(page, 1), page)
+        view.plot_mode.setCurrentText("Overlay")
+        view.slice_center.setValue(-1)
+        view.slice_width.setValue(.1)
+        view.slice.click()
+        _wait(app, lambda: _ready(page, 1), page)
+        assert page._edit_scientific_preference(ShellCommand(ShellCommandKind.PIN_SLICE))
+        _wait(app, lambda: _ready(page, 0, pins=1), page)
+        view.slice_center.setValue(1)
+        before = _wait(app, lambda: _ready(page, 1, pins=1), page)
+        original = _transport_api().read_frame_preview
+
+        def held_read(*args, **kwargs):
+            entered.set()
+            assert finish.wait(8)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(_transport_api(), "read_frame_preview", held_read)
+        browse, owner = controller.browse_context, controller._browse_hydration_owner
+        _demote_browse_publication(browse, controller.navigation.current.local_frame_label)
+        label, generation = controller.navigation.current.local_frame_label, controller.selection.display_generation
+        key = HydrationReadKey(HydrationScope(*browse.hydration_owner.as_tuple()), browse.requested_path,
+                               label, HydrationPurpose.PREVIEW, browse.load_request.source_root)
+        request = HydrationRequest(label, HydrationPurpose.PREVIEW, generation, browse.hydration_owner,
+                                   (browse.publication_store,), browse.commit_gate,
+                                   read_key=key, token=HydrationToken(key, generation))
+        assert owner.submit(request) == request.token
+        assert entered.wait(5)
+        receipt = controller._release_browse(browse, preserve_pending_repaint=True)
+        assert receipt.cleanup_status is CleanupStatus.CLEANUP_PENDING
+        assert controller._browse_hydration_owner is owner and not browse.released
+        page._refresh_shell()
+        after = page._last_scientific_projection
+        assert after.traces == before.traces
+        assert after.pinned_traces == before.pinned_traces
+        assert len(view.curve.listDataItems()) == 2
+    finally:
+        finish.set()
         _close(page, app)
 
 

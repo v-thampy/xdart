@@ -413,7 +413,7 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
-        if self._slice_lane is not None and not self._slice_lane.release(
+        if self._slice_lane is not None and not self._slice_lane.settle(
             preserve_pending_repaint=preserve_pending_repaint,
         ):
             return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
@@ -445,13 +445,20 @@ class _BrowseHydrationOwner:
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
-        if not self._one_d_lane.release(
-            preserve_pending_repaint=preserve_pending_repaint,
-        ):
+        if not self.retire():
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
-        if not self.retire():
+        # All work is settled before cache/context release. Close data lanes
+        # only after transport retirement too: a pending retry still presents
+        # this Browse's completed rows, slices and pins.
+        if self._slice_lane is not None and not self._slice_lane.release(
+            preserve_pending_repaint=preserve_pending_repaint,
+        ):
+            return BrowseCleanupReceipt(request, CleanupStatus.CLEANUP_PENDING)
+        if not self._one_d_lane.release(
+            preserve_pending_repaint=preserve_pending_repaint,
+        ):
             return BrowseCleanupReceipt(
                 request, CleanupStatus.CLEANUP_PENDING
             )
