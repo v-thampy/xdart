@@ -170,9 +170,10 @@ def test_copyable_command_never_offers_pip_for_a_pixi_install(tmp_path, monkeypa
     monkeypatch.setenv("PIXI_HOME", str(home))
     assert updater.copyable_update_command("pixi-global", prefix=str(env)) == "pixi global update xdart"
     monkeypatch.setenv("PIXI_HOME", str(tmp_path / "default-home"))
-    assert updater.copyable_update_command("pixi-global", prefix=str(env)) == (
-        f'PIXI_HOME="{home}" pixi global update xdart')
-    assert updater.pixi_global_command("sync", prefix=str(env)) == f'PIXI_HOME="{home}" pixi global sync'
+    other_home = (f"$env:PIXI_HOME = '{home}'; pixi global" if sys.platform.startswith("win")   # PowerShell
+                  else f'PIXI_HOME="{home}" pixi global')
+    assert updater.copyable_update_command("pixi-global", prefix=str(env)) == f"{other_home} update xdart"
+    assert updater.pixi_global_command("sync", prefix=str(env)) == f"{other_home} sync"
     assert updater.copyable_update_command("managed") == 'pip install -U "xdart[gui]"'
 
 
@@ -885,7 +886,7 @@ def test_window_close_needs_the_macos_terminal_the_app_opened(monkeypatch):
         def fileno(self):
             return 1
     monkeypatch.setattr(sys, "stdout", Terminal())
-    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys009")
+    monkeypatch.setattr(os, "ttyname", lambda fd: "/dev/ttys009", raising=False)   # Windows has no ttyname
     monkeypatch.setattr(sys, "platform", "linux")
     assert helper._schedule_window_close({"close_window_s": 10}) is False
     monkeypatch.setattr(sys, "platform", "darwin")
