@@ -664,7 +664,7 @@ class Main(QMainWindow):
         self.actionCheckForUpdates = QtGui.QAction("Check for Updates…", self)
         self.actionCheckForUpdates.setToolTip(
             "Look for a newer xdart now. A pixi install updates in one click: xdart closes, a window shows the update, "
-            "and xdart reopens.")
+            "then choose Restart xdart when it finishes.")
         self.actionCheckForUpdates.triggered.connect(self._check_for_updates)
         self.actionCheckUpdatesAtStartup = QtGui.QAction("Check for Updates at Startup", self)
         self.actionCheckUpdatesAtStartup.setCheckable(True)

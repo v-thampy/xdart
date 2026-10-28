@@ -95,6 +95,7 @@ function completed() {
         h.exit === 0 && !h.timed_out && !h.refused;
 }
 function tick() {
+    if (terminal && !started) return; // a failed readiness check must never launch on a later tick
     if (!started) {
         if (!window.visible) throw Error('The update window is not visible.');
         started = true;
