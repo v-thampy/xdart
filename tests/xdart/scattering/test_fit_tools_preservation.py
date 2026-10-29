@@ -304,12 +304,13 @@ def test_held_controls_stay_held_through_a_fit(monkeypatch, qapp):
         peak.fit_btn.click()
         assert page._consume_analysis_update(_settle(page))
         for dialog, controls in ((peak, (("live_check", "peak_live"), ("batch_btn", "peak_batch"))),
-                                 (phase, (("texture_combo", "phase_texture"), ("batch_btn", "phase_batch")))):
+                                 (phase, (("batch_btn", "phase_batch"),))):
             for name, reason in controls:
                 control = getattr(dialog, name)
                 # a held control explains its code through the shared guidance text (c47d4a9f)
                 assert not control.isEnabled() and control.toolTip() == diagnostic_text(mount.HELD_REASONS[reason])
         assert not peak.live_check.isChecked()
+        assert phase.texture_combo.isEnabled()  # PHASE-ANALYSIS-128 lifted the texture hold
     finally:
         _close_page(page, qapp)
 
@@ -320,18 +321,25 @@ def test_phase_defaults_choices_and_values(monkeypatch, qapp):
     page = _page()
     try:
         dialog = _show(page, monkeypatch, "phase", trace, anchor)
+        # PHASE-ANALYSIS-128: every notebook option, at the default that reproduces the parent's fit
         assert dialog.vnext_fit_values() == {
-            "cif_paths": (), "phase_names": (), "expected_hashes": (), "prefit_background": "none",
-            "phase_profile": "pseudovoigt", "lattice_pct": 0.05, "min_intensity": 5.0, "max_nfev": None,
+            "cif_paths": (), "phase_names": (), "expected_hashes": (), "phase_entries": (),
+            "prefit_background": "none", "phase_profile": "pseudovoigt", "lattice_pct": 0.05,
+            "min_intensity": 5.0, "max_nfev": None, "width_model": "caglioti", "width_limits": (None, None),
+            "texture": "none", "march_axis": (0, 0, 1), "free_height_range": (0.0, 10.0), "q_shift_bound": 0.05,
+            "lock_cross_phase": False, "snip_width": None, "fit_background": "none", "fit_background_degree": 3,
+            "background_template": None, "amorphous_peak": "none", "amorphous_center": 1.5,
+            "amorphous_sigma": 0.3, "fit_range": None, "fit_range_unit": "q_A^-1",
         }
         assert [dialog.profile_combo.itemText(i) for i in range(dialog.profile_combo.count())] == [
-            "Pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt"]
+            "Pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt", "Lorentzian²", "Pearson VII", "Pearson IV",
+            "Split Lorentzian", "Moffat", "Student's t", "Skewed Gaussian"]
         assert [dialog.bkg_combo.itemText(i) for i in range(dialog.bkg_combo.count())] == ["None", "SNIP", "Chebyshev"]
         assert [dialog.texture_combo.itemText(i) for i in range(dialog.texture_combo.count())] == [
             "None", "March-Dollase", "Free (per-peak)"]
         dialog.profile_combo.setCurrentIndex(1); dialog.bkg_combo.setCurrentIndex(1)
         # REFERENCE-PHASES-20261011 successor: the global minimum is a decimal spinbox (numeric setter).
-        dialog.lattice_pct.setText("2.5"); dialog.min_intensity.setValue(1.); dialog.max_nfev.setValue(300)
+        dialog.lattice_row.set_number(2.5); dialog.min_intensity.setValue(1.); dialog.max_nfev.setValue(300)
         values = dialog.vnext_fit_values()
         assert (values["phase_profile"], values["prefit_background"], values["lattice_pct"],
                 values["min_intensity"], values["max_nfev"]) == ("gaussian", "snip", 0.025, 1.0, 300)
@@ -348,10 +356,19 @@ def test_phase_refusals_are_named_and_adopt_nothing(case, monkeypatch, qapp, tmp
     page = _page()
     try:
         dialog = _show(page, monkeypatch, "phase", trace, anchor)
+        # PHASE-ANALYSIS-128: CIFs join the library through the shared source; a CIF the library no longer holds
+        # is the missing case (the retired deferred path took any path).
+        from pymatgen.core import Lattice, Structure
+        from pymatgen.io.cif import CifWriter
+        monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+        from xrd_tools.analysis.phase_references import PhaseLibrary
+        dialog.phase_source.library = PhaseLibrary()
         cif = tmp_path / "missing.cif"
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(cif), "CIF"))
-        dialog._add_cif()
-        assert dialog._phases == [(str(cif), "missing")]
+        cif.write_text(str(CifWriter(Structure(Lattice.cubic(4.1), ["Cs", "Cl"], [[0, 0, 0], [.5, .5, .5]]))))
+        added, = dialog.phase_source.add_cif_paths((str(cif),))
+        assert added.name == "missing" and len(dialog.phase_source.selection) == 1
+        if case == "missing_cif":
+            added.cif_path.unlink()
         dialog.fit_btn.click()
         assert page._consume_analysis_update(_settle(page))
         expected = {"two_theta": "PHASE_Q_UNIT_REQUIRED", "no_wavelength": "INVALID_PHASE_PLAN",
@@ -377,10 +394,9 @@ def test_phase_fits_a_real_cif_and_shows_its_receipt_lattice_component_markers_a
     page = _page()
     try:
         dialog = _show(page, monkeypatch, "phase", trace, anchor)
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(_TIN), "CIF"))
-        dialog._add_cif()
-        assert len(dialog._phases) == 1
-        managed_path, phase_name = dialog._phases[0]
+        dialog.phase_source.add_cif_paths((str(_TIN),))  # PHASE-ANALYSIS-128: through the shared source
+        entry, = dialog.phase_source.selected_entries()
+        managed_path, phase_name = entry.cif_path, entry.name
         assert phase_name == "TiN" and Path(managed_path).read_bytes() == _TIN.read_bytes()
         assert Path(managed_path).is_relative_to(Path(os.environ["XDART_PHASE_LIBRARY"]))
         dialog.fit_btn.click()

@@ -22,6 +22,7 @@ from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 from tests.xdart.scattering.test_predicted_ring_overlays import choice, choose, rings, run_page, select, settle
 from tests.xdart.scattering.test_phase_reference_overlays import _cif, _settle, _stitch
 from tests.xdart.scattering.test_reference_phases_window import LAB6, _commands, _marker, _options, _pane_items, _window
+from tests.xdart.scattering.test_predicted_ring_overlays import close_phase_window
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -280,7 +281,7 @@ def test_gc1f_stitchs_fit_host_close_and_page_shutdown_drop_a_held_add(qapp, tmp
     from tests.xdart.pages.test_stitch_fit_host import _finish
     _chooser(monkeypatch, _cif(tmp_path, 'phaseA', 4.1))
     with _stitch(qapp, tmp_path / 'stitch') as (page, _view, _payload):
-        page.tools.page_tool('phase_fit').click()
+        page.tools.page_tool('phase_analysis').click()
         qapp.processEvents()
         host = page._fit_hosts['phase']
         _finish(host, qapp)
@@ -292,7 +293,7 @@ def test_gc1f_stitchs_fit_host_close_and_page_shutdown_drop_a_held_add(qapp, tmp
             assert _busy(source) and source.selection == (), source.add_cif_btn.toolTip()
             host.dialog.close()
             qapp.processEvents()
-            page.tools.page_tool('phase_fit').click()  # reopened while the CIF is still read
+            page.tools.page_tool('phase_analysis').click()  # reopened while the CIF is still read
             qapp.processEvents()
             gate.set()
             _until(qapp, lambda: returned, what='the held parse to return')
@@ -325,24 +326,29 @@ def test_gc3a_the_grid_rows_disabled_tooltip_names_the_coordinate_grid(qapp):
             assert 'coordinate grid' in reason and 'ring' not in reason, tip
 
 
+@contextmanager
 def _fitted_dialog(qapp, tmp_path):
-    """Int's PhaseFitDialog on its pattern-provider path: a real lattice-plus-CIF analyzer fit."""
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    from tests.core.test_reference_phase_sources import _fit_inputs
+    """PHASE-ANALYSIS-128: Int's mounted Phase Analysis window with a real lattice-plus-CIF displayed fit delivered
+    (the retired pattern-provider path's successor)."""
+    from tests.core.test_reference_phase_sources import WAVELENGTH, _fit_inputs
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
+    from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan, run_displayed_phase_fit
     paths, trace = _fit_inputs(tmp_path)
-    x, y = np.asarray(trace.axis, dtype=float), np.asarray(trace.intensity, dtype=float)
-    dialog = PhaseFitDialog(pattern_provider=lambda: (x, y, 'q (Å⁻¹)'))
-    dialog.phase_source.add_cif_paths((str(paths[1]),))
-    assert dialog.phase_source.add_lattice('NaCl cell', a=5.64, space_group=225) is not None
-    dialog.show()
-    dialog.fit_btn.click()
-    qapp.processEvents()
-    return dialog
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
+        dialog.phase_source.add_cif_paths((str(paths[1]),))
+        assert dialog.phase_source.add_lattice('NaCl cell', a=5.64, space_group=225) is not None
+        dialog.set_vnext_trace(trace)
+        result = run_displayed_phase_fit(DisplayedPhaseFitPlan(trace, wavelength_angstrom=WAVELENGTH,
+                                                               **dialog.vnext_fit_values()))
+        assert result.code == 'OK', (result.code, result.diagnostics)
+        dialog.set_vnext_result(result)
+        qapp.processEvents()
+        yield dialog
 
 
 def test_gc3b_a_lattice_plus_cif_fits_dash_cells_carry_their_own_columns_reason(qapp, tmp_path):
-    dialog = _fitted_dialog(qapp, tmp_path)
-    try:
+    with _fitted_dialog(qapp, tmp_path) as dialog:
         table = dialog.table
         headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
         dashes = [(row, column) for row in range(table.rowCount()) for column in range(table.columnCount())
@@ -358,17 +364,14 @@ def test_gc3b_a_lattice_plus_cif_fits_dash_cells_carry_their_own_columns_reason(
                 assert 'fraction' in tip.lower(), tip
             else:
                 assert 'fraction' not in tip.lower(), ('a lattice cell names its own reason', headers[column], tip)
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
 
 def test_gc3c_a_source_message_shows_in_exactly_one_visible_fitter_label(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = PhaseFitDialog()
-    try:
-        dialog.show()
+    """PHASE-ANALYSIS-128: the one window shows a source message once, on its own status line (the retired
+    Reference Phases window's own-status half went with it)."""
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         dialog.phase_source.add_library_entry('0' * 64)
         qapp.processEvents()
         message = dialog.phase_source.reason
@@ -376,26 +379,17 @@ def test_gc3c_a_source_message_shows_in_exactly_one_visible_fitter_label(qapp, t
                  if label.isVisible() and message and message in label.text()]
         assert message and len(shown) == 1, (message, [label.objectName() for label in shown])
         assert shown[0] is dialog.status and dialog.status.toolTip()
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
-    with _shell(qapp) as view:
-        source = _window(qapp, view).phase_source
-        source.add_library_entry('0' * 64)
-        qapp.processEvents()
-        assert source.status.isVisible() and source.reason and source.reason in source.status.text()
 
 
 def test_gc3d_every_visible_fitter_widget_resolves_a_tooltip_and_each_control_has_its_own(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
     from xdart.gui.tabs.scattering.results_table import ResultsTable
     shown = (QtWidgets.QAbstractButton, QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QLineEdit,
              QtWidgets.QLabel, QtWidgets.QAbstractItemView, QtWidgets.QHeaderView)
     controls = (QtWidgets.QAbstractButton, QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QLineEdit,
                 ResultsTable)
-    dialog = PhaseFitDialog()
-    try:
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         dialog.phase_source.add_cif_paths(tuple(str(_cif(tmp_path, f'p{index}', 4.1 + .15 * index))
                                                 for index in range(2)))
         assert dialog.phase_source.add_lattice('cell', a=4.0, space_group=221) is not None
@@ -421,10 +415,6 @@ def test_gc3d_every_visible_fitter_widget_resolves_a_tooltip_and_each_control_ha
         assert not own, own
         unresolved = [name(widget) for widget in widgets if not resolves(widget)]
         assert not unresolved, unresolved
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
 
 # ---- GC4 (R6d): the owner accessor ---------------------------------------------------------------------------------
@@ -713,7 +703,7 @@ def test_gc7a_a_merged_cif_stick_lists_every_family_its_d_spacing_and_intensity(
         a = 6. * math.pi / (low_q + .55 * (high_q - low_q))  # the merged (300)/(221) line mid-range
         entry = PhaseLibrary().add_cif(_cif(tmp_path, 'CsCl', a))
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
-        view.reference_phases.close()
+        close_phase_window(view)
         _settle(qapp, view, lambda: _marker(view, entry.id))
         family = view.phase_families[entry.id]
         index = int(np.argmin(np.abs(np.asarray(family.q_lines) - 6. * math.pi / a)))
@@ -747,7 +737,7 @@ def test_gc7b_a_ring_on_the_raw_pane_and_cake_and_the_raw_popup_lists_its_reflec
     with run_page(qapp, tmp_path / 'int', energies=(16, 16)) as (page, view):
         page.resize(1600, 1000)
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
-        view.reference_phases.close()
+        close_phase_window(view)
         _settle(qapp, view, lambda: _pane_items(view.raw, entry.id) and _pane_items(view.cake, entry.id))
         canvas, box = _pane(view.raw)
         segment = _segments(_pane_items(view.raw, entry.id)[0])[0]
@@ -765,7 +755,7 @@ def test_gc7b_a_ring_on_the_raw_pane_and_cake_and_the_raw_popup_lists_its_reflec
         assert all(_label(hkl) in text for hkl in line.hkls) and f'd {line.d_spacing:.3f} Å' in text, text
     with run_page(qapp, tmp_path / 'popup', energies=(16, 16), mode='Int 1D') as (page, view):
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
-        view.reference_phases.close()
+        close_phase_window(view)
         view.raw_popup_button.click()
         qapp.processEvents()
         select(qapp, page, page._context_controller.navigation.current)
@@ -795,7 +785,7 @@ def test_gc7c_coincident_lines_list_each_phase_and_a_calibrant_line_shows_its_d_
         cif = library.add_cif(_cif(tmp_path, 'CsCl', a))
         lattice = library.add_lattice('cell', a=a, space_group=221)
         _window(qapp, view).phase_source.set_selection(((cif.id, True), (lattice.id, True), (LAB6, True)))
-        view.reference_phases.close()
+        close_phase_window(view)
         _settle(qapp, view, lambda: all(_marker(view, i) for i in (cif.id, lattice.id, LAB6)))
         canvas, box = _plot(view)
         low, high = box.viewRange()[1]
@@ -835,7 +825,7 @@ def test_gc7d_a_phase_tooltip_clears_when_the_cursor_leaves_phases_switch_off_or
     with run_page(qapp, tmp_path / 'int', energies=(16, 17)) as (page, view):
         page.resize(1600, 1000)
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
-        view.reference_phases.close()
+        close_phase_window(view)
         _settle(qapp, view, lambda: _pane_items(view.raw, entry.id))
         canvas, box = _pane(view.raw)
 
@@ -1081,7 +1071,7 @@ def test_ge3_frames_arriving_at_one_energy_list_the_calibrant_rings_once(qapp, t
                         and not view.phase_worker.busy and bool(rings(view.raw)))
             _until(qapp, drawn, seconds=30, what=f'frame {index} drawn with its image and rings')
             assert shell.run_controls.stopButton.isEnabled(), 'the frame is drawn while the Run is still going'
-            assert view.reference_phases.rings_note.text() == '', view.reference_phases.rings_note.text()
+            assert view.phase_rings_reason == '', view.phase_rings_reason
         assert len(controller.frame_keys) == 4
         assert calls == [(LAB6,)], calls
         shell.run_controls.stopButton.click()

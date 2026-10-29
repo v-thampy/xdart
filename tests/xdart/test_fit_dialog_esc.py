@@ -32,4 +32,4 @@ def test_peak_fit_dialog_swallows_escape(qapp):
 
 def test_phase_fit_dialog_swallows_escape(qapp):
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    assert _survives_escape(PhaseFitDialog(analysis_context=None), qapp)
+    assert _survives_escape(PhaseFitDialog(vnext_submit=lambda *_args: None), qapp)  # PHASE-ANALYSIS-128

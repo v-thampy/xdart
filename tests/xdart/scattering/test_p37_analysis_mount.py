@@ -250,12 +250,12 @@ def test_metadata_row_headers_remain_default_unless_explicitly_selected(qapp):
 def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -> None:
     # Plot Metadata is in the shared popup; ROI remains a tool. Literal routes
     # remain accepted for existing command consumers. REFERENCE-PHASES-20261011 added
-    # the Reference Phases launcher, which opens a view-owned window (no analysis mount).
-    from xdart.gui.tabs.scattering.tools_view import REFERENCE_PHASES_TOOLTIP
+    # the Reference Phases launcher; PHASE-ANALYSIS-128 folded it and Phase Fitting into one Phase Analysis
+    # launcher, which opens the phase analysis mount.
+    from xdart.gui.tabs.scattering.tools_view import PHASE_ANALYSIS_TOOLTIP
     assert ToolsView._TOOLS == (
         ("\u2227 Peak Fitting", "peak_fitting"),
-        ("\u2248 Phase Fitting", "phase_fitting"),
-        ("\u2506 Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
+        ("\u2248 Phase Analysis", "phase_analysis", PHASE_ANALYSIS_TOOLTIP),
         ("\u25a3 ROI Statistics", "roi_statistics"),
     )
     from xdart.gui.tabs.scattering.analysis_mount import MOUNT_TARGETS
@@ -265,7 +265,7 @@ def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -
         (ShellCommandKind.LAUNCH_TOOL, "plot_metadata"): "scan_roi",
         (ShellCommandKind.LAUNCH_TOOL, "roi_statistics"): "scan_roi",
         (ShellCommandKind.LAUNCH_TOOL, "peak_fitting"): "peak",
-        (ShellCommandKind.LAUNCH_TOOL, "phase_fitting"): "phase",
+        (ShellCommandKind.LAUNCH_TOOL, "phase_analysis"): "phase",
         (ShellCommandKind.ANALYSIS_ACTION, "scan_plot"): "scan_roi",
         (ShellCommandKind.ANALYSIS_ACTION, "roi_stats"): "scan_roi",
         (ShellCommandKind.ANALYSIS_ACTION, "peak_fit"): "peak",
@@ -1964,7 +1964,7 @@ def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
 
 
 def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
-        monkeypatch, qapp) -> None:
+        monkeypatch, qapp, tmp_path) -> None:
     import xdart.gui.tabs.scattering.analysis_mount as mount
 
     for wavelength_m, expected in ((1.234e-10, 1.234), (1.0e-10, 1.0)):
@@ -1991,19 +1991,16 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
                             lambda *args: True)
         monkeypatch.setattr(mount, "phase_wavelength_angstrom",
                             lambda controller, frame: 1.0)
-        too_long = "/tmp/" + "x" * 257 + ".cif"
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
-            lambda *args, **kwargs: (too_long, "CIF"))
-        dialog._add_cif()
-        assert not dialog._phases
-        assert dialog.status.text() == "PHASE_NAME_LIMIT_EXCEEDED"
-        choices = iter(("/tmp/alpha.cif", "/tmp/beta.cif", "/tmp/alpha.cif"))
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
-            lambda *args, **kwargs: (next(choices), "CIF"))
-        dialog._add_cif(); dialog._add_cif(); dialog._add_cif()
-        assert dialog._phases == [
-            ("/tmp/alpha.cif", "alpha"), ("/tmp/beta.cif", "beta")]
-        assert "Duplicate" in dialog.status.text()
+        # PHASE-ANALYSIS-128: every CIF joins the phase library through the shared source (the deferred-path list,
+        # and its name-limit and duplicate-path refusals, are retired with it); receipts follow each CIF's id.
+        monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+        from tests.xdart.scattering.test_phase_reference_overlays import _cif
+        from xrd_tools.analysis.phase_references import PhaseLibrary
+        source = dialog.phase_source
+        source.library = PhaseLibrary()
+        alpha, beta = _cif(tmp_path, "alpha", 4.1), _cif(tmp_path, "beta", 4.25)
+        source.add_cif_paths((str(alpha), str(beta), str(alpha)))  # the duplicate selects nothing new
+        assert [entry.name for entry, _shown in source.listed_entries()] == ["alpha", "beta"]
         dialog.set_vnext_trace(trace)
         plans = []
         identity = OperationIdentity(81)
@@ -2011,15 +2008,15 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
             lambda plan, stamp: plans.append(plan) or identity)
         dialog.fit_btn.click()
         plan = plans[-1]
-        assert plan.trace is trace
-        assert plan.cif_paths == (Path("/tmp/alpha.cif"), Path("/tmp/beta.cif"))
+        assert plan.trace is trace and plan.cif_paths == ()
         assert plan.phase_names == ("alpha", "beta")
+        assert tuple(entry.name for entry in plan.phase_entries) == ("alpha", "beta")
         assert plan.wavelength_angstrom == 1.0
+        entries = plan.phase_entries
         states = (1, 2, 3, 4, 5, 6)
         receipts = tuple(CifAssetReceipt(
-            Path(f"/tmp/{name}.cif"), Path(f"/resolved/{name}.cif"), name,
-            100 + index, f"sha-{name}", None, states, states,
-            f"receipt-{name}") for index, name in enumerate(("alpha", "beta")))
+            entry.cif_path, entry.cif_path, entry.name, 100 + index, entry.id, entry.id, states, states,
+            f"receipt-{entry.name}") for index, entry in enumerate(entries))
         result = DisplayedPhaseFitResult(
             AnalysisDisposition.COMPLETED, "OK", diagnostics=("phase-detail",),
             trace_fingerprint=trace.trace_fingerprint,
@@ -2038,23 +2035,21 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
             background=np.array([1.0, 1.0, 1.0]),
             residual=np.array([0.1, 0.0, -0.1]),
             marker_positions=np.array([1.5, 2.5]), storage_bytes=256,
-            result_fingerprint="phase-result")
+            result_fingerprint="phase-result", phase_names=("alpha", "beta"))
         assert page._consume_analysis_update(_returned(identity, result))
         assert page._phase_result is result
         assert len(dialog.plot.listDataItems()) >= 5
         assert dialog.resid_plot.listDataItems()
         assert dialog.table.rowCount() == 3
-        assert "sha-alpha" in dialog.cif_list.item(0).toolTip()
+        assert entries[0].id in dialog.cif_list.item(0).toolTip()
+        assert entries[1].id in dialog.cif_list.item(1).toolTip()
         assert "phase-detail" in dialog.status.text()
         assert "phase-plan" in dialog.status.toolTip()
-
-        more = iter(f"/tmp/{name}.cif" for name in "cdefgh")
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
-            lambda *args, **kwargs: (next(more), "CIF"))
-        for _ in range(6): dialog._add_cif()
-        assert len(dialog._phases) == 8
-        dialog._add_cif()
-        assert dialog.status.text() == "PHASE_COUNT_LIMIT_EXCEEDED"
+        more = [_cif(tmp_path, f"phase{name}", 4.3 + .05 * index) for index, name in enumerate("cdefgh")]
+        source.add_cif_paths(tuple(str(path) for path in more))
+        assert len(source.selection) == 8
+        source.add_cif_paths((str(_cif(tmp_path, "ninth", 4.9)),))
+        assert len(source.selection) == 8 and "eight" in dialog.status.text().casefold()
     finally:
         _close_page(page, qapp)
 
@@ -2759,7 +2754,6 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
         "peak_live": "P3_7_LIVE_FITTING_UNAVAILABLE",
         "peak_batch": "P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE",
         "phase_batch": "P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE",
-        "phase_texture": "P3_7_PHASE_TEXTURE_UNAVAILABLE",
         "export": "P3_7_EXPORT_UNAVAILABLE",
     }
     text = Path(importlib.import_module(
@@ -2777,8 +2771,9 @@ def test_p37b_batch_live_texture_export_writer_and_private_average_are_absent(
         assert peak.live_check.toolTip() == diagnostic_text(HELD_REASONS["peak_live"])
         assert not peak.batch_btn.isEnabled()
         assert peak.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["peak_batch"])
-        assert not phase.texture_combo.isEnabled()
-        assert phase.texture_combo.toolTip() == diagnostic_text(HELD_REASONS["phase_texture"])
+        # PHASE-ANALYSIS-128 lifted the texture hold ("all of them"): the notebook's texture models are offered
+        assert phase.texture_combo.isEnabled()
+        assert diagnostic_text("P3_7_PHASE_TEXTURE_UNAVAILABLE") not in phase.texture_combo.toolTip()
         assert not phase.batch_btn.isEnabled()
         assert phase.batch_btn.toolTip() == diagnostic_text(HELD_REASONS["phase_batch"])
     finally:
@@ -2802,12 +2797,14 @@ def test_p37b_legacy_dialog_defaults_remain_reachable_only_for_canonical_callers
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     from xdart.gui.analysis.scan_plot_dialog import ScanPlotDialog
 
-    dialogs = [ScanPlotDialog(), PeakFitDialog(), PhaseFitDialog()]
+    # PHASE-ANALYSIS-128 retired the Phase Fitter's standalone path: the window needs its host's submit.
+    with pytest.raises(TypeError):
+        PhaseFitDialog()
+    dialogs = [ScanPlotDialog(), PeakFitDialog()]
     try:
         assert all(not getattr(dialog, "_vnext", False) for dialog in dialogs)
         assert dialogs[0].save_btn.isEnabled() is False
         assert dialogs[1].batch_btn.isEnabled()
-        assert dialogs[2].texture_combo.isEnabled()
     finally:
         for dialog in dialogs: dialog.close()
         qapp.processEvents()

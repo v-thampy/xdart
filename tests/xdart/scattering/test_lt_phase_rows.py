@@ -208,7 +208,7 @@ def test_p2_remove_acts_only_on_the_selected_phase_in_the_window(qapp, tmp_path)
     library = PhaseLibrary()
     a, b = (library.add_cif(_cif(tmp_path, name, a)) for name, a in (('phaseA', 4.1), ('phaseB', 4.25)))
     with run_page(qapp, tmp_path / 'int', energies=(16, 16)) as (page, view):
-        view.reference_phases.phase_source.set_selection(((a.id, True), (b.id, True), (LAB6, True)))
+        _window(qapp, view).phase_source.set_selection(((a.id, True), (b.id, True), (LAB6, True)))
         _settle(qapp, view)
         window = _window(qapp, view)  # its first show, with three phases listed
         window.activateWindow()
@@ -270,10 +270,11 @@ def test_p2_remove_acts_only_on_the_selected_phase_in_the_window(qapp, tmp_path)
 
 
 def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    # PHASE-ANALYSIS-128: the window Int's page mounts (the standalone constructor is retired)
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
     paths = tuple(str(_cif(tmp_path, name, a)) for name, a in (('CubicA', 4.0), ('CubicB', 4.5), ('CubicC', 5.0)))
-    dialog = PhaseFitDialog()
-    try:
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         source = dialog.phase_source
         source.add_cif_paths(paths)
         dialog.show()
@@ -300,13 +301,9 @@ def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
         _click(qapp, source.remove_btn)
         assert _ids(source) == [ids[1]] and fitted() == [ids[1]]
         _remove_follows_selection(source)
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
-    fresh = PhaseFitDialog()
-    try:
+    with empty_page(qapp) as other:  # a fresh page: its own, empty reference list
+        fresh = _open(qapp, other)
         fresh.phase_source.add_cif_paths(paths[:2])
         fresh.show()
         qapp.processEvents()
@@ -314,17 +311,13 @@ def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
         _remove_follows_selection(fresh.phase_source)
         _click(qapp, fresh.phase_source.remove_btn)
         assert len(_ids(fresh.phase_source)) == 2
-    finally:
-        fresh.close()
-        fresh.deleteLater()
-        qapp.processEvents()
 
 
 def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_path):
     from xrd_tools.analysis.phase_references import PhaseLibrary
     tin = PhaseLibrary().add_lattice(TIN, a=4.24, space_group=225)
     with run_page(qapp, tmp_path / 'int', energies=(16, 16)) as (page, view):
-        view.reference_phases.phase_source.set_selection(((LAB6, True), (tin.id, True)))
+        _window(qapp, view).phase_source.set_selection(((LAB6, True), (tin.id, True)))
         _settle(qapp, view)
         window = _window(qapp, view)  # its first show, with the reported pair listed
         source, scans = window.phase_source, window.phase_source.browser.scans
@@ -358,19 +351,16 @@ def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_p
 
 
 def test_p3_phase_fitter_rows_fit_with_a_long_name(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = PhaseFitDialog()
-    try:
+    # PHASE-ANALYSIS-128: the window Int's page mounts (the standalone constructor is retired)
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         source = dialog.phase_source
         source.add_lattice(TIN, a=4.24, space_group=225)
         source.add_lattice('Ti2AlN_mp-1234_conventional_standard_' + 'superlattice' * 8, a=3.0, space_group=221)
         dialog.show()
         qapp.processEvents()
         _rows_fit(qapp, source)
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
 
 def test_p3_row_editor_commits_once_and_keeps_its_draft(qapp, tmp_path):

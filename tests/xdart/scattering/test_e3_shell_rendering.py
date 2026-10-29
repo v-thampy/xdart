@@ -733,7 +733,7 @@ def test_e3_ui2_restores_control_inventory_and_ranges(
             "Metadata",
             "Auto Last",
             "Peak Fitting",
-            "Phase Fitting",
+            "Phase Analysis",  # PHASE-ANALYSIS-128 folded Phase Fitting and Reference Phases
             "ROI Statistics",  # Metadata plotting moved into the Metadata popup at 2fa82580.
             "Run",
         } <= {

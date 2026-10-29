@@ -3,6 +3,8 @@
 REFERENCE-PHASES-20261011 successor (declared in its kickoff): calibrant rings now come from calibrant entries in
 the Tools-panel Reference Phases window, through the shared phase worker, instead of Plot Options' Calibrant row.
 Every scientific assertion of the eight original rows is kept; helpers keep their names for D and DP.
+PHASE-ANALYSIS-128 successor (2026-10-29): the window is Phase Analysis, opened through the view's host page
+(Int's Tools command, Stitch's page tool); `phase_window` and `close_phase_window` are the shared helpers.
 """
 from contextlib import contextmanager
 from dataclasses import replace
@@ -74,11 +76,42 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
         page.close(); page.deleteLater(); qapp.processEvents()
 
 
+def _host_window(view):
+    """The Phase Analysis window the view's host has open, or None."""
+    host = view.window()
+    if hasattr(host, "_phase_dialog"):
+        return host._phase_dialog
+    fit_host = getattr(host, "_fit_hosts", {}).get("phase")
+    return None if fit_host is None else fit_host.dialog
+
+
+def phase_window(view):
+    """Phase Analysis through the view's host page: Int's real Tools command or Stitch's page tool."""
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    host = view.window()
+    if hasattr(host, "_phase_dialog"):
+        host._shell.commandRequested.emit(ShellCommand(ShellCommandKind.LAUNCH_TOOL, "phase_analysis"))
+    else:
+        host.tools.page_tool("phase_analysis").click()
+    QtWidgets.QApplication.processEvents()
+    window = _host_window(view)
+    assert window is not None and window.isVisible() and window.windowTitle() == "Phase Analysis"
+    assert view.phase_list is window.phase_binding
+    return window
+
+
+def close_phase_window(view):
+    """Close the host's Phase Analysis window (an Int window deletes itself; Stitch keeps its host)."""
+    window = _host_window(view)
+    if window is not None:
+        window.close()
+    QtWidgets.QApplication.processEvents()
+
+
 def choice(view):
     """The window whose calibrant chooser replaced Plot Options' Calibrant row."""
-    view.show_reference_phases()
-    window = view.reference_phases
-    assert window.isVisible() and window.phase_source.calibrant_row.editor.toolTip()
+    window = phase_window(view)
+    assert window.phase_source.calibrant_row.editor.toolTip()
     return window
 
 

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from pathlib import Path
+
 import numpy as np
 import pyqtgraph as pg
 import pytest
@@ -86,28 +88,31 @@ def test_the_phase_fit_dialog_shows_its_pattern_fit_and_residual_through_the_sha
     ``test_p37_analysis_mount.py``."""
     _app()
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = PhaseFitDialog(analysis_context=None)
+    dialog = PhaseFitDialog(vnext_submit=lambda *_args: None)  # PHASE-ANALYSIS-128: the one displayed path
     try:
         assert isinstance(dialog.fit_view, FitView)
         assert (dialog.plot, dialog.resid_plot) == (dialog.fit_view.plot, dialog.fit_view.residuals)
         assert isinstance(dialog.plot.getPlotItem().vb, RectViewBox)
         x = np.linspace(1.0, 3.0, 5)
-        dialog.set_live_pattern(x, x ** 2, "q (Å⁻¹)")
+        from xrd_tools.analysis.display_fit_operations import (AnalysisDisposition, DisplayedPhaseFitResult,
+                                                               DisplayedTraceInput, DisplayedTraceReceipt)
+        trace = DisplayedTraceInput(x, x ** 2, "q (Å⁻¹)", "q (Å⁻¹)", "q", 1, DisplayedTraceReceipt(
+            "displayed-trace-v1", 1, "run", "1", Path("/fit-view/output.nxs"), "q", 0))
+        dialog.set_vnext_trace(trace)
         shown = dialog.fit_view.projection
         assert [series.role for series in shown.upper.series] == ["data_line"]
         assert (shown.upper.x_label, shown.upper.y_label) == ("q (Å⁻¹)", "Intensity")
         assert shown.lower.zero_line and not shown.lower.series
-        overlay = SimpleNamespace(x=x, traces={"fit": x ** 2 + .5, "residual": x * 0})
-        dialog._draw_outcome(SimpleNamespace(overlay=overlay, result=SimpleNamespace(payload=[]),
-                                             label="current", params={}))
+        dialog.set_vnext_result(DisplayedPhaseFitResult(AnalysisDisposition.COMPLETED, "OK", fit=x ** 2 + .5,
+                                                        residual=x * 0, message="fit"))
         shown = dialog.fit_view.projection
         assert [(series.role, series.name) for series in shown.upper.series] == [
             ("data_line", "data"), ("fit", "fit")]
         assert [series.role for series in shown.lower.series] == ["residual"]
-        assert shown.lower.y_label == "resid"
         assert [item.name() for item in dialog.plot.listDataItems()] == ["data", "fit"]
-        dialog._clear_fit()
-        assert not dialog.resid_plot.listDataItems() and dialog.fit_view.projection.upper == shown.upper
+        dialog.set_vnext_trace(trace)  # a new input clears the fit and keeps the pattern
+        assert not dialog.resid_plot.listDataItems()
+        assert [series.role for series in dialog.fit_view.projection.upper.series] == ["data_line"]
     finally:
         dialog.close()
 

@@ -114,22 +114,27 @@ def test_reconciling_plot_options_reads_no_phase_library_files(qapp, tmp_path, m
     path.write_text(str(CifWriter(Structure(Lattice.cubic(4.1), ["Cs", "Cl"], [[0, 0, 0], [.5, .5, .5]]))))
     cif = library.add_cif(path, name="CsCl")
     lattice = library.add_lattice("cell", a=4.2, space_group="Pm-3m")
-    from xdart.gui.tabs.scattering.reference_phases import ReferencePhasesWindow
+    # PHASE-ANALYSIS-128: the retired window's code is the binding over a mounted source; the view's own
+    # resolver is K9 (tests/core/test_phase_analysis_options.py).
+    from xdart.gui.analysis.phase_source import PhaseSourceWidget
+    from xdart.gui.tabs.scattering.reference_phases import ReferencePhaseBinding
     from xdart.gui.tabs.scattering.shell_values import ScientificPlotOptions
-    dialog = ReferencePhasesWindow()
+    dialog = PhaseSourceWidget(checkable=True, show_library=False, calibrants=True, cutoffs=True,
+                               status_visible=False)
+    binding = ReferencePhaseBinding(dialog)
     try:
         options = replace(ScientificPlotOptions(), phase_references=((cif.id, True), (lattice.id, True)))
-        dialog.reconcile(options)
-        assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
+        binding.reconcile(options)
+        assert tuple(entry.id for entry in dialog.selected_entries()) == (cif.id, lattice.id)
         reads = []
         for name in ("resolve", "entries"):
             actual = getattr(PhaseLibrary, name)
             monkeypatch.setattr(PhaseLibrary, name, lambda self, *args, _actual=actual, _name=name, **kwargs:
                                 (reads.append(_name), _actual(self, *args, **kwargs))[1])
         for _ in range(3):
-            dialog.reconcile(options)
-            dialog.set_available(True)
-            assert tuple(entry.id for entry in dialog.phase_source.selected_entries()) == (cif.id, lattice.id)
+            binding.reconcile(options)
+            binding.set_available(True)
+            assert tuple(entry.id for entry in dialog.selected_entries()) == (cif.id, lattice.id)
         assert reads == [], "a projection reconcile must not read the phase library on the GUI thread"
     finally:
         dialog.close()

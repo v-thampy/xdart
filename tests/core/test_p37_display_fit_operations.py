@@ -774,8 +774,8 @@ def test_peak_phase_batch_and_live_are_absent_from_p37_public_reachability():
         "LiveFrameSource", "NexusRecordWriter", "OutputTransaction",
     ):
         assert forbidden not in source
-    with pytest.raises(TypeError):
-        _phase_plan(_trace(), (), texture="march_dollase")
+    # PHASE-ANALYSIS-128 lifted the texture hold ("all of them"): texture is now a plan field.
+    assert _phase_plan(_trace(), (), texture="march_dollase").texture == "march_dollase"
 
 
 def test_p37_peak_range_finite_manual_auto_suggestion_policy_is_headless_and_versioned(
@@ -1128,7 +1128,7 @@ def test_p37_phase_reads_hashes_and_parses_each_cif_exactly_once_from_one_buffer
         _phase_plan(
             _trace(), cifs, prefit_background=_StringAlias("none"),
         ),
-        _phase_plan(_trace(), cifs, phase_profile="pearson7"),
+        _phase_plan(_trace(), cifs, phase_profile="pearson9"),  # PHASE-ANALYSIS-128: pearson7 is now one of the 11
         _phase_plan(
             _trace(), cifs, phase_profile=_StringAlias("gaussian"),
         ),

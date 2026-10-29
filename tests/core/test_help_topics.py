@@ -7,6 +7,9 @@ import pytest
 IDS = (
     "calibration.multi-step", "calibration.frame-choice", "geometry.orientation",
     "calibration.diagnostics", "corrections.existing", "analysis.plot-roi",
+    # PHASE-ANALYSIS-128 (2026-10-29): one topic per section of the Phase Analysis window, appended.
+    "phase-analysis.phases", "phase-analysis.peak-shape", "phase-analysis.background",
+    "phase-analysis.constraints", "phase-analysis.batch",
 )
 CODES = (
     "ROI_RAW_UNAVAILABLE", "ROI_RAW_SHAPE_INVALID", "ROI_PREVIEW_LIMIT_EXCEEDED",
@@ -16,6 +19,7 @@ CODES = (
 
 
 def test_six_immutable_topics_cover_the_frozen_scientific_questions():
+    """The six frozen topics, then PHASE-ANALYSIS-128's five, each in the same ten-heading shape."""
     from xrd_tools.help_topics import TOPICS, get_topic
     from dataclasses import FrozenInstanceError
     assert tuple(t.identifier for t in TOPICS) == IDS
@@ -26,6 +30,11 @@ def test_six_immutable_topics_cover_the_frozen_scientific_questions():
         ("RMS", "Å", "condition", "correlation", "residual"),
         ("dark", "flat", "solid angle", "polarization", "parallax", "normalization"),
         ("mean", "sum", "max", "min", "std", "subtract", "divide", "stale", "Log"),
+        ("include", "calibrant", "library", "minimum", "legend", "colour", "fitted"),
+        ("profile", "Caglioti", "Scherrer", "March", "free", "σ"),
+        ("SNIP", "Chebyshev", "substrate", "template", "amorphous", "flat"),
+        ("lattice", "q-shift", "cross-phase", "fit range", "iterations", "uncertainties"),
+        ("Batch", "Sequential", "seed", "trend", "settings", "notebook"),
     )
     for topic, words in zip(TOPICS, concepts, strict=True):
         assert get_topic(topic.identifier) is topic

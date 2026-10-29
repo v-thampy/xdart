@@ -29,24 +29,27 @@ def isolated_library(tmp_path, monkeypatch):
 
 
 def test_sr1_the_rings_notice_is_the_shared_sources_note_line(qapp):
-    from xdart.gui.tabs.scattering.reference_phases import RINGS_TOOLTIP, ReferencePhasesWindow
-    window = ReferencePhasesWindow()
+    """PHASE-ANALYSIS-128: the binding (the retired window's code) shows the view's rings notice on its source's note
+    line and builds no display of its own."""
+    from xdart.gui.analysis.phase_source import PhaseSourceWidget
+    from xdart.gui.tabs.scattering.reference_phases import RINGS_TOOLTIP, ReferencePhaseBinding
+    source = PhaseSourceWidget(checkable=True, show_library=False, calibrants=True, cutoffs=True,
+                               status_visible=False)
+    binding = ReferencePhaseBinding(source)
     try:
-        source = window.phase_source
-        own = [label for label in window.findChildren(QtWidgets.QLabel) if not source.isAncestorOf(label)]
-        assert not own, 'the window builds no display of its own: ' + repr([label.objectName() for label in own])
-        assert window.rings_note is source.note
-        window.show()
+        assert not binding.findChildren(QtWidgets.QWidget), 'the binding builds no display of its own'
+        assert binding.rings_note is source.note
+        source.show()
         qapp.processEvents()
         assert source.note.isHidden() and source.note.toolTip() == RINGS_TOOLTIP
-        window.set_rings_reason('Rings need a Run frame.')
-        assert source.note.isVisibleTo(window) and source.note.text() == 'Rings need a Run frame.'
+        binding.set_rings_reason('Rings need a Run frame.')
+        assert source.note.isVisibleTo(source) and source.note.text() == 'Rings need a Run frame.'
         assert source.note.toolTip() == RINGS_TOOLTIP + ' Rings need a Run frame.'
-        window.set_rings_reason('')
+        binding.set_rings_reason('')
         assert source.note.isHidden() and not source.note.text()
     finally:
-        window.close()
-        window.deleteLater()
+        source.close()
+        source.deleteLater()
         qapp.processEvents()
 
 
@@ -58,7 +61,7 @@ def test_sr2_closing_the_page_closes_its_reference_phases_window(qapp, tmp_path)
         _settle(qapp, view)
         assert page.close_workspace().cleanup_status is CleanupStatus.CLEANED
         qapp.processEvents()
-        assert not window.isVisible(), 'the window does not outlive its page'
+        assert page._phase_dialog is None and view.phase_list is None, 'the window does not outlive its page'
 
 
 def test_sr2_stitch_shutdown_closes_its_reference_phases_window(qapp, tmp_path):
@@ -69,7 +72,7 @@ def test_sr2_stitch_shutdown_closes_its_reference_phases_window(qapp, tmp_path):
         _settle(qapp, view)
         assert page.shutdown().status is PageCleanup.CLEAN
         qapp.processEvents()
-        assert not window.isVisible(), 'the window does not outlive its Stitch page'
+        assert not window.isVisible() and view.phase_list is None, 'the window does not outlive its Stitch page'
 
 
 def test_sr3_a_cif_minimum_edit_leaves_calibrant_and_lattice_families_identical(qapp, tmp_path):

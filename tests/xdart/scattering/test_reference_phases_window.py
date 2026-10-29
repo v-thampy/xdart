@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
-from tests.xdart.scattering.test_predicted_ring_overlays import run_page, select
+from tests.xdart.scattering.test_predicted_ring_overlays import phase_window, run_page, select
 from tests.xdart.scattering.test_phase_reference_overlays import _cif, _navigation, _settle, _stitch
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
@@ -38,10 +38,9 @@ def isolated_library(tmp_path, monkeypatch):
 
 
 def _window(qapp, view):
-    view.show_reference_phases()
+    """PHASE-ANALYSIS-128: the Phase Analysis window, opened through the view's host page."""
+    window = phase_window(view)
     qapp.processEvents()
-    window = view.reference_phases
-    assert window.isVisible() and window.windowTitle() == 'Reference Phases'
     return window
 
 
@@ -107,32 +106,38 @@ def _ids(source):
 def test_rw1_tools_buttons_open_the_view_owned_window_and_plot_options_lose_phase_rows(qapp, tmp_path):
     with run_page(qapp, tmp_path / 'int') as (page, view):
         shell = page.findChild(ScatteringWorkspaceShell)
-        button = shell.tools.page_tool('reference_phases')
-        assert 'Reference Phases' in button.text() and button.toolTip()
+        button = shell.tools.page_tool('phase_analysis')
+        assert 'Phase Analysis' in button.text() and button.toolTip()
+        for retired in ('reference_phases', 'phase_fitting'):
+            with pytest.raises(KeyError):
+                shell.tools.page_tool(retired)
         button.click()
         qapp.processEvents()
-        window = view.reference_phases
-        assert window.isVisible() and window.windowTitle() == 'Reference Phases' and window.toolTip()
-        assert window.parent() is view
-        assert window.close_button.toolTip()
+        window = page._phase_dialog
+        assert window.isVisible() and window.windowTitle() == 'Phase Analysis' and window.toolTip()
+        assert window.parent() is page and view.phase_list is window.phase_binding
         dialog = view.plot_options_dialog
         assert not [label for label in dialog.findChildren(QtWidgets.QLabel) if label.text() == 'Calibrant']
         assert not [group for group in dialog.findChildren(QtWidgets.QGroupBox) if group.title() == 'Reference phases']
         assert not hasattr(dialog, 'phase_source') and not hasattr(dialog, 'phase_floor')
-        window.close_button.click()
+        window.close()
         qapp.processEvents()
-        assert not window.isVisible()
+        assert page._phase_dialog is None and view.phase_list is None
     with _stitch(qapp, tmp_path / 'stitch') as (page, view, _payload):
-        button = page.tools.page_tool('reference_phases')
-        assert 'Reference Phases' in button.text() and button.toolTip()
+        button = page.tools.page_tool('phase_analysis')
+        assert 'Phase Analysis' in button.text() and button.toolTip()
+        for retired in ('reference_phases', 'phase_fit'):
+            with pytest.raises(KeyError):
+                page.tools.page_tool(retired)
         button.click()
         qapp.processEvents()
-        assert view.reference_phases.isVisible()
+        assert page._fit_hosts['phase'].dialog.isVisible()
     from tests.xdart.pages.test_rsm_page import _close, _page
     rsm = _page(qapp)
     try:
-        with pytest.raises(KeyError):
-            rsm.tools.page_tool('reference_phases')
+        for name in ('reference_phases', 'phase_analysis'):
+            with pytest.raises(KeyError):
+                rsm.tools.page_tool(name)
     finally:
         _close(rsm, qapp)
 
@@ -413,8 +418,11 @@ _HEADLESS_WINDOW = textwrap.dedent("""
     shell = ScatteringWorkspaceShell(); state = make_shell_projection()
     shell.show(); shell.apply_state(state); app.processEvents()
     view = shell.scientific
-    view.show_reference_phases(); app.processEvents()
-    source = view.reference_phases.phase_source
+    # PHASE-ANALYSIS-128: a bare shell has no page, so the window is built as a host builds it.
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    dialog = PhaseFitDialog(parent=shell, vnext_submit=lambda action, values: None)
+    view.attach_phase_list(dialog.phase_binding); dialog.show(); app.processEvents()
+    source = dialog.phase_source
     report = {"cif": [source.add_cif_btn.isEnabled(), source.add_cif_btn.toolTip()],
               "lattice": [source.add_lattice_btn.isEnabled(), source.add_lattice_btn.toolTip()],
               "calibrant": [source.calibrant_row.editor.isEnabled(), source.calibrant_row.editor.toolTip()]}
@@ -459,8 +467,9 @@ def test_rw8_phase_fitter_rows_switch_real_fit_and_stitch_batch(qapp, tmp_path):
                                                          _fit_inputs)
     from tests.xdart.pages.test_stitch_fit_host import _finish
     paths, trace = _fit_inputs(tmp_path)
-    dialog = PhaseFitDialog()
-    try:
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
+    with empty_page(qapp) as int_page:
+        dialog = _open(qapp, int_page)
         source = dialog.phase_source
         advanced = [row.label.text() for row in dialog.advanced.findChildren(QtWidgets.QWidget)
                     if row.objectName() == 'controlsFormRow']
@@ -485,12 +494,8 @@ def test_rw8_phase_fitter_rows_switch_real_fit_and_stitch_batch(qapp, tmp_path):
         source.global_switch.editor.click()
         qapp.processEvents()
         assert dialog.vnext_fit_values() == baseline, 'switch on: the settings are exactly as before'
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
     with _stitch(qapp, tmp_path / 'stitch') as (page, view, _payload):
-        page.tools.page_tool('phase_fit').click()
+        page.tools.page_tool('phase_analysis').click()
         qapp.processEvents()
         host = page._fit_hosts['phase']
         _finish(host, qapp)  # the host's opening reload, as test_stitch_fit_host waits (Batch while busy cancels)
