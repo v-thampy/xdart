@@ -397,6 +397,227 @@ xrd_tools/core/roi.py — valid support and reducer behavior.
 xrd_tools/analysis/plans.py — raw scan reduction and background handling.
 xrd_tools/analysis/scan_operations.py — identity, normalization and admission.
 """),
+    HelpTopic("phase-analysis.phases", "Phase Analysis: the phase list", """Purpose
+One list of phases serves both the reference overlays on the plots and the fit. A
+checked (include) phase is drawn as a reference and is fitted; an unchecked one is
+neither. Built-in calibrants are reference lines only: they are drawn but never fitted.
+
+Required inputs
+CIF files, lattice parameters (cell lengths, angles and space group), a built-in
+calibrant, or an entry already kept in the phase library. Fitting also needs one
+displayed radial trace in q (Int) or Q/2θ with a recorded wavelength (Stitch).
+
+Steps
+1. Add CIF… parses the files on a worker and keeps their bytes in the phase library.
+2. Add lattice… predicts positions only; Add calibrant… and Add from library… list
+   built-in calibrants and kept entries. Remove takes only the selected row.
+3. Check a row to include it: it is drawn and, unless it is a calibrant, fitted.
+4. Same minimum for all phases applies one minimum intensity to every CIF phase; turn
+   it off to give each CIF row its own minimum.
+
+Units and conventions
+Minimum intensity is a percent of a phase's strongest reachable reflection. Each phase
+keeps the colour slot it joined with, and its legend entry; clicking a legend entry
+flips the include check. The top-bar Phases toggle hides the overlays only.
+
+Assumptions
+At most eight phases. Lattice and calibrant phases carry no structural intensities, so
+no minimum applies to them and their positions are all listed.
+
+Expected observations
+The list is saved with the session's plot options; closing and reopening the window
+lists the same rows. After a fit, a CIF row's tooltip shows the receipt of the bytes
+that were fitted.
+
+Diagnostics
+The rings notice under the list says why detector rings are unavailable. A missing
+library entry is named in the status line. A list holding only calibrants refuses Fit.
+
+Common mistakes and corrective actions
+An unchecked phase is not fitted: check it. A calibrant is never fitted: to fit an
+internal standard, add its CIF. A legend click also changes what the next Fit uses.
+
+Worked example
+List LaB6 (calibrant), HfO2 (CIF) and a TiN lattice; uncheck TiN. Fit uses HfO2 only,
+LaB6 stays a reference line, and TiN is neither drawn nor fitted.
+
+References
+xdart/gui/analysis/phase_source.py — the shared phase list.
+xrd_tools/analysis/phase_references.py — the phase library and calibrant entries.
+"""),
+    HelpTopic("phase-analysis.peak-shape", "Phase Analysis: peak shape", """Purpose
+Choose the profile every reflection is fitted with, how its width varies with q, and
+how relative intensities within a phase may depart from the structure (texture).
+
+Required inputs
+At least one included CIF or lattice phase and a displayed radial trace.
+
+Steps
+1. Profile: pseudo-Voigt, Gaussian, Lorentzian, Voigt, Lorentzian², Pearson VII,
+   Pearson IV, split Lorentzian, Moffat, Student's t or skewed Gaussian.
+2. Width model: Caglioti U, V, W (σ² = U·q² + V·q + W), Scherrer size and strain
+   (crystallite size D and microstrain ε), or one fixed width per phase.
+3. Texture: None, March-Dollase (one ratio r along the axis h₀ k₀ l₀ in Advanced), or
+   free per-peak heights within the free-height range in Advanced.
+4. σ min and σ max in Advanced bound the width; blank uses automatic limits.
+
+Units and conventions
+q in Å⁻¹; σ in Å⁻¹; D in Å; ε dimensionless. Extra shape parameters (fraction,
+exponent, skew) are fitted for the profiles that have them.
+
+Assumptions
+Texture applies to CIF phases. A lattice phase always fits free heights, because it
+has no structural intensities.
+
+Expected observations
+The table lists each phase's lattice and fraction; Scherrer adds D and ε, Caglioti U,
+V and W. A March-Dollase r near 1 means little preferred orientation.
+
+Diagnostics
+FIT_PARAMETER_LIMIT_EXCEEDED: free heights over many reflections can exceed the
+512-parameter limit; raise the minimum intensity or narrow the fit range.
+
+Common mistakes and corrective actions
+Free texture with fractions: free heights trade off with the phase scale, so fractions
+become less reliable. Prefer March-Dollase when one orientation dominates.
+
+Worked example
+A thin film with (111) preferred orientation: Texture March-Dollase, axis 1 1 1. If r
+fits near 0.7, intensities along (111) are enhanced.
+
+References
+xrd_tools/analysis/fitting/phase_fitting.py — profiles, width models and texture.
+"""),
+    HelpTopic("phase-analysis.background", "Phase Analysis: background", """Purpose
+Model what is not crystalline: a baseline removed before the fit, a background fitted
+with the phases, a measured substrate template, and an amorphous peak.
+
+Required inputs
+A displayed radial trace. A substrate template also needs the bare substrate's pattern,
+processed with the same calibration and displayed (for example an Average result).
+
+Steps
+1. Pre-fit background: None, SNIP (width in points in Advanced; blank is 5 % of the
+   trace) or Chebyshev; it is subtracted before the fit and has no free parameters.
+2. Fitted background: Linear, Polynomial, Chebyshev or Spline of the chosen degree
+   (Spline uses at least four knots), refined with the phases.
+3. Substrate: show the substrate's pattern, click Use displayed as substrate, then
+   choose Substrate (one free amplitude) or Substrate plus linear, polynomial or
+   Chebyshev. Clear substrate forgets it.
+4. Amorphous peak: Gaussian, pseudo-Voigt, Lorentzian, Voigt or Lorentzian², with a
+   starting centre and σ.
+
+Units and conventions
+The substrate template is captured in q (Å⁻¹) through the same input path as the fit;
+centre and σ are in Å⁻¹. Outside the template's q range its value is held flat.
+
+Assumptions
+The substrate pattern scales as a whole; its shape does not change between samples.
+
+Expected observations
+The fitted background and the amorphous peak are drawn as their own curves. A template
+amplitude near the substrate's share of the scattering is expected.
+
+Diagnostics
+A substrate choice without a captured template refuses Fit by name. A template must be
+in Å⁻¹ with at least two distinct finite points.
+
+Common mistakes and corrective actions
+An amorphous peak can absorb broad crystalline intensity: start its centre on the
+hump and keep σ broad. Do not combine SNIP with a fitted background of high degree.
+
+Worked example
+Fused silica under a thin film: an amorphous Gaussian near 1.55 Å⁻¹ with σ 0.3 Å⁻¹, or
+the bare substrate captured as a template with one free amplitude.
+
+References
+xrd_tools/analysis/fitting/phase_fitting.py — template, fitted background, amorphous.
+xrd_tools/analysis/fitting/background.py — SNIP and Chebyshev baselines.
+"""),
+    HelpTopic("phase-analysis.constraints", "Phase Analysis: constraints and solver", """Purpose
+Bound how far the fit may move each lattice and the whole pattern, keep lattice axes in
+order, choose the fitted q interval and set the solver's budget and weighting.
+
+Required inputs
+Included CIF or lattice phases with starting cells.
+
+Steps
+1. Lattice ±%: each cell length may move within this percent of its start.
+2. q-shift bound: one global shift of every reflection, within ± this value.
+3. Cross-phase lock keeps the same axis letter ordered across phases.
+4. Fit range: drag the range on the plot or type it; only these points enter the
+   solve, while the whole trace is drawn.
+5. In Advanced, Max iterations caps solver evaluations (blank is automatic) and Use
+   uncertainties weights points by their measured σ.
+
+Units and conventions
+The q-shift bound is in Å⁻¹ and must be positive. The fit range is in the displayed
+axis; a 2θ range is converted with the recorded wavelength.
+
+Assumptions
+Cell angles are not refined; symmetry-equal axes stay tied.
+
+Expected observations
+A refined lattice parameter well inside its bound. A q-shift pinned at its bound means
+the bound is too tight or the calibration is off.
+
+Diagnostics
+INSUFFICIENT_FIT_POINTS: fewer than ten finite points inside the fit range.
+
+Common mistakes and corrective actions
+A tight lattice tolerance stops a strained film from fitting: widen it. Use
+uncertainties only when the trace carries measured uncertainties.
+
+Worked example
+Lattice ±2 %, q-shift bound 0.02 Å⁻¹, fit range 1.0 to 5.8 Å⁻¹, 4000 iterations, as
+in the HZO batch fitting notebook.
+
+References
+xrd_tools/analysis/fitting/phase_fitting.py — bounds, ordering and q-shift.
+xrd_tools/analysis/display_fit_operations.py — the displayed fit's validation.
+"""),
+    HelpTopic("phase-analysis.batch", "Phase Analysis: batch, settings and export", """Purpose
+Fit many results with the same settings, seed each fit from the previous one, save and
+reload the window's settings, and export a notebook that repeats the fit.
+
+Required inputs
+Stitch results for Batch (Int's Batch is not available here), and a writable folder
+for saved settings.
+
+Steps
+1. Batch fits the selected results, or all listed results, and plots the trend.
+2. Sequential seeds each fit from the previous fit's values; a fit whose reflections
+   differ starts fresh, and a refused fit leaves the seed as it was.
+3. The Trend column plots a scan column instead of the result order.
+4. Save settings… writes every option and the phase list; Load settings… restores
+   them. The substrate template and seeds are not saved.
+
+Units and conventions
+Saved settings are a versioned JSON document. The trend's x is the result order or
+the chosen scan column.
+
+Assumptions
+Neighbouring results are similar when Sequential is on.
+
+Expected observations
+With Sequential on, each fit starts near its neighbour's answer and converges faster.
+
+Diagnostics
+A foreign or newer settings file is refused and nothing changes; missing phases are
+named. PHASE_TEMPLATE_NOTEBOOK_UNAVAILABLE: export a notebook without a substrate.
+
+Common mistakes and corrective actions
+Sequential across a phase change carries the old values: turn it off there. After
+Load settings, capture the substrate again before fitting with it.
+
+Worked example
+A composition series: fit the first result, check it, then Batch with Sequential on;
+save the settings to repeat the series later or in a notebook.
+
+References
+xdart/gui/analysis/snapshot_fit_host.py — Batch and the trend.
+xrd_tools/notebooks/recipe.py — exported fit recipes.
+"""),
 )
 
 

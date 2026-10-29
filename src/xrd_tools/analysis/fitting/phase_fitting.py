@@ -1411,6 +1411,12 @@ class PhaseFitter:
         self.composite = None
         self._phase_models = []
 
+    def reflection_hkls(self) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+        """Each registered phase's admitted reflections in their parameter order (the j-th is ``p{i}_pk{j}``): the
+        listing a Sequential seed must match (PHASE-ANALYSIS-128)."""
+        return tuple(tuple(tuple(int(round(float(value))) for value in row) for row in hkl)
+                     for hkl in self._hkl_arrays)
+
     # ------------------------------------------------------------------
     # Composite / parameter construction
     # ------------------------------------------------------------------

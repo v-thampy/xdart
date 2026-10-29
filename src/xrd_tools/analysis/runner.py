@@ -547,8 +547,11 @@ def _displayed_outcome(label: str, plan: Any, result: Any, params: "dict[str, fl
     from xrd_tools.analysis.scan_operations import AnalysisDisposition
     if result.disposition is not AnalysisDisposition.COMPLETED:
         return AnalysisOutcome(label, False, result=result, message="; ".join((result.code, *result.diagnostics)))
-    overlay = Overlay(np.array(displayed_fit_axis(plan), copy=True),
-                      {"fit": result.fit, "background": result.background, "residual": result.residual},
+    traces = {"fit": result.fit, "background": result.background, "residual": result.residual}
+    for name in ("fit_background", "amorphous"):  # PHASE-ANALYSIS-128: a phase fit's own components, when present
+        if getattr(result, name, None) is not None:
+            traces[name] = getattr(result, name)
+    overlay = Overlay(np.array(displayed_fit_axis(plan), copy=True), traces,
                       [float(value) for value in result.marker_positions])
     values = dict(zip(result.parameter_names, result.parameter_values))
     errors = dict(zip(result.parameter_names, result.parameter_stderr))
@@ -606,20 +609,32 @@ class DisplayedPhaseFitAnalyzer:
     """``run_displayed_phase_fit`` as a frame-unit analyzer, with ``settings`` (``DisplayedPhaseFitPlan``'s fields but
     its trace and wavelength). A snapshot is fitted at its own recorded wavelength (None is refused by name, never
     replaced by a default); an :class:`AnalysisInput` at ``wavelength_angstrom``, the caller's. Its params are each
-    phase's ``frac_<phase>`` and ``<phase>_<a|b|c|alpha|beta|gamma>``."""
+    phase's ``frac_<phase>`` and ``<phase>_<a|b|c|alpha|beta|gamma>``. ``sequential`` (PHASE-ANALYSIS-128, the
+    notebook's ``fit_sequence(sequential=True)``) seeds each input from the last completed fit of this analyzer, so
+    one analyzer serves one batch; a refused or cancelled input leaves the seed as it was."""
 
     settings: "dict[str, Any]" = field(default_factory=dict)
     wavelength_angstrom: "float | None" = None
     cancel_token: Any = None
     kind: str = "phase_fit"
     unit: str = "frame"
+    sequential: bool = False
+    _seed: "tuple" = field(default=(), init=False, repr=False)
+    _topology: "tuple" = field(default=(), init=False, repr=False)
 
     def analyze(self, inp: Any) -> AnalysisOutcome:
         from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan, run_displayed_phase_fit
+        from xrd_tools.analysis.scan_operations import AnalysisDisposition
         label, trace, snapshot = _displayed_input(inp)
         wavelength = self.wavelength_angstrom if snapshot is None else snapshot.wavelength_angstrom
-        plan = DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength, **dict(self.settings))
+        settings = dict(self.settings)
+        if self.sequential and self._seed:
+            settings.update(initial_values=self._seed, initial_topology=self._topology)
+        plan = DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength, **settings)
         result = run_displayed_phase_fit(plan, cancel_token=self.cancel_token)
+        if self.sequential and result.disposition is AnalysisDisposition.COMPLETED:
+            self._seed = tuple(zip(result.parameter_names, result.parameter_values))
+            self._topology = result.seed_topology
         params = {f"frac_{name}": float(value) for name, value in result.phase_fractions}
         for name, cell in result.lattice_parameters:
             params.update((f"{name}_{key}", float(value)) for key, value in cell)

@@ -201,6 +201,33 @@ class PhaseLibrary:
         return tuple(rows)
 
 
+class PhaseSelectionResolver:
+    """A reference list resolved to its entries, for a view that draws them (PHASE-ANALYSIS-128).
+
+    Each id is read once through ``PhaseLibrary.resolve`` (a calibrant id needs no file) and kept, so listing ids
+    already resolved reads nothing; ids that leave the list are forgotten. ``refresh`` forgets every lookup, so the
+    next listing reads each id again, a previously missing one included (an explicit open, library edit or add)."""
+
+    def __init__(self, library: "PhaseLibrary | None" = None):
+        self.library = PhaseLibrary() if library is None else library
+        self._lookups: dict[str, PhaseLibraryLookup] = {}
+
+    def listed(self, selection) -> tuple[tuple[PhaseEntry, bool], ...]:
+        """The selection's resolved entries with their visibility, in list order; a missing entry is left out."""
+        listed = {identifier for identifier, _shown in selection}
+        for identifier in tuple(self._lookups):
+            if identifier not in listed:
+                del self._lookups[identifier]
+        for identifier, _shown in selection:
+            if identifier not in self._lookups:
+                self._lookups[identifier] = self.library.resolve(identifier)
+        return tuple((self._lookups[identifier].entry, bool(shown)) for identifier, shown in selection
+                     if self._lookups[identifier].entry is not None)
+
+    def refresh(self) -> None:
+        self._lookups.clear()
+
+
 def calibrant_entry(name: str) -> PhaseEntry:
     """A built-in calibrant (pyFAI's, as Calibrate offers them): positions only, with no library file."""
     from xrd_tools.integrate.calibration import CALIBRANT_NAMES
