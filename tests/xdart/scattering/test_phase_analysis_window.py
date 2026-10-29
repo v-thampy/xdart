@@ -137,7 +137,8 @@ def test_w1_int_tools_show_one_phase_analysis_launcher_that_opens_the_bounded_wi
         dialog = _open(qapp, page)
         assert dialog.windowTitle() == "Phase Analysis" and dialog.toolTip()
         available = dialog.screen().availableGeometry()
-        assert dialog.width() == min(1000, int(.95 * available.width()))
+        # the maintainer after the mockup (2026-10-29): "the window can be wider. 1400x1200 is also fine"
+        assert dialog.width() == min(1400, int(.95 * available.width()))
         assert dialog.height() == min(1200, int(.95 * available.height()))
         view = page._shell.scientific
         assert view.phase_list is dialog.phase_binding
