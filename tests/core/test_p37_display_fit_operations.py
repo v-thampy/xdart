@@ -271,6 +271,9 @@ class _PhaseFitter:
         assert params is not None
         return self.intensity + 0.1
 
+    def reflection_hkls(self):  # PHASE-ANALYSIS-128: the kernel's listing accessor (the seed topology)
+        return tuple(() for _phase in self.phases)
+
     def eval_phase(self, index, params):
         assert params is not None
         return np.full_like(self.intensity, 1.0 / max(len(self.phases), 1))

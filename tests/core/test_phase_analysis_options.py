@@ -435,7 +435,7 @@ def _batch(entry, extents, *, sequential):
 
 def test_k7_sequential_seeds_each_fit_from_the_previous_and_a_changed_listing_drops_the_seed(library, tmp_path):
     entry = _cscl(library, tmp_path)
-    same, wider = (1., 6.), (1.5, 6.)
+    same, wider = (1., 6.), (1.6, 6.)  # 1.6 Å⁻¹ drops CsCl's (100) at 1.53 Å⁻¹: a changed listing
     plain = _batch(entry, (same, same), sequential=False)
     assert all(_completed(outcome) for outcome in plain)
     assert plain[1].result.parameter_values == plain[0].result.parameter_values  # identical input and start
@@ -508,15 +508,22 @@ def _recipe(tmp_path, entry, settings, *, batch=1):
     from xrd_tools.analysis.fit_snapshot import FitAxis, FitInputKey, FitInputSnapshot
     from xrd_tools.notebooks import FitNotebookRecipe, capture_snapshot
     q = np.linspace(1., 6., 301)
-    native = FitInputSnapshot(FitInputKey("phase analysis 128", "derived", "receipt", 4,
-                                          selection=(("meaning", "radial"),)),
-                              (FitAxis("q", "q_A^-1", q),), _synthetic(entry, q, q_shift=.006),
-                              wavelength_angstrom=WL)
+    def snapshot(index):  # each batch input its own key: a compact batch keys outcomes by label
+        return FitInputSnapshot(FitInputKey(f"phase analysis 128 #{index}", "derived", "receipt", 4,
+                                            selection=(("meaning", "radial"),)),
+                                (FitAxis("q", "q_A^-1", q),), _synthetic(entry, q, q_shift=.006),
+                                wavelength_angstrom=WL)
+    native = snapshot(0)
     captured = capture_snapshot(native, "phase.npz")
     (tmp_path / "phase.npz").write_bytes(captured.content)
+    references = [captured.reference]
+    for index in range(1, batch):
+        more = capture_snapshot(snapshot(index), f"phase{index}.npz")
+        (tmp_path / f"phase{index}.npz").write_bytes(more.content)
+        references.append(more.reference)
     plain = {"cif_paths": (f"{entry.name}.cif",), "expected_hashes": (None,), "phase_names": (entry.name,),
              **settings}
-    recipe = FitNotebookRecipe("phase", captured.reference, settings=plain, batch=(captured.reference,) * batch)
+    recipe = FitNotebookRecipe("phase", captured.reference, settings=plain, batch=tuple(references))
     return recipe, native, {**plain, "cif_paths": (tmp_path / f"{entry.name}.cif",)}
 
 
@@ -554,7 +561,8 @@ def test_k8_a_sequential_recipe_batch_reuses_one_analyzer(library, tmp_path):
                                                                   "sequential": True}, batch=2)
     fresh = run_recipe_batch(plain, bundle_root=tmp_path)
     chained = run_recipe_batch(seeded, bundle_root=tmp_path)
-    assert all(_completed(outcome) for outcome in (*fresh, *chained))
+    assert len(fresh) == len(chained) == 2
+    assert all(outcome.params for outcome in (*fresh, *chained))  # a compact batch keeps result on the last only
     assert fresh[0].params == fresh[1].params
     assert chained[0].params == fresh[0].params and chained[1].params != chained[0].params
 
