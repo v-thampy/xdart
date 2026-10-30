@@ -9,7 +9,7 @@ delivers a press a disabled child does not take. Setup (adding phases, the share
 owners' own paths.
 """
 import pytest
-from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 from tests.xdart.scattering.test_help_residuals_gui import _phases_button
 from tests.xdart.scattering.test_phase_reference_overlays import _cif, _settle
@@ -54,6 +54,17 @@ def _label_point(scans, item):
 def _click(qapp, widget, point=None):
     QtTest.QTest.mouseClick(widget, LEFT, NONE, point if point is not None else widget.rect().center())
     qapp.processEvents()
+
+
+def _focus_name(widget):
+    return None if widget is None else f'{type(widget).__name__}:{widget.objectName() or "-"}'
+
+
+def _focus_state(qapp, window, editor, line):
+    """Where the keyboard focus is, for a failure message (CI-REDS diagnosis, 2026-10-29)."""
+    return dict(platform=QtGui.QGuiApplication.platformName(), focus=_focus_name(qapp.focusWidget()),
+                active=_focus_name(qapp.activeWindow()), window_active=window.isActiveWindow(),
+                editor_focus=editor.hasFocus(), line_focus=line.hasFocus(), text=line.text(), value=editor.value())
 
 
 def _selected(source):
@@ -394,9 +405,27 @@ def test_p3_row_editor_commits_once_and_keeps_its_draft(qapp, tmp_path):
         assert len(_of(commands, 'phase_floors')) == 1 and floor() == 2., 'Return commits once'
         commands.clear()
         edit('3')
-        QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Tab)
-        _settle(qapp, view)
-        assert len(_of(commands, 'phase_floors')) == 1 and floor() == 3., 'leaving the box commits once'
+        # CI-REDS diagnosis (2026-10-29): on Linux CI this Tab sent no commit (run 40996196112); record where the
+        # focus went, so a recurrence names its cause in the failure message.
+        moves = []
+
+        def record(old, new):
+            moves.append((_focus_name(old), _focus_name(new)))
+
+        def changed(value):  # the box's own commit, before BrowserView's same-value guard
+            moves.append(('valueChanged', value))
+        qapp.focusChanged.connect(record)
+        editor.valueChanged.connect(changed)
+        try:
+            before = _focus_state(qapp, window, editor, line)
+            QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Tab)
+            _settle(qapp, view)
+            after = _focus_state(qapp, window, editor, line)
+        finally:
+            qapp.focusChanged.disconnect(record)
+            editor.valueChanged.disconnect(changed)
+        assert len(_of(commands, 'phase_floors')) == 1 and floor() == 3., (
+            f'leaving the box commits once; before={before} after={after} moves={moves} commands={len(commands)}')
         commands.clear()
         _click(qapp, line)
         QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Up)
