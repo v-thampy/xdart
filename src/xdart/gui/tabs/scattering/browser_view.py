@@ -16,6 +16,7 @@ from .browser_catalog import BrowserCatalogEntry
 from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
+    ALL_FRAMES_PLOT_MODES,
     BrowserProjection,
     FrameSelectionIntent,
     FrameNavigationProjection,
@@ -32,6 +33,11 @@ _ACCUMULATING_PLOT_MODES = frozenset(
     {"Overlay", "Waterfall", "Sum", "Average"}
 )
 _VISIT_ACCUMULATING_PLOT_MODES = frozenset({"Overlay", "Waterfall"})
+_ALL_FRAMES_TIP = (
+    "All frames: when on, each result you open in Overlay or Waterfall shows every one of its frames. Earlier "
+    "results' curves stay, as always, until Clear. Step through results with the Up and Down arrow keys in the list. "
+    "Leaving a frame out (Ctrl-click or Shift-click) turns it off. Greyed out in Single, Average and Sum. "
+    "Remembered between sessions.")
 _FRAME_SELECTION_SETTLE_MS = 100
 _FRAME_NAVIGATION_KEYS = frozenset(
     {
@@ -650,11 +656,14 @@ class BrowserView(QtWidgets.QFrame):
 
         actions = QtWidgets.QHBoxLayout()
         self._actions_layout = actions
-        self.show_all = QtWidgets.QPushButton("Show All")
+        # The "Show All" action, now the persistent All frames toggle (ALL-FRAMES-128; the profile key stays)
+        self.show_all = QtWidgets.QPushButton("All frames")
         self.metadata = QtWidgets.QPushButton("Metadata")
         self.auto_last = QtWidgets.QPushButton("Auto Last")
         for button in (self.show_all, self.metadata, self.auto_last):
             button.setObjectName("e3BrowserCompactButton")
+        self.show_all.setCheckable(True)
+        self.show_all.setToolTip(_ALL_FRAMES_TIP)
         self.auto_last.setCheckable(True)
         self._action_buttons = {"Show All": self.show_all, "Metadata": self.metadata,
                                 "Auto Last": self.auto_last}
@@ -720,8 +729,10 @@ class BrowserView(QtWidgets.QFrame):
                     None if current is None else current.data(_USER_ROLE),
                 )
             )
-        self.show_all.clicked.connect(
-            lambda: self._emit(ShellCommandKind.SHOW_ALL)
+        self.show_all.toggled.connect(
+            lambda checked: self._emit(
+                ShellCommandKind.SET_ALL_FRAMES, bool(checked)
+            )
         )
         self.metadata.clicked.connect(
             lambda: self._emit(ShellCommandKind.SHOW_METADATA)
@@ -1294,6 +1305,7 @@ class BrowserView(QtWidgets.QFrame):
                 self.scans,
                 self.date_sort,
                 self.auto_last,
+                self.show_all,
             )
         ]
         self.directory_label.set_path(state.directory)
@@ -1451,6 +1463,8 @@ class BrowserView(QtWidgets.QFrame):
         self._reconciling_frames = False
         self.date_sort.setChecked(state.date_sorted)
         self.auto_last.setChecked(state.auto_last)
+        self.show_all.setChecked(state.all_frames)
+        self.show_all.setEnabled(plot_mode in ALL_FRAMES_PLOT_MODES)
         del blockers
 
     def _visit_artifact(

@@ -180,6 +180,7 @@ from .scientific_axes import (
 from .scientific_plot_options import waterfall_should_be_active
 from .scientific_preferences import scientific_preference_updates
 from .shell_values import (
+    ALL_FRAMES_PLOT_MODES,
     ArtifactProgress,
     DirectoryFileProgress,
     new_frames_note,
@@ -714,6 +715,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._deferred_browse_selection: _DeferredBrowseSelection | None = None
         self._deferred_browse_reopen: _DeferredBrowseReopen | None = None
+        # The latest Browse open a click admitted: All frames applies to its READY adoption alone (ALL-FRAMES-128)
+        self._all_frames_open: BrowseLoadRequest | None = None
         self._pending_viewer_2d_path: str | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
@@ -3439,17 +3442,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
-            self._retire_batch_presentation()
-            self._retain_outgoing_display = False
-            ScatteringWorkspace._clear_presentation_targets(self)
-            self._shell.browser.cancel_pending_frame_selection()
-            navigation = self._context_controller.navigation
-            if (
-                navigation.frames
-                and self._context_controller.select_navigation(
-                    navigation.current, navigation.frames
-                )
-            ):
+            if ScatteringWorkspace._select_every_frame(self):
                 self._refresh_shell()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
@@ -4812,6 +4805,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and self._context_controller.select_browser_target(value)
         ):
             self._notice("")
+            ScatteringWorkspace._show_every_browse_frame(self)
             self._refresh_shell()
             return
         try:
@@ -4838,6 +4832,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
+        self._all_frames_open = request
         if terminal_request is not None and request is not terminal_request:
             self._processed_browser.retire_terminal(
                 terminal_request
@@ -4900,6 +4895,36 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._select_scan(deferred.value, reopen=deferred.reopen, retry=deferred)
         return True
 
+    def _select_every_frame(self) -> bool:
+        """Show All's selection, the one-shot and the All frames toggle turned on alike: every frame the shown context
+        holds, through the navigation owner, with no paint of its own (the caller refreshes)."""
+        self._retire_batch_presentation()
+        self._retain_outgoing_display = False
+        ScatteringWorkspace._clear_presentation_targets(self)
+        self._shell.browser.cancel_pending_frame_selection()
+        navigation = self._context_controller.navigation
+        return bool(navigation.frames) and self._context_controller.select_navigation(
+            navigation.current, navigation.frames)
+
+    def _all_frames_applies(self) -> bool:
+        """All frames is on, the plot is Overlay or Waterfall and a Browse result is shown (ALL-FRAMES-128). A Run's own
+        frames keep their rules: each arrival already joins an Overlay/Waterfall. An owner without Browser state reads
+        it as off, as the preference editor reads its other optional parts."""
+        if getattr(getattr(self, "_processed_browser", None), "all_frames", False) is not True:
+            return False
+        selection = self._context_controller.selection
+        return (self._preferences.plot_mode in ALL_FRAMES_PLOT_MODES
+                and selection is not None and selection.kind is ContextKind.BROWSE)
+
+    def _show_every_browse_frame(self) -> bool:
+        """Every frame of the shown Browse result where All frames applies; no paint of its own, and earlier results'
+        curves stay (maintainer: "overlay/waterfall mode should alway overlay. even when all frames is toggled")."""
+        if not ScatteringWorkspace._all_frames_applies(self):
+            return False
+        navigation = self._context_controller.navigation
+        return bool(navigation.frames) and self._context_controller.select_navigation(
+            navigation.current, navigation.frames)
+
     def _select_frames(self, command: ShellCommand) -> None:
         frame = command.frame
         frames = command.frames
@@ -4954,6 +4979,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if frame is not None and frame is not latest:
             self._processed_browser.set_auto_last(False)
+        if (ScatteringWorkspace._all_frames_applies(self)
+                and {id(item) for item in navigation.selected} != {id(item) for item in navigation.frames}):
+            # A frame left out (Ctrl-click, Shift-click) turns All frames off; a visit keeps every frame drawn.
+            self._processed_browser.set_all_frames(False)
         handoff = self._processed_browser.terminal_handoff
         request = None if handoff is None else handoff.request
         terminal_artifact = (
@@ -5105,6 +5134,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     if (detail or self._deferred_browse_reopen is None) and (
                             detail or not self._progress.terminal or not self._notice_text):
                         self._notice(detail)
+                if load_outcome is not None and load_outcome.request is self._all_frames_open:
+                    self._all_frames_open = None
+                    if load_outcome.status is BrowseLoadStatus.READY and not successor_settled:
+                        ScatteringWorkspace._show_every_browse_frame(self)
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
@@ -6993,6 +7026,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
             auto_last=browser.auto_last,
+            all_frames=browser.all_frames,
             executor_available=self._run_executor is not None,
             start_permitted=permitted,
             start_blocker=blocker,
@@ -7902,6 +7936,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             requested = bool(value)
             self._processed_browser.set_date_sorted(requested)
             return True
+        elif kind is ShellCommandKind.SET_ALL_FRAMES:
+            requested = bool(value)
+            self._processed_browser.set_all_frames(requested)
+            if requested and self._preferences.plot_mode in ALL_FRAMES_PLOT_MODES:
+                ScatteringWorkspace._select_every_frame(self)  # as Show All did, the Run's frames too
+            return True
         elif kind is ShellCommandKind.SET_AUTO_LAST:
             requested = bool(value)
             if self._processed_browser.set_auto_last(requested):
@@ -7924,9 +7964,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.browser.cancel_pending_frame_selection()
             self._shell.scientific.clear_trace_history()
             current = self._context_controller.navigation.current
-            self._context_controller.select_navigation(
+            if self._context_controller.select_navigation(
                 current, () if current is None else (current,)
-            )
+            ):
+                # All frames on: the fresh overlay holds every frame of the shown result
+                ScatteringWorkspace._show_every_browse_frame(self)
             if self._preferences.slice_pins:
                 self._preferences = replace(
                     self._preferences,
@@ -7948,6 +7990,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     "slice_center", "slice_width"))):
             self._shell.scientific.clear_trace_history()
         self._preferences = replace(self._preferences, **updates)
+        if kind is ShellCommandKind.SET_PLOT_MODE:
+            # All frames: back in Overlay or Waterfall, every frame again
+            ScatteringWorkspace._show_every_browse_frame(self)
         return True
 
     def _render_start_outcome(self, outcome: object) -> None:

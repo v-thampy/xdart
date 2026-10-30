@@ -37,6 +37,7 @@ class ShellCommandKind(str, Enum):
     SHOW_ALL = "show_all"
     SHOW_METADATA = "show_metadata"
     SET_AUTO_LAST = "set_auto_last"
+    SET_ALL_FRAMES = "set_all_frames"
     LAUNCH_TOOL = "launch_tool"
     LAUNCH_EXTERNAL_VIEWER = "launch_external_viewer"
     SET_NORM_CHANNEL = "set_norm_channel"
@@ -286,6 +287,11 @@ class FrameNavigationProjection:
                 )
 
 
+#: The plot modes All frames acts in (ALL-FRAMES-128): Single shows one frame, and Browse draws nothing in Average and
+#: Sum (the page's "Browse cache display is unavailable for Average/Sum" refusal).
+ALL_FRAMES_PLOT_MODES = frozenset({"Overlay", "Waterfall"})
+
+
 @dataclass(frozen=True, slots=True)
 class BrowserProjection:
     directory: str = ""
@@ -298,6 +304,9 @@ class BrowserProjection:
     multi_artifact_selection: bool = False
     #: Why the scan list is closed now, as its tooltip ("" while it is open): a running Run keeps other scans shut.
     scans_locked: str = ""
+    #: All frames (ALL-FRAMES-128): each result opened in Overlay/Waterfall shows every one of its frames; last, so
+    #: positional constructions keep their meaning
+    all_frames: bool = False
 
     def __post_init__(self) -> None:
         if type(self.scans_locked) is not str:
@@ -1047,6 +1056,7 @@ def _scalar_is_valid(value: object) -> bool:
 
 
 __all__ = [
+    "ALL_FRAMES_PLOT_MODES",
     "ArtifactProgress",
     "AxisProjection",
     "BrowserProjection",

@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _SESSION_PROFILE_KEY = "scattering_run_profile"
 _SESSION_PHASE_KEY = "scattering_phase_references"
+#: the Browser's remembered toggle, ``{"all_frames": bool}`` (ALL-FRAMES-128); Auto Last is not remembered
+_SESSION_BROWSER_KEY = "scattering_browser"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +121,9 @@ class _WorkspaceCloser:
                     profile = dump_run_intent_profile(self.widget._intents.snapshot().thaw())
                     options = self.widget._preferences.plot_options
                     save_session({_SESSION_PROFILE_KEY: profile,
-                                  _SESSION_PHASE_KEY: phase_reference_document(options)})
+                                  _SESSION_PHASE_KEY: phase_reference_document(options),
+                                  _SESSION_BROWSER_KEY: {
+                                      "all_frames": self.widget._processed_browser.all_frames}})
                 except Exception:
                     logger.warning("Could not save the last run configuration", exc_info=True)
                 self._session_saved = True
@@ -520,6 +524,7 @@ def build_scattering_workspace(
     intents = services.run_intents.store_for(key)
     persist_session = intents is None
     phase_preferences = None
+    browser_preferences = None
     if intents is None:
         from xdart.gui.tabs.scattering.controls_editing import (
             DEFAULT_POLARIZATION_FACTOR,
@@ -548,6 +553,7 @@ def build_scattering_workspace(
             saved_session = load_session()
             profile = saved_session.get(_SESSION_PROFILE_KEY)
             phase_preferences = saved_session.get(_SESSION_PHASE_KEY)
+            browser_preferences = saved_session.get(_SESSION_BROWSER_KEY)
             if profile is not None:
                 intent = load_run_intent_profile(profile)
         except Exception:
@@ -581,6 +587,10 @@ def build_scattering_workspace(
             widget._refresh_shell()
         except (AttributeError, TypeError, ValueError):
             logger.warning("Could not restore the last reference phases", exc_info=True)
+    # A saved true or false restores All frames; anything else (missing, malformed) leaves it off.
+    if isinstance(browser_preferences, dict) and type(browser_preferences.get("all_frames")) is bool:
+        if widget._processed_browser.set_all_frames(browser_preferences["all_frames"]):
+            widget._refresh_shell()
 
     # Operation/analysis refusal paths emit a notice and return without a
     # projection refresh; bridge them to the host status presenter so the

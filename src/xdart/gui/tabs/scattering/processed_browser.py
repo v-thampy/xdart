@@ -459,6 +459,8 @@ class ProcessedBrowserProjection:
     date_sorted: bool
     auto_last: bool
     explicit_directory: bool
+    #: All frames (ALL-FRAMES-128): each result opened in Overlay/Waterfall shows every one of its frames
+    all_frames: bool
 
     def __post_init__(self) -> None:
         if (
@@ -472,6 +474,7 @@ class ProcessedBrowserProjection:
             or type(self.date_sorted) is not bool
             or type(self.auto_last) is not bool
             or type(self.explicit_directory) is not bool
+            or type(self.all_frames) is not bool
         ):
             raise ValueError("processed Browser projection is invalid")
 
@@ -552,6 +555,7 @@ class ProcessedBrowserOwner:
         self._explicit_directory = False
         self._date_sorted = False
         self._auto_last = True
+        self._all_frames = False
         self._follow_identity: RunIdentity | None = None
         self._seen_artifacts: set[str] = set()
         self._transient_frame: DisplayFrameKey | None = None
@@ -586,6 +590,10 @@ class ProcessedBrowserOwner:
     @property
     def auto_last(self) -> bool:
         return self._auto_last
+
+    @property
+    def all_frames(self) -> bool:
+        return self._all_frames
 
     @property
     def explicit_directory(self) -> bool:
@@ -1118,6 +1126,7 @@ class ProcessedBrowserOwner:
             self._date_sorted,
             self._auto_last,
             self._explicit_directory,
+            self._all_frames,
         )
 
     def clear_directory_cache(self) -> None:
@@ -1248,6 +1257,13 @@ class ProcessedBrowserOwner:
             return False
         changed = requested != self._auto_last
         self._auto_last = requested
+        return changed
+
+    def set_all_frames(self, requested: bool) -> bool:
+        if self._closing or self._closed or type(requested) is not bool:
+            return False
+        changed = requested != self._all_frames
+        self._all_frames = requested
         return changed
 
     def reconcile_intent(
