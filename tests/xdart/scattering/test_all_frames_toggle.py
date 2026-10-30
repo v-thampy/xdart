@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import os
 import shutil
+from threading import Event
 
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
 
 from tests.xdart.scattering.test_e4_accumulation_selection_parity import _click_frame
+from tests.xdart.scattering.test_browse_latest_selection import burst
 from tests.xdart.scattering.test_e4_preview_transport import _write_processed
 from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
 from tests.xdart.scattering.test_p34_reintegrate_operation import _wait
 from xdart.gui.tabs.scattering.events import CleanupStatus
+from xdart.gui.tabs.scattering.browse_1d_hydration import Browse1DHydrationLane
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
@@ -180,6 +183,14 @@ def test_af5_leaving_a_frame_out_turns_it_off_and_a_plain_click_does_not(qapp, w
     _click_frame(qapp, shell, 1)
     _settle(page)
     assert _on(page) is True and _all_selected(page), "a plain click visits a frame and keeps every frame drawn"
+    assert page._processed_browser.auto_last is False, "earlier-frame visits still disable Auto Last"
+    shell.scientific.frame_selector.setCurrentIndex(2)
+    _settle(page)
+    assert _on(page) is True and _all_selected(page), "the footer only moves the current frame"
+    shell.browser.frames.setFocus()
+    QtTest.QTest.keyClick(shell.browser.frames, QtCore.Qt.Key.Key_A, CTRL)
+    _settle(page)
+    assert _on(page) is True and _all_selected(page)
     _click_frame(qapp, shell, 2, modifiers=CTRL)
     _settle(page)
     assert _on(page) is False and not _all_selected(page), "a Ctrl-click leaves a frame out"
@@ -221,6 +232,10 @@ def test_af7_af8_other_plot_modes_grey_it_out_and_keep_the_check(workspace, two_
     assert not button.isEnabled() and button.isChecked() and _on(page) is True
     if plot_mode == "Single":
         assert len(page._context_controller.navigation.selected) == 1
+    QtTest.QTest.mouseClick(page._shell.scientific.clear, LEFT)
+    QtWidgets.QApplication.processEvents()
+    _settle(page)
+    assert _on(page) is True and len(page._context_controller.navigation.selected) == 1
     _mode(page, "Overlay")
     assert button.isEnabled() and _all_selected(page)
 
@@ -248,6 +263,7 @@ def test_af9_remembered_between_sessions_and_never_in_a_fresh_one(qapp, tmp_path
     window, page = started()
     try:
         assert not page._shell.browser.show_all.isChecked(), "off until it is turned on"
+        _mode(page, "Overlay")
         _toggle(page)
         assert _on(page) is True
     finally:
@@ -263,6 +279,7 @@ def test_af9_remembered_between_sessions_and_never_in_a_fresh_one(qapp, tmp_path
     window, page = started()
     try:
         assert _on(page) is False, "a fresh session reads nothing"
+        _mode(page, "Overlay")
         _toggle(page)
     finally:
         closed(window)
@@ -278,3 +295,111 @@ def test_af10_the_button_is_a_checkable_all_frames_toggle_with_its_tooltip(works
     for phrase in ("Overlay or Waterfall", "every one of its frames", "until Clear", "Up and Down arrow keys",
                    "Ctrl-click", "Greyed out in Single, Average and Sum", "Remembered between sessions"):
         assert phrase in tip, (phrase, tip)
+
+
+def test_af11_same_result_reselect_uses_the_existing_context_and_all_its_frames(workspace, two_results):
+    page, (first, _second) = workspace, two_results
+    _mode(page, "Overlay")
+    _toggle(page)
+    _open(page, first)
+    context = page._context_controller.browse_context
+    _open(page, first)
+    assert page._context_controller.browse_context is context
+    assert _all_selected(page) and _rows(page) == A
+    assert _on(page) is True
+
+
+@pytest.mark.parametrize("toggle_state", ("enabled", "disabled", "enabled_while_pending"))
+def test_af12_latest_request_uses_the_current_toggle_at_adoption(burst, toggle_state):
+    (page, loader, original, paths, select, entered, release_read,
+     closing, release_close, opened, closed) = burst
+    _mode(page, "Overlay")
+    if toggle_state != "enabled_while_pending":
+        _toggle(page)
+    active = select(paths[0])
+    assert entered.wait(5)
+    skipped = select(paths[1])
+    latest = select(paths[2])
+    assert not loader.owns_request(skipped) and loader.owns_request(latest)
+    page._handle_shell_command(ShellCommand(
+        ShellCommandKind.SELECT_SCAN, original.requested_path, path=("artifact",)))
+    assert page._context_controller._browse_request is latest, "the held old target cannot erase newer intent"
+    if toggle_state != "enabled":
+        QtTest.QTest.mouseClick(page._shell.browser.show_all, LEFT)
+        QtWidgets.QApplication.processEvents()
+    release_read.set()
+    assert closing.wait(5)
+    newest = select(paths[3])
+    assert newest is not latest and newest is not active
+    release_close.set()
+    _shown(page, paths[3])
+    assert opened == closed == [paths[0], paths[3]], "replaced files are never adopted"
+    navigation = page._context_controller.navigation
+    expected = [2] if toggle_state == "disabled" else [2, 5, 9]
+    assert [frame.local_frame_label for frame in navigation.selected] == expected
+    assert _on(page) is (toggle_state != "disabled")
+
+
+@pytest.mark.parametrize("action", ("replay", "replace", "refresh"))
+def test_af13_pending_read_cleanup_replay_replacement_and_refresh(
+    workspace, two_results, tmp_path, monkeypatch, action,
+):
+    page, (first, second) = workspace, two_results
+    third, _ = _write_processed(tmp_path / "third", labels=(4, 5, 6))
+    _open(page, first)
+    entered, release = Event(), Event()
+    real_read = Browse1DHydrationLane._open_and_read
+
+    def held_read(self, task, labels):
+        entered.set()
+        assert release.wait(10)
+        return real_read(self, task, labels)
+
+    monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
+    try:
+        _mode(page, "Overlay")
+        QtTest.QTest.mouseClick(page._shell.browser.show_all, LEFT)
+        QtWidgets.QApplication.processEvents()
+        assert entered.wait(5), "the real all-frame read is held at its I/O boundary"
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(second), path=("artifact",)))
+        assert page._deferred_browse_reopen.value == str(second)
+        if action == "replace":
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(third), path=("artifact",)))
+            assert page._deferred_browse_reopen.value == str(third)
+        elif action == "refresh":
+            page._handle_shell_command(ShellCommand(ShellCommandKind.REFRESH_BROWSER))
+            assert page._deferred_browse_reopen is None
+        release.set()
+        target = first if action == "refresh" else third if action == "replace" else second
+        if action == "refresh":
+            # Catalog refresh cancels the kept click; it does not admit/repaint a fresh Browse context.
+            controller = page._context_controller
+            _wait(lambda: True if not controller.browse_pending
+                  and not controller.browse_preview_polling_needed else None)
+            assert controller.navigation.current.artifact == str(first)
+        else:
+            _shown(page, target)
+            _wait(lambda: True if not page._context_controller.browse_preview_polling_needed else None)
+        assert page._deferred_browse_reopen is None
+        assert _all_selected(page) and _on(page) is True
+        if action != "replay":
+            assert all(frame.artifact != str(second) for frame in page._shell.scientific.trace_history_keys)
+    finally:
+        release.set()
+
+
+def test_af14_fresh_open_reads_a_grown_result_and_selects_its_new_frame(workspace, two_results, tmp_path):
+    page, (first, second) = workspace, two_results
+    _mode(page, "Waterfall")
+    _toggle(page)
+    _open(page, first)
+    prior = page._context_controller.browse_context
+    _open(page, second)
+    grown, _ = _write_processed(tmp_path / "grown", labels=(1, 2, 3, 4))
+    shutil.copyfile(grown, first)
+    _open(page, first)
+    assert page._context_controller.browse_context is not prior
+    navigation = page._context_controller.navigation
+    assert [frame.local_frame_label for frame in navigation.frames] == [1, 2, 3, 4]
+    assert _all_selected(page) and _on(page) is True
+    assert ("scan.nexus", 4) in _rows(page)
