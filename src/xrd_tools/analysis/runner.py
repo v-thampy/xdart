@@ -33,9 +33,11 @@ from xrd_tools.analysis.plans import (
     PeakFitPlan,
     PhaseFitPlan,
     Sin2PsiPlan,
+    StrainPlan,
     run_peak_fit,
     run_phase_fit,
     run_sin2psi,
+    run_strain,
 )
 from xrd_tools.core.containers import IntegrationResult2D
 
@@ -411,6 +413,127 @@ def _sin2psi_overlay(payload: Any) -> Overlay:
     x = np.asarray(payload.sin2psi, dtype=float)
     d = np.asarray(payload.d_values, dtype=float)
     fit = np.asarray(payload.d0 + payload.slope * x, dtype=float)
+    return Overlay(x=x, traces={"data": d, "fit": fit}, markers=[])
+
+
+# --------------------------------------------------------------------------
+# Strain (frame-unit) — STRAIN-ANALYSIS-128: one GI fiber map per frame, so a
+# batch (compact too) gives the intercept / slope / stress trends.
+# --------------------------------------------------------------------------
+
+
+def strain_input_from_view(view: Any, *, receipt: Any, wavelength_m: "float | None",
+                           derived: bool = False) -> AnalysisInput:
+    """One saved frame's GI fiber map as a strain input: the record's own (q, χ) grid, with its σ where it has one (a
+    GI q_chi integration writes none), the frame's own incidence and the frame-bound wavelength, carried with the
+    receipt that names the artifact and frame.
+
+    Refuses, with the reason: a derived re-bin (it resamples another map), a map that is not a GI fiber q_chi map (a
+    standard cake's χ is the detector azimuth, not the sample tilt), a frame without its incidence, a missing
+    wavelength, and a receipt that is not this frame's. Nothing is defaulted."""
+    from xrd_tools.analysis.display_fit_operations import DisplayedTraceReceipt
+    from xrd_tools.core.energy import wavelength_m_to_energy_eV
+    from xrd_tools.core.frame_view import TwoDKind, view_to_result_2d
+
+    if derived:
+        raise ValueError("strain needs the run's own map: a derived re-bin resamples another map")
+    if view.two_d_kind is not TwoDKind.QTOT_CHIGI:
+        raise ValueError("strain needs a GI fiber q_chi map: a standard cake's χ is the detector azimuth, "
+                         "not the sample tilt")
+    incidence = view.incident_angle
+    if incidence is None and view.geometry is not None:
+        incidence = view.geometry.incident_angle
+    if incidence is None or not np.isfinite(incidence):
+        raise ValueError("strain needs the frame's incidence angle, and this record has none")
+    if wavelength_m is None or not np.isfinite(wavelength_m) or wavelength_m <= 0:
+        raise ValueError("strain needs the frame's wavelength, and none is recorded")
+    if not isinstance(receipt, DisplayedTraceReceipt) or receipt.frame_label != str(view.label):
+        raise ValueError("strain needs this frame's receipt (the artifact and frame the map came from)")
+    result2d = view_to_result_2d(view)
+    if result2d is None:
+        raise ValueError("strain needs the frame's 2-D map, and this record has none")
+    return AnalysisInput(str(view.label), np.empty(0), np.empty(0), metadata={
+        "result_2d": result2d, "incident_angle_deg": float(incidence),
+        "energy_eV": wavelength_m_to_energy_eV(wavelength_m), "wavelength_m": float(wavelength_m),
+        "receipt": receipt})
+
+
+@dataclass
+class StrainAnalyzer:
+    """Frame-unit analyzer wrapping :class:`StrainPlan` + :func:`run_strain`.
+
+    Each input is one frame's GI fiber map from :func:`strain_input_from_view`; the refraction check runs at that
+    frame's own incidence and energy. Projects the fit over both branches to flat params (``intercept`` /
+    ``slope`` / ``r_squared`` / ``n_used``, ``stress`` / ``stress_err`` with elastic constants and an independent
+    d0, ``apparent`` 1.0 or 0.0 when refraction was checked) and a sin²ψ-vs-d overlay (``data`` + ``fit``).
+    """
+
+    plan: StrainPlan
+    kind: str = "strain"
+    unit: str = "frame"
+
+    def analyze(self, inp: AnalysisInput) -> AnalysisOutcome:
+        metadata = inp.metadata or {}
+        result2d = metadata.get("result_2d")
+        if not isinstance(result2d, IntegrationResult2D):
+            return AnalysisOutcome(inp.label, ok=False,
+                                   message="strain needs a frame's GI q_chi map (see strain_input_from_view)")
+        try:
+            result = run_strain(self.plan, result2d, incident_angle_deg=metadata.get("incident_angle_deg"),
+                                energy_eV=metadata.get("energy_eV"))
+        except Exception as exc:  # sector/fit/regression refusal -> inert
+            return AnalysisOutcome(inp.label, ok=False, message=str(exc))
+        receipt = metadata.get("receipt")
+        if receipt is not None:
+            result.provenance["capture"] = {
+                "artifact": str(receipt.artifact), "frame_label": receipt.frame_label,
+                "run_fingerprint": receipt.run_fingerprint, "map_kind": "qtot_chigi",
+                "wavelength_m": metadata.get("wavelength_m")}
+        payload = result.payload
+        notices = ["" if result.provenance["sigma_recorded"] else _NO_SIGMA, payload.fit.notice,
+                   getattr(payload.refraction, "notice", "")]
+        return AnalysisOutcome(
+            label=inp.label,
+            ok=True,
+            params=_strain_params(payload),
+            overlay=_strain_overlay(payload),
+            result=result,
+            message="; ".join(notice for notice in notices if notice),
+        )
+
+    def analyze_scan(self, inputs: Sequence[AnalysisInput]) -> AnalysisOutcome:
+        raise NotImplementedError(
+            "StrainAnalyzer is frame-unit; the runner calls analyze() per frame."
+        )
+
+
+_NO_SIGMA = "no σ recorded: each point's error is its sector fit's standard error"
+
+
+def _strain_params(payload: Any) -> "dict[str, float]":
+    fit = payload.fit
+    out: "dict[str, float]" = {
+        "intercept": float(fit.intercept),
+        "intercept_err": float(fit.intercept_err),
+        "slope": float(fit.slope),
+        "slope_err": float(fit.slope_err),
+        "r_squared": float(fit.r_squared),
+        "n_used": float(fit.n_used),
+    }
+    if fit.stress is not None:
+        out["stress"] = float(fit.stress)
+    if fit.stress_err is not None:
+        out["stress_err"] = float(fit.stress_err)
+    if payload.refraction is not None:
+        out["apparent"] = 1.0 if payload.refraction.apparent else 0.0
+    return out
+
+
+def _strain_overlay(payload: Any) -> Overlay:
+    points = payload.fit.admitted
+    x = np.array([point.sin2psi for point in points], dtype=float)
+    d = np.array([point.d for point in points], dtype=float)
+    fit = np.asarray(payload.fit.intercept + payload.fit.slope * x, dtype=float)
     return Overlay(x=x, traces={"data": d, "fit": fit}, markers=[])
 
 
