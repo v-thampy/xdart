@@ -87,6 +87,7 @@ def test_f1_nearest_context_unknown_fallback_and_shared_help_window(qapp):
 
 
 def test_real_search_selection_and_f1_inside_help_return_to_index(qapp):
+    from xrd_tools.help_topics import TOPICS
     from xdart.gui.widgets.context_help import owner_for
     root = QtWidgets.QWidget(); owner = owner_for(root)
     try:
@@ -102,10 +103,11 @@ def test_real_search_selection_and_f1_inside_help_return_to_index(qapp):
         assert window.topic_id == "corrections.existing"
         _f1(window, window.pane, qapp)
         assert window.topic_id is None and window.search_row.editor.hasFocus()
-        assert window.browser.scans.count() == 6
+        # declared oracle repair (PHASE-ANALYSIS-128): the whole index is the catalogue (six topics at 1.2.7)
+        assert window.browser.scans.count() == len(TOPICS)
         QtTest.QTest.keyClicks(window.search_row.editor, "nothing_matches_123")
         assert window.browser.scans.count() == 0
-        window.search_row.editor.clear(); assert window.browser.scans.count() == 6
+        window.search_row.editor.clear(); assert window.browser.scans.count() == len(TOPICS)
     finally:
         _dispose(root, qapp)
 
