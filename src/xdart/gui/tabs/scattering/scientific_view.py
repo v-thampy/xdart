@@ -140,9 +140,10 @@ MAX_WATERFALL_DISPLAY_ROWS = 256
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
 #: the top bar's Phases toggle (C6)
-PHASES_TOOLTIP = ("Switch every reference phase listed in the Reference Phases window off or on at once; the list, "
-                  "each phase's include check and every minimum intensity are kept.")
-PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Reference Phases window."
+PHASES_TOOLTIP = ("Switch every reference phase listed in the Phase Analysis window off or on at once; the list, "
+                  "each phase's include check and every minimum intensity are kept. Display only: the fit still "
+                  "uses every included phase.")
+PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Phase Analysis window."
 PHASES_OFF_NOTE = ("Reference phases are switched off with the top bar's Phases button; the list, include checks and "
                    "minimums are kept.")
 _STANDARD_PLOT_AXIS_CHOICES = (
@@ -1377,10 +1378,17 @@ class ScientificView(QtWidgets.QFrame):
         self.options = _CompactMenuButton("Options")
         self.options.setToolTip("Edit plot options and display limits. Display limit changes apply immediately.")
         self.plot_options_dialog = PlotOptionsDialog(self)
-        from .reference_phases import ReferencePhasesWindow
-        self.reference_phases = ReferencePhasesWindow(self)
-        self.reference_phases.optionEdited.connect(
-            lambda path, value: self._emit(ShellCommandKind.SET_PLOT_OPTION, value, path))
+        # PHASE-ANALYSIS-128: the reference phases are the plot options' list, resolved here once per id; a Phase
+        # Analysis window's list (its host attaches its ReferencePhaseBinding) edits them and shows this view's notices.
+        from xrd_tools.analysis.phase_references import PhaseSelectionResolver
+        self._phase_resolver = PhaseSelectionResolver()
+        self._phase_list = None
+        #: the accepted plot options (the legend click's), the list's availability and its rings notice, as last set
+        self._phase_options = None
+        self._phase_availability = (True, '')
+        self._phase_rings_reason = ''
+        #: the last phase reconcile's (state, navigation): an explicit library refresh redraws from it
+        self._phase_reconcile_args = None
         self._grid_cache = self._grid_prediction = self._grid_frame = None
         self._phase_job = PhaseOverlayJob()
         self._phase_requests = LatestRequestOwner(self._phase_job, self._phase_done,
@@ -1398,7 +1406,7 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_ring_run = None
         #: closed tools' phase workers a host retired here (a deleted Phase Fitter's Add CIF…), until each is CLEAN
         self._retired_phase_workers = []
-        #: every listed phase with its include flag, as the window resolved it (legend entries and colours)
+        #: every listed phase with its include flag, as the resolver resolved it (legend entries and colours)
         self._phase_listed = ()
         #: each listed phase's colour slot, kept from when it joined the list until it leaves it
         self._phase_color_slots = {}
@@ -1497,12 +1505,6 @@ class ScientificView(QtWidgets.QFrame):
         self.next_frame.clicked.connect(lambda: self._navigate(1))
         return row
 
-    def show_reference_phases(self) -> None:
-        """The Tools panel's Reference Phases window (REFERENCE-PHASES-20261011)."""
-        self.reference_phases.show()
-        self.reference_phases.raise_()
-        self.reference_phases.activateWindow()
-
     def _show_plot_options(self) -> None:
         self._emit(ShellCommandKind.SHOW_WATERFALL_OPTIONS)
         self._sync_share_axis_options()
@@ -1568,21 +1570,93 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_ring_run = None
         self._phase_listed = ()
         self._phase_color_slots = {}
+        self._phase_reconcile_args = None
 
     def retire_phase_worker(self, worker):
-        """Keep a closed tool's phase worker (a deleted Phase Fitter's Add CIF…) until it closes CLEAN; this view's
-        shutdown waits for it."""
+        """Keep a closed tool's phase worker (a deleted Phase Analysis window's Add CIF…) until it closes CLEAN; this
+        view's shutdown waits for it."""
         if worker.close().status is not PageCleanup.CLEAN:
             self._retired_phase_workers.append(worker)
 
+    @property
+    def phase_list(self):
+        """The attached Phase Analysis list (its ``ReferencePhaseBinding``), or None."""
+        return self._phase_list
+
+    @property
+    def phase_availability(self):
+        """Whether the list can be edited here, and why not: (available, reason)."""
+        return self._phase_availability
+
+    @property
+    def phase_rings_reason(self):
+        """Why current-Run detector rings cannot be drawn for the listed phases ("" when they can, or none are)."""
+        return self._phase_rings_reason
+
+    def attach_phase_list(self, binding):
+        """Mount a Phase Analysis window's list on this view's reference phases (one slot; the same binding again
+        changes nothing, another replaces it): it reconciles from the accepted options at once, its edits become
+        plot-option commands, its explicit library refreshes re-read this view's lookups, and it shows this view's
+        availability and rings notice."""
+        if binding is self._phase_list:
+            return
+        self.detach_phase_list(self._phase_list)
+        self._phase_list = binding
+        binding.optionEdited.connect(self._phase_list_edited)
+        binding.refreshRequested.connect(self._phase_library_refreshed)
+        if self._phase_options is not None:
+            binding.reconcile(self._phase_options)
+        binding.set_available(*self._phase_availability)
+        binding.set_rings_reason(self._phase_rings_reason)
+
+    def detach_phase_list(self, binding):
+        """Disconnect the attached list; another object (or None) changes nothing."""
+        if binding is None or binding is not self._phase_list:
+            return
+        self._phase_list = None
+        for signal, slot in ((binding.optionEdited, self._phase_list_edited),
+                             (binding.refreshRequested, self._phase_library_refreshed)):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass  # a binding being deleted has already dropped its connections
+
+    def adopt_phase_state(self, old):
+        """A replacement view (``replace_scientific_with_blank``) takes the old view's accepted reference-phase
+        options and its retired Add CIF… workers, so the list it attaches next erases nothing and no worker is lost."""
+        self._phase_options = old._phase_options
+        self._retired_phase_workers.extend(old._retired_phase_workers)
+        old._retired_phase_workers = []
+
+    def _phase_list_edited(self, path, value):
+        self._emit(ShellCommandKind.SET_PLOT_OPTION, value, path)
+
+    def _phase_library_refreshed(self):
+        """An explicit library read (a window's open, an add): every listed id is read again, a previously missing
+        one included, and the overlays redrawn."""
+        self._phase_resolver.refresh()
+        if self._phase_reconcile_args is not None:
+            self._reconcile_phase_overlay(*self._phase_reconcile_args)
+
+    def _set_phase_availability(self, available, reason=''):
+        self._phase_availability = (bool(available), '' if available else str(reason))
+        if self._phase_list is not None:
+            self._phase_list.set_available(*self._phase_availability)
+
+    def _set_phase_rings_reason(self, reason):
+        self._phase_rings_reason = str(reason)
+        if self._phase_list is not None:
+            self._phase_list.set_rings_reason(self._phase_rings_reason)
+
     def shutdown_phase_overlays(self):
-        """Close the phase worker, the window's Add CIF… worker, any retired one and the angular coverage strip's
-        reconstruction owner: CLEAN, or PENDING while one runs (the host asks again)."""
-        self.reference_phases.close()  # the view's window does not outlive its overlays
+        """Detach the list (its window is its host's to close), then close the phase worker, any retired Add CIF…
+        worker and the angular coverage strip's reconstruction owner: CLEAN, or PENDING while one runs (the host
+        asks again)."""
+        self.detach_phase_list(self._phase_list)
         self._clear_phase_overlays()
         retired = [(worker, worker.close()) for worker in self._retired_phase_workers]
         self._retired_phase_workers = [worker for worker, receipt in retired if receipt.status is not PageCleanup.CLEAN]
-        receipts = (self._phase_requests.shutdown(), self.reference_phases.phase_source.shutdown(),
+        receipts = (self._phase_requests.shutdown(),
                     self.angular_support_owner.shutdown(),  # the strip's reconstructions retire with the view
                     *(receipt for _worker, receipt in retired))
         return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])
@@ -1613,12 +1687,16 @@ class ScientificView(QtWidgets.QFrame):
         # view's shutdown (HELP-RETIRED-ADD-PAYLOAD); one still reading stays, and its close does not wait
         self._retired_phase_workers = [worker for worker in self._retired_phase_workers
                                        if worker.close().status is not PageCleanup.CLEAN]
-        options, window = state.plot_options, self.reference_phases
+        options = state.plot_options
+        self._phase_reconcile_args = (state, navigation)
         visible = state.processing_mode != '2D Viewer'
-        window.set_available(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')
-        window.reconcile(options)
+        self._set_phase_availability(visible, '' if visible else 'Reference phases are unavailable in the 2D Viewer.')
+        self._phase_options = options
+        if self._phase_list is not None:
+            self._phase_list.reconcile(options)
         self._sync_phases_button(options, visible)
-        listed = window.phase_source.listed_entries() if visible else ()
+        # each listed id resolved once (PHASE-ANALYSIS-128): an unchanged list reads no library file
+        listed = self._phase_resolver.listed(options.phase_references) if visible else ()
         listed_ids = {entry.id for entry, _shown in listed}
         # Switched off (C6): nothing draws, while the list, each include flag, every minimum and the colour slots stay.
         switched_off = not options.phase_references_shown
@@ -1640,7 +1718,7 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_listed = () if switched_off else listed
         if not entries:
             self._phase_requests.release()
-            window.set_rings_reason(PHASES_OFF_NOTE if switched_off and listed else '')
+            self._set_phase_rings_reason(PHASES_OFF_NOTE if switched_off and listed else '')
             self._draw_phase_legends()
             return
         wavelengths = self._phase_wavelengths
@@ -1687,7 +1765,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._phase_ring_context = (navigation.current, snapshot, shape)
             else:
                 self._phase_ring_context = None
-        window.set_rings_reason(ring_reason if raw_shown else '')
+        self._set_phase_rings_reason(ring_reason if raw_shown else '')
         self._phase_display_contract = (state.measurement_mode, self._phase_line_context, cake,
             self._phase_axis(self._rendered_cake_y_axis), wavelength, shape, bool(snapshot), state.processing_mode)
         floors = () if options.phase_global_floor else tuple(
@@ -1764,7 +1842,9 @@ class ScientificView(QtWidgets.QFrame):
         if identifier is None:
             return  # a trace's own entry: pyqtgraph shows or hides the trace itself
         shown = bool(item.isVisible())  # the sample toggled its proxy before this signal
-        options = self.reference_phases.projection
+        options = self._phase_options
+        if options is None:
+            return
         references = tuple((key, shown if key == identifier else flag) for key, flag in options.phase_references)
         if references != options.phase_references:
             self._emit(ShellCommandKind.SET_PLOT_OPTION, references, ('other', 'phase_references'))
@@ -1883,7 +1963,7 @@ class ScientificView(QtWidgets.QFrame):
             self._clear_grid_overlay()
             self.plot_options_dialog.set_grid_available(False, visible=False)
             self._clear_phase_overlays()
-            self.reference_phases.set_available(False, 'Reference phases are unavailable in the 2D Viewer.')
+            self._set_phase_availability(False, 'Reference phases are unavailable in the 2D Viewer.')
             self._clear_angular_support()  # no 1-D profile in the 2D Viewer: no strip and no option
             self.plot_options_dialog.set_angular_support_mounted(False)
         coverage = (
@@ -2413,7 +2493,8 @@ class ScientificView(QtWidgets.QFrame):
                 _new_viewer_1d_renderer_clear_receipt(request, cleared))
 
     def clear_workspace(self) -> bool:
-        """Drop every mounted scientific payload before owner retirement."""
+        """Drop every mounted scientific payload before owner retirement; the attached phase list is detached."""
+        self.detach_phase_list(self._phase_list)
         self._clear_phase_overlays()
         self._clear_grid_overlay()
         self.drop_viewer_loading_snapshot()
@@ -4234,7 +4315,7 @@ class ScientificView(QtWidgets.QFrame):
         if type(state) is not KeyedPanelsProjection:
             raise TypeError("a keyed layout is drawn from a KeyedPanelsProjection")
         self._clear_phase_overlays()
-        self.reference_phases.set_available(False, "Reference phases are unavailable in keyed views.", visible=False)
+        self._set_phase_availability(False, "Reference phases are unavailable in keyed views.")
         self._clear_angular_support()  # RSM's keyed panels: no strip and no option
         self.plot_options_dialog.set_angular_support_mounted(False)
         prior = self._keyed_shown

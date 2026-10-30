@@ -546,7 +546,7 @@ class StitchPage(QtWidgets.QWidget):
         # Frames, and Open… · Metadata · Raw image. Stitch publishes its results and frames to it and acts on
         # its commands, as the lists' own signals did.
         from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserView, ResultDirectoryBrowser
-        from xdart.gui.tabs.scattering.tools_view import (REFERENCE_PHASES_TOOLTIP, BrowserToolsColumn,
+        from xdart.gui.tabs.scattering.tools_view import (PHASE_ANALYSIS_TOOLTIP, BrowserToolsColumn,
                                                             ToolsView)
         self.browser = BrowserView(profile=BrowserProfile(
             menus=(("File", ("Open Folder", "Open result…", "Integration workspace")), ("Config", ()), ("Help", ())),
@@ -562,9 +562,9 @@ class StitchPage(QtWidgets.QWidget):
         self.tools = ToolsView(page_tools=(
             ("peak_fit", "∧ Peak Fitting", "Fit the current linear trace. Batch fits selected results, or all "
              "listed results when none are selected. Overlay selects displayed slices for a slice batch."),
-            ("phase_fit", "≈ Phase Fitting", "Fit radial Intensity in Q or 2θ with its recorded wavelength. "
-             "Batch fits selected results, or all listed results when none are selected."),
-            ("reference_phases", "┆ Reference Phases", REFERENCE_PHASES_TOOLTIP),
+            ("phase_analysis", "≈ Phase Analysis", PHASE_ANALYSIS_TOOLTIP + " Fit uses radial Intensity in Q or "
+             "2θ with its recorded wavelength; Batch fits selected results, or all listed results when none are "
+             "selected."),
         ), external_viewers=False)
         self.tools.commandRequested.connect(self._view_command)
         self.splitter.addWidget(BrowserToolsColumn(self.browser, self.tools))
@@ -3251,17 +3251,25 @@ class StitchPage(QtWidgets.QWidget):
             return "FIT_CURRENT_SELECTION_UNAVAILABLE: an exact current displayed trace is required"
         return ""
 
+    def _phase_fit_reason(self):
+        """Why the Phase Analysis window cannot fit now; its list stays editable (PHASE-ANALYSIS-128)."""
+        if any(dialog.active() for dialog in self._authoring_dialogs):
+            return "Stitch's calibration or mask window is working; fit once it is done"
+        return self._fit_reason("phase")
+
     def _sync_fit_tools(self):
-        for kind in ("peak", "phase"):
-            button = self.tools.page_tool(f"{kind}_fit")
-            reason = self._fit_reason(kind)
-            button.setEnabled(not reason and not self._authoring_active())
-            if reason:
-                button.setToolTip(reason)
-            else:
-                button.setToolTip("Fit the current linear trace. Batch fits selected results, or all listed "
-                                  "results when none are selected. Overlay selects displayed slices for a "
-                                  "slice batch; uncaptured slices or backgrounds fail explicitly.")
+        button, reason = self.tools.page_tool("peak_fit"), self._fit_reason("peak")
+        button.setEnabled(not reason and not self._authoring_active())
+        if reason:
+            button.setToolTip(reason)
+        else:
+            button.setToolTip("Fit the current linear trace. Batch fits selected results, or all listed "
+                              "results when none are selected. Overlay selects displayed slices for a "
+                              "slice batch; uncaptured slices or backgrounds fail explicitly.")
+        # Phase Analysis opens whenever asked, as Reference Phases did: Fit and Batch carry the reason instead
+        host = self._fit_hosts.get("phase")
+        if host is not None:
+            host.dialog.set_fit_reason(self._phase_fit_reason())
 
     def _fit_target(self, path, kind, *, current=False):
         """Capture immutable selectors/references now; copies, source reads and trend means run in the host."""
@@ -3350,7 +3358,7 @@ class StitchPage(QtWidgets.QWidget):
         return tuple(self._fit_target(path, kind) for path in paths)
 
     def _open_fit(self, kind):
-        if self._fit_reason(kind) or self._authoring_active():
+        if kind == "peak" and (self._fit_reason(kind) or self._authoring_active()):
             return
         host = self._fit_hosts.get(kind)
         if host is None:
@@ -3359,6 +3367,13 @@ class StitchPage(QtWidgets.QWidget):
                                    scope=self._fit_scope, batch=lambda: self._fit_batch(kind),
                                    source_root=lambda: str(self._value("project_root")) or None)
             self._fit_hosts[kind] = host
+            if kind == "phase":  # an ordinary close detaches its list; opening it again reattaches it
+                host.dialog.finished.connect(
+                    lambda _result, binding=host.dialog.phase_binding: self.scientific.detach_phase_list(binding))
+        if kind == "phase":
+            # the window's list is this view's reference phases (PHASE-ANALYSIS-128)
+            self.scientific.attach_phase_list(host.dialog.phase_binding)
+            host.dialog.set_fit_reason(self._phase_fit_reason())
         host.reload()
         host.dialog.show()
         host.dialog.raise_()
@@ -3437,10 +3452,7 @@ class StitchPage(QtWidgets.QWidget):
         if kind is ShellCommandKind.PAGE_TOOL and command.value == "export-run":
             self._workflow_export.choose()
             return
-        if kind is ShellCommandKind.PAGE_TOOL and command.value == "reference_phases":
-            self.scientific.show_reference_phases()
-            return
-        if kind is ShellCommandKind.PAGE_TOOL and command.value in {"peak_fit", "phase_fit"}:
+        if kind is ShellCommandKind.PAGE_TOOL and command.value in {"peak_fit", "phase_analysis"}:
             self._open_fit("peak" if command.value == "peak_fit" else "phase")
             return
         if kind in {ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:

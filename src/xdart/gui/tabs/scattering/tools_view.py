@@ -13,8 +13,11 @@ from .external_tools import (
 )
 from .shell_values import ShellCommand, ShellCommandKind
 
-#: The Tools button that opens ScientificView's Reference Phases window (REFERENCE-PHASES-20261011).
-REFERENCE_PHASES_TOOLTIP = ("Show reference lines and detector rings for calibrants, CIF phases and lattices, each with its own colour, legend entry and minimum intensity. Display only.")
+#: The Tools button that opens the Phase Analysis window (PHASE-ANALYSIS-128): it replaced Phase Fitting and
+#: Reference Phases, one list for the plots' reference phases and the fit.
+PHASE_ANALYSIS_TOOLTIP = ("Phase Analysis: draw reference lines and detector rings for calibrants, CIF phases and "
+                          "lattices, and fit the checked CIF and lattice phases to the displayed pattern, with every "
+                          "option of the phase-fitting notebook.")
 
 
 class ToolsView(QtWidgets.QFrame):
@@ -23,8 +26,7 @@ class ToolsView(QtWidgets.QFrame):
     #: Int's analysis launchers: (label, command value[, tooltip])
     _TOOLS = (
         ("∧ Peak Fitting", "peak_fitting"),
-        ("≈ Phase Fitting", "phase_fitting"),
-        ("┆ Reference Phases", "reference_phases", REFERENCE_PHASES_TOOLTIP),
+        ("≈ Phase Analysis", "phase_analysis", PHASE_ANALYSIS_TOOLTIP),
         ("▣ ROI Statistics", "roi_statistics"),
     )
     _EXTERNAL_VIEWERS = (

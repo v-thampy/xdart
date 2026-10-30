@@ -1310,8 +1310,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif target == "peak": self._peak_result = None
         elif target == "phase":
             self._phase_result = None
-            # Nothing a CIF still being read returns reaches this Fitter (it deletes on close); the view keeps its
-            # Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            # The list stays the view's plot options (PHASE-ANALYSIS-128): the window's binding leaves the current
+            # view before the window is deleted. Nothing a CIF still being read returns reaches this window; the view
+            # keeps its Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            self._shell.scientific.detach_phase_list(dialog.phase_binding)
             dialog.phase_source.shutdown()
             self._shell.scientific.retire_phase_worker(dialog.phase_source.add_worker)
 
@@ -1332,6 +1334,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else:
                 from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
+                dialog.busy_probe = lambda: self._analysis_target == "phase" and self._analysis_identity is not None
+                # its list is this view's reference phases, attached before it opens (PHASE-ANALYSIS-128)
+                self._shell.scientific.attach_phase_list(dialog.phase_binding)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
             if target in {"peak", "phase"}:
@@ -1492,6 +1497,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if action == "close":
             self._analysis_dialog_closed("phase", self._phase_dialog); return
         if action == "reload": self._refresh_fit_trace("phase"); return
+        if action == "capture_template":
+            # the substrate, through the fit's own displayed input (PHASE-ANALYSIS-128)
+            trace, _anchor = self._capture_analysis_trace("phase")
+            if self._phase_dialog is None: return
+            if trace is None:
+                self._phase_dialog.status.setText("Select one displayed 1-D trace first: it becomes the substrate.")
+                return
+            self._phase_dialog.set_substrate_template(trace); return
         if action != "fit": return
         trace, anchor = self._capture_analysis_trace("phase")
         from .analysis_mount import phase_wavelength_angstrom
@@ -3280,9 +3293,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     tool, nexus=nexus,
                 )
             )
-            return
-        if kind is ShellCommandKind.LAUNCH_TOOL and command.value == "reference_phases":
-            self._shell.scientific.show_reference_phases()  # a view-owned window, not an analysis mount
             return
         if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
                     ShellCommandKind.ANALYSIS_ACTION}:

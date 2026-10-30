@@ -30,6 +30,9 @@ from xdart.gui.widgets.scientific_plot import PlotCursorReadout, trace_colors
 _DATA = (210, 210, 220)
 _FIT = (189, 147, 249)
 _BACKGROUND = (130, 200, 160)
+#: PHASE-ANALYSIS-128: a phase fit's own components, a background refined with the phases and an amorphous peak
+_FIT_BACKGROUND = (110, 170, 230)
+_AMORPHOUS = (235, 150, 95)
 _RESIDUAL = (230, 133, 151)
 _REJECTED = (230, 110, 110)
 _ZERO = (130, 130, 140)
@@ -43,6 +46,8 @@ _ROLES = {
     "data_line": ("line", _DATA, 1),
     "fit": ("line", _FIT, 2),
     "background": ("dash", _BACKGROUND, 1.3),
+    "fit_background": ("dash", _FIT_BACKGROUND, 1.3),
+    "amorphous": ("dash", _AMORPHOUS, 1.3),
     "component": ("dash", None, 1),
     "group": ("o", "group", 5),
     "rejected": ("x", _REJECTED, 7),
@@ -119,13 +124,18 @@ def draw_zero_line(plot):
 
 
 def fit_result_series(x, result, components=()):
-    """A displayed fit result as the view's series: its fit, background and named ``components`` (name, values)
-    above, the peak markers, and its residual below; every array on the fitted ``x``."""
+    """A displayed fit result as the view's series: its fit, background, a phase fit's fitted background and
+    amorphous peak when it has them, and named ``components`` (name, values) above, the peak markers, and its
+    residual below; every array on the fitted ``x``."""
     upper = []
     if result.fit is not None:
         upper.append(FitSeries(x, result.fit, "fit", "fit"))
     if result.background is not None:
         upper.append(FitSeries(x, result.background, "background", "background"))
+    for role, name in (("fit_background", "fitted background"), ("amorphous", "amorphous")):
+        values = getattr(result, role, None)
+        if values is not None:
+            upper.append(FitSeries(x, values, role, name))
     upper += [FitSeries(x, values, "component", name) for name, values in components]
     markers = (() if result.marker_positions is None
                else tuple(float(position) for position in result.marker_positions))

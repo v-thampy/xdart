@@ -13,7 +13,7 @@ MOUNT_TARGETS = {
     (ShellCommandKind.LAUNCH_TOOL, "plot_metadata"): "scan_roi",
     (ShellCommandKind.LAUNCH_TOOL, "roi_statistics"): "scan_roi",
     (ShellCommandKind.LAUNCH_TOOL, "peak_fitting"): "peak",
-    (ShellCommandKind.LAUNCH_TOOL, "phase_fitting"): "phase",
+    (ShellCommandKind.LAUNCH_TOOL, "phase_analysis"): "phase",
     (ShellCommandKind.ANALYSIS_ACTION, "scan_plot"): "scan_roi",
     (ShellCommandKind.ANALYSIS_ACTION, "roi_stats"): "scan_roi",
     (ShellCommandKind.ANALYSIS_ACTION, "peak_fit"): "peak",
@@ -23,7 +23,6 @@ HELD_REASONS = {
     "peak_live": "P3_7_LIVE_FITTING_UNAVAILABLE",
     "peak_batch": "P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE",
     "phase_batch": "P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE",
-    "phase_texture": "P3_7_PHASE_TEXTURE_UNAVAILABLE",
     "export": "P3_7_EXPORT_UNAVAILABLE",
 }
 RETENTION_LIMIT = 128 << 20
@@ -185,6 +184,11 @@ def analysis_request_facts(plan: object, *, table=None, roi=None,
     row = tuple(getattr(plan, field.name) for field in fields(plan))
     if kind in {"peak", "phase"}:
         row = (plan.trace.trace_fingerprint, plan.trace.receipt, *row[1:])
+    if kind == "phase" and plan.background_template is not None:
+        # a substrate is projected as the trace is (PHASE-ANALYSIS-128): a changed substrate is a changed request
+        index = 1 + [field.name for field in fields(plan)].index("background_template")
+        template = plan.background_template
+        row = (*row[:index], (template.trace_fingerprint, template.receipt), *row[index + 1:])
     if kind == "scan_plot":
         echo = (getattr(table, "table_fingerprint", ""),
                 getattr(roi, "result_fingerprint", None), plan.x, plan.y,

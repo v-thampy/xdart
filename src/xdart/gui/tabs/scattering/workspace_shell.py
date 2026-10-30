@@ -311,6 +311,8 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
         """Abandon a partially-mutated paint as one whole view object."""
 
         old = self.scientific
+        # a Phase Analysis window's list, captured before the old view's clear detaches it (PHASE-ANALYSIS-128)
+        binding = old.phase_list
         sizes = self.splitter.sizes()
         fresh = ScientificView()
         fresh.commandRequested.connect(self._forward)
@@ -336,6 +338,11 @@ class ScatteringWorkspaceShell(QtWidgets.QWidget):
             old.clear_workspace()
         except Exception:
             pass
+        old.detach_phase_list(binding)
+        # the fresh view takes the accepted reference phases and retired Add CIF… workers, then the same list
+        fresh.adopt_phase_state(old)
+        if binding is not None:
+            fresh.attach_phase_list(binding)
         old.setParent(None)
         old.deleteLater()
         return fresh
