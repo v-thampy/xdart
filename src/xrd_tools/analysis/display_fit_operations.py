@@ -987,7 +987,6 @@ def run_displayed_phase_fit(
                 extra[name] = _result_array(values_array, x.size)
                 size = _result_add(size, extra[name])
                 arrays += ((name, extra[name]),)  # joins the fingerprint only when present
-        size = _result_add(size, topology)  # retained seed metadata shares the existing result-byte budget
         fingerprint = _digest((scalar, arrays))
         _progress(progress_callback, len(sources) + 1, len(sources) + 1)
         if cancel_token is not None and cancel_token.is_set():
