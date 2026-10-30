@@ -96,6 +96,12 @@ def _number(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _range_text(value):
+    """A fit-range bound as the field shows it and the fit uses it: four significant digits, never more than three
+    decimals (the maintainer, 2026-10-29: "reduce it down to 4. the display shouldn't be more than 3")."""
+    return '' if value is None else f'{round(float(value), 3):.4g}'
+
+
 class PhaseFitDialog(QtWidgets.QDialog):
     """The Phase Analysis window; ``vnext_submit(action, values)`` is its host's ("reload", "fit", "close",
     "capture_template"), and ``allow_batch`` whether the host can fit a batch (Stitch can; Int's is held)."""
@@ -176,6 +182,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
         controls.setObjectName("phaseAnalysisControls")
         controls.setWidgetResizable(True)
         column = QtWidgets.QWidget(controls)
+        # the cards keep their natural height and the pane scrolls: a short window never squeezes the phase list
+        column.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Minimum)
         self._cards = QtWidgets.QVBoxLayout(column)
         self._cards.setContentsMargins(0, 0, 6, 0)
         self._build_phases()
@@ -804,7 +812,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
         for editor, value in zip(self.fit_range_row.editors, bounds):
             with QtCore.QSignalBlocker(editor):
-                editor.setText('' if value is None else f'{value:.12g}')
+                editor.setText(_range_text(value))
 
     def _range_edited(self):
         self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
@@ -1039,7 +1047,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             row, bound = self._settings_rows[key]
             if bound is not None:
                 edit = row.editors[bound]
-                edit.setText("" if value is None else f"{float(value):.12g}")
+                edit.setText(_range_text(value))
                 edit.setModified(False)
             elif isinstance(row.editor, QtWidgets.QComboBox):
                 row.editor.setCurrentIndex(row.editor.findData(value))

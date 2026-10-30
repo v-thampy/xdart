@@ -23,6 +23,9 @@ def test_stitch_range_survives_axis_change_and_settings_reload(qapp, tmp_path):
         for editor, value in zip(dialog.fit_range_row.editors, old):
             editor.setText(f"{value:.12g}")
         expected = convert_radial_axis(np.asarray(old), "2th_deg", "q_A^-1", host.snapshot.wavelength_angstrom)
+        # declared repair (the maintainer, 2026-10-29: "reduce it down to 4. the display shouldn't be more than 3"):
+        # a converted bound is shown, and fitted, at four significant digits with at most three decimals
+        expected = np.asarray([float(f"{round(float(value), 3):.4g}") for value in expected])
         path = tmp_path / "phase-settings.json"
         dialog._settings_path_chooser = lambda _action, _start: str(path)
         assert type(dialog.settings_io.save()).__name__ == "ActionCompleted"
