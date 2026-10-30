@@ -4922,8 +4922,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not ScatteringWorkspace._all_frames_applies(self):
             return False
         navigation = self._context_controller.navigation
-        return bool(navigation.frames) and self._context_controller.select_navigation(
-            navigation.current, navigation.frames)
+        if not navigation.frames or not self._context_controller.select_navigation(
+                navigation.current, navigation.frames):
+            return False
+        # An accepted result choice supersedes an earlier debounced frame gesture, including when the
+        # result is reselected in place. A refused selection must leave pending intent untouched.
+        self._shell.browser.cancel_pending_frame_selection()
+        return True
 
     def _select_frames(self, command: ShellCommand) -> None:
         frame = command.frame

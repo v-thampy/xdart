@@ -313,6 +313,25 @@ def test_af11_same_result_reselect_uses_the_existing_context_and_all_its_frames(
     assert _on(page) is True
 
 
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Waterfall"))
+def test_af16_same_result_reselect_supersedes_a_pending_frame_removal(
+    qapp, workspace, two_results, plot_mode,
+):
+    page, (first, _second) = workspace, two_results
+    _mode(page, plot_mode)
+    _toggle(page)
+    _open(page, first)
+    context = page._context_controller.browse_context
+    _click_frame(qapp, page._shell, 2, modifiers=CTRL, settle=False)
+    assert page._shell.browser.frame_selection_pending
+    page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(first), path=("artifact",)))
+    assert not page._shell.browser.frame_selection_pending, "the later accepted result choice supersedes the gesture"
+    _shown(page, first)
+    assert page._context_controller.browse_context is context
+    assert _on(page) is True and _all_selected(page)
+    assert _rows(page) == A
+
+
 @pytest.mark.parametrize("toggle_state", ("enabled", "disabled", "enabled_while_pending"))
 def test_af12_latest_request_uses_the_current_toggle_at_adoption(burst, toggle_state):
     (page, loader, original, paths, select, entered, release_read,
