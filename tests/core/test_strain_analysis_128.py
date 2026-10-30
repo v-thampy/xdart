@@ -5,7 +5,9 @@ strain"), headless first, held to the deferred ledger's STRAIN/A3 gates: an expl
 stress-free d0), a weighted regression with covariance, reflection-specific elastic constants, the true sample-frame
 psi, and a refraction check. S rows use synthetic data with known answers; P rows run his reference notebook's
 pipeline on test_data/sin2psi inside the test and compare with today's sin2psi_analysis on the same map. New APIs are
-reached inside test bodies, so a missing one fails its own row.
+reached inside test bodies, so a missing one fails its own row. Checkpoint A (DESIGN-STRAIN-128.md) re-froze S15
+without its sigma case and added S17: no producer writes sigma for a GI q_chi map. S18 (self-review) names a left-out
+sector by its signed chi centre.
 """
 from __future__ import annotations
 
@@ -379,7 +381,7 @@ def test_s14_saved_frame_capture_keeps_axes_sigma_incidence_and_receipt(tmp_path
         assert inp.metadata["energy_eV"] == pytest.approx(12398.419843320026 / 0.97625)
 
 
-@pytest.mark.parametrize("bad", ["standard", "derived", "sigma", "incidence", "wavelength", "receipt"])
+@pytest.mark.parametrize("bad", ["standard", "derived", "incidence", "wavelength", "receipt"])
 def test_s15_capture_refuses_unsupported_or_incomplete_records(tmp_path, bad):
     from dataclasses import replace
     from xrd_tools.core.frame_view import FrameView, TwoDKind
@@ -389,8 +391,6 @@ def test_s15_capture_refuses_unsupported_or_incomplete_records(tmp_path, bad):
         view = replace(view, two_d_kind=TwoDKind.Q_CHI)
     elif bad == "derived":
         kwargs["derived"] = True
-    elif bad == "sigma":
-        view = replace(view, sigma_2d=None)
     elif bad == "incidence":
         view = replace(view, incident_angle=None, geometry=None)
     elif bad == "wavelength":
@@ -416,6 +416,42 @@ def test_s16_sector_sigma_uses_the_same_finite_samples_as_intensity():
     np.testing.assert_allclose(sector.intensity, 10.)
     np.testing.assert_allclose(sector.sigma[:2], [np.sqrt(20.) / 2, 5. / 2])
     np.testing.assert_allclose(sector.sigma[2:], np.sqrt(29.) / 3)
+
+
+@needs_lmfit
+def test_s17_a_native_gi_map_without_sigma_is_admitted_and_names_its_error_basis(tmp_path):
+    """Checkpoint A: no producer writes sigma for a GI q_chi map, so capture admits one without it; each point's
+    error is then its sector fit's standard error, and the outcome says so."""
+    from dataclasses import replace
+    from xrd_tools.analysis.plans import StrainPlan
+    from xrd_tools.analysis.runner import StrainAnalyzer, strain_input_from_view
+    from xrd_tools.core.frame_view import FrameView
+    view = replace(FrameView.from_results(label=3, result_2d=_polar_map(nq=80, nchi=41), incident_angle=0.4),
+                   sigma_2d=None)
+    inp = strain_input_from_view(view, receipt=_receipt(tmp_path / "scan.nexus", 3), wavelength_m=0.97625e-10)
+    assert inp.metadata["result_2d"].sigma is None
+    plan = StrainPlan(q_range=(3.0, 3.48), chi_range=(15.0, 85.0), chi_width=10.0, n_sectors=7)
+    outcome = StrainAnalyzer(plan).analyze(inp)
+    assert outcome.ok, outcome.message
+    assert "no σ recorded" in outcome.message
+    assert outcome.result.provenance["sigma_recorded"] is False
+    fit = outcome.result.payload.fit
+    assert fit.weighted and all(point.d_err > 0 for point in fit.admitted)
+
+
+@needs_lmfit
+def test_s18_a_left_out_sector_is_named_by_its_signed_chi_centre():
+    from dataclasses import replace
+    from xrd_tools.analysis.plans import StrainPlan, run_strain
+    polar = _polar_map(nq=80, nchi=41)
+    plan = StrainPlan(q_range=(3.0, 3.48), chi_range=(15.0, 85.0), chi_width=10.0, n_sectors=7, branches=(1, -1))
+    base = run_strain(plan, polar).payload
+    centre = next(point.sector.chi_center for point in base.points if point.excluded is None and point.branch == 1)
+    again = run_strain(replace(plan, excluded_chi=(centre,)), polar).payload
+    reasons = {point.sector.chi_center: point.excluded for point in again.points}
+    assert reasons[centre] == "left out by you"
+    assert reasons[-centre] is None  # the other branch's sector at the same psi stays
+    assert again.fit.n_used == base.fit.n_used - 1
 
 
 # S10: two reflections, each with its own constants, combine into one stress -------------------------------------
