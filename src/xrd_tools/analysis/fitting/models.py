@@ -129,6 +129,18 @@ def lorentzian_squared(x, amplitude=1.0, center=0.0, sigma=1.0):
     return amplitude * (1 / (1 + ((x - center) / sigma) ** 2)) ** 2
 
 
+def split_pseudovoigt(x, amplitude=1.0, center=0.0, sigma=1.0, sigma_r=1.0, fraction=0.5):
+    r"""
+    Continuous split pseudo-Voigt: one height and Lorentzian ``fraction``, with the half width at half maximum
+    ``sigma`` left of the centre and ``sigma_r`` right of it. ``amplitude`` is the area.
+    """
+    x = np.asarray(x, dtype=float)
+    z = (x - center) / np.where(x < center, sigma, sigma_r)
+    shape = (1.0 - fraction) * np.exp(-np.log(2.0) * z ** 2) + fraction / (1.0 + z ** 2)
+    area_per_height = 0.5 * (sigma + sigma_r) * ((1.0 - fraction) * np.sqrt(np.pi / np.log(2.0)) + fraction * np.pi)
+    return amplitude / area_per_height * shape
+
+
 def asymmetric_rectangle(
     x,
     amplitude1=1.0,
@@ -244,6 +256,18 @@ class LorentzianSquaredModel(Model):
     def guess(self, data, x=None, negative=False, **kwargs):
         pars = guess_from_peak(self, data, x, negative, ampscale=0.5, amp_area=False)
         return update_param_vals(pars, self.prefix, **kwargs)
+
+
+class SplitPseudoVoigtModel(Model):
+    r"""Split pseudo-Voigt 1D model: HWHM ``sigma`` (left) and ``sigma_r`` (right), one Lorentzian fraction."""
+    __doc__ = (split_pseudovoigt.__doc__ or "") + COMMON_DOC
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(split_pseudovoigt, *args, **kwargs)
+        self.set_param_hint("sigma", min=0)
+        self.set_param_hint("sigma_r", min=0)
+        self.set_param_hint("fraction", value=0.5, min=0, max=1)
+        self.set_param_hint("fwhm", expr="%ssigma+%ssigma_r" % (self.prefix, self.prefix))
 
 
 class AsymmetricRectangleModel(Model):

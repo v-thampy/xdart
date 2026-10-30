@@ -24,6 +24,7 @@ from lmfit import Model as LmfitModel
 from lmfit.models import (
     GaussianModel,
     LorentzianModel,
+    Pearson7Model,
     PseudoVoigtModel,
     VoigtModel,
     LinearModel,
@@ -34,6 +35,7 @@ from lmfit.models import (
 from xrd_tools.analysis.fitting.models import (
     lorentzian_squared,
     LorentzianSquaredModel,
+    SplitPseudoVoigtModel,
     Gaussian2DModel,
     LorentzianSquared2DModel,
     PseudoVoigt2DModel,
@@ -56,7 +58,30 @@ _PEAK_MODEL_MAP: dict[str, type] = {
     "pvoigt": PseudoVoigtModel,
     "lorentzian_squared": LorentzianSquaredModel,
     "lor2": LorentzianSquaredModel,
+    "pearson7": Pearson7Model,
+    "split_pseudovoigt": SplitPseudoVoigtModel,
 }
+#: Profiles whose width-blind default start (a quarter of the window) is too far off to converge reliably: without a
+#: given start their width and area come from the data's half maximum (STRAIN-ANALYSIS-128).
+_START_FROM_DATA = frozenset({"pearson7", "split_pseudovoigt"})
+
+
+def _half_width_at_half_maximum(x: np.ndarray, y: np.ndarray, center: float) -> tuple[float, float] | None:
+    """The data's half width at half maximum and peak height above its minimum, at ``center``; None when the
+    half-maximum crossings are not found on both sides."""
+    index = int(np.argmin(np.abs(x - center)))
+    base = float(np.nanmin(y))
+    height = float(y[index]) - base
+    if not height > 0:
+        return None
+    half = base + 0.5 * height
+    left, right = index, index
+    while left > 0 and y[left] > half:
+        left -= 1
+    while right < len(y) - 1 and y[right] > half:
+        right += 1
+    width = 0.5 * float(x[right] - x[left])
+    return (width, height) if width > 0 and y[left] <= half and y[right] <= half else None
 
 
 def get_peak_model(model: str, prefix: str = "") -> LmfitModel:
@@ -66,7 +91,8 @@ def get_peak_model(model: str, prefix: str = "") -> LmfitModel:
     Parameters
     ----------
     model : str
-        One of: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt', 'lorentzian_squared' (or 'lor2').
+        One of: 'gaussian', 'lorentzian', 'voigt', 'pseudovoigt', 'lorentzian_squared' (or 'lor2'), 'pearson7',
+        'split_pseudovoigt'.
     prefix : str
         Prefix for parameter names (needed when combining multiple peaks).
 
@@ -261,6 +287,13 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
 
     # Defaults
     data_range = x.max() - x.min()
+    key = model.lower().replace(" ", "").replace("-", "")
+    measured = ([_half_width_at_half_maximum(x, y, center) for center in positions]
+                if key in _START_FROM_DATA and sigma_init is None else None)
+    if measured is not None and amplitude_init is None and all(m is not None for m in measured):
+        amplitude_init = [2.0 * height * width for width, height in measured]
+    if measured is not None and all(m is not None for m in measured):
+        sigma_init = [width for width, _height in measured]
     if sigma_init is None:
         sigma_init = data_range / (4 * max(n_peaks, 1))
     if isinstance(sigma_init, (int, float)):
@@ -340,6 +373,11 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
         pars[f"{prefix}amplitude"].set(
             value=amplitude_init[i], min=amp_min, max=amp_max,
         )
+
+        # Right half width (split pseudo-Voigt): starts and is bounded as sigma
+        right_key = f"{prefix}sigma_r"
+        if right_key in pars:
+            pars[right_key].set(value=sigma_init[i], min=sigma_bounds[0], max=sigma_bounds[1])
 
         # Gamma (Voigt)
         gamma_key = f"{prefix}gamma"
