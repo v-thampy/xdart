@@ -66,6 +66,8 @@ _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
 #: Display-only choice: a q–χ map re-binned from the saved q_ip–q_oop cake.
 #: Never a GI mode key and never written; see ``xrd_tools.session.gi_derived_view``.
 DERIVED_Q_CHI = "q_chi_derived"
+#: A standard (non-GI) result's maps, as its image selector offers them.
+_STANDARD_IMAGE_AXES = ("Q-Chi", "2Th-Chi")
 _SHARE_PLOT_AXIS_BY_IMAGE = {
     "Q-Chi": "Q",
     "2Th-Chi": "2theta",
@@ -208,6 +210,25 @@ def resolve_gi_display_axes(
         }.get(image_axis, ())
     if axes and plot_axis not in axes:
         plot_axis = axes[0]
+    return image_axis, plot_axis
+
+
+def resolve_standard_display_axes(
+    native_axis: str | None, image_axis: str, plot_axis: str, *, allow_cake: bool = True,
+) -> tuple[str, str]:
+    """Resolve a standard result's map and trace to the axes its selectors offer, as
+    :func:`resolve_gi_display_axes` does a GI result's: a selection only a GI result has (Qᵢₚ, a GI map) falls back
+    to this result's own (BROWSE-1D-128)."""
+    if image_axis not in _STANDARD_IMAGE_AXES:
+        image_axis = _STANDARD_IMAGE_AXES[0]
+    if allow_cake:
+        axes = ("Q", "2theta", "chi")
+    elif native_axis == "chi":
+        axes = ("chi",)
+    else:
+        axes = ("Q", "2theta")
+    if plot_axis not in axes:
+        plot_axis = native_axis if native_axis is not None and native_axis in axes else axes[0]
     return image_axis, plot_axis
 
 

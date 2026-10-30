@@ -174,6 +174,7 @@ from .scientific_axes import (
     native_1d_plot_axis,
     resolve_gi_display_axes,
     resolve_norm_presentation,
+    resolve_standard_display_axes,
     shown_slice_pin,
     slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
@@ -6818,6 +6819,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         self._preferences, image_axis=image_axis,
                         plot_axis=requested_plot_axis,
                     )
+                else:
+                    # A selection a GI result left (Qᵢₚ, a GI map) is not offered here: without this its 1-D
+                    # trace was asked for Qᵢₚ and never drawn (BROWSE-1D-128). An offered one stays untouched.
+                    image_axis, plot_axis = resolve_standard_display_axes(
+                        native_axis, self._preferences.image_axis, self._preferences.plot_axis,
+                        allow_cake=intent.processing_mode != "Int 1D",
+                    )
+                    if (image_axis, plot_axis) != (self._preferences.image_axis, self._preferences.plot_axis):
+                        self._preferences = replace(
+                            self._preferences, image_axis=image_axis, plot_axis=plot_axis,
+                        )
+                        requested_plot_axis = (
+                            share_plot_axis_for_image(image_axis) or plot_axis
+                            if self._preferences.share_axis else plot_axis
+                        )
                 cake_axis_requested = requested_plot_axis != native_axis and not (
                     {requested_plot_axis, native_axis} <= {"Q", "2theta"}
                 )
