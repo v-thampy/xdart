@@ -6798,6 +6798,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             catalog = browse.scalar_catalog
             row = None if catalog is None else catalog.row(navigation.current.local_frame_label)
             if row is not None:
+                # Match the shared projection: Share Axis follows only a cake
+                # actually offered in Int 2D, never an absent/hidden map.
+                allow_cake = intent.processing_mode == "Int 2D" and row.active_mode_2d is not None
+                share_cake_axis = self._preferences.share_axis and allow_cake
+                requested_plot_axis = self._preferences.plot_axis
+                if share_cake_axis:
+                    requested_plot_axis = (
+                        share_plot_axis_for_image(self._preferences.image_axis) or requested_plot_axis
+                    )
                 native_axis = next((
                     native_1d_plot_axis(unit)
                     for mode, _label, unit, _log in catalog.axes_1d
@@ -6807,11 +6816,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     image_axis, requested_plot_axis = resolve_gi_display_axes(
                         row.active_mode_2d, row.modes_2d, native_axis,
                         self._preferences.image_axis, requested_plot_axis,
-                        allow_cake=intent.processing_mode != "Int 1D",
+                        allow_cake=allow_cake,
                         chi_axis=("chi" if dict(row.two_d_kinds).get("q_chi")
                                   is TwoDKind.Q_CHI else "chi_gi"),
                     )
-                    if self._preferences.share_axis:
+                    if share_cake_axis:
                         requested_plot_axis = (
                             share_plot_axis_for_image(image_axis) or requested_plot_axis
                         )
@@ -6824,7 +6833,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     # trace was asked for Qᵢₚ and never drawn (BROWSE-1D-128). An offered one stays untouched.
                     image_axis, plot_axis = resolve_standard_display_axes(
                         native_axis, self._preferences.image_axis, self._preferences.plot_axis,
-                        allow_cake=intent.processing_mode != "Int 1D",
+                        allow_cake=allow_cake,
                     )
                     if (image_axis, plot_axis) != (self._preferences.image_axis, self._preferences.plot_axis):
                         self._preferences = replace(
@@ -6832,7 +6841,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         )
                         requested_plot_axis = (
                             share_plot_axis_for_image(image_axis) or plot_axis
-                            if self._preferences.share_axis else plot_axis
+                            if share_cake_axis else plot_axis
                         )
                 cake_axis_requested = requested_plot_axis != native_axis and not (
                     {requested_plot_axis, native_axis} <= {"Q", "2theta"}

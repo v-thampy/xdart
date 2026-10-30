@@ -216,15 +216,17 @@ def resolve_gi_display_axes(
 def resolve_standard_display_axes(
     native_axis: str | None, image_axis: str, plot_axis: str, *, allow_cake: bool = True,
 ) -> tuple[str, str]:
-    """Resolve a standard result's map and trace to the axes its selectors offer, as
-    :func:`resolve_gi_display_axes` does a GI result's: a selection only a GI result has (Qᵢₚ, a GI map) falls back
-    to this result's own (BROWSE-1D-128)."""
+    """Resolve standard maps, or just the native trace when no cake is displayed.
+
+    A 1-D-only record may itself be GI. Its native axis remains available even
+    though there is no named GI map from which to infer additional cuts.
+    """
     if image_axis not in _STANDARD_IMAGE_AXES:
         image_axis = _STANDARD_IMAGE_AXES[0]
     if allow_cake:
         axes = ("Q", "2theta", "chi")
-    elif native_axis == "chi":
-        axes = ("chi",)
+    elif native_axis is not None and native_axis not in {"Q", "2theta"}:
+        axes = (native_axis,)
     else:
         axes = ("Q", "2theta")
     if plot_axis not in axes:
