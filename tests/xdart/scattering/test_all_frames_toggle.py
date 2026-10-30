@@ -222,11 +222,44 @@ def test_af6_clear_keeps_every_frame_of_the_shown_result_and_the_toggle(workspac
     assert _all_selected(page) and _rows(page) == B
 
 
-# AF7, AF8: Single (one frame), Average and Sum (Browse draws nothing there) grey it out and keep its check; back in
-# Overlay every frame shows again -----------------------------------------------------------------------------------
+# AF7 (his live check, 2026-10-30: "previously even in single mode, when show all was clicked, it selected all the
+# frames and showed the frames together"; his choice "Same as Overlay (Recommended)"): in Single too, every frame of
+# each result opened is drawn; a plain click shows one frame and turns it off. The first assertions hold on the
+# parent before ALL-FRAMES-128, where Show All drew every frame in Single --------------------------------------------
 
-@pytest.mark.parametrize("plot_mode", ("Single", "Average", "Sum"))
-def test_af7_af8_other_plot_modes_grey_it_out_and_keep_the_check(workspace, two_results, plot_mode):
+def test_af7_single_draws_every_frame_and_a_plain_click_turns_it_off(qapp, workspace, two_results):
+    page, (first, second) = workspace, two_results
+    shell = page._shell
+    _mode(page, "Single")
+    page._set_browser_directory(str(first.parent), explicit=True)
+    _open(page, first)
+    assert len(page._context_controller.navigation.selected) == 1
+    _toggle(page)
+    assert _all_selected(page) and _rows(page) == A, "as Show All did in Single, every frame is drawn"
+    assert _on(page) is True
+    scans = shell.browser.scans
+    _wait(lambda: True if any(scans.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == str(second)
+                              for row in range(scans.count())) else None)
+    scans.setFocus()
+    QtTest.QTest.keyClick(scans, QtCore.Qt.Key.Key_Down)
+    _shown(page, second)
+    assert _all_selected(page) and _rows(page) == B, "the next result draws every one of its frames"
+    _click_frame(qapp, shell, 1)
+    _settle(page)
+    assert _on(page) is False, "a plain click in Single leaves the other frames out"
+    assert [frame.local_frame_label for frame in page._context_controller.navigation.selected] == [2]
+    assert _rows(page) == B[1:2]
+    _toggle(page)
+    _mode(page, "Overlay")
+    _mode(page, "Single")
+    assert _on(page) is True and _all_selected(page), "entering Single with it on keeps every frame"
+
+
+# AF8: Average and Sum (Browse draws nothing there) grey it out and keep its check; back in Overlay every frame shows
+# again -------------------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("plot_mode", ("Average", "Sum"))
+def test_af8_average_and_sum_grey_it_out_and_keep_the_check(workspace, two_results, plot_mode):
     page, (first, _second) = workspace, two_results
     button = page._shell.browser.show_all
     _mode(page, "Overlay")
@@ -234,8 +267,6 @@ def test_af7_af8_other_plot_modes_grey_it_out_and_keep_the_check(workspace, two_
     _open(page, first)
     _mode(page, plot_mode)
     assert not button.isEnabled() and button.isChecked() and _on(page) is True
-    if plot_mode == "Single":
-        assert len(page._context_controller.navigation.selected) == 1
     QtTest.QTest.mouseClick(page._shell.scientific.clear, LEFT)
     QtWidgets.QApplication.processEvents()
     _settle(page)
@@ -296,8 +327,9 @@ def test_af10_the_button_is_a_checkable_all_frames_toggle_with_its_tooltip(works
     button = workspace._shell.browser.show_all
     assert button.text() == "All frames" and button.isCheckable()
     tip = button.toolTip()
-    for phrase in ("Overlay or Waterfall", "every one of its frames", "until Clear", "Up and Down arrow keys",
-                   "Ctrl-click", "Greyed out in Single, Average and Sum", "Remembered between sessions"):
+    for phrase in ("Single, Overlay or Waterfall", "every one of its frames", "until Clear", "Up and Down arrow keys",
+                   "Ctrl-click", "in Single a plain click", "Greyed out in Average and Sum",
+                   "Remembered between sessions"):
         assert phrase in tip, (phrase, tip)
 
 
