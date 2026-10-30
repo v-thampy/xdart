@@ -221,7 +221,7 @@ class SnapshotFitHost(QtCore.QObject):
             self.snapshot = terminal.payload
             if self.snapshot is None:
                 return False
-            self.dialog.set_vnext_trace(self.snapshot.trace_input())
+            self._show_trace()
             return True
         self.outcomes, self.snapshot, self._keys, xs = terminal.payload
         self._last_settings = plain_settings(dict(request.settings))
@@ -232,7 +232,7 @@ class SnapshotFitHost(QtCore.QObject):
             return False
         outcome = self.outcomes[-1]
         if outcome.overlay is not None and self.snapshot is not None:
-            self.dialog.set_vnext_trace(self.snapshot.trace_input())
+            self._show_trace()
             overlay = outcome.overlay
             if self.kind == 'phase' and self.snapshot.axes[0].unit in {'2th_deg', '2th_rad'}:
                 from xrd_tools.core.containers import convert_radial_axis
@@ -246,10 +246,17 @@ class SnapshotFitHost(QtCore.QObject):
             lower = (FitSeries(x, overlay.traces['residual'], 'residual', 'residual'),)
             self.dialog.fit_view.reconcile(FitProjection(self.dialog._pattern_panel(*upper, markers=tuple(markers)),
                                                         FitPanel(lower, zero_line=True)))
-            self.dialog.table.show_rows(*(peak_parameter_rows(outcome.result) if self.kind == 'peak'
-                                          else phase_result_rows(outcome.result)))
-        self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
+            if self.kind == 'phase':
+                self.dialog.show_phase_result_details(outcome.result)
+            else:
+                self.dialog.table.show_rows(*peak_parameter_rows(outcome.result))
+        if self.kind != 'phase' or outcome.overlay is None:
+            self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         return outcome.ok
+
+    def _show_trace(self):
+        options = {'wavelength': self.snapshot.wavelength_angstrom} if self.kind == 'phase' else {}
+        self.dialog.set_vnext_trace(self.snapshot.trace_input(), **options)
 
     def invalidate(self):
         self.owner.release()

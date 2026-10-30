@@ -84,9 +84,10 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
     cells = [
         ("", "import marimo as mo\nfrom pathlib import Path\nimport json\nfrom dataclasses import replace\n"
          "from xrd_tools.notebooks import recipe_from_json, run_recipe, run_recipe_batch, load_snapshot\n"
+         "from xrd_tools.notebooks.recipe import native_fit_range, apply_native_fit_range\n"
          "from xrd_tools.analysis.fit_table import outcomes_table, table_csv\n"
          "from xrd_tools.viz.plotly import plot_analysis_outcome\n"
-         "return mo, Path, json, replace, recipe_from_json, run_recipe, run_recipe_batch, load_snapshot, outcomes_table, table_csv, plot_analysis_outcome"),
+         "return mo, Path, json, replace, recipe_from_json, run_recipe, run_recipe_batch, load_snapshot, outcomes_table, table_csv, plot_analysis_outcome, native_fit_range, apply_native_fit_range"),
         ("Path, recipe_from_json", f"BUNDLE_ROOT = Path({bundle_root!r}).expanduser()\n"
          f"DATA_ROOT = Path({(bundle_root if data_root is None else data_root)!r}).expanduser()\n"
          f"recipe = recipe_from_json({recipe_to_json(recipe)!r})\nnotebook_description = {header!r}\n"
@@ -104,13 +105,13 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
          "comparison_selector = mo.ui.multiselect(options={r.label + ' [' + str(i) + ']': i for i, r in enumerate((recipe.input, *recipe.batch))}, value=[], max_selections=4, label='Comparison inputs') if recipe.tool in ('peak', 'phase') else None\n"
          "log_display = mo.ui.switch(value=False, label='Log intensity')\n"
          "mo.hstack([w for w in [input_selector, overlay_selector, comparison_selector, log_display] if w is not None])\nreturn input_selector, overlay_selector, comparison_selector, log_display"),
-        ("mo, recipe, BUNDLE_ROOT, DATA_ROOT, load_snapshot, json, input_selector",
+        ("mo, recipe, BUNDLE_ROOT, DATA_ROOT, load_snapshot, json, input_selector, native_fit_range",
          "_reference = (recipe.input, *recipe.batch)[input_selector.value]\n"
          "_snapshot = load_snapshot(_reference, bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
          "_axis = _snapshot.axes[0].values\n"
          "_lo, _hi = float(_axis.min()), float(_axis.max())\n"
          "_settings = dict(recipe.settings)\n"
-         "fit_range = mo.ui.range_slider(start=_lo, stop=_hi, step=(_hi-_lo)/500, value=list(_settings.get('fit_range') or _settings.get('fit_bounds') or (_lo, _hi)), label='Fit bounds (native coordinates)') if len(_snapshot.axes) == 1 else None\n"
+         "fit_range = mo.ui.range_slider(start=_lo, stop=_hi, step=(_hi-_lo)/500, value=list(native_fit_range(_settings, _snapshot) or (_lo, _hi)), label='Fit bounds (native coordinates)') if len(_snapshot.axes) == 1 else None\n"
          "region_ranges = {a.name: mo.ui.range_slider(start=float(a.values.min()), stop=float(a.values.max()), step=float(a.values.max()-a.values.min())/500, value=list(dict(_settings.get('region_bounds', ())).get(a.name, (float(a.values.min()), float(a.values.max())))), label=a.name + ' (' + a.unit + ') fit bounds') for a in _snapshot.axes} if recipe.tool.startswith('region') else {}\n"
          "settings_editor = mo.ui.text_area(value=json.dumps(_settings, indent=2), label='Scientific settings (JSON; initials and bounds)', full_width=True)\n"
          "phase_selector = mo.ui.multiselect(options=list(_settings.get('phase_names', ())), value=list(_settings.get('phase_names', ())), label='Enabled phases') if recipe.tool == 'phase' else None\n"
@@ -131,13 +132,12 @@ def render_notebook(recipe, *, format: str, bundle_root: str = ".", data_root: s
          "_axis = next(a for a in _snapshot.axes if a.name == slice_axis.value)\n"
          "slice_coordinate = mo.ui.number(value=float(_axis.values[len(_axis.values)//2]), label='Slice coordinate (nearest native bin)')\n"
          "mo.vstack([slice_coordinate]) if len(_snapshot.axes) == 3 else None\nreturn slice_coordinate"),
-        ("fit_apply, input_selector, fit_range, region_ranges, phase_selector, settings_editor, json, replace, recipe, run_recipe, BUNDLE_ROOT, DATA_ROOT, set_committed, set_batch",
+        ("fit_apply, input_selector, fit_range, region_ranges, phase_selector, settings_editor, json, replace, recipe, run_recipe, BUNDLE_ROOT, DATA_ROOT, set_committed, set_batch, load_snapshot, apply_native_fit_range",
          "if fit_apply.value:\n"
          "    _settings = json.loads(settings_editor.value)\n"
-         "    if recipe.tool == 'phase' and 'fit_range' in _settings:\n"
-         "        _settings['fit_range'] = tuple(fit_range.value)  # the solve's interval; its unit stays the recipe's\n"
-         "    elif recipe.tool in ('peak', 'phase'):\n"
-         "        _settings['fit_bounds'] = tuple(fit_range.value)\n"
+         "    if recipe.tool in ('peak', 'phase'):\n"
+         "        _snapshot = load_snapshot((recipe.input, *recipe.batch)[input_selector.value], bundle_root=BUNDLE_ROOT, data_root=DATA_ROOT)\n"
+         "        _settings = apply_native_fit_range(_settings, fit_range.value, _snapshot)\n"
          "    if recipe.tool.startswith('region'):\n"
          "        _settings['region_bounds'] = tuple((name, tuple(control.value)) for name, control in region_ranges.items())\n"
          "    if recipe.tool == 'phase':\n"

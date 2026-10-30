@@ -1462,11 +1462,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             target="scan_roi", request=analysis_request_facts(plan))
 
     def _refresh_fit_trace(self, kind):
-        trace, _anchor = self._capture_analysis_trace(kind)
+        trace, anchor = self._capture_analysis_trace(kind)
         dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
         if trace is None or dialog is None:
             self._notice("Select one displayed 1-D trace first."); return None
-        dialog.set_vnext_trace(trace); return trace
+        from .analysis_mount import phase_wavelength_angstrom
+        options = ({'wavelength': phase_wavelength_angstrom(self._context_controller, anchor.frame)}
+                   if kind == 'phase' and anchor is not None else {})
+        dialog.set_vnext_trace(trace, **options); return trace
 
     def _fit_export_snapshot(self, kind):
         """Detach the current displayed trace and controls, never an earlier fit's input."""

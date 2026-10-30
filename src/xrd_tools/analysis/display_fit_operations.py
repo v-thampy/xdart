@@ -631,6 +631,11 @@ def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> 
     if len(limits) != 2 or any(value is not None and not (_valid_number(value) and value > 0) for value in limits) or (
             None not in limits and not limits[0] < limits[1]):
         raise _invalid("width_limits")
+    # The kernel fills each omitted bound independently, using the full finite trace (not the solve mask).
+    floor = 1e-5 if limits[0] is None else limits[0]
+    cap = float(np.ptp(plan.trace.axis[finite])) / 4 if limits[1] is None else limits[1]
+    if not floor < cap or (plan.width_model == "caglioti" and not max(floor ** 2, 1e-12) < cap ** 2):
+        raise _invalid("width_limits")
     if not _choice(plan.texture, _TEXTURES):
         raise _invalid("texture")
     axis = plan.march_axis
@@ -657,13 +662,15 @@ def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> 
         _template_arrays(plan.background_template)
     if not _choice(plan.amorphous_peak, _AMORPHOUS_PROFILES):
         raise _invalid("amorphous_peak")
+    if not _valid_number(plan.amorphous_center):
+        raise _invalid("amorphous_center")
+    if not _valid_number(plan.amorphous_sigma) or not plan.amorphous_sigma > 0:
+        raise _invalid("amorphous_sigma")
     if plan.amorphous_peak != "none":
         axis_values = plan.trace.axis[finite]
-        if not _valid_number(plan.amorphous_center) or not float(np.min(axis_values)) <= plan.amorphous_center <= float(
+        if not float(np.min(axis_values)) <= plan.amorphous_center <= float(
                 np.max(axis_values)):
             raise _invalid("amorphous_center")
-        if not _valid_number(plan.amorphous_sigma) or not plan.amorphous_sigma > 0:
-            raise _invalid("amorphous_sigma")
     if not _choice(plan.fit_range_unit, _RANGE_UNITS):
         raise _invalid("fit_range_unit")
     if plan.fit_range is not None:
@@ -675,15 +682,31 @@ def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> 
     seeds = plan.initial_values
     if seeds:
         if (len(seeds) > _MAX_FIT_PARAMETERS or any(len(pair) != 2 or type(pair[0]) is not str or not pair[0]
+                                                   or len(pair[0].encode("utf-8")) > _MAX_PARAMETER_NAME_BYTES
                                                    or not _valid_number(pair[1]) for pair in seeds)
-                or len({name for name, _value in seeds}) != len(seeds)):
+                or len({name for name, _value in seeds}) != len(seeds)
+                or sum(len(name.encode("utf-8")) for name, _value in seeds) > _MAX_PARAMETER_NAMES_BYTES):
             raise _invalid("initial_values")
         if not plan.initial_topology:
             raise _invalid("initial_topology")
-    if plan.initial_topology and (len(plan.initial_topology) > _MAX_PHASES or any(
-            type(phase) is not tuple or len(phase) != 3 or type(phase[0]) is not str or type(phase[1]) is not str
-            or len(phase[2]) > _MAX_REFLECTIONS_PER_PHASE for phase in plan.initial_topology)):
+    topology = plan.initial_topology
+    if type(topology) is not tuple:
         raise _invalid("initial_topology")
+    if topology:
+        if len(topology) > _MAX_PHASES:
+            raise _invalid("initial_topology")
+        reflections = 0
+        for phase in topology:
+            if (type(phase) is not tuple or len(phase) != 3 or type(phase[0]) is not str or not phase[0]
+                    or len(phase[0].encode("utf-8")) > 256 or phase[1] not in ("cif", "lattice")
+                    or type(phase[2]) is not tuple or len(phase[2]) > _MAX_REFLECTIONS_PER_PHASE
+                    or any(type(hkl) is not tuple or len(hkl) != 3 or any(
+                        type(v) is not int or abs(v) > 2**31 - 1 for v in hkl)
+                           for hkl in phase[2])):
+                raise _invalid("initial_topology")
+            reflections += len(phase[2])
+        if reflections > _MAX_REFLECTIONS_TOTAL:
+            raise _invalid("initial_topology")
 def _q_bounds(plan: DisplayedPhaseFitPlan) -> tuple[float, float] | None:
     """The fit range in Å⁻¹ (a 2θ range converted with the plan's wavelength), or None."""
     if plan.fit_range is None:
@@ -711,7 +734,7 @@ def _template_arrays(template: Any) -> tuple[np.ndarray, np.ndarray]:
     x, y = np.asarray(template.axis)[keep], np.asarray(template.intensity)[keep]
     order = np.argsort(x, kind="stable")
     x, y = x[order], y[order]
-    if np.unique(x).size < 2:
+    if x.size < 2 or np.any(np.diff(x) <= 0):
         raise _invalid("background_template")
     return x, y
 def _fit_background_spec(plan: DisplayedPhaseFitPlan) -> str | None:
@@ -964,6 +987,7 @@ def run_displayed_phase_fit(
                 extra[name] = _result_array(values_array, x.size)
                 size = _result_add(size, extra[name])
                 arrays += ((name, extra[name]),)  # joins the fingerprint only when present
+        size = _result_add(size, topology)  # retained seed metadata shares the existing result-byte budget
         fingerprint = _digest((scalar, arrays))
         _progress(progress_callback, len(sources) + 1, len(sources) + 1)
         if cancel_token is not None and cancel_token.is_set():

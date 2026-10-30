@@ -100,6 +100,32 @@ def recipe_analyzer(recipe: FitNotebookRecipe, *, data_root: str | Path):
     return analyzer(seeds=seeds, **settings)
 
 
+def native_fit_range(settings, snapshot):
+    """A notebook slider's bounds in its input's native axis; legacy bounds are already native."""
+    import numpy as np
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    from xrd_tools.core.containers import convert_radial_axis
+    bounds = settings.get("fit_range")
+    if bounds is None:
+        return settings.get("fit_bounds")
+    unit = canonical_q_unit(snapshot.axes[0].unit)
+    converted = convert_radial_axis(np.asarray(bounds), settings.get("fit_range_unit", "q_A^-1"),
+                                    unit, snapshot.wavelength_angstrom)
+    return tuple(float(value) for value in converted)
+
+
+def apply_native_fit_range(settings, bounds, snapshot):
+    """Commit a native slider edit without mixing legacy pre-crop and phase solve-mask semantics."""
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    settings = dict(settings)
+    if "fit_range" in settings:
+        settings.pop("fit_bounds", None)
+        settings.update(fit_range=tuple(bounds), fit_range_unit=canonical_q_unit(snapshot.axes[0].unit))
+    else:
+        settings["fit_bounds"] = tuple(bounds)
+    return settings
+
+
 def analyze_recipe_snapshot(recipe, snapshot, *, data_root, analyzer=None):
     """Adapt native selection coordinates through the shared source owner, then call the public analyzer
     (``analyzer``: a batch's one analyzer, so a Sequential batch carries its seed)."""

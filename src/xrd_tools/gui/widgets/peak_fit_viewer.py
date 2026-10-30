@@ -105,7 +105,8 @@ class PeakFitViewer:
         self.selector.overlays.observe(self._presentation_changed, names="value")
         axis = self.snapshot.axes[0]
         finite = axis.values[np.isfinite(axis.values)]
-        self.ranges = FitRangeControls((finite.min(), finite.max()), fit_bounds=self._settings.get("fit_bounds"),
+        from xrd_tools.notebooks.recipe import native_fit_range
+        self.ranges = FitRangeControls((finite.min(), finite.max()), fit_bounds=native_fit_range(self._settings, self.snapshot),
                                        label=f"{axis.name} ({axis.unit})", on_display=self.render)
         self.region_ranges = None
         if tool.startswith("region"):
@@ -165,7 +166,8 @@ class PeakFitViewer:
     def current_settings(self):
         settings = self.controls.get_params()
         if self.tool in {"peak", "phase"}:
-            settings["fit_bounds"] = tuple(self.ranges.fit_bounds.value)
+            from xrd_tools.notebooks.recipe import apply_native_fit_range
+            settings = apply_native_fit_range(settings, self.ranges.fit_bounds.value, self.snapshot)
         elif self.region_ranges is not None:
             settings["region_bounds"] = self.region_ranges.bounds
         return settings

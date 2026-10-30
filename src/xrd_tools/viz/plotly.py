@@ -660,7 +660,8 @@ def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "backgroun
     if outcome is not None and outcome.overlay is not None:
         overlay = outcome.overlay
         for name, values in overlay.traces.items():
-            if name not in overlays or values is None:
+            component = name in {"fit_background", "amorphous"} and "components" in overlays
+            if (name not in overlays and not component) or values is None:
                 continue
             fig.add_trace(go.Scattergl(x=convert(overlay.x), y=values, mode="lines", name=name),
                           row=2 if name == "residual" else 1, col=1)

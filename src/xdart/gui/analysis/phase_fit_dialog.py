@@ -116,6 +116,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._export_snapshot_provider = None
         self._x = self._y = None
         self._x_label, self._x_unit = "q", ""
+        self._fit_bounds_unit, self._range_reason = "q_A^-1", ""
         #: the substrate pattern the host captured (a q ``DisplayedTraceInput``), kept until cleared and never saved
         self._template = None
         self._receipts = {}
@@ -362,6 +363,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             'Drag it on the plot or type it; blank fits the whole trace.'))
         for edit in self.fit_range_row.editors:
             edit.setValidator(QtGui.QDoubleValidator(self))
+            edit.textEdited.connect(lambda _text: self._range_edited())
 
     def _build_batch(self):
         card = self.batch_card = self._card("Batch", "batch", (
@@ -543,6 +545,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def fit_refusal(self):
         """Why Fit or Batch cannot start with these options ("" when they can): a refused number, a list of only
         calibrants, or a Substrate background without a captured substrate."""
+        if self._range_reason:
+            return self._range_reason
         for row in (self._maxfev_row, self.fit_background_degree_row, self.snip_width_row, *self.march_rows):
             if row.refusal():
                 return f"{row.label.text()}: {row.refusal()}"
@@ -583,7 +587,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             "amorphous_peak": self.amorphous_row.current_value(),
             "amorphous_center": float(self.amorphous_center_row.current_value()),
             "amorphous_sigma": float(self.amorphous_sigma_row.current_value()),
-            "fit_range": fit_range, "fit_range_unit": "q_A^-1" if fit_range is None else self._range_unit(),
+            "fit_range": fit_range, "fit_range_unit": "q_A^-1" if fit_range is None else self._fit_bounds_unit,
         }
         if not cutoffs.global_on:
             # each included phase's own minimum, in the fit's phase order (a lattice phase's is ignored)
@@ -680,15 +684,22 @@ class PhaseFitDialog(QtWidgets.QDialog):
         return FitPanel((FitSeries(self._x, self._y, "data_line", "data"), *series),
                         self._x_label, "Intensity", markers=markers)
 
-    def set_vnext_trace(self, trace):
+    def set_vnext_trace(self, trace, *, wavelength=None):
         self._export_trace = trace
+        self._export_wavelength = wavelength
         self._x_unit = trace.axis_unit
+        try:
+            bounds = self._converted_bounds(self._range_values(self.fit_range_row), self._fit_bounds_unit)
+            self._set_range_fields(bounds)
+        except ValueError as error:
+            self._range_reason = f"Fit range: {error}. Clear or re-enter the range in {self._range_unit()}."
         self.use_uncertainties.setEnabled(trace.sigma is not None)
         if trace.sigma is None:
             self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
         self._fields_to_region()
-        self.status.setText("Displayed trace captured. Check the phases to fit and click Fit.")
+        self.status.setText(self._range_reason or "Displayed trace captured. Check the phases to fit and click Fit.")
+        self._sync_actions()
 
     def clear_input(self):
         """Release a detached displayed input when its host changes scope or closes."""
@@ -719,6 +730,10 @@ class PhaseFitDialog(QtWidgets.QDialog):
                       result.phase_components, strict=True)))
         self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
                                               FitPanel(lower, zero_line=True)))
+        self.show_phase_result_details(result)
+
+    def show_phase_result_details(self, result):
+        """The shared receipt, table and status projection for Int and snapshot hosts' phase fits."""
         # Each fitted CIF row shows the receipt of the bytes the fit read, by its library id (never its position).
         self._receipts = {receipt.expected_sha256 or receipt.sha256: "\n".join(map(str, (
             receipt.phase_name, receipt.lexical_path, receipt.resolved_path, receipt.byte_count, receipt.sha256,
@@ -767,13 +782,38 @@ class PhaseFitDialog(QtWidgets.QDialog):
 
     def _region_to_fields(self, lo, hi):
         """The fit range dragged on the plot, written into the Fit range row."""
-        low, high = self.fit_range_row.editors
-        low.setText(f"{lo:.6g}")
-        high.setText(f"{hi:.6g}")
+        self._set_range_fields((lo, hi))
+
+    def _converted_bounds(self, bounds, unit):
+        """Preserve the scientific interval when the displayed axis changes, using the recorded wavelength."""
+        if unit not in ("q_A^-1", "2th_deg", "2th_rad"):
+            raise ValueError("saved fit_range_unit is missing or invalid")
+        if unit == self._range_unit() or all(value is None for value in bounds):
+            return bounds
+        from xrd_tools.core.containers import convert_radial_axis
+        values = convert_radial_axis(np.asarray([np.nan if v is None else v for v in bounds]), unit,
+                                    self._range_unit(), self._export_wavelength)
+        if any(value is not None and not np.isfinite(converted) for value, converted in zip(bounds, values)):
+            raise ValueError("range conversion is not finite")
+        converted = tuple(None if value is None else float(new) for value, new in zip(bounds, values))
+        if None not in converted and not converted[0] < converted[1]:
+            raise ValueError("converted low must be less than high")
+        return converted
+
+    def _set_range_fields(self, bounds):
+        self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
+        for editor, value in zip(self.fit_range_row.editors, bounds):
+            with QtCore.QSignalBlocker(editor):
+                editor.setText('' if value is None else f'{value:.12g}')
+
+    def _range_edited(self):
+        self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
+        self._fields_to_region()
+        self._sync_actions()
 
     def _fields_to_region(self):
         """The Fit range row's values (the whole trace while blank), shown as the plot's fit range."""
-        if self._x is None:
+        if self._x is None or self._range_reason:
             self.fit_view.set_fit_range(None)
             return
         extent = self._data_extent()
@@ -781,9 +821,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.fit_view.set_fit_range(extent if bounds is None else bounds, limits=extent)
 
     def _on_full(self):
-        for edit in self.fit_range_row.editors:
-            edit.setText("")
+        self._set_range_fields((None, None))
         self._fields_to_region()
+        self._sync_actions()
 
     # ---- batch hooks (driven by the host) -------------------------------
     def batch_x_range(self):
@@ -897,6 +937,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 for identifier, shown in self.phase_source.selection]
         return {"kind": PHASE_ANALYSIS_SETTINGS.kind, "version": PHASE_ANALYSIS_SETTINGS.version,
                 "fields": {key: plain(self._setting(key)) for key in self._settings_rows},
+                "fit_range_unit": self._fit_bounds_unit,
                 "phases": {"rows": rows, "global_on": bool(cutoffs.global_on), "value": float(cutoffs.global_value)}}
 
     def _checked_fields(self, document):
@@ -925,6 +966,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 raise ValueError(f"{field.label}: {value!r} {refusal}")
         current = {key: self._setting(key) for key in self._settings_rows}
         merged = {**current, **fields}
+        if merged['texture'] == 'march_dollase' and not any(merged[f'march_{axis}'] for axis in 'hkl'):
+            raise ValueError('March-Dollase axis must not be (0, 0, 0)')
         for key in ("fit_range", "free_height", "width"):
             low, high = (merged[f"{key}_low"], merged[f"{key}_high"]) if key != "width" else (
                 merged["width_min"], merged["width_max"])
@@ -937,6 +980,11 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 raise ValueError(f"{label}: σ limits must be positive")
             if key != "free_height" and low is not None and high is not None and not low < high:
                 raise ValueError(f"{label}: low must be less than high")
+        if 'fit_range_low' in fields or 'fit_range_high' in fields:
+            bounds = (merged['fit_range_low'], merged['fit_range_high'])
+            unit = document.get('fit_range_unit', self._range_unit() if bounds == (None, None) else None)
+            low, high = self._converted_bounds(bounds, unit)
+            fields.update(fit_range_low=low, fit_range_high=high)
         return fields
 
     def _checked_phases(self, document):
@@ -991,7 +1039,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
             row, bound = self._settings_rows[key]
             if bound is not None:
                 edit = row.editors[bound]
-                edit.setText("" if value is None else f"{float(value):.6g}")
+                edit.setText("" if value is None else f"{float(value):.12g}")
                 edit.setModified(False)
             elif isinstance(row.editor, QtWidgets.QComboBox):
                 row.editor.setCurrentIndex(row.editor.findData(value))
@@ -1008,6 +1056,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
             if missing:
                 notices.append(f"Missing phase library entries were skipped: {', '.join(missing)}.")
         self._template = None
+        if 'fit_range_low' in fields or 'fit_range_high' in fields:
+            self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
         self._sync_options()
         self._fields_to_region()
         if self.fit_background_row.current_value().startswith("template"):
