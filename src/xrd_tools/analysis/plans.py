@@ -1357,17 +1357,18 @@ class StrainPlan:
 
 def run_strain(plan: StrainPlan, result2d: IntegrationResult2D, *, incident_angle_deg: float | None = None,
                energy_eV: float | None = None) -> AnalysisResult:
-    """The strain analysis of one GI fiber map; the refraction check runs when the frame's incidence and energy are
-    known."""
+    """The strain analysis of one GI fiber map; missing refraction context is explicitly apparent/unknown."""
     from xrd_tools.analysis.axis_units import require_inverse_angstrom
     from xrd_tools.analysis.strain import (
-        StrainAnalysisResult, fit_strain_sectors, refraction_estimate, strain_regression, strain_sectors,
+        RefractionEstimate, StrainAnalysisResult, fit_strain_sectors, refraction_estimate, strain_regression,
+        strain_sectors,
     )
 
     require_inverse_angstrom(result2d.unit)
     sectors = strain_sectors(
         result2d, chi_centers=plan.chi_centers, chi_width=plan.chi_width, n_sectors=plan.n_sectors,
-        chi_range=plan.chi_range, branches=plan.branches, min_finite_fraction=plan.min_finite_fraction)
+        chi_range=plan.chi_range, branches=plan.branches, min_finite_fraction=plan.min_finite_fraction,
+        q_range=plan.q_range)
     points = fit_strain_sectors(
         sectors, plan.q_range, model=plan.model, background=plan.background, sigma_init=plan.sigma_init,
         sigma_bounds=plan.sigma_bounds, center_bounds_delta=plan.center_bounds_delta,
@@ -1381,14 +1382,17 @@ def run_strain(plan: StrainPlan, result2d: IntegrationResult2D, *, incident_angl
     usable = [point for point in points if point.excluded is None]
     fit = strain_regression(usable, d0=plan.d0, elastic=plan.elastic, stress_state=plan.stress_state)
     branch_fits = {}
-    for branch in sorted({point.branch for point in usable}):
+    observed_branches = sorted({point.branch for point in usable})
+    for branch in observed_branches:
         side = [point for point in usable if point.branch == branch]
-        if len(plan.branches) > 1 and len(side) >= 3:
+        if len(observed_branches) > 1 and len(side) >= 3:
             try:
                 branch_fits[branch] = strain_regression(side)
             except ValueError:
                 pass
-    refraction = None
+    missing = [name for name, value in (("incidence", incident_angle_deg), ("energy", energy_eV)) if value is None]
+    refraction = RefractionEstimate(None, True, None, None,
+                                   "refraction unknown: missing " + " and ".join(missing) + "; stress is apparent")
     if incident_angle_deg is not None and energy_eV is not None:
         refraction = refraction_estimate(
             points, fit, incident_angle_deg=incident_angle_deg, energy_eV=energy_eV, material=plan.material,

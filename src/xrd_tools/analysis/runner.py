@@ -465,7 +465,8 @@ class StrainAnalyzer:
     Each input is one frame's GI fiber map from :func:`strain_input_from_view`; the refraction check runs at that
     frame's own incidence and energy. Projects the fit over both branches to flat params (``intercept`` /
     ``slope`` / ``r_squared`` / ``n_used``, ``stress`` / ``stress_err`` with elastic constants and an independent
-    d0, ``apparent`` 1.0 or 0.0 when refraction was checked) and a sin²ψ-vs-d overlay (``data`` + ``fit``).
+    d0, ``d0`` / ``d0_err`` when given, ``apparent`` 1.0 when refraction is unknown or significant, otherwise 0.0)
+    and a sin²ψ-vs-d overlay (``data`` + ``fit``). Weighted chi²_red accompanies the conditional formal errors.
     """
 
     plan: StrainPlan
@@ -491,6 +492,7 @@ class StrainAnalyzer:
                 "wavelength_m": metadata.get("wavelength_m")}
         payload = result.payload
         notices = ["" if result.provenance["sigma_recorded"] else _NO_SIGMA, payload.fit.notice,
+                   "" if payload.fit.d0 is None else payload.fit.d0.label,
                    getattr(payload.refraction, "notice", "")]
         return AnalysisOutcome(
             label=inp.label,
@@ -524,8 +526,13 @@ def _strain_params(payload: Any) -> "dict[str, float]":
         out["stress"] = float(fit.stress)
     if fit.stress_err is not None:
         out["stress_err"] = float(fit.stress_err)
-    if payload.refraction is not None:
-        out["apparent"] = 1.0 if payload.refraction.apparent else 0.0
+    if fit.d0 is not None:
+        out["d0"] = float(fit.d0.value)
+        if fit.d0.stderr is not None:
+            out["d0_err"] = float(fit.d0.stderr)
+    if fit.reduced_chi_squared is not None:
+        out["reduced_chi_squared"] = float(fit.reduced_chi_squared)
+    out["apparent"] = 1.0 if payload.refraction is None or payload.refraction.apparent else 0.0
     return out
 
 

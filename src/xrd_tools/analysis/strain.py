@@ -483,13 +483,15 @@ def strain_sectors(
     chi_range: tuple[float, float] | None = None,
     branches: tuple[int, ...] = (1,),
     min_finite_fraction: float = 0.5,
+    q_range: tuple[float, float] | None = None,
 ) -> tuple[StrainSector, ...]:
     """The χ sectors of a GI fiber map (radial q_total, azimuthal χ_GI, intensity (nq, nχ)).
 
     Explicit ``chi_centers`` keep their sign; otherwise ``n_sectors`` (default: as many as tile the range) of width
     ``chi_width`` tile the |χ| range ``chi_range`` on each of ``branches`` (+1, −1). No sector spans χ = 0. A sector
     whose finite fraction is under ``min_finite_fraction`` (the missing wedge, read from the map's own coverage, or
-    detector gaps) stays in the list with its reason.
+    detector gaps) stays in the list with its reason. Supply the fitted ``q_range`` for quantitative analysis:
+    coverage, reporting angle and the extracted profile then use only that window. Without it the whole map is used.
     """
     chi = np.asarray(result2d.azimuthal, dtype=float)
     q = np.asarray(result2d.radial, dtype=float)
@@ -501,6 +503,13 @@ def strain_sectors(
     sigma = None if result2d.sigma is None else np.asarray(result2d.sigma, dtype=float)
     if sigma is not None and sigma.shape != intensity.shape:
         raise ValueError("the map's sigma does not match its intensity")
+    if q_range is not None:
+        low_q, high_q = sorted(float(value) for value in q_range)
+        rows = (q >= low_q) & (q <= high_q)
+        if not np.any(rows):
+            raise ValueError("the q window contains no map samples")
+        q, intensity = q[rows], intensity[rows]
+        sigma = None if sigma is None else sigma[rows]
     width = float(chi_width)
     if not width > 0:
         raise ValueError("the sector width must be positive")
@@ -698,11 +707,17 @@ def d0_from_library(entry, hkl, *, wavelength_angstrom: float) -> D0Reference:
     if getattr(entry, "source_kind", None) == "calibrant":
         raise ValueError("a calibrant line carries no hkl to choose: pick a CIF or lattice phase")
     wanted = tuple(int(index) for index in hkl)
-    _, (reference,) = prepare_phase_models(entry, wavelength_angstrom=float(wavelength_angstrom), min_intensity=0)
+    (model,), (reference,) = prepare_phase_models(
+        entry, wavelength_angstrom=float(wavelength_angstrom), min_intensity=0)
     exact = [line for line in reference.reflections if wanted in tuple(tuple(h) for h in line.hkls)]
     family = sorted(abs(index) for index in wanted)
+    # Family representatives may omit an equivalent signed/permuted hkl. A
+    # permutation alone is not an equivalence in a non-cubic lattice: never
+    # return another plane's spacing under the requested label.
+    wanted_d = float(model.lattice.d_hkl(wanted))
     similar = [line for line in reference.reflections
-               if any(sorted(abs(index) for index in h) == family for h in line.hkls)]
+               if np.isclose(line.d_spacing, wanted_d, rtol=1e-8, atol=1e-10)
+               and any(sorted(abs(index) for index in h) == family for h in line.hkls)]
     matches = exact or (similar if len(similar) == 1 else [])
     text = "".join(str(index) for index in wanted)
     if not matches:
@@ -753,6 +768,7 @@ class StrainFit:
     sin2psi_star: float | None = None
     shear: float | None = None
     elastic: ElasticConstants | None = None
+    reduced_chi_squared: float | None = None
 
     @property
     def slope_err(self) -> float:
@@ -807,6 +823,10 @@ def strain_regression(points, *, d0=None, elastic: ElasticConstants | None = Non
     beta = inverse @ (design.T @ (weights * y))
     residual = y - design @ beta
     ss_res = float(np.sum(weights * residual ** 2))
+    reduced_chi_squared = ss_res / (len(admitted) - 2) if weighted else None
+    if reduced_chi_squared is not None and reduced_chi_squared > 1.0:
+        notes.append(f"weighted chi²_red = {reduced_chi_squared:.3g}: excess scatter; formal errors are "
+                     "conditional on the point errors and linear model, not inflated for this scatter")
     cov = inverse if weighted else inverse * (ss_res / (len(admitted) - 2))
     mean = float(np.sum(weights * y) / np.sum(weights))
     ss_tot = float(np.sum(weights * (y - mean) ** 2))
@@ -845,7 +865,8 @@ def strain_regression(points, *, d0=None, elastic: ElasticConstants | None = Non
         weighted=weighted, n_used=len(admitted), admitted=tuple(admitted), notice="; ".join(notes),
         r_squared=float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 1.0,
         reading="tensile" if sign > 0 else "compressive" if sign < 0 else "none",
-        d0=reference, strain=strain, stress=stress, stress_err=stress_err, sin2psi_star=star, elastic=elastic)
+        d0=reference, strain=strain, stress=stress, stress_err=stress_err, sin2psi_star=star, elastic=elastic,
+        reduced_chi_squared=reduced_chi_squared)
 
 
 def combined_stress(fits) -> tuple[float, float]:
@@ -930,8 +951,8 @@ def refraction_estimate(points, fit: StrainFit, *, incident_angle_deg: float, en
 @dataclass(frozen=True, eq=False)
 class StrainAnalysisResult:
     """One frame's strain analysis: its sectors, the points fitted from them, the fit over both branches, each
-    branch's own descriptive fit (no stress claim), and the refraction estimate (None without incidence and
-    energy)."""
+    branch's own descriptive fit (no stress claim), and the refraction estimate (explicitly unknown when incidence
+    or energy is absent)."""
 
     sectors: tuple[StrainSector, ...] = field(repr=False)
     points: tuple[StrainPoint, ...] = field(repr=False)

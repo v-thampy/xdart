@@ -552,6 +552,13 @@ def test_p2_pt_200_batch_over_the_four_anneals_runs_frame_by_frame(pt_maps, tmp_
         values = [outcome.params[key] for key in ("intercept", "slope", "stress", "stress_err")]
         assert np.all(np.isfinite(values))
         assert outcome.params["apparent"] == 1.0
+        fit = outcome.result.payload.fit
+        redchi = sum(((p.d - fit.intercept - fit.slope * p.sin2psi) / p.d_err)**2
+                     for p in fit.admitted) / (fit.n_used - 2)
+        assert np.isfinite(redchi)
+        print(f"P2 scatter frame={outcome.label} n={fit.n_used} chi2_red={redchi:.6g} "
+              f"stress_MPa={fit.stress / 1e6:.6g} formal_err_MPa={fit.stress_err / 1e6:.6g} "
+              f"scatter_factor={np.sqrt(max(1., redchi)):.6g}")
     print("P2 Pt 200 intercept/slope/stress:",
           [(round(o.params["intercept"], 5), round(o.params["slope"], 5), round(o.params["stress"] / 1e6, 1))
            for o in outcomes])
