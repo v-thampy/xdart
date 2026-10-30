@@ -729,7 +729,7 @@ def test_e3_ui2_restores_control_inventory_and_ranges(
             "File",
             "Config",
             "Help",
-            "Show All",
+            "All frames",  # ALL-FRAMES-128: Show All became the persistent All frames toggle
             "Metadata",
             "Auto Last",
             "Peak Fitting",

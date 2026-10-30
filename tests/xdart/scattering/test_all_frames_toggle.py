@@ -12,8 +12,10 @@ close and restart.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import shutil
 from threading import Event
+import time
 
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
@@ -41,10 +43,12 @@ def qapp():
 
 @pytest.fixture
 def two_results(tmp_path):
-    """Two three-frame outputs in one folder, as two samples' files sit side by side."""
+    """Two three-frame outputs in one folder, as two samples' files sit side by side. The second carries Int 1D's
+    output slot (``_int1d``), as a real output does, so the results list's Auto filter lists it (declared oracle repair,
+    ALL-FRAMES-128 implementation: Auto hid ``scan_b.nexus`` and AF1/AF2 waited for its row)."""
     first, _ = _write_processed(tmp_path / "a", labels=(1, 2, 3))
     other, _ = _write_processed(tmp_path / "b", labels=(1, 2, 3))
-    second = first.parent / "scan_b.nexus"
+    second = first.parent / "scan_b_int1d.nexus"
     shutil.copyfile(other, second)
     return first, second
 
@@ -120,7 +124,7 @@ def _rows(page):
 
 
 A = [("scan.nexus", label) for label in (1, 2, 3)]
-B = [("scan_b.nexus", label) for label in (1, 2, 3)]
+B = [("scan_b_int1d.nexus", label) for label in (1, 2, 3)]
 
 
 # AF1, AF2: every frame of each result opened, earlier results kept; the next result is one Down-arrow key ----------
@@ -403,3 +407,46 @@ def test_af14_fresh_open_reads_a_grown_result_and_selects_its_new_frame(workspac
     assert [frame.local_frame_label for frame in navigation.frames] == [1, 2, 3, 4]
     assert _all_selected(page) and _on(page) is True
     assert ("scan.nexus", 4) in _rows(page)
+
+
+# AF15 (added at the implementation terminal, Codex REVIEW-1: "Measure actual long-file toggle-switch time"): the
+# maintainer's case at its measured size, read-only on test_data. Design probe at the parent: open 1.80-2.77 s, Show All
+# +0.33-0.34 s on these 2500-frame bursts.
+
+_BURST = ("bo_0_506V_0p1ms_sfpx_45p19_halpha_0p30_burst_00001_int2d.nexus",
+          "bo_2_716V_5p9ms_sfpx_23p70_halpha_0p30_burst_00001_int2d.nexus")
+
+
+@pytest.mark.skipif(not os.environ.get("XDART_TEST_DATA"), reason="needs test_data's 2500-frame burst outputs")
+@pytest.mark.parametrize("all_frames", (True, False), ids=("on", "off"))
+def test_af15_two_2500_frame_results_switch_with_all_frames_on(qapp, tmp_path, monkeypatch, all_frames):
+    """Off is the same switch's one-frame open, run beside it so the difference is All frames' own cost."""
+    folder = Path(os.environ["XDART_TEST_DATA"]) / "xdart_processed_data" / "bo_burst"
+    first, second = (folder / name for name in _BURST)
+    if not (first.is_file() and second.is_file()):
+        pytest.skip("the burst outputs are not in this test_data")
+    page, _ = _page(tmp_path, monkeypatch, store=RunIntentStore(RunIntent(
+        project_root=str(folder), processing_mode="Int 2D")))
+    page.resize(1200, 800)
+    page.show()
+    try:
+        _mode(page, "Waterfall")
+        if all_frames:
+            _toggle(page)
+        times = []
+        for path in (first, second):
+            start = time.perf_counter()
+            _open(page, path)
+            times.append(time.perf_counter() - start)
+            navigation = page._context_controller.navigation
+            assert len(navigation.frames) == 2500
+            assert _all_selected(page) if all_frames else len(navigation.selected) == 1
+        rows = _rows(page)
+        assert sum(name == second.name for name, _label in rows) == (2500 if all_frames else 1)
+        assert any(name == first.name for name, _label in rows), "the earlier result stays overlaid"
+        state = "on" if all_frames else "off"
+        print(f"AF15 result switch with All frames {state}: {', '.join(f'{seconds:.2f} s' for seconds in times)}")
+    finally:
+        _wait(lambda: True if page.close_workspace().cleanup_status is CleanupStatus.CLEANED else None)
+        page.deleteLater()
+        qapp.processEvents()
