@@ -40,6 +40,11 @@ def _polar_map(*, d0=1.94, slope=0.04, shear=0.0, chi=(-85.0, 85.0), nchi=341, w
         scale = 0.01 if any(lo <= c <= hi for lo, hi in weak) else 1.0
         intensity[:, j] = scale * peak + background
     intensity = rng.poisson(intensity).astype(float)
+    # A deliberately peak-free sector, not an arbitrary 100x attenuation that
+    # may still be significant after averaging its independent angular bins.
+    for j, c in enumerate(chis):
+        if any(lo <= c <= hi for lo, hi in weak):
+            intensity[:, j] = background
     sigma = np.sqrt(np.maximum(intensity, 1.0))
     inside = np.abs(chis) < wedge
     intensity[:, inside] = np.nan
@@ -105,7 +110,7 @@ def test_s3_a_point_without_an_error_is_left_out_and_too_few_fall_back_to_unweig
     assert fit.weighted is False and fit.n_used == 3 and "unweighted" in fit.notice.lower()
 
 
-# S4: every d0 is labelled: a library line, typed, a stress-free reference, psi* (equibiaxial or uniaxial) --------
+# S4: every d0 is labelled; directional stress requires geometry beyond polar psi -----------------------------
 
 @pytest.mark.skipif(not _HAS_PYMATGEN, reason="needs pymatgen")
 def test_s4_each_d0_is_labelled_and_the_intercept_is_never_called_d0(tmp_path, monkeypatch):
@@ -130,9 +135,9 @@ def test_s4_each_d0_is_labelled_and_the_intercept_is_never_called_d0(tmp_path, m
     reference = d0_from_reference([StrainPoint(p, 1.950, 3e-4) for p in np.arange(15.0, 85.0, 10.0)])
     assert reference.kind == "reference" and reference.value == pytest.approx(1.950, rel=1e-12)
     equi = strain_regression(points, d0="psi_star", elastic=elastic, stress_state="equibiaxial")
-    uni = strain_regression(points, d0="psi_star", elastic=elastic, stress_state="uniaxial")
     assert equi.sin2psi_star == pytest.approx(2 * 0.39 / 1.39, rel=1e-9)
-    assert uni.sin2psi_star == pytest.approx(0.39 / 1.39, rel=1e-9)
+    with pytest.raises(ValueError, match="(?i)(geometry|direction|azimuth)"):
+        strain_regression(points, d0="psi_star", elastic=elastic, stress_state="uniaxial")
     assert equi.d0.kind == "psi_star"
     assert equi.d0.value == pytest.approx(equi.intercept + equi.slope * equi.sin2psi_star, rel=1e-12)
 
@@ -159,17 +164,19 @@ def test_s5_elastic_constants_two_ways_recover_a_known_stress_with_its_covarianc
     assert fit_a.reading == "compressive"
 
 
-# S6: +chi and -chi kept apart recover a shear term; averaged, the shear cancels ---------------------------------
+# S6: +/-chi alone is not the geometry required for a physical shear interpretation ----------------------------
 
-def test_s6_plus_and_minus_chi_branches_recover_a_shear_term():
+def test_s6_plus_and_minus_chi_do_not_establish_a_shear_geometry():
     from xrd_tools.analysis.strain import StrainPoint, strain_regression
     psi = np.arange(15.0, 85.0, 5.0)
     points = [StrainPoint(p, _line(p) + branch * 0.003 * abs(np.sin(2 * np.deg2rad(p))), 1e-4, branch=branch)
               for branch in (1, -1) for p in psi]
-    fit = strain_regression(points, shear=True)
-    assert fit.shear == pytest.approx(0.003, rel=1e-6) and fit.slope == pytest.approx(0.04, rel=1e-6)
-    plain = strain_regression(points)
-    assert plain.slope == pytest.approx(0.04, rel=1e-6) and plain.shear is None
+    with pytest.raises(ValueError, match="(?i)(geometry|direction|azimuth)"):
+        strain_regression(points, shear=True)
+    # Branch-separated descriptive fits remain possible; they make no stress claim.
+    for branch in (1, -1):
+        plain = strain_regression([p for p in points if p.branch == branch])
+        assert np.isfinite(plain.slope) and plain.stress is None
 
 
 # S7: the shared fitter gains Pearson VII and split pseudo-Voigt -------------------------------------------------
@@ -180,11 +187,19 @@ def test_s7_the_shared_fitter_has_pearson_vii_and_split_pseudo_voigt(model):
     from xrd_tools.analysis.fitting import fit_peaks
     x = np.linspace(2.9, 3.6, 700)
     center = 3.24
-    width = np.where(x < center, 0.010, 0.016)
-    y = 500.0 / (1 + ((x - center) / width) ** 2) ** 1.6 + 5.0
+    if model == "pearson7":
+        y = 500.0 / (1 + ((x - center) / 0.012) ** 2) ** 1.6 + 5.0
+    else:
+        # Continuous split pseudo-Voigt: a common height/fraction and distinct
+        # left/right half widths. Neither row asks a symmetric model to recover
+        # the mode of a different, asymmetric profile.
+        width = np.where(x < center, 0.010, 0.016)
+        z = (x - center) / width
+        y = 500.0 * (0.65 * np.exp(-np.log(2) * z**2) + 0.35 / (1 + z**2)) + 5.0
     result = fit_peaks(x, y, model=model, n_peaks=1, background="constant")
     assert result.success
-    assert result.peak_centers[0] == pytest.approx(center, abs=2e-3)
+    assert result.peak_centers[0] == pytest.approx(center, abs=1e-4)
+    assert np.sqrt(np.mean((result.best_fit - y)**2)) < 0.01
 
 
 # S8: weak sectors are left out; each fit starts at its own peak, so tight centre bounds still hold it --------------
@@ -218,6 +233,189 @@ def test_s9_refraction_marks_pt_at_0_4_degrees_apparent_and_not_at_2_degrees():
     assert low.apparent is True and high.apparent is False
     assert 0.2 < low.alpha_c_deg < 0.4
     assert abs(low.slope) > abs(high.slope)
+
+
+def test_s9b_refraction_slope_is_the_change_on_the_same_admitted_points():
+    pytest.importorskip("xrayutilities")
+    from xrd_tools.corrections.grazing import GICorrectionStack
+    psi = np.arange(15.0, 85.0, 5.0)
+    d = _line(psi, slope=0.043)
+    err = np.linspace(2e-4, 7e-4, len(psi))
+    q = 2 * np.pi / d
+    qz = q * np.cos(np.deg2rad(psi))
+    stack = GICorrectionStack(material="Pt", energy_eV=12700.0)
+    k = stack.optical_constants()["k0_per_A"]
+    af = np.arcsin(qz / k - np.sin(np.deg2rad(2.0)))
+    corrected = stack.refract_q(incident_angle_deg=2.0, alpha_f_rad=af, q_total=q, q_z=qz)
+    delta = 2 * np.pi / corrected - d
+    expected = np.polyfit(np.sin(np.deg2rad(psi))**2, delta, 1, w=1 / err)[0]
+    assert abs(expected) < 0.1 * 0.043  # independent real-owner premise
+    from xrd_tools.analysis.strain import StrainPoint, refraction_estimate, strain_regression
+    points = [StrainPoint(p, v, e) for p, v, e in zip(psi, d, err)]
+    points.append(StrainPoint(88.0, 1.0, 0.0))  # left out of weighted regression
+    fit = strain_regression(points)
+    result = refraction_estimate(points, fit, incident_angle_deg=2.0, energy_eV=12700.0, material="Pt")
+    assert result.slope == pytest.approx(expected, rel=1e-8, abs=1e-12)
+    assert result.apparent is False
+
+
+def test_s9c_high_incidence_does_not_hide_a_critical_exit_or_invalid_material():
+    pytest.importorskip("xrayutilities")
+    from xrd_tools.corrections.grazing import GICorrectionStack
+    stack = GICorrectionStack(material="Pt", energy_eV=12700.0)
+    oc = stack.optical_constants()
+    # One perfectly legal upper-half ray exits at alpha_c, despite ai > 3 alpha_c.
+    d, ai = 1.96, 2.0
+    psi_critical = np.rad2deg(np.arccos(
+        oc["k0_per_A"] * (np.sin(np.deg2rad(ai)) + np.sin(oc["ac_rad"])) / (2 * np.pi / d)))
+    from xrd_tools.analysis.strain import StrainPoint, refraction_estimate, strain_regression
+    points = [StrainPoint(p, d, 3e-4) for p in (30., 50., 70., psi_critical)]
+    fit = strain_regression(points)
+    result = refraction_estimate(points, fit, incident_angle_deg=ai, energy_eV=12700., material="Pt")
+    assert result.apparent is True and "exit" in result.notice.lower()
+    unavailable = refraction_estimate(points, fit, incident_angle_deg=ai, energy_eV=12700.,
+                                      material="not_a_material")
+    assert unavailable.apparent is True and unavailable.slope is None
+    assert "material" in unavailable.notice.lower()
+
+
+def test_s11_psi_star_propagates_covariance_and_is_not_an_independent_reference():
+    from xrd_tools.analysis.strain import ElasticConstants, StrainPoint, strain_regression
+    elastic = ElasticConstants.from_E_nu((2, 0, 0), E=170e9, nu=0.39)
+    psi = np.arange(15., 85., 5.)
+    err = np.linspace(2e-4, 8e-4, len(psi))
+    points = [StrainPoint(p, _line(p), e) for p, e in zip(psi, err)]
+    fit = strain_regression(points, d0="psi_star", elastic=elastic, stress_state="equibiaxial")
+    c = 2 * 0.39 / 1.39
+    d0 = fit.intercept + c * fit.slope
+    cov = np.asarray(fit.cov)
+    d0_gradient = np.array([c, 1.0])
+    stress_gradient = np.array([fit.intercept, -fit.slope]) / (elastic.half_s2 * d0**2)
+    assert fit.d0.stderr == pytest.approx(np.sqrt(d0_gradient @ cov @ d0_gradient), rel=1e-9)
+    assert fit.stress_err == pytest.approx(np.sqrt(stress_gradient @ cov @ stress_gradient), rel=1e-9)
+    assert fit.strain is None  # no independent strain claim from the same fit
+    assert "model" in fit.d0.label.lower()
+
+
+def test_s12_independent_reference_error_is_retained_in_stress_uncertainty():
+    from xrd_tools.analysis.strain import ElasticConstants, StrainPoint, d0_from_reference, strain_regression
+    elastic = ElasticConstants.from_E_nu((2, 0, 0), E=170e9, nu=0.39)
+    reference = d0_from_reference([StrainPoint(p, 1.96, 3e-3) for p in (20., 40., 60.)])
+    assert reference.stderr == pytest.approx(3e-3 / np.sqrt(3), rel=1e-10)
+    fit = strain_regression([StrainPoint(p, _line(p), 4e-4) for p in (15., 30., 45., 60., 75.)],
+                            d0=reference, elastic=elastic)
+    variance = (fit.cov[0][0] / (reference.value * elastic.half_s2)**2
+                + (fit.stress * reference.stderr / reference.value)**2)
+    assert fit.stress_err == pytest.approx(np.sqrt(variance), rel=1e-9)
+
+
+def test_s13_unweighted_covariance_and_rank_refusal_are_explicit():
+    from xrd_tools.analysis.strain import StrainPoint, strain_regression
+    psi = np.array([15., 35., 55., 75.])
+    d = _line(psi) + np.array([0., 0.001, -0.002, 0.001])
+    points = [StrainPoint(p, v, None) for p, v in zip(psi, d)]
+    fit = strain_regression(points)
+    expected, cov = np.polyfit(np.sin(np.deg2rad(psi))**2, d, 1, cov=True)
+    assert fit.weighted is False and "unweighted" in fit.notice.lower()
+    np.testing.assert_allclose([fit.slope, fit.intercept], expected, rtol=1e-10)
+    np.testing.assert_allclose(fit.cov, cov, rtol=1e-8)
+    with pytest.raises(ValueError, match="(?i)(rank|distinct|coverage)"):
+        strain_regression([StrainPoint(30., v, 1e-4) for v in (1.94, 1.95, 1.96)])
+    with pytest.raises(ValueError, match="(?i)(three|3|points)"):
+        strain_regression(points[:2])
+
+
+def _saved_polar_views(tmp_path, maps, wavelength_m):
+    """Exercise the production writer, bounded record reader and wavelength owner."""
+    import h5py
+    from xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.frame_view import read_frame_views
+    from xrd_tools.io.browse_presentation import read_browse_presentation
+    from xrd_tools.io.schema import (PROCESSED_SCHEMA_NAME, PROCESSED_SCHEMA_VERSION,
+                                     SCHEMA_NAME_ATTR, SCHEMA_VERSION_ATTR)
+    path = tmp_path / "strain_int2d.nexus"
+    labels = list(range(1, len(maps) + 1))
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.attrs[SCHEMA_NAME_ATTR] = PROCESSED_SCHEMA_NAME
+        entry.attrs[SCHEMA_VERSION_ATTR] = PROCESSED_SCHEMA_VERSION
+        write_integrated_stack(entry, frame_indices=labels, results_2d=[polar for _, polar in maps])
+        geometry = entry.create_group("per_frame_geometry")
+        geometry.create_dataset("frame_index", data=np.array(labels, dtype=np.int64))
+        geometry.create_dataset("incident_angle", data=np.array([angle for angle, _ in maps]))
+        mono = entry.create_group("instrument/monochromator")
+        mono.create_dataset("wavelength", data=wavelength_m * 1e10)
+    views = read_frame_views(path, labels, include_thumbnail=False)
+    presentation, _ = read_browse_presentation(path)
+    return path, views, presentation["wavelength_m"]
+
+
+def _receipt(path, label):
+    from xrd_tools.analysis.display_fit_operations import DisplayedTraceReceipt
+    return DisplayedTraceReceipt("p37-display-trace-v1", 1, "test-run-fingerprint", "scan", path, str(label))
+
+
+def test_s14_saved_frame_capture_keeps_axes_sigma_incidence_and_receipt(tmp_path):
+    from xrd_tools.core.frame_view import TwoDKind, view_to_result_2d
+    maps = [(0.4, _polar_map(nq=80, nchi=41)), (2.0, _polar_map(nq=80, nchi=41, seed=9))]
+    path, views, wavelength_m = _saved_polar_views(tmp_path, maps, 0.97625e-10)
+    assert wavelength_m == pytest.approx(0.97625e-10)
+    for view, (angle, original) in zip(views, maps):
+        assert view.two_d_kind is TwoDKind.QTOT_CHIGI
+        np.testing.assert_allclose(view.intensity_2d, original.intensity.T, equal_nan=True)
+        np.testing.assert_allclose(view.sigma_2d, original.sigma.T, equal_nan=True)
+        assert view.incident_angle == pytest.approx(angle)
+        np.testing.assert_allclose(view_to_result_2d(view).sigma, original.sigma, equal_nan=True)
+    from xrd_tools.analysis.runner import strain_input_from_view
+    for view in views:
+        receipt = _receipt(path, view.label)
+        inp = strain_input_from_view(view, receipt=receipt, wavelength_m=wavelength_m)
+        polar = inp.metadata["result_2d"]
+        np.testing.assert_allclose(polar.intensity, view.intensity_2d.T, equal_nan=True)
+        np.testing.assert_allclose(polar.sigma, view.sigma_2d.T, equal_nan=True)
+        assert inp.metadata["incident_angle_deg"] == view.incident_angle
+        assert inp.metadata["receipt"] == receipt
+        assert inp.metadata["energy_eV"] == pytest.approx(12398.419843320026 / 0.97625)
+
+
+@pytest.mark.parametrize("bad", ["standard", "derived", "sigma", "incidence", "wavelength", "receipt"])
+def test_s15_capture_refuses_unsupported_or_incomplete_records(tmp_path, bad):
+    from dataclasses import replace
+    from xrd_tools.core.frame_view import FrameView, TwoDKind
+    view = FrameView.from_results(label=3, result_2d=_polar_map(nq=80, nchi=41), incident_angle=0.4)
+    kwargs = dict(receipt=_receipt(tmp_path / "scan.nexus", 3), wavelength_m=0.97625e-10)
+    if bad == "standard":
+        view = replace(view, two_d_kind=TwoDKind.Q_CHI)
+    elif bad == "derived":
+        kwargs["derived"] = True
+    elif bad == "sigma":
+        view = replace(view, sigma_2d=None)
+    elif bad == "incidence":
+        view = replace(view, incident_angle=None, geometry=None)
+    elif bad == "wavelength":
+        kwargs["wavelength_m"] = None
+    else:
+        kwargs["receipt"] = _receipt(tmp_path / "scan.nexus", 4)
+    from xrd_tools.analysis.runner import strain_input_from_view
+    with pytest.raises(ValueError):
+        strain_input_from_view(view, **kwargs)
+
+
+def test_s16_sector_sigma_uses_the_same_finite_samples_as_intensity():
+    from xrd_tools.analysis.strain import strain_sectors
+    q = np.linspace(3., 3.4, 8)
+    chi = np.array([20., 21., 22.])
+    intensity = np.full((8, 3), 10.)
+    sigma = np.broadcast_to([2., 3., 4.], (8, 3)).copy()
+    intensity[0, 1] = np.nan
+    sigma[1, 0] = np.nan
+    polar = IntegrationResult2D(radial=q, azimuthal=chi, intensity=intensity, sigma=sigma,
+                                 unit="qtot_A^-1", azimuthal_unit="chigi_deg")
+    (sector,) = strain_sectors(polar, chi_centers=(21.,), chi_width=2., min_finite_fraction=0.)
+    np.testing.assert_allclose(sector.intensity, 10.)
+    np.testing.assert_allclose(sector.sigma[:2], [np.sqrt(20.) / 2, 5. / 2])
+    np.testing.assert_allclose(sector.sigma[2:], np.sqrt(29.) / 3)
 
 
 # S10: two reflections, each with its own constants, combine into one stress -------------------------------------
@@ -299,20 +497,19 @@ def test_p1_pt_200_as_deposited_agrees_with_todays_path_and_reads_apparent(pt_ma
 
 @needs_pt
 @needs_lmfit
-def test_p2_pt_200_batch_over_the_four_anneals_runs_frame_by_frame(pt_maps):
+def test_p2_pt_200_batch_over_the_four_anneals_runs_frame_by_frame(pt_maps, tmp_path):
     from xrd_tools.analysis.plans import StrainPlan
-    from xrd_tools.analysis.runner import AnalysisInput, StrainAnalyzer, run_batch
+    from xrd_tools.analysis.runner import StrainAnalyzer, run_batch, strain_input_from_view
     from xrd_tools.analysis.strain import D0Reference, ElasticConstants
     poni, maps = pt_maps
-    energy_eV = 12398.419843320026 / (float(poni.wavelength) * 1e10)
     plan = StrainPlan(q_range=(3.0, 3.48), chi_range=(10.0, 85.0), chi_width=5.0, n_sectors=15,
                       model="pseudovoigt", background="linear", d0=D0Reference.typed(3.924 / 2),
                       elastic=ElasticConstants.from_E_nu((2, 0, 0), E=168e9, nu=0.38), material="Pt")
     analyzer = StrainAnalyzer(plan)
     assert analyzer.unit == "frame"
-    inputs = [AnalysisInput(label=run, x=np.empty(0), y=np.empty(0),
-                            metadata={"result_2d": polar, "incident_angle_deg": th, "energy_eV": energy_eV})
-              for run, (th, polar) in zip(_RUNS, maps)]
+    path, views, wavelength_m = _saved_polar_views(tmp_path, maps, float(poni.wavelength))
+    inputs = [strain_input_from_view(view, receipt=_receipt(path, view.label), wavelength_m=wavelength_m)
+              for view in views]
     outcomes = run_batch(analyzer, inputs)
     assert len(outcomes) == 4 and all(outcome.ok for outcome in outcomes), [o.message for o in outcomes]
     for outcome in outcomes:
