@@ -458,3 +458,33 @@ def test_w10_save_and_load_round_trip_every_option_and_the_list_and_refuse_bad_d
         path.write_text(json.dumps(missing), encoding="utf-8")
         assert dialog.settings_io.load().__class__.__name__ == "ActionCompleted"
         assert "0" * 8 in dialog.status.text() or "missing" in dialog.status.text().casefold()
+
+
+def test_w11_return_in_a_field_commits_it_and_presses_no_button(qapp):
+    """PR #6 run 41005408144 (row added after the freeze for that defect): Return in an option box reached the
+    window, which pressed its default button, the first section's "?", so Help opened on every committed value; off
+    macOS a phase row's minimum box did the same (test_lt_phase_rows p3)."""
+    from xdart.gui.widgets.context_help import HelpWindow
+
+    def help_shown():
+        return [window for window in QtWidgets.QApplication.topLevelWidgets()
+                if isinstance(window, HelpWindow) and window.isVisible()]
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
+        dialog.activateWindow()
+        qapp.processEvents()
+        assert not help_shown()
+        line = dialog.lattice_pct.lineEdit()
+        _press(qapp, line)
+        line.selectAll()
+        QtTest.QTest.keyClicks(line, "7")
+        QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Return)
+        qapp.processEvents()
+        assert dialog.vnext_fit_values()["lattice_pct"] == pytest.approx(.07, abs=0), "Return commits the value"
+        assert not help_shown() and dialog.isVisible(), "and presses no button"
+        # A focused button still answers its own Return.
+        button = next(button for button in dialog.findChildren(QtWidgets.QPushButton) if button.text() == "?")
+        button.setFocus()
+        QtTest.QTest.keyClick(button, QtCore.Qt.Key.Key_Return)
+        qapp.processEvents()
+        assert help_shown(), "a focused ? opens Help on Return"
