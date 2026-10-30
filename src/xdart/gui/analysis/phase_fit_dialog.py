@@ -141,6 +141,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.resize(width, height)
         controls = min(440, width // 2)
         self.splitter.setSizes([controls, max(1, width - controls)])
+        self.displays.setSizes([600, 260, 140])  # the fit first; each splitter keeps its proportions as it grows
 
     # ---- UI construction ------------------------------------------------
     def _card(self, title, section, tip):
