@@ -325,17 +325,18 @@ def test_rw5_calibrants_draw_on_the_phase_path_with_p3a_semantics(qapp, tmp_path
             shell.apply_state(state)
             qapp.processEvents()
             view = shell.scientific
-            window = _window(qapp, view)
+            # declared oracle repair (PHASE-ANALYSIS-128): a bare shell has no host page to open the window, so the
+            # view's own notices are read; W6 covers an attached window's list greying through Int's page
             _settle(qapp, view)
             assert not _pane_items(view.raw, LAB6)
             if mode == '2D Viewer':
-                assert not view.phase_families and not window.phase_source.isEnabled()
-                assert window.phase_source.toolTip()
+                available, reason = view.phase_availability
+                assert not view.phase_families and not available and reason
             else:
                 # BROWSE-REFERENCE-RINGS-20261013 (superseded text): saved Int outputs now draw rings too, so the
                 # generic reason states the rule rather than "only on a Run's frames".
                 from xrd_tools.geometry_figures import RUN_RING_REASON
-                assert window.rings_note.text() == RUN_RING_REASON, window.rings_note.text()
+                assert view.phase_rings_reason == RUN_RING_REASON, view.phase_rings_reason
                 assert 'opened from a file' not in RUN_RING_REASON and "only on a Run's frames" not in RUN_RING_REASON
         finally:
             shell.close()

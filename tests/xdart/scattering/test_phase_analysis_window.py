@@ -162,10 +162,13 @@ def test_w2_every_add_reaches_the_plot_options_and_the_view_and_a_reopened_windo
         _press(qapp, source.add_cif_btn)
         _added(qapp, source, lambda: len(_options(page).phase_references) == 1)
         cif = source.listed_entries()[0][0]
+        # a user's choice is an activation (FormRow ignores programmatic index changes): declared oracle repair
         source.calibrant_row.editor.setCurrentText("LaB6")
+        source.calibrant_row.editor.textActivated.emit("LaB6")
         qapp.processEvents()
         library_index = source.library_row.editor.findData(kept.id)
         source.library_row.editor.setCurrentIndex(library_index)
+        source.library_row.editor.textActivated.emit(source.library_row.editor.currentText())
         qapp.processEvents()
         _press(qapp, source.add_lattice_btn)
         for key, text in (("name", "cell"), ("a", "4.3"), ("space_group", "221")):
@@ -221,10 +224,11 @@ def test_w3_w4_the_fit_takes_the_included_non_calibrant_rows_and_receipts_follow
         source.cutoff_editor(one.id).setValue(1.)
         qapp.processEvents()
         assert dialog.vnext_fit_values()["phase_min_intensities"] == (1., 5.)
-        trace, _anchor = page._capture_analysis_trace("phase")
+        # declared oracle repair: the run's own trace has eight points (npt=8), under the fit's ten-point floor
+        from tests.xdart.scattering.test_fit_tools_preservation import _peaks, _trace
+        trace, _anchor = _trace(*_peaks())
         dialog.set_vnext_trace(trace)
-        from xdart.gui.tabs.scattering.analysis_mount import phase_wavelength_angstrom
-        wavelength = phase_wavelength_angstrom(page._context_controller, page._context_controller.navigation.current)
+        wavelength = 1.0
         result = run_displayed_phase_fit(DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength,
                                                                **dict(dialog.vnext_fit_values(), max_nfev=5)))
         assert result.code == "OK", (result.code, result.diagnostics)

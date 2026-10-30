@@ -275,7 +275,8 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
         view = shell.scientific
         assert not rings(view.raw)
         if mode.startswith('Int') or mode in ('Average', 'Reintegrate'):
-            window = choice(view)
+            # declared oracle repair (PHASE-ANALYSIS-128): a bare shell has no host page to open the window, so the
+            # view's own rings notice is read (an attached window's note line shows it)
             options = replace(state.scientific.plot_options, phase_references=(('calibrant:LaB6', True),))
             shell.apply_state(replace(state, scientific=replace(state.scientific, plot_options=options)))
             settle(qapp, view)
@@ -283,7 +284,7 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
             # BROWSE-REFERENCE-RINGS-20261013 (superseded text): saved Int outputs now carry ring geometry, so the
             # generic reason no longer says that frames opened from a file cannot.
             from xrd_tools.geometry_figures import RUN_RING_REASON
-            assert window.rings_note.text() == RUN_RING_REASON and 'opened from a file' not in RUN_RING_REASON
+            assert view.phase_rings_reason == RUN_RING_REASON and 'opened from a file' not in RUN_RING_REASON
         view.show_raw_popup('Contributing raw')
         raw = np.arange(35.).reshape(5,7)
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)

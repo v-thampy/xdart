@@ -194,6 +194,8 @@ def test_p1_include_checks_follow_real_indicator_clicks_and_space(qapp, tmp_path
         reopened = _window(qapp, view)
         assert _row(reopened.phase_source, a.id).checkState() != CHECKED
         assert _row(reopened.phase_source, b.id).checkState() == CHECKED and _flags(page)[a.id] is False
+        # declared oracle repair (PHASE-ANALYSIS-128): Int's window deletes on close, so its list is the reopened one
+        source, scans = reopened.phase_source, reopened.phase_source.browser.scans
 
         # A double-click on B's indicator behaves exactly as Qt's own checkable list does (B starts checked).
         changes, checked_after = _plain_double_click()
