@@ -81,7 +81,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     #: consumer's own lookups of these ids are stale (PHASE-ANALYSIS-128); a reconcile never emits it
     libraryRefreshed = QtCore.Signal()
 
-    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True, key_by_index=False,
+    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True,
                  calibrants=False, cutoffs=False, status_visible=True):
         super().__init__(parent)
         from xrd_tools.analysis.phase_references import PhaseLibrary
@@ -91,7 +91,6 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._resolved = {}
         self._show_library = bool(show_library)
         self._checkable = bool(checkable)
-        self._key_by_index = bool(key_by_index)
         self._shown_ids = ()
         self._details = {}
         self._reason = ''
@@ -303,8 +302,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         """The listed phase's row editor (None: not listed, or no cutoffs)."""
         if identifier not in self._shown_ids:
             return None
-        key = str(self._shown_ids.index(identifier)) if self._key_by_index else identifier
-        return self.browser.result_value_editor(key)
+        return self.browser.result_value_editor(identifier)
 
     def refresh_cutoffs(self):
         """Re-project the cutoff rows and Remove's readiness after a host reconciled this source's list itself."""
@@ -319,17 +317,16 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             return
         cutoffs, available = self._cutoffs, self.isEnabled() and not self._availability_reason
         own, rows = dict(cutoffs.per_phase), {}
-        for index, identifier in enumerate(self._shown_ids):
+        for identifier in self._shown_ids:
             entry = self._resolved.get(identifier)
             if entry is None:
                 continue
-            key = str(index) if self._key_by_index else identifier
             if entry.source_kind != 'cif':
-                rows[key] = (cutoffs.global_value, False, _NO_INTENSITY_TIP.get(entry.source_kind, _ROW_TIP))
+                rows[identifier] = (cutoffs.global_value, False, _NO_INTENSITY_TIP.get(entry.source_kind, _ROW_TIP))
             else:
                 value = cutoffs.global_value if cutoffs.global_on else own.get(identifier, cutoffs.global_value)
                 tip = _ROW_TIP + (' ' + _SAME_TIP if cutoffs.global_on else '')
-                rows[key] = (value, available and not cutoffs.global_on, tip)
+                rows[identifier] = (value, available and not cutoffs.global_on, tip)
         self.browser.reconcile_result_values(rows)
         blocked = self.global_switch.editor.blockSignals(True)
         try:
@@ -376,8 +373,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._sync_cutoff_rows()
         self.cutoffsChanged.emit(self._cutoffs)
 
-    def _row_edited(self, key, value):
-        identifier = self._shown_ids[int(key)] if self._key_by_index else key
+    def _row_edited(self, identifier, value):
         own = dict(self._cutoffs.per_phase)
         if own.get(identifier) == value:
             return
@@ -421,12 +417,10 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._resolved = {identifier: lookup.entry for identifier, lookup in lookups.items()
                           if lookup.entry is not None}
         self._shown_ids = tuple(identifier for identifier, _name, _kind in listed)
-        rows = tuple(BrowserResult(str(index) if self._key_by_index else identifier, name,
-                                   self._details.get(identifier, _detail(kind, name)))
-                     for index, (identifier, name, kind) in enumerate(listed))
+        rows = tuple(BrowserResult(identifier, name, self._details.get(identifier, _detail(kind, name)))
+                     for identifier, name, kind in listed)
         if self._checkable:
-            checked = tuple(row.identifier for row, identifier in zip(rows, self._shown_ids)
-                            if selected.get(identifier, False))
+            checked = tuple(identifier for identifier in self._shown_ids if selected.get(identifier, False))
             self.browser.reconcile_checked_results(rows, checked)
         else:
             self.browser.reconcile_results(rows, self.browser.current_result())
@@ -468,8 +462,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     def _checks_changed(self, checked):
         checked = set(checked)
-        visible_ids = {identifier for index, identifier in enumerate(self._shown_ids)
-                       if (str(index) if self._key_by_index else identifier) in checked}
+        visible_ids = {identifier for identifier in self._shown_ids if identifier in checked}
         known_ids = {identifier for identifier, _visible in self._selection}
         selected = tuple((identifier, identifier in visible_ids)
                          for identifier, _visible in self._selection)
