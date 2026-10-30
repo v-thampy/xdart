@@ -34,10 +34,10 @@ _ACCUMULATING_PLOT_MODES = frozenset(
 )
 _VISIT_ACCUMULATING_PLOT_MODES = frozenset({"Overlay", "Waterfall"})
 _ALL_FRAMES_TIP = (
-    "All frames: when on, each result you open in Overlay or Waterfall shows every one of its frames. Earlier "
-    "results' curves stay, as always, until Clear. Step through results with the Up and Down arrow keys in the list. "
-    "Leaving a frame out (Ctrl-click or Shift-click) turns it off. Greyed out in Single, Average and Sum. "
-    "Remembered between sessions.")
+    "All frames: when on, each result you open in Single, Overlay or Waterfall shows every one of its frames. In "
+    "Overlay and Waterfall, earlier results' curves stay, as always, until Clear. Step through results with the Up "
+    "and Down arrow keys in the list. Leaving a frame out turns it off: a Ctrl-click or Shift-click, or in Single a "
+    "plain click. Greyed out in Average and Sum. Remembered between sessions.")
 _FRAME_SELECTION_SETTLE_MS = 100
 _FRAME_NAVIGATION_KEYS = frozenset(
     {
