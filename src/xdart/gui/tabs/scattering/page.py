@@ -4907,9 +4907,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             navigation.current, navigation.frames)
 
     def _all_frames_applies(self) -> bool:
-        """All frames is on, the plot is Overlay or Waterfall and a Browse result is shown (ALL-FRAMES-128). A Run's own
-        frames keep their rules: each arrival already joins an Overlay/Waterfall. An owner without Browser state reads
-        it as off, as the preference editor reads its other optional parts."""
+        """All frames is on, the plot is Single, Overlay or Waterfall and a Browse result is shown (ALL-FRAMES-128). A
+        Run's own frames keep their rules: each arrival already joins an Overlay/Waterfall. An owner without Browser
+        state reads it as off, as the preference editor reads its other optional parts."""
         if getattr(getattr(self, "_processed_browser", None), "all_frames", False) is not True:
             return False
         selection = self._context_controller.selection
@@ -4986,7 +4986,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._processed_browser.set_auto_last(False)
         if (ScatteringWorkspace._all_frames_applies(self)
                 and {id(item) for item in navigation.selected} != {id(item) for item in navigation.frames}):
-            # A frame left out (Ctrl-click, Shift-click) turns All frames off; a visit keeps every frame drawn.
+            # A frame left out (Ctrl-click, Shift-click, a plain click in Single) turns All frames off; an Overlay or
+            # Waterfall visit keeps every frame drawn.
             self._processed_browser.set_all_frames(False)
         handoff = self._processed_browser.terminal_handoff
         request = None if handoff is None else handoff.request
@@ -7996,7 +7997,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.clear_trace_history()
         self._preferences = replace(self._preferences, **updates)
         if kind is ShellCommandKind.SET_PLOT_MODE:
-            # All frames: back in Overlay or Waterfall, every frame again
+            # All frames: back in Single, Overlay or Waterfall, every frame again
             ScatteringWorkspace._show_every_browse_frame(self)
         return True
 

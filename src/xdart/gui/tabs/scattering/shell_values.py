@@ -287,9 +287,10 @@ class FrameNavigationProjection:
                 )
 
 
-#: The plot modes All frames acts in (ALL-FRAMES-128): Single shows one frame, and Browse draws nothing in Average and
-#: Sum (the page's "Browse cache display is unavailable for Average/Sum" refusal).
-ALL_FRAMES_PLOT_MODES = frozenset({"Overlay", "Waterfall"})
+#: The plot modes All frames acts in (ALL-FRAMES-128). Single draws a multi-frame selection together, as Show All did
+#: there (maintainer, 2026-10-30: "Same as Overlay (Recommended)"); Browse draws nothing in Average and Sum (the page's
+#: "Browse cache display is unavailable for Average/Sum" refusal).
+ALL_FRAMES_PLOT_MODES = frozenset({"Single", "Overlay", "Waterfall"})
 
 
 @dataclass(frozen=True, slots=True)
