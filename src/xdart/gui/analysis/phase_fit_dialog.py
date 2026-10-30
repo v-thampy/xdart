@@ -654,8 +654,11 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def keyPressEvent(self, event):
         # Esc must not discard the fit setup (phases/range/results); the default
         # QDialog Esc -> reject closes the popup.  Match the metadata plotter.
-        # Other keys pass through.
-        if event.key() == QtCore.Qt.Key.Key_Escape:
+        # Return/Enter arrive here after the field they were typed in has taken
+        # them; QDialog would then press its default button, the first section's
+        # "?", so Help opened on every committed value (PR #6 run 41005408144).
+        # A focused button still takes its own Return.  Other keys pass through.
+        if event.key() in (QtCore.Qt.Key.Key_Escape, QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
             event.accept()
             return
         super().keyPressEvent(event)
