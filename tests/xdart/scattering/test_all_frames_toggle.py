@@ -253,6 +253,15 @@ def test_af7_single_draws_every_frame_and_a_plain_click_turns_it_off(qapp, works
     _mode(page, "Overlay")
     _mode(page, "Single")
     assert _on(page) is True and _all_selected(page), "entering Single with it on keeps every frame"
+    footer = shell.scientific.frame_selector
+    footer.setCurrentIndex((footer.currentIndex() + 1) % footer.count())
+    _settle(page)
+    assert _on(page) is False and len(page._context_controller.navigation.selected) == 1, "the footer acts as a click"
+    _toggle(page)
+    QtTest.QTest.mouseClick(shell.scientific.clear, LEFT)
+    QtWidgets.QApplication.processEvents()
+    _settle(page)
+    assert _on(page) is True and _all_selected(page), "Clear keeps every frame and the toggle, as in Overlay"
 
 
 # AF8: Average and Sum (Browse draws nothing there) grey it out and keep its check; back in Overlay every frame shows
