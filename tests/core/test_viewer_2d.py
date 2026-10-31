@@ -20,11 +20,18 @@ _EXPECTED_R = 11_546_624
 
 try:
     _PHYSICAL_RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    _WINDOWS_RAM = 0
 except (ValueError, OSError, AttributeError):
-    # Windows has no sysconf: the viewer reads GlobalMemoryStatusEx there (VIEWER-2D-BUDGET-128).
+    # Windows has no sysconf: the viewer reads GlobalMemoryStatusEx there, never below the fallback
+    # (VIEWER-2D-BUDGET-128).
     from xrd_tools.core.staging import windows_physical_ram_bytes
-    _PHYSICAL_RAM = windows_physical_ram_bytes() or 0
-_EXPECTED_B = 884_736_000 if _PHYSICAL_RAM <= 0 else min(1024**3, _PHYSICAL_RAM // 20)
+    _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
+if _PHYSICAL_RAM > 0:
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 20)
+elif _WINDOWS_RAM > 0:
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 20))
+else:
+    _EXPECTED_B = 884_736_000
 
 
 @pytest.fixture(autouse=True)
@@ -2279,7 +2286,15 @@ def test_windows_budget_uses_the_pcs_own_ram(monkeypatch):
     assert ledger.budget == 1024**3, "a 32 GB Windows PC gets the 1 GiB cap, not the fixed fallback"
     assert ledger.admission <= ledger.budget, "a 4096x4096 frame fits it"
     _as_windows(monkeypatch, 16 * 1024**3)
-    assert api.viewer_2d_memory_ledger(1, 1).budget == 16 * 1024**3 // 20, "a twentieth of RAM below the cap"
+    assert api.viewer_2d_memory_ledger(1, 1).budget == 884_736_000, "16 GB keeps the fallback it had (819 MiB < 844)"
+
+
+def test_a_small_windows_pc_keeps_the_budget_it_had(monkeypatch):
+    """Reading Windows RAM must not take anything away: an 8 GB Windows PC had the 884,736,000-byte fallback, where a
+    9-megapixel Eiger2 frame (3108x3262) is admitted; a twentieth of its RAM (410 MiB) would refuse it."""
+    _as_windows(monkeypatch, 8 * 1024**3)
+    ledger = api.viewer_2d_memory_ledger(3108, 3262, encoded_retained=40 * 1024**2)
+    assert ledger.budget == 884_736_000 and ledger.admission <= ledger.budget
 
 
 def test_windows_pc_reads_a_4096_square_16_bit_tiff(tmp_path, monkeypatch):

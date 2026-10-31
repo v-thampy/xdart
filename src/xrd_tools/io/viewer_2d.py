@@ -42,6 +42,8 @@ _MAX_CSV = 512 * 1024**2
 _MAX_NPY = 64 * 1024**3
 _MAX_NPZ = 2 * 1024**3
 _MAX_FABIO = 256 * 1024**2
+#: The memory budget when the PC's RAM cannot be read.
+_UNKNOWN_RAM_BUDGET = 884_736_000
 _HDF5_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus"})
 _RAW_DATASETS = (
     "/entry/instrument/detector/data", "/entry/instrument/detector/data_000001",
@@ -396,12 +398,16 @@ class Viewer2DMemoryLedger:
 
 
 def _memory_budget(ram_bytes=None):
-    # Windows has no os.sysconf RAM figure: without its own (GlobalMemoryStatusEx), every Windows PC got the fixed
-    # fallback and refused a 4096x4096 frame (VIEWER-2D-BUDGET-128).
-    detected = (_physical_ram_bytes() or _staging.windows_physical_ram_bytes()) if ram_bytes is None else ram_bytes
-    return 884_736_000 if type(detected) is not int or detected <= 0 else min(
-        1024**3, detected // 20
-    )
+    detected = _physical_ram_bytes() if ram_bytes is None else ram_bytes
+    if type(detected) is int and detected > 0:
+        return min(1024**3, detected // 20)
+    # Windows has no os.sysconf RAM figure, so every Windows PC got the fixed fallback and refused a 4096x4096 frame
+    # (VIEWER-2D-BUDGET-128). Its own reading (GlobalMemoryStatusEx) raises a large PC to the cap and never lowers a
+    # small one below the fallback it had.
+    windows = _staging.windows_physical_ram_bytes() if ram_bytes is None else None
+    if type(windows) is int and windows > 0:
+        return min(1024**3, max(_UNKNOWN_RAM_BUDGET, windows // 20))
+    return _UNKNOWN_RAM_BUDGET
 
 
 def viewer_2d_memory_ledger(height, width, *, encoded_retained=0, ram_bytes=None):
