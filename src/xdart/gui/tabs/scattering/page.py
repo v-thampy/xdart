@@ -5023,7 +5023,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._context_controller.select_navigation(current, selected)
 
-    def _stamp_click_perf(self, traced: bool, preview: object) -> None:
+    def _stamp_click_perf(self, traced: bool, imaged: bool) -> None:
         """Log a click's first painted trace and its current image once each, for that click's own context."""
         perf = self._click_perf
         if perf is None or perf.worker is None:
@@ -5034,9 +5034,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if traced and perf.first_trace_s is None:
             perf.first_trace_s = elapsed
             _log_click_perf(perf, "first-trace", elapsed)
-        view = getattr(preview, "view", None)
-        if perf.image_s is None and type(preview) is StandardDisplayPayload and view is not None and (
-                view.raw is not None or view.thumbnail is not None or view.intensity_2d is not None):
+        if imaged and perf.image_s is None:
             perf.image_s = elapsed
             _log_click_perf(perf, "image", elapsed)
         if perf.first_trace_s is not None and perf.image_s is not None:
@@ -5292,6 +5290,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
         if self._retire_lost_reintegrate_successor():
             changed = True
+        perf = self._click_perf
+        if perf is not None and not self._context_controller.owns_browse_request(perf.request):
+            self._click_perf = None
         handoff = self._processed_browser.terminal_handoff
         if (
             handoff is not None
@@ -7386,7 +7387,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
-            ScatteringWorkspace._stamp_click_perf(self, cache_trace_snapshot is not None, cache_current_preview)
+            # A resident preview can precede the sparse rows, or a pending browser
+            # gesture can preserve outgoing paint. Only stamp the projection the
+            # shared shell actually reconciled, never the independently read payload.
+            if (not preserve_display and not preserve_scientific
+                    and not self._shell.browser.frame_selection_pending):
+                heavy = projection.scientific.heavy
+                ScatteringWorkspace._stamp_click_perf(
+                    self,
+                    cache_trace_snapshot is not None and bool(projection.scientific.traces),
+                    heavy is not None and heavy.frame is navigation.current and (
+                        heavy.cake is not None
+                        or heavy.raw is not None and projection.scientific.processing_mode != "Int 1D"
+                    ),
+                )
             comparison_notice = self._shell.scientific.browse_comparison_notice
             if comparison_notice and comparison_notice != self._notice_text:
                 self._notice(comparison_notice)

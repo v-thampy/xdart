@@ -740,6 +740,10 @@ class BrowserView(QtWidgets.QFrame):
         elif self.profile.results:
             self.scans.currentItemChanged.connect(self._result_selected)
         else:
+            self.scans_label.setToolTip(
+                "Click a result to open it. Click the selected result again to check whether its saved file "
+                "changed and reload it if needed, keeping the current frame when it still exists."
+            )
             self.scans.itemSelectionChanged.connect(self._scan_selected)
             self.scans.itemClicked.connect(self._activate_directory)
             self.scans.itemActivated.connect(self._activate_directory)
