@@ -73,6 +73,31 @@ def displayed_trace_input(projection: object, current: object):
         trace.axis.label, trace.axis.unit, trace.title,
         epoch_token(trace.epoch), receipt,
     )
+def displayed_mode_1d(controller: object, current: object) -> str:
+    """The displayed trace's 1-D mode as its file names it: the projection's GI mode, or "default" for a single
+    result (and when the projection cannot say)."""
+    try:
+        request = controller.project_request(current, require_complete=False)
+        payload = controller.resolve_projection(request)
+        mode = "" if payload is None else getattr(payload, "gi_mode_1d", "")
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        mode = ""
+    return str(mode) if mode else "default"
+def displayed_template_candidate(controller: object, trace: object, current: object):
+    """The file, frame and 1-D mode behind a captured displayed trace (NEXT-128-PEAK-FIT), as a
+    ``BackgroundTemplateSource`` and "", or None and why it names none. The first fit checks that the file reproduces
+    the trace before the template is named by it."""
+    from xrd_tools.analysis.background_template import BackgroundTemplateRefused, BackgroundTemplateSource
+    receipt = trace.receipt
+    try:
+        frame = int(receipt.frame_label)
+    except (TypeError, ValueError):
+        return None, f"the displayed trace's frame {receipt.frame_label!r} is not a NeXus frame number"
+    try:
+        return BackgroundTemplateSource("nexus", str(receipt.artifact), frame=frame,
+                                        mode=displayed_mode_1d(controller, current)), ""
+    except BackgroundTemplateRefused as refused:
+        return None, str(refused)
 def phase_wavelength_angstrom(controller: object, current: object) -> float | None:
     from xrd_tools.core.energy import wavelength_m_to_angstrom
     try:
@@ -184,8 +209,9 @@ def analysis_request_facts(plan: object, *, table=None, roi=None,
     row = tuple(getattr(plan, field.name) for field in fields(plan))
     if kind in {"peak", "phase"}:
         row = (plan.trace.trace_fingerprint, plan.trace.receipt, *row[1:])
-    if kind == "phase" and plan.background_template is not None:
-        # a substrate is projected as the trace is (PHASE-ANALYSIS-128): a changed substrate is a changed request
+    if kind in {"peak", "phase"} and plan.background_template is not None:
+        # a captured template is projected as the trace is (PHASE-ANALYSIS-128; the Peak Fitter's too since
+        # NEXT-128-PEAK-FIT): a changed capture is a changed request
         index = 1 + [field.name for field in fields(plan)].index("background_template")
         template = plan.background_template
         row = (*row[:index], (template.trace_fingerprint, template.receipt), *row[index + 1:])

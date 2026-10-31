@@ -18,6 +18,9 @@ BACKGROUND_IMAGE_FILTER = "Detector images (*.tif *.tiff *.cbf *.edf *.img *.mar
 #: A Stitch calibration: a PONI or a goniometer / XU calibration JSON.
 CALIBRATION_FILTER = "Calibrations (*.poni *.json);;All files (*)"
 NEXUS_FILTER = "NeXus / HDF5 (*.nexus *.nxs *.h5 *.hdf5);;All files (*)"
+#: A fit's background template (NEXT-128-PEAK-FIT): a processed NeXus result or an .xye file.
+BACKGROUND_TEMPLATE_FILTER = ("Background templates (*.nxs *.nexus *.h5 *.hdf5 *.xye);;NeXus / HDF5 (*.nxs "
+                              "*.nexus *.h5 *.hdf5);;XYE (*.xye);;All files (*)")
 #: An original detector frame to draw a mask on: an image file, or a raw NeXus / Eiger master.
 DETECTOR_SOURCE_FILTER = ("Detector images and raw NeXus (*.tif *.tiff *.cbf *.edf *.img *.mar3450 *.raw "
                           "*.nxs *.h5 *.hdf5);;All files (*)")

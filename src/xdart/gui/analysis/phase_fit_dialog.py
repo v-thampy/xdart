@@ -12,7 +12,8 @@ and a built-in calibrant is drawn only.
 It builds no display or editor widget of its own (hard rule 14): its options are the shared Controls rows
 (``FormRow``, ``RangeRow``) in ``SectionCard``s, the rarely changed ones the shared ``AdvancedDialog``'s groups; its
 plots ``FitView``, its trend ``TrendView``, its table ``ResultsTable``; Save and Load settings the shared
-``PageSettings``; Browse the shared ``file_dialogs``.
+``PageSettings``; Browse the shared ``file_dialogs``; its substrate the shared ``BackgroundTemplateRow``
+(NEXT-128-PEAK-FIT: the Peak Fitter mounts the same row), saved by its file and exported to notebooks.
 
 Needs the ``xrd-tools[fitting]`` extra: ``lmfit`` (the fit) and ``pymatgen`` (CIF parsing), both imported lazily.
 """
@@ -23,7 +24,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xrd_tools.help_topics import diagnostic_text
 from xrd_tools.session.readiness import (
-    ControlAction, ControlActionSpec, ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
+    ControlActionSpec, ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
 )
 
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
@@ -32,7 +33,7 @@ from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSerie
 from xdart.gui.tabs.scattering.results_table import PHASE_RESULT_HEADERS, ResultsTable, phase_result_rows
 from xdart.gui.tabs.scattering.trend_view import TrendView
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
-from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
 
 #: each section's help topic (``xrd_tools.help_topics``)
 TOPICS = {"phases": "phase-analysis.phases", "shape": "phase-analysis.peak-shape",
@@ -40,7 +41,7 @@ TOPICS = {"phases": "phase-analysis.phases", "shape": "phase-analysis.peak-shape
           "batch": "phase-analysis.batch"}
 #: the window's saved settings (Save settings…, Load settings…); no last-session restore
 PHASE_ANALYSIS_SETTINGS = SettingsKind("xdart-phase-analysis-settings", 1, "phase_analysis_settings", "Phase Analysis",
-                                       sections=("phases",))
+                                       sections=("phases", "background_template"))
 
 # (display label, plan value)
 _PROFILES = (("Pseudo-Voigt", "pseudovoigt"), ("Gaussian", "gaussian"), ("Lorentzian", "lorentzian"),
@@ -65,16 +66,16 @@ _TEXTURE_TIP = ('How relative intensities within each CIF phase may depart from 
                 'along the axis in Advanced, or free per-peak heights within the range in Advanced.')
 _TEXTURE_LATTICE_TIP = ' Lattice phases always fit free per-peak heights: they have no structural intensities.'
 _FIT_BACKGROUND_TIP = ('A background refined with the phases: linear, polynomial, Chebyshev or spline of the degree '
-                       'below, or the captured substrate scaled by one amplitude, alone or plus a polynomial.')
+                       'below, or the substrate (captured or read from its file) scaled by one amplitude, alone or '
+                       'plus a polynomial.')
 _FIT_TIP = 'Fit the checked CIF and lattice phases to the displayed pattern; calibrants are reference lines only.'
 _BATCH_TIP = ('Fit every selected result with these settings, then plot fractions and lattice against the result '
               'order or a scan column.')
 _CALIBRANT_ONLY = 'Calibrants are reference lines only and are not fitted: check a CIF or lattice phase to fit.'
-_SUBSTRATE_NEEDED = ('The Substrate background needs a captured substrate: show the bare substrate\'s pattern and '
-                     'click Use displayed as substrate.')
-_TEMPLATE_EXPORT_REASON = ('PHASE_TEMPLATE_NOTEBOOK_UNAVAILABLE: a fit that scales a captured substrate cannot be '
-                           'exported as a notebook; clear the substrate or choose another background to export.')
-_RECAPTURE_NOTICE = 'The substrate is not saved: capture it again before fitting with it.'
+_SUBSTRATE_NEEDED = ('The Substrate backgrounds need a substrate: show the bare substrate\'s pattern and click Use '
+                     'displayed as substrate, or choose its NeXus or .xye file.')
+_RECAPTURE_NOTICE = ('These settings name no substrate file: choose the substrate\'s file or capture it again before '
+                     'fitting with it.')
 
 
 def _path(name):
@@ -123,8 +124,6 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._x = self._y = None
         self._x_label, self._x_unit = "q", ""
         self._fit_bounds_unit, self._range_reason = "q_A^-1", ""
-        #: the substrate pattern the host captured (a q ``DisplayedTraceInput``), kept until cleared and never saved
-        self._template = None
         self._receipts = {}
         self._load_notice = ''
         self._closing = False
@@ -228,11 +227,13 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.advanced_btn.setToolTip('The rarely changed options: the solver\'s budget and weighting, the SNIP width, '
                                      'the March-Dollase axis and free-height range, and the σ limits.')
         self.load_settings_btn = QtWidgets.QPushButton("Load settings…", self)
-        self.load_settings_btn.setToolTip('Restore every option and the phase list from a saved Phase Analysis '
-                                          'settings file. A substrate is not saved: capture it again.')
+        self.load_settings_btn.setToolTip('Restore every option, the phase list and the substrate\'s file from a '
+                                          'saved Phase Analysis settings file; a captured substrate not named by its '
+                                          'file is not saved.')
         self.save_settings_btn = QtWidgets.QPushButton("Save settings…", self)
-        self.save_settings_btn.setToolTip('Save every option and the phase list as a versioned settings file; the '
-                                          'substrate and Sequential\'s seeds are not saved.')
+        self.save_settings_btn.setToolTip('Save every option, the phase list and the substrate\'s file (once a fit '
+                                          'has recorded its content) as a versioned settings file; Sequential\'s '
+                                          'seeds are not saved.')
         self.refresh_btn = QtWidgets.QPushButton("Reload", self)
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
         self.fit_btn = QtWidgets.QPushButton("Fit", self)
@@ -261,7 +262,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.load_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.load))
         self.save_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.save))
         self.substrate_capture_btn.clicked.connect(lambda: self._vnext_submit("capture_template", None))
-        self.substrate_clear_btn.clicked.connect(lambda: self.set_substrate_template(None))
+        self.background_template_row.changed.connect(self._sync_options)
         self.fit_view.rangeChanged.connect(self._region_to_fields)
         self.fit_range_row.valueChanged.connect(lambda _path, _value: self._fields_to_region())
         self.full_btn.clicked.connect(self._on_full)
@@ -318,23 +319,20 @@ class PhaseFitDialog(QtWidgets.QDialog):
             "Degree", "fit_background_degree", "3", 2, 15), (
             'The fitted background\'s polynomial or Chebyshev degree, or a spline\'s knots (at least four), from 2 '
             'to 15.'))
-        # The substrate, captured through the host's own fit input: the card's status names it.
-        self.substrate_capture_btn = ActionButton(ControlActionSpec(
-            ControlAction.PREVIEW, "Use displayed as substrate", SectionId.PROCESSING), self)
+        # The substrate: the shared template row (captured through the host's own fit input, or read from its file);
+        # the card's status names it.
+        from .background_template_row import BackgroundTemplateRow
+        self.background_template_row = BackgroundTemplateRow(card, what="substrate",
+                                                             capture_label="Use displayed as substrate",
+                                                             clear_label="Clear substrate")
+        self.background_template_row.set_help_topic(TOPICS["background"])
+        self.substrate_capture_btn = self.background_template_row.capture_btn
+        self.substrate_clear_btn = self.background_template_row.clear_btn
         self.substrate_capture_btn.set_purpose_tooltip(
             'Capture the displayed trace, in Å⁻¹, as the substrate template: show the bare substrate\'s pattern '
-            'first. It is kept until cleared and is not saved with the settings.')
-        self.substrate_clear_btn = ActionButton(ControlActionSpec(
-            ControlAction.PREVIEW, "Clear substrate", SectionId.PROCESSING), self)
-        self.substrate_clear_btn.set_purpose_tooltip('Forget the captured substrate template.')
-        substrate = QtWidgets.QWidget(card)
-        buttons = QtWidgets.QHBoxLayout(substrate)
-        buttons.setContentsMargins(0, 0, 0, 0)
-        for button in (self.substrate_capture_btn, self.substrate_clear_btn):
-            button.setAutoDefault(False)
-            buttons.addWidget(button)
-        buttons.addStretch(1)
-        card.add_row(substrate)
+            'first. Its file, frame and mode name it once the first fit confirms that file holds this curve; until '
+            'then it is not saved or exported.')
+        card.add_row(self.background_template_row)
         self.amorphous_row = self._option(card, "background", _combo("Amorphous peak", "amorphous_peak", _AMORPHOUS),
                                           'A broad peak for an amorphous component, fitted with the phases from the '
                                           'starting centre and σ below.')
@@ -437,7 +435,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                      if shown and entry.source_kind == 'calibrant')
 
     def _template_in_use(self):
-        return self._template is not None and self.fit_background_row.current_value().startswith("template")
+        return (self.background_template_row.has_template()
+                and self.fit_background_row.current_value().startswith("template"))
 
     def _sync_options(self):
         """Each row that a choice makes irrelevant is off and says why; Texture's tip names lattice phases; the
@@ -448,7 +447,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
         lattice = any(entry.source_kind == 'lattice' for entry in self._fitted_entries())
         self.texture_row.set_purpose_tooltip(_TEXTURE_TIP + (_TEXTURE_LATTICE_TIP if lattice else ''))
         self.fit_background_row.set_purpose_tooltip(_FIT_BACKGROUND_TIP + (
-            ' ' + _SUBSTRATE_NEEDED if fit_background.startswith("template") and self._template is None else ''))
+            ' ' + _SUBSTRATE_NEEDED if fit_background.startswith("template")
+            and not self.background_template_row.has_template() else ''))
         for rows, on, reason in (
                 ((self.fit_background_degree_row,), fit_background in _DEGREE_BACKGROUNDS,
                  'Choose a polynomial, Chebyshev or spline background to set its degree.'),
@@ -465,48 +465,47 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 row.set_purpose_tooltip(self._tips[row] if on else f'{self._tips[row]} {reason}')
         if hasattr(self, 'export_actions'):
             reason = (self._lattice_export_reason() if lattice else
-                      _TEMPLATE_EXPORT_REASON if self._template_in_use() else '')
+                      self.background_template_row.export_reason() if fit_background.startswith("template") else '')
             self.export_actions.set_available(not reason, reason)
         self._sync_substrate()
 
     def _sync_substrate(self):
-        """The Background card's status names the captured substrate; Clear is available while one is."""
-        template, wanted = self._template, self.fit_background_row.current_value().startswith("template")
-        if template is not None:
-            name = f"{template.title} ({template.label})" if template.title else template.label
-            self.background_card.set_status_text(f"Substrate: {name}", tooltip=(
-                'The captured substrate template the Substrate backgrounds scale, captured in Å⁻¹ through the fit\'s '
-                'own input. Clear substrate forgets it.'))
+        """The Background card's status names the substrate (the shared row's own words)."""
+        row, wanted = self.background_template_row, self.fit_background_row.current_value().startswith("template")
+        if row.has_template() or row.reason:
+            self.background_card.set_status_text(f"Substrate: {row.describe()}", tooltip=(
+                'The substrate the Substrate backgrounds scale: captured in Å⁻¹ through the fit\'s own input, or read '
+                'from its file. Clear substrate forgets it.'))
         else:
-            self.background_card.set_status_text("Substrate: not captured" if wanted else "", tooltip=(
+            self.background_card.set_status_text("Substrate: not set" if wanted else "", tooltip=(
                 _SUBSTRATE_NEEDED if wanted else ''))
-        spec = self.substrate_clear_btn.spec
-        self.substrate_clear_btn.apply_spec(ControlActionSpec(
-            spec.action, spec.label, spec.section, enabled=template is not None,
-            reason='' if template is not None else 'No substrate is captured.'))
 
-    def set_substrate_template(self, trace):
-        """The substrate pattern the host captured through its own fit input (a q ``DisplayedTraceInput``), or None
-        to clear it. A trace not in Å⁻¹ is refused, keeping the substrate before it; True when it is set."""
-        if trace is not None:
-            from xrd_tools.analysis.axis_units import require_inverse_angstrom
-            from xrd_tools.analysis.display_fit_operations import DisplayedTraceInput
-            if not isinstance(trace, DisplayedTraceInput):
-                raise TypeError("a substrate is a DisplayedTraceInput")
-            try:
-                require_inverse_angstrom(trace.axis_unit, operation="a substrate template")
-            except ValueError as error:
-                self.status.setText(str(error))
-                return False
-        self._template = trace
-        self._sync_options()
-        if trace is not None:
-            self.status.setText(f"Substrate captured: {trace.title or trace.label}.")
+    def set_substrate_template(self, trace, candidate=None, reason=""):
+        """The substrate pattern the host captured through its own fit input (a q ``DisplayedTraceInput``), with the
+        file, frame and mode it names (``candidate``) or why it names none, or None to clear it. A trace not in Å⁻¹
+        is refused, keeping the substrate before it; True when it is set."""
+        if trace is None:
+            self.background_template_row.clear()
+            return True
+        from xrd_tools.analysis.axis_units import require_inverse_angstrom
+        from xrd_tools.analysis.display_fit_operations import DisplayedTraceInput
+        if not isinstance(trace, DisplayedTraceInput):
+            raise TypeError("a substrate is a DisplayedTraceInput")
+        try:
+            require_inverse_angstrom(trace.axis_unit, operation="a substrate template")
+        except ValueError as error:
+            self.status.setText(str(error))
+            return False
+        self.background_template_row.set_capture(trace, candidate, reason)
+        self.status.setText(f"Substrate captured: {trace.title or trace.label}.")
         return True
+
+    capture_background_template = set_substrate_template
 
     @property
     def substrate_template(self):
-        return self._template
+        """The captured substrate trace while it is not named by its file (the shared row's), or None."""
+        return self.background_template_row.template
 
     def sequential_batch(self):
         """Whether a Batch seeds each fit from the previous one (an analyzer option, not a plan field)."""
@@ -565,8 +564,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                 return f"{row.label.text()}: {error}"
         if not self._fitted_entries() and self._included_calibrants():
             return _CALIBRANT_ONLY
-        if self.fit_background_row.current_value().startswith("template") and self._template is None:
-            return _SUBSTRATE_NEEDED
+        if self.fit_background_row.current_value().startswith("template"):
+            return self.background_template_row.fit_refusal(_SUBSTRATE_NEEDED)
         return ""
 
     def vnext_fit_values(self):
@@ -591,7 +590,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
             "lock_cross_phase": bool(self.cross_phase_row.current_value()),
             "snip_width": self.snip_width_row.editor.value(),
             "fit_background": fit_background, "fit_background_degree": self.fit_background_degree_row.editor.value(),
-            "background_template": self._template if fit_background.startswith("template") else None,
+            "background_template": (self.background_template_row.template if fit_background.startswith("template")
+                                    else None),
             "amorphous_peak": self.amorphous_row.current_value(),
             "amorphous_center": float(self.amorphous_center_row.current_value()),
             "amorphous_sigma": float(self.amorphous_sigma_row.current_value()),
@@ -604,6 +604,8 @@ class PhaseFitDialog(QtWidgets.QDialog):
                                                     for entry in entries)
         if self.use_uncertainties.isChecked() and self.use_uncertainties.isEnabled():
             values['use_uncertainties'] = True
+        if fit_background.startswith("template"):
+            values.update(self.background_template_row.values())
         return values
 
     @staticmethod
@@ -614,8 +616,11 @@ class PhaseFitDialog(QtWidgets.QDialog):
     def export_fit_values(self):
         """Keep structural-library exports on the existing portable CIF recipe; Sequential travels with them."""
         values = dict(self.vnext_fit_values())
-        if values.get("background_template") is not None:
-            raise ValueError(_TEMPLATE_EXPORT_REASON)
+        if values["fit_background"].startswith("template"):
+            reason = self.background_template_row.export_reason()
+            if reason:
+                raise ValueError(reason)
+        values.pop("background_template", None)  # a notebook names the substrate by its file, never its arrays
         entries = values.pop('phase_entries', ())
         if any(entry.source_kind == 'lattice' for entry in entries):
             raise ValueError(self._lattice_export_reason())
@@ -742,6 +747,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
                                               FitPanel(lower, zero_line=True)))
         self.show_phase_result_details(result)
+        self.background_template_row.adopt(result)
 
     def show_phase_result_details(self, result):
         """The shared receipt, table and status projection for Int and snapshot hosts' phase fits."""
@@ -878,7 +884,7 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.settings_io = PageSettings(self, PHASE_ANALYSIS_SETTINGS, document=self._settings_document,
                                         apply=self._apply_settings, busy=self._busy_reason,
                                         close=lambda: CloseReceipt(PageCleanup.CLEAN),
-                                        snapshot=lambda: self._template, restore=self._restore_runtime)
+                                        snapshot=self.background_template_row.state, restore=self._restore_runtime)
 
     def _descriptor(self, key, row, bound):
         """The shared field descriptor ``check_fields`` reads: a choice among the stored values, a toggle, a whole
@@ -937,8 +943,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
             self.status.setText(outcome.reason)
 
     def _settings_document(self, _page):
-        """Every option (plain values, a range as its two bounds) and the phase list: each row's id, include flag
-        and own minimum, the switch and the global minimum. The substrate and Sequential's seeds are not saved."""
+        """Every option (plain values, a range as its two bounds), the phase list (each row's id, include flag and own
+        minimum, the switch and the global minimum) and the substrate's named file with its recorded identity. A
+        captured substrate not named by its file, and Sequential's seeds, are not saved."""
         cutoffs = self.phase_source.cutoffs
         own = dict(cutoffs.per_phase)
         names = {entry.id: entry.name for entry, _shown in self.phase_source.listed_entries()}
@@ -946,10 +953,15 @@ class PhaseFitDialog(QtWidgets.QDialog):
                  **({"name": names[identifier]} if identifier in names else {}),
                  **({"minimum": float(own[identifier])} if identifier in own else {})}
                 for identifier, shown in self.phase_source.selection]
-        return {"kind": PHASE_ANALYSIS_SETTINGS.kind, "version": PHASE_ANALYSIS_SETTINGS.version,
-                "fields": {key: plain(self._setting(key)) for key in self._settings_rows},
-                "fit_range_unit": self._fit_bounds_unit,
-                "phases": {"rows": rows, "global_on": bool(cutoffs.global_on), "value": float(cutoffs.global_value)}}
+        document = {"kind": PHASE_ANALYSIS_SETTINGS.kind, "version": PHASE_ANALYSIS_SETTINGS.version,
+                    "fields": {key: plain(self._setting(key)) for key in self._settings_rows},
+                    "fit_range_unit": self._fit_bounds_unit,
+                    "phases": {"rows": rows, "global_on": bool(cutoffs.global_on),
+                               "value": float(cutoffs.global_value)}}
+        section = self.background_template_row.section()
+        if section is not None:
+            document["background_template"] = section
+        return document
 
     def _checked_fields(self, document):
         """The document's fields this window has, each within its row's choices and bounds, and the ranges in
@@ -1041,11 +1053,13 @@ class PhaseFitDialog(QtWidgets.QDialog):
         return tuple(selection), PhaseCutoffs(global_on, float(value), per_phase), tuple(missing)
 
     def _apply_settings(self, _page, document):
-        """Check the whole document first, then restore its options and its phase list (as ordered plot-option
-        edits, through the binding); a successful load clears the substrate, which is never saved."""
+        """Check the whole document first, then restore its options, its phase list (as ordered plot-option edits,
+        through the binding) and its substrate's named file (read at the next fit; a missing one is named now). A
+        document without a substrate section (an older one) clears the substrate."""
         document = PHASE_ANALYSIS_SETTINGS.validate(document)
         fields = self._checked_fields(document)
         phases = self._checked_phases(document)
+        template = self.background_template_row.parse_section(document.get("background_template"))
         for key, value in fields.items():
             row, bound = self._settings_rows[key]
             if bound is not None:
@@ -1066,17 +1080,20 @@ class PhaseFitDialog(QtWidgets.QDialog):
             self.phase_binding.submit_cutoffs(cutoffs)
             if missing:
                 notices.append(f"Missing phase library entries were skipped: {', '.join(missing)}.")
-        self._template = None
+        self.background_template_row.restore(template)
         if 'fit_range_low' in fields or 'fit_range_high' in fields:
             self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
         self._sync_options()
         self._fields_to_region()
         if self.fit_background_row.current_value().startswith("template"):
-            notices.append(_RECAPTURE_NOTICE)
+            if template is None:
+                notices.append(_RECAPTURE_NOTICE)
+            elif self.background_template_row.reason:
+                notices.append(self.background_template_row.reason)
         self._load_notice = " ".join(notices)
 
-    def _restore_runtime(self, template):
-        """A load that could not apply: the substrate before it, and no load notice."""
-        self._template = template
+    def _restore_runtime(self, state):
+        """A load that could not apply: the substrate row as it was, and no load notice."""
+        self.background_template_row.set_state(state)
         self._load_notice = ''
         self._sync_options()

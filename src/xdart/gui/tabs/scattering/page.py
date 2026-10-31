@@ -1370,6 +1370,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             elif target == "peak":
                 from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
                 dialog = PeakFitDialog(parent=self, vnext_submit=self._peak_analysis_action)
+                dialog.busy_probe = lambda: self._analysis_target == "peak" and self._analysis_identity is not None
             else:
                 from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
@@ -1380,6 +1381,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             setattr(self, field, dialog)
             if target in {"peak", "phase"}:
                 dialog._export_snapshot_provider = lambda t=target: self._fit_export_snapshot(t)
+                dialog.background_template_row.describe_displayed = lambda t=target: self._displayed_template(t)
             if target in {"metadata", "scan_roi"}:
                 if self._metadata_operations.open_dialog(target) is None:
                     dialog.close()
@@ -1522,10 +1524,37 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             wavelength=phase_wavelength_angstrom(self._context_controller, anchor.frame),
             settings=plain_settings(dialog.vnext_fit_values()))
 
+    def _displayed_template(self, kind):
+        """The file, frame and 1-D mode behind the displayed trace, as ``(path, frame, mode)``, or None: a chosen
+        template file that is this one starts at its frame and mode (NEXT-128-PEAK-FIT)."""
+        trace, anchor = self._capture_analysis_trace(kind)
+        if trace is None:
+            return None
+        from .analysis_mount import displayed_template_candidate
+        candidate, _reason = displayed_template_candidate(self._context_controller, trace,
+                                                          None if anchor is None else anchor.frame)
+        return None if candidate is None else (candidate.path, candidate.frame, candidate.mode)
+
+    def _capture_template(self, kind):
+        """Use displayed (NEXT-128-PEAK-FIT; PHASE-ANALYSIS-128 for the substrate): the fit's own displayed input,
+        and the file, frame and mode behind it, which the first fit checks."""
+        dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+        if dialog is None:
+            return
+        trace, anchor = self._capture_analysis_trace(kind)
+        if trace is None:
+            dialog.status.setText("Select one displayed 1-D trace first: it becomes the template.")
+            return
+        from .analysis_mount import displayed_template_candidate
+        candidate, reason = displayed_template_candidate(self._context_controller, trace,
+                                                         None if anchor is None else anchor.frame)
+        dialog.capture_background_template(trace, candidate, reason)
+
     def _peak_analysis_action(self, action, values):
         if action == "close":
             self._analysis_dialog_closed("peak", self._peak_dialog); return
         if action == "reload": self._refresh_fit_trace("peak"); return
+        if action == "capture_template": self._capture_template("peak"); return
         if action != "fit": return
         trace, anchor = self._capture_analysis_trace("peak")
         if trace is None: return
@@ -1539,14 +1568,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if action == "close":
             self._analysis_dialog_closed("phase", self._phase_dialog); return
         if action == "reload": self._refresh_fit_trace("phase"); return
-        if action == "capture_template":
-            # the substrate, through the fit's own displayed input (PHASE-ANALYSIS-128)
-            trace, _anchor = self._capture_analysis_trace("phase")
-            if self._phase_dialog is None: return
-            if trace is None:
-                self._phase_dialog.status.setText("Select one displayed 1-D trace first: it becomes the substrate.")
-                return
-            self._phase_dialog.set_substrate_template(trace); return
+        if action == "capture_template": self._capture_template("phase"); return
         if action != "fit": return
         trace, anchor = self._capture_analysis_trace("phase")
         from .analysis_mount import phase_wavelength_angstrom
@@ -1767,6 +1789,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if target == "scan_roi" and self._scan_roi_dialog is not None:
             self._scan_roi_dialog.set_analysis_busy()
         if payload is None:
+            if kind in {"peak", "phase"} and current and not update.stale and update.terminal is not None:
+                # a refusal of the current template names why on the shared template row (NEXT-128-PEAK-FIT)
+                fit_dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+                if fit_dialog is not None and update.terminal.payload is not None:
+                    fit_dialog.background_template_row.refuse(update.terminal.payload)
             if target == "scan_roi" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog.status.setText(diagnostic)
                 terminal_payload = None if update.terminal is None else update.terminal.payload

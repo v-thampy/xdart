@@ -51,9 +51,11 @@ def _snapshot(target, settings):
 
 def _job(request, cancel, progress):
     settings = dict(request.settings)
-    if request.action == 'capture':  # a substrate (PHASE-ANALYSIS-128): the fit's own input, converted to Å⁻¹
+    if request.action == 'capture':  # a template: the fit's own input, a phase fit's converted to Å⁻¹
         snapshot = _snapshot(request.inputs[0], request.settings)
-        return None if cancel.is_set() else phase_fit_snapshot(snapshot).trace_input()
+        if cancel.is_set():
+            return None
+        return (phase_fit_snapshot(snapshot) if request.kind == 'phase' else snapshot).trace_input()
     if request.action in {'reload', 'export'}:
         snapshot = _snapshot(request.inputs[0], request.settings)
         if cancel.is_set():
@@ -94,6 +96,10 @@ def _job(request, cancel, progress):
     return tuple(outcomes), last[0], keys, xs
 
 
+_UNNAMED_CAPTURE = ("a result page's trace is not named by a NeXus file and frame; choose its file to save or export "
+                    "the template")
+
+
 class SnapshotFitHost(QtCore.QObject):
     """Mount Int's fit dialogs with explicit Batch capability, never unholding Int's own profile."""
     def __init__(self, kind, parent=None, *, current, scope, batch=None, source_root=None):
@@ -115,9 +121,9 @@ class SnapshotFitHost(QtCore.QObject):
                                    kind='combo', choices=('Result order',))
         self.column_row.editor.setEditable(True)
         self.column_row.setToolTip('Contributing-row mean of this scan column; missing values are unavailable')
-        if kind == 'phase':  # Phase Analysis keeps it in its Batch card, and Load settings waits for a fit
+        self.dialog.busy_probe = lambda: self.computing  # Load settings waits for a fit (both tools)
+        if kind == 'phase':  # Phase Analysis keeps it in its Batch card
             self.dialog.add_batch_row(self.column_row)
-            self.dialog.busy_probe = lambda: self.computing
         else:
             self.dialog.layout().insertWidget(0, self.column_row)
         self.column_row.setVisible(batch is not None)
@@ -215,8 +221,9 @@ class SnapshotFitHost(QtCore.QObject):
         if request.action == 'export':
             self.dialog.status.setText(f'Exported {terminal.payload}')
             return True
-        if request.action == 'capture':
-            return terminal.payload is not None and self.dialog.set_substrate_template(terminal.payload)
+        if request.action == 'capture':  # a result's trace names no NeXus frame: usable, not saved or exported
+            return terminal.payload is not None and self.dialog.capture_background_template(
+                terminal.payload, None, _UNNAMED_CAPTURE)
         if request.action == 'reload':
             self.snapshot = terminal.payload
             if self.snapshot is None:
@@ -225,6 +232,7 @@ class SnapshotFitHost(QtCore.QObject):
             return True
         self.outcomes, self.snapshot, self._keys, xs = terminal.payload
         self._last_settings = plain_settings(dict(request.settings))
+        self._adopt_template(self.outcomes)
         self.dialog.trend.clear()
         for position, outcome in enumerate(self.outcomes):
             self.dialog.trend.set_row(outcome.label, xs.get(outcome.label) if request.column else float(position), outcome.params)
@@ -253,6 +261,14 @@ class SnapshotFitHost(QtCore.QObject):
         if self.kind != 'phase' or outcome.overlay is None:
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         return outcome.ok
+
+    def _adopt_template(self, outcomes):
+        """A fit's template echo on the shared row (NEXT-128-PEAK-FIT): the first completed fit of the row's file
+        records its identity; else a template refusal says why."""
+        row = self.dialog.background_template_row
+        results = [outcome.result for outcome in outcomes if getattr(outcome, 'result', None) is not None]
+        if not any(row.adopt(result) for result in results) and results:
+            row.refuse(results[-1])
 
     def _show_trace(self):
         options = {'wavelength': self.snapshot.wavelength_angstrom} if self.kind == 'phase' else {}

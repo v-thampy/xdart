@@ -11,15 +11,26 @@ Controls rows (``FormRow``, ``RangeRow``) in a ``SectionCard``, its rarely chang
 ``ResultsTable``. Int's page drives it through ``vnext_submit`` (its analysis slot runs the headless displayed-fit
 operation); without it, the dialog's own path fits through the headless analyzer. ``lmfit`` (the ``xrd-tools[fitting]``
 extra) is imported lazily so xdart still launches without it.
+
+NEXT-128-PEAK-FIT: Pearson VII and split pseudo-Voigt; the template backgrounds through the shared
+``BackgroundTemplateRow`` (Phase Analysis mounts the same row); a "?" on every option (``xrd_tools.help_topics``
+``peak-fit.*``); and Save settings… / Load settings… through the shared ``PageSettings``, with no last-session restore.
 """
 
 import logging
+import math
 
 from xrd_tools.help_topics import diagnostic_text
+from xrd_tools.session.readiness import (
+    ControlActionSpec, ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
+)
 
 import numpy as np
 from dataclasses import replace
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+from xdart.gui.pages.values import CloseReceipt, PageCleanup
+from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
 
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView, fit_result_series
@@ -46,6 +57,8 @@ _MODELS = [
     ("Gaussian", "gaussian"),
     ("Lorentzian", "lorentzian"),
     ("Voigt", "voigt"),
+    ("Pearson VII", "pearson7"),
+    ("Split pseudo-Voigt", "split_pseudovoigt"),
 ]
 # (display label, fit_peaks background string)
 _BACKGROUNDS = [
@@ -53,11 +66,28 @@ _BACKGROUNDS = [
     ("Constant", "constant"),
     ("None", "none"),
     ("Chebyshev (3)", "chebyshev3"),
+    ("Template", "template"),
+    ("Template + linear", "template+linear"),
+    ("Template + Chebyshev (3)", "template+chebyshev3"),
 ]
+#: each group of options' help topic (``xrd_tools.help_topics``)
+TOPICS = {"model": "peak-fit.model", "background": "peak-fit.background", "peaks": "peak-fit.peaks",
+          "range": "peak-fit.range", "weighting": "peak-fit.weighting"}
+#: the Peak Fitter's saved settings (Save settings…, Load settings…); no last-session restore
+PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_settings", "Peak Fitter",
+                                 sections=("background_template",))
+_RANGE_KEYS = ("range_low", "range_high")
+_TEXT_KEYS = ("centers", "sigma_init", "sigma_min", "sigma_max", "center_delta", "fraction")
 
 
 def _path(name):
     return ("peak_fit", name)
+
+
+def _combo(label, name, choices):
+    values = tuple(value for _text, value in choices)
+    return FormRow(label=label, path=_path(name), value=values[0], kind="combo", choices=values,
+                   choice_labels={value: text for text, value in choices})
 
 
 class PeakFitDialog(QtWidgets.QDialog):
@@ -92,9 +122,12 @@ class PeakFitDialog(QtWidgets.QDialog):
         # Reload so stepping through frames keeps the chosen window.
         self._fit_lo = None
         self._fit_hi = None
+        #: a host's probe of a fit it runs (Load settings waits for it); None: the host runs none in the background
+        self.busy_probe = None
+        self._closing = False
         self.setObjectName("peakFitDialog")
         self.setWindowTitle("Peak Fitting")
-        self.resize(560, 860)
+        self.resize(560, 900)
         self._build_ui()
         if self._vnext:
             self.live_check.setChecked(False); self.live_check.setEnabled(False)
@@ -104,7 +137,9 @@ class PeakFitDialog(QtWidgets.QDialog):
                 self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
         from .fit_export import FitExportActions
         self.export_actions = FitExportActions(self, tool='peak', snapshot=self.export_snapshot,
-                                               settings=self.vnext_fit_values)
+                                               settings=self.export_fit_values)
+        self._build_settings()
+        self._sync_export()
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
@@ -112,12 +147,16 @@ class PeakFitDialog(QtWidgets.QDialog):
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
 
-        # The fit's rows: model, background, peaks (Auto or a count) and the fit range, on the shared rows.
+        # The fit's rows: model, background and its template, peaks (Auto or a count) and the fit range, on the
+        # shared rows, each with its "?".
+        from .background_template_row import BackgroundTemplateRow
         card = SectionCard("Peak fit", collapsible=False)
-        models, backgrounds = [label for label, _ in _MODELS], [label for label, _ in _BACKGROUNDS]
-        self.model_row = FormRow(label="Model", path=_path("model"), value=models[0], kind="combo", choices=models)
-        self.bkg_row = FormRow(label="Background", path=_path("background"), value=backgrounds[0], kind="combo",
-                               choices=backgrounds)
+        card.set_purpose_tooltip("The peak model, the background and its template, the peaks and the fit range.")
+        card.set_help_topic(TOPICS["model"])
+        self.model_row = _combo("Model", "model", _MODELS)
+        self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
+        self.background_template_row = BackgroundTemplateRow(self)
+        self.background_template_row.set_help_topic(TOPICS["background"])
         self.auto_row = FormRow(label="Auto", path=_path("auto"), value=True, kind="bool")
         self.count_row = FormRow(label="Peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
                                  maximum=_MAX_PEAKS)
@@ -126,14 +165,27 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.model_combo, self.bkg_combo = self.model_row.editor, self.bkg_row.editor
         self.auto_check, self.npeaks_spin = self.auto_row.editor, self.count_row.editor
         self.range_lo, self.range_hi = self.range_row.editors
-        self.auto_check.setToolTip("Detect peaks automatically (scipy find_peaks) over the fit range")
+        for row, topic, tip in (
+                (self.model_row, "model", "The profile fitted to every peak: pseudo-Voigt, Gaussian, Lorentzian, "
+                                          "Voigt, Pearson VII or split pseudo-Voigt."),
+                (self.bkg_row, "background", "The background under the peaks: linear, constant, none or Chebyshev; "
+                                             "or the template below scaled by one amplitude, alone or plus a "
+                                             "linear or Chebyshev correction."),
+                (self.auto_row, "peaks", "Detect peaks automatically (scipy find_peaks) over the fit range"),
+                (self.count_row, "peaks", "The number of peaks to fit when Auto is off, spread across the range "
+                                          "unless Advanced gives their centers."),
+                (self.range_row, "range", "The interval fitted, in the displayed axis: drag it on the plot or type "
+                                          "it; Full fits the whole trace.")):
+            row.set_purpose_tooltip(tip)
+            row.set_help_topic(TOPICS[topic], button=True)
         self.npeaks_spin.setEnabled(False)        # auto on by default
         for edit in (self.range_lo, self.range_hi):
             edit.setValidator(QtGui.QDoubleValidator(self))
         self.full_btn = QtWidgets.QPushButton("Full")
         self.full_btn.setToolTip("Reset the fit range to the whole pattern")
         self.range_row.add_trailing_widget(self.full_btn)
-        for row in (self.model_row, self.bkg_row, self.auto_row, self.count_row, self.range_row):
+        for row in (self.model_row, self.bkg_row, self.background_template_row, self.auto_row, self.count_row,
+                    self.range_row):
             card.add_row(row)
         lay.addWidget(card)
 
@@ -155,7 +207,19 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.batch_btn.setToolTip(
             "Fit every frame in the scan with these settings, then plot the "
             "parameters vs frame number.")
+        self.load_settings_btn = QtWidgets.QPushButton("Load settings…")
+        self.load_settings_btn.setToolTip("Restore every option and the template's file from a saved Peak Fitter "
+                                          "settings file; a captured trace not named by its file is not saved.")
+        self.save_settings_btn = QtWidgets.QPushButton("Save settings…")
+        self.save_settings_btn.setToolTip("Save every option and the template's file (once a fit has recorded its "
+                                          "content) as a versioned settings file.")
+        self.advanced_btn.setToolTip("The rarely changed options: peak centers, σ start and bounds, center bounds, "
+                                     "PV fraction, the solver's budget and weighting.")
+        for button in (self.advanced_btn, self.load_settings_btn, self.save_settings_btn):
+            button.setAutoDefault(False)
         actions.addWidget(self.advanced_btn)
+        actions.addWidget(self.load_settings_btn)
+        actions.addWidget(self.save_settings_btn)
         actions.addStretch(1)
         actions.addWidget(self.refresh_btn)
         actions.addWidget(self.live_row)
@@ -189,6 +253,11 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.refresh_btn.clicked.connect(self.refresh_pattern)
         self.full_btn.clicked.connect(self._on_full)
         self.advanced_btn.clicked.connect(self._show_advanced)
+        self.load_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.load))
+        self.save_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.save))
+        self.background_template_row.capture_btn.clicked.connect(self._capture_template)
+        self.background_template_row.changed.connect(self._sync_export)
+        self.bkg_combo.currentIndexChanged.connect(lambda _index: self._sync_export())
         self.auto_check.toggled.connect(lambda on: self.npeaks_spin.setEnabled(not on))
         self.fit_view.rangeChanged.connect(self._region_to_fields)
         self.range_row.valueChanged.connect(lambda _path, _value: self._fields_to_region())
@@ -208,13 +277,27 @@ class PeakFitDialog(QtWidgets.QDialog):
             "max_nfev": FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
                                 maximum=1_000_000, allow_blank=True),
         }
-        self.advanced.add_group("Peaks", tuple(rows.values()))
+        self.advanced.add_group("Peaks", tuple(rows.values())).set_help_topic(TOPICS["peaks"])
         uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
-        self.advanced.add_group("Weighting", (uncertainty,))
+        self.advanced.add_group("Weighting", (uncertainty,)).set_help_topic(TOPICS["weighting"])
         self.use_uncertainties = uncertainty.editor
         self.use_uncertainties.setEnabled(False)
-        self.use_uncertainties.setToolTip("Use admitted measured sigma; no uncertainties are inferred")
+        self._uncertainty_row = uncertainty
         self._maxfev_row = rows["max_nfev"]
+        self._advanced_rows = rows
+        for row, topic, tip in (
+                (rows["centers"], "peaks", "Manual peak centers (current x-unit), comma-separated.  When set, these "
+                                           "seed the fit and override Auto-detect — for shoulders / weak peaks "
+                                           "find_peaks misses."),
+                (rows["sigma_init"], "peaks", "Initial peak width σ (blank = auto)"),
+                (rows["sigma_bounds"], "peaks", "Bounds on each peak's width σ (blank = automatic)"),
+                (rows["center_delta"], "peaks", "Constrain each center to ± this much around its start (blank = free)"),
+                (rows["fraction"], "model", "Pseudo-Voigt Gaussian/Lorentzian mix, 0–1 (Pseudo-Voigt and split "
+                                            "pseudo-Voigt)"),
+                (rows["max_nfev"], "peaks", "Max solver iterations (max_nfev); blank or 0 = lmfit default"),
+                (uncertainty, "weighting", "Use admitted measured sigma; no uncertainties are inferred")):
+            row.set_purpose_tooltip(tip)
+            row.set_help_topic(TOPICS[topic], button=True)
         self.adv_centers = rows["centers"].editor
         self.adv_sigma_init = rows["sigma_init"].editor
         self.adv_sigma_min, self.adv_sigma_max = rows["sigma_bounds"].editors
@@ -222,31 +305,29 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.adv_fraction = rows["fraction"].editor
         self.adv_maxfev = rows["max_nfev"].editor
         self.adv_centers.setPlaceholderText("auto-detect — e.g. 2.1, 3.5, 4.8")
-        self.adv_centers.setToolTip(
-            "Manual peak centers (current x-unit), comma-separated.  When set, "
-            "these seed the fit and override Auto-detect — for shoulders / weak "
-            "peaks find_peaks misses.")
         for edit in (self.adv_sigma_init, self.adv_sigma_min, self.adv_sigma_max, self.adv_center_delta,
                      self.adv_fraction):
             edit.setValidator(QtGui.QDoubleValidator(self))
         for edit in (self.adv_sigma_init, self.adv_center_delta):
             edit.setPlaceholderText("auto")
-        self.adv_sigma_init.setToolTip("Initial peak width σ (blank = auto)")
-        self.adv_center_delta.setToolTip("Constrain each center to ± this much around its start (blank = free)")
         self.adv_fraction.setPlaceholderText("0.5")
-        self.adv_fraction.setToolTip("Pseudo-Voigt Gaussian/Lorentzian mix, 0–1 (Pseudo-Voigt only)")
         self.adv_maxfev.setPlaceholderText("auto")
-        self.adv_maxfev.setToolTip("Max solver iterations (max_nfev); blank or 0 = lmfit default")
 
     def _show_advanced(self):
         self.advanced.show(); self.advanced.raise_(); self.advanced.activateWindow()
 
     def _refusal(self):
-        """The first whole-number row whose text is refused, named as the rows name it ("" when none)."""
+        """The first whole-number row whose text is refused, named as the rows name it, or a template background
+        without its template ("" when none)."""
         for row in (self.count_row, self._maxfev_row):
             if row.refusal():
                 return f"{row.label.text()}: {row.refusal()}"
+        if self._background().startswith("template"):
+            return self.background_template_row.fit_refusal()
         return ""
+
+    def _background(self):
+        return _BACKGROUNDS[self.bkg_combo.currentIndex()][1]
 
     # ---- range sync -----------------------------------------------------
     def _data_extent(self):
@@ -344,6 +425,12 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.fit_btn.setEnabled(not running)
         self.live_check.setEnabled(not running and not self._vnext)
         self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
+        # a capture shares the host's fit worker: it waits for a running batch rather than replace it
+        capture = self.background_template_row.capture_btn
+        spec = capture.spec
+        capture.apply_spec(ControlActionSpec(spec.action, spec.label, spec.section, enabled=not running,
+                                             reason='A batch is fitting; capture the template when it is done.'
+                                             if running else ''))
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Batch fitting… {done}/{total}")
@@ -440,6 +527,10 @@ class PeakFitDialog(QtWidgets.QDialog):
 
         model = _MODELS[self.model_combo.currentIndex()][1]
         background = _BACKGROUNDS[self.bkg_combo.currentIndex()][1]
+        if background.startswith("template"):
+            self.status.setText("The template backgrounds fit through the page's fit route: open the Peak Fitter "
+                                "from Int's or a result page's Tools.")
+            return None
         # Restrict to the fit range AND the finite samples (NaN-masked detector
         # gaps break lmfit).
         lo, hi = self._fit_range()
@@ -549,7 +640,42 @@ class PeakFitDialog(QtWidgets.QDialog):
         }
         if self.use_uncertainties.isChecked():
             values['use_uncertainties'] = True
+        if values["background"].startswith("template"):
+            values.update(self.background_template_row.values())
         return values
+
+    def export_fit_values(self):
+        """The settings a notebook carries: a template background's file and its recorded identity, never a captured
+        trace; refused (ValueError) with the row's reason when the template cannot be exported."""
+        values = dict(self.vnext_fit_values())
+        if values["background"].startswith("template"):
+            reason = self.background_template_row.export_reason()
+            if reason:
+                raise ValueError(reason)
+        values.pop("background_template", None)
+        return values
+
+    def _sync_export(self):
+        """The export buttons say why a template background cannot be exported."""
+        if not hasattr(self, "export_actions"):
+            return
+        reason = self.background_template_row.export_reason() if self._background().startswith("template") else ""
+        self.export_actions.set_available(not reason, reason)
+
+    def _capture_template(self):
+        """Use displayed: the host captures the displayed trace (and the file, frame and mode behind it)."""
+        if self._vnext:
+            self._vnext_submit("capture_template", None)
+        else:
+            self.status.setText("Use displayed captures through the page's fit route: open the Peak Fitter from "
+                                "Int's or a result page's Tools.")
+
+    def capture_background_template(self, trace, candidate=None, reason=""):
+        """The host's captured trace for the template row, with the file, frame and mode it names (``candidate``)
+        or why it names none; True when it is set."""
+        self.background_template_row.set_capture(trace, candidate, reason)
+        self.status.setText(f"Template captured: {trace.title or trace.label}.")
+        return True
 
     def _do_fit(self):
         refusal = self._refusal()
@@ -615,6 +741,7 @@ class PeakFitDialog(QtWidgets.QDialog):
                             (result.message or result.code) + (f"; {detail}" if detail else ""))
         self.status.setToolTip("\n".join((result.plan_fingerprint,
             result.policy_fingerprint, result.result_fingerprint)))
+        self.background_template_row.adopt(result)
 
     def closeEvent(self, event):
         if self._vnext:
@@ -650,6 +777,154 @@ class PeakFitDialog(QtWidgets.QDialog):
             frame_idx = None
         if frame_idx is not None:
             self._accumulate_frame_params(frame_idx, outcome.params)
+
+    # ---- saved settings (the shared PageSettings owner) -----------------
+    def _build_settings(self):
+        """Save settings… and Load settings…: every option as a plain field and the template's named file, through
+        the shared owner, with its page surface (``_status``, ``_readiness``, ``_value``, ``_closing``, the chooser).
+        No last session is restored."""
+        rows = self._advanced_rows
+        text = lambda edit: (edit.text, edit.setText)
+        #: each saved field (PLAN contract revision 11): (its row, a getter, a setter)
+        self._settings_rows = {
+            "model": (self.model_row, self.model_row.current_value,
+                      lambda value: self.model_combo.setCurrentIndex(self.model_combo.findData(value))),
+            "background": (self.bkg_row, self.bkg_row.current_value,
+                           lambda value: self.bkg_combo.setCurrentIndex(self.bkg_combo.findData(value))),
+            "auto": (self.auto_row, self.auto_check.isChecked, self.auto_check.setChecked),
+            "n_peaks": (self.count_row, self.npeaks_spin.value, self.count_row.set_number),
+            "range_low": (self.range_row, lambda: self._fit_lo, lambda value: self._set_range_bound(0, value)),
+            "range_high": (self.range_row, lambda: self._fit_hi, lambda value: self._set_range_bound(1, value)),
+            "centers": (rows["centers"], *text(self.adv_centers)),
+            "sigma_init": (rows["sigma_init"], *text(self.adv_sigma_init)),
+            "sigma_min": (rows["sigma_bounds"], *text(self.adv_sigma_min)),
+            "sigma_max": (rows["sigma_bounds"], *text(self.adv_sigma_max)),
+            "center_delta": (rows["center_delta"], *text(self.adv_center_delta)),
+            "fraction": (rows["fraction"], *text(self.adv_fraction)),
+            "max_nfev": (self._maxfev_row, self.adv_maxfev.value, self._maxfev_row.set_number),
+            "use_uncertainties": (self._uncertainty_row, self.use_uncertainties.isChecked,
+                                  self.use_uncertainties.setChecked),
+        }
+        self._fields = {key: self._descriptor(key, row) for key, (row, _get, _set) in self._settings_rows.items()}
+        self._settings_path_chooser = lambda action, start: self.settings_io.choose_path(action, start)
+        self._load_notice = ''
+        row = self.background_template_row
+        self.settings_io = PageSettings(self, PEAK_FIT_SETTINGS, document=self._settings_document,
+                                        apply=self._apply_settings, busy=self._busy_reason,
+                                        close=lambda: CloseReceipt(PageCleanup.CLEAN),
+                                        snapshot=row.state, restore=row.set_state)
+
+    def _descriptor(self, key, row):
+        """The shared field descriptor ``check_fields`` reads: a choice among the stored values, a toggle, a whole
+        number with its bounds, or a number or text."""
+        label = row.label.text() + {"range_low": " (low)", "range_high": " (high)", "sigma_min": " (min)",
+                                    "sigma_max": " (max)"}.get(key, "")
+        if key in ("model", "background"):
+            combo = row.editor
+            return ControlFormField(SectionId.PROCESSING, label, row.path, kind=ControlFieldKind.COMBO,
+                                    choices=tuple(combo.itemData(index) for index in range(combo.count())))
+        if key in ("auto", "use_uncertainties"):
+            return ControlFormField(SectionId.PROCESSING, label, row.path, kind=ControlFieldKind.BOOL)
+        if key in ("n_peaks", "max_nfev"):
+            minimum, maximum, blank = (1, _MAX_PEAKS, False) if key == "n_peaks" else (0, 1_000_000, True)
+            return ControlFormField(SectionId.PROCESSING, label, row.path, kind=ControlFieldKind.INT,
+                                    minimum=minimum, maximum=maximum, allow_blank=blank)
+        return ControlFormField(SectionId.PROCESSING, label, _path(key))
+
+    def _setting(self, key):
+        """A saved field's current value; ValueError names a whole-number row whose text is refused."""
+        row, get, _set = self._settings_rows[key]
+        if key in ("n_peaks", "max_nfev") and row.refusal():
+            raise ValueError(f"{row.label.text()}: {row.refusal()}")
+        return get()
+
+    def _set_range_bound(self, index, value):
+        """A saved fit-range bound: kept exactly, shown as the Range row shows a dragged one, and drawn."""
+        if index == 0:
+            self._fit_lo = value
+        else:
+            self._fit_hi = value
+        editor = self.range_row.editors[index]
+        with QtCore.QSignalBlocker(editor):
+            editor.setText("" if value is None else f"{value:.4g}")
+        if self._x is not None:
+            self.fit_view.set_fit_range(self._fit_range(), limits=self._data_extent())
+
+    @property
+    def _readiness(self):
+        return ("", True)
+
+    def _value(self, key):
+        return "" if key == "project_root" else self._setting(key)
+
+    def _status(self, text, *, ready=True):
+        """The settings owner's message, on this window's status line; a load's notice stays after it."""
+        notice, self._load_notice = self._load_notice, ''
+        self.status.setText(" ".join(part for part in (str(text), notice) if part))
+
+    def _busy_reason(self):
+        if self.busy_probe is not None and self.busy_probe():
+            return "The Peak Fitter is fitting; load settings when the fit is done."
+        return ""
+
+    def _settings_action(self, action):
+        outcome = action()
+        if hasattr(outcome, 'reason'):
+            self.status.setText(outcome.reason)
+
+    def _settings_document(self, _page):
+        """Every option as a plain value (a range as its two bounds) and the template's named file with its
+        recorded identity; a captured trace not named by its file is not saved."""
+        document = {"kind": PEAK_FIT_SETTINGS.kind, "version": PEAK_FIT_SETTINGS.version,
+                    "fields": {key: plain(self._setting(key)) for key in self._settings_rows}}
+        section = self.background_template_row.section()
+        if section is not None:
+            document["background_template"] = section
+        return document
+
+    def _checked_fields(self, document):
+        """The document's fields this window has, each within its row's choices and bounds: ValueError names the
+        first that is not (nothing applies)."""
+        fields = saved_fields(self, document)
+        check_fields(self, fields)
+        for key, value in fields.items():
+            field = self._fields[key]
+            if field.kind is ControlFieldKind.INT:
+                if value is None and field.allow_blank:
+                    continue
+                refusal = ('is not a whole number' if type(value) is not int else integer_field_refusal(
+                    str(value), minimum=field.minimum, maximum=field.maximum, allow_blank=field.allow_blank))
+            elif key in _RANGE_KEYS:
+                refusal = '' if value is None or (type(value) in (int, float) and math.isfinite(value)) else (
+                    'is not a number')
+            else:
+                refusal = ''
+            if refusal:
+                raise ValueError(f"{field.label}: {value!r} {refusal}")
+        low = fields.get("range_low", self._fit_lo)
+        high = fields.get("range_high", self._fit_hi)
+        if low is not None and high is not None and not low < high:
+            raise ValueError("Range: low must be less than high")
+        return fields
+
+    def _apply_settings(self, _page, document):
+        """Check the whole document first, then restore its options and the template's named file (read at the next
+        fit; a missing one is named now). A document without a template section clears the template."""
+        document = PEAK_FIT_SETTINGS.validate(document)
+        fields = self._checked_fields(document)
+        template = self.background_template_row.parse_section(document.get("background_template"))
+        for key, value in fields.items():
+            _row, _get, setter = self._settings_rows[key]
+            if key in _TEXT_KEYS:
+                setter("" if value is None else str(value))
+            elif key in _RANGE_KEYS:
+                setter(None if value is None else float(value))
+            else:
+                setter(value)
+        self.background_template_row.restore(template)
+        self._sync_export()
+        reason = self.background_template_row.reason
+        self._load_notice = reason if reason and self._background().startswith("template") else ''
 
     # ---- the parameter trend ---------------------------------------------
     def reset_param_trend(self):
