@@ -135,12 +135,12 @@ def draw_zero_line(plot):
     return plot.addLine(y=0, pen=pg.mkPen(_ZERO, width=1))
 
 
-def fit_result_series(x, result, components=()):
+def fit_result_series(x, result, components=(), *, peaks=False):
     """A displayed fit result as the view's series: its fit, background, a phase fit's fitted background and
-    amorphous peak when it has them, and named ``components`` (name, values) above (a peak fit's own peaks when none
-    are given: ``peak_component_curves``), the peak markers, and its residual below; every array on the fitted
-    ``x``."""
-    if not components and getattr(result, "model", "") and result.parameter_names:
+    amorphous peak when it has them, and named ``components`` (name, values) above (``peaks``: a peak fit's own peaks
+    when none are given, ``peak_component_curves``, evaluated only when asked for), the peak markers, and its
+    residual below; every array on the fitted ``x``."""
+    if peaks and not components and getattr(result, "model", "") and result.parameter_names:
         from xrd_tools.analysis.fitting.fit import peak_component_curves
         components = peak_component_curves(result.model, result.parameter_names, result.parameter_values, x)
     upper = []

@@ -130,6 +130,8 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._fit_hi = None
         #: a host's probe of a fit it runs (Load settings waits for it); None: the host runs none in the background
         self.busy_probe = None
+        #: the shown fit: its fitted x and result (each peak's line is evaluated only while Components is on)
+        self._fitted = None
         self._closing = False
         self.setObjectName("peakFitDialog")
         self.setWindowTitle("Peak Fitting")
@@ -250,6 +252,7 @@ class PeakFitDialog(QtWidgets.QDialog):
         # Parameters vs frame (live or batch), on the shared trend; its x is the frame, not q.
         self.trend = TrendView(self, name="peakFitTrend")
         self.trend.add_header_widget(self.fit_view.components_toggle)  # each peak's own line, off by default
+        self.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_fitted())
         self.trend.messageChanged.connect(self.status.setText)
         lay.addWidget(self.trend, 2)
 
@@ -462,6 +465,8 @@ class PeakFitDialog(QtWidgets.QDialog):
         else:
             self.trend.set_value_unit(self._x_label)
         lower = FitPanel(zero_line=True) if clear_fit else self.fit_view.projection.lower
+        if clear_fit:
+            self._fitted = None
         self.fit_view.reconcile(FitProjection(self._pattern_panel(), lower))
         if clear_fit:
             self.table.clear_rows()
@@ -469,6 +474,7 @@ class PeakFitDialog(QtWidgets.QDialog):
         self._region_to_fields(*self.fit_view.fit_range)
 
     def _clear_fit(self):
+        self._fitted = None
         self.fit_view.reconcile(replace(self.fit_view.projection, lower=FitPanel(zero_line=True)))
         self.table.clear_rows()
 
@@ -726,9 +732,19 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.fit_view.set_title(_trace_title(trace))
         self.status.setText("Displayed trace captured. Click Fit.")
 
+    def _draw_fitted(self):
+        """The shown fit over the pattern; each peak's own line only while Components is on (a large trace's
+        components are never kept hidden)."""
+        if self._fitted is None or self._x is None:
+            return
+        x, result = self._fitted
+        upper, markers, lower = fit_result_series(x, result, peaks=self.fit_view.components_toggle.isChecked())
+        self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
+                                              FitPanel(lower, zero_line=True)))
+
     def clear_input(self):
         """Release a detached displayed input when its host changes scope or closes."""
-        self._x = self._y = self._export_trace = None
+        self._x = self._y = self._export_trace = self._fitted = None
         self.fit_view.reconcile(FitProjection(FitPanel(), FitPanel(zero_line=True)))
         self.table.clear_rows()
         self.fit_btn.setEnabled(False)
@@ -746,9 +762,8 @@ class PeakFitDialog(QtWidgets.QDialog):
     def set_vnext_result(self, result):
         lo, hi = self._fit_range()
         mask = np.isfinite(self._x) & np.isfinite(self._y) & (self._x >= lo) & (self._x <= hi)
-        upper, markers, lower = fit_result_series(self._x[mask], result)
-        self.fit_view.reconcile(FitProjection(self._pattern_panel(*upper, markers=markers),
-                                              FitPanel(lower, zero_line=True)))
+        self._fitted = (self._x[mask], result)
+        self._draw_fitted()
         self.table.show_rows(*peak_parameter_rows(result))
         detail = "; ".join(result.diagnostics)
         self.status.setText(result.code if result.fit_success is None else

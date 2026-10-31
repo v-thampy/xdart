@@ -128,6 +128,9 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.layout().insertWidget(0, self.column_row)
         self.column_row.setVisible(batch is not None)
         self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, parent=self)
+        self._shown_outcome = None
+        # a peak fit's own peaks are evaluated only while Components is on
+        self.dialog.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_outcome(self._shown_outcome))
 
     @property
     def computing(self):
@@ -239,26 +242,11 @@ class SnapshotFitHost(QtCore.QObject):
         if not self.outcomes:
             return False
         outcome = self.outcomes[-1]
+        self._shown_outcome = None
         if outcome.overlay is not None and self.snapshot is not None:
             self._show_trace()
-            overlay = outcome.overlay
-            if self.kind == 'phase' and self.snapshot.axes[0].unit in {'2th_deg', '2th_rad'}:
-                from xrd_tools.core.containers import convert_radial_axis
-                convert = lambda values: convert_radial_axis(np.asarray(values), 'q_A^-1',
-                    self.snapshot.axes[0].unit, self.snapshot.wavelength_angstrom)
-                x, markers = convert(overlay.x), convert(overlay.markers)
-            else:
-                x, markers = overlay.x, overlay.markers
-            upper = tuple(FitSeries(x, values, name, name) for name, values in overlay.traces.items()
-                          if name != 'residual')
-            result = outcome.result
-            if self.kind != 'phase' and getattr(result, 'model', ''):  # each fitted peak (the components toggle)
-                from xrd_tools.analysis.fitting.fit import peak_component_curves
-                upper += tuple(FitSeries(x, values, 'component', name) for name, values in peak_component_curves(
-                    result.model, result.parameter_names, result.parameter_values, overlay.x))
-            lower = (FitSeries(x, overlay.traces['residual'], 'residual', 'residual'),)
-            self.dialog.fit_view.reconcile(FitProjection(self.dialog._pattern_panel(*upper, markers=tuple(markers)),
-                                                        FitPanel(lower, zero_line=True)))
+            self._shown_outcome = outcome
+            self._draw_outcome(outcome)
             if self.kind == 'phase':
                 self.dialog.show_phase_result_details(outcome.result)
             else:
@@ -266,6 +254,31 @@ class SnapshotFitHost(QtCore.QObject):
         if self.kind != 'phase' or outcome.overlay is None:
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         return outcome.ok
+
+    def _draw_outcome(self, outcome):
+        """The shown fit over the pattern (a phase fit's x back in a 2θ result's own axis); a peak fit's own peaks
+        only while Components is on."""
+        if outcome is None or outcome.overlay is None or self.snapshot is None:
+            return
+        overlay = outcome.overlay
+        if self.kind == 'phase' and self.snapshot.axes[0].unit in {'2th_deg', '2th_rad'}:
+            from xrd_tools.core.containers import convert_radial_axis
+            convert = lambda values: convert_radial_axis(np.asarray(values), 'q_A^-1',
+                self.snapshot.axes[0].unit, self.snapshot.wavelength_angstrom)
+            x, markers = convert(overlay.x), convert(overlay.markers)
+        else:
+            x, markers = overlay.x, overlay.markers
+        upper = tuple(FitSeries(x, values, name, name) for name, values in overlay.traces.items()
+                      if name != 'residual')
+        result = outcome.result
+        if (self.kind != 'phase' and getattr(result, 'model', '')
+                and self.dialog.fit_view.components_toggle.isChecked()):
+            from xrd_tools.analysis.fitting.fit import peak_component_curves
+            upper += tuple(FitSeries(x, values, 'component', name) for name, values in peak_component_curves(
+                result.model, result.parameter_names, result.parameter_values, overlay.x))
+        lower = (FitSeries(x, overlay.traces['residual'], 'residual', 'residual'),)
+        self.dialog.fit_view.reconcile(FitProjection(self.dialog._pattern_panel(*upper, markers=tuple(markers)),
+                                                    FitPanel(lower, zero_line=True)))
 
     def _adopt_template(self, outcomes):
         """A fit's template echo on the shared row (NEXT-128-PEAK-FIT): the first completed fit of the row's file
@@ -281,7 +294,7 @@ class SnapshotFitHost(QtCore.QObject):
 
     def invalidate(self):
         self.owner.release()
-        self.snapshot = None
+        self.snapshot = self._shown_outcome = None
         self.outcomes, self._keys = (), {}
         self.dialog.clear_input()
         self.dialog.trend.clear()
