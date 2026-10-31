@@ -1,6 +1,8 @@
 """Terminal support: real available coverage and revision-bound cache ownership."""
 from dataclasses import replace
+import hashlib
 import os
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -24,6 +26,8 @@ def source(qapp, tmp_path):
         result = attach_saved_support_source(ScientificProjection(processing_mode="Int 1D"), context)
         result = result.saved_support_source
         assert result is not None and result.terminal is not None
+        assert result.terminal.digest != hashlib.sha256(Path(result.path).read_bytes()).hexdigest(), \
+            "the real writer must supply a held evidence seal, not a full-file digest"
     return result
 
 
@@ -42,7 +46,6 @@ def _change_axis_preserving_size_and_mtime(source):
 
 @pytest.mark.parametrize("domain", ["full", "held"])
 def test_real_terminal_reconstruction_is_available_and_changed_revision_refuses(source, domain, monkeypatch):
-    from pathlib import Path
     from xrd_tools.analysis.angular_support import reconstruct_saved_support
     from xrd_tools.io import output_transaction as transaction
     if domain == "full":
