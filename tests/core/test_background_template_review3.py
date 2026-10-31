@@ -33,7 +33,10 @@ def test_f3_small_1d_template_does_not_hydrate_unrelated_2d(tmp_path):
         write_frame_records(current_entry(handle), [FrameRecord.from_view(view)])
     source = BackgroundTemplateSource("nexus", str(path), frame=0, mode="default")
     prepared = prepare_background_template(source)
-    np.testing.assert_array_equal(prepared.y, q + 1)
+    # test-only oracle repair (Claude, after the freeze): the writer stores 1-D intensities as float32
+    # (entry/integrated_1d/intensity is <f4, with or without a 2-D result; FrameViewReader.read and read_1d_rows
+    # return the same values), so the file's own curve is q + 1 rounded to float32, not the float64 input
+    np.testing.assert_array_equal(prepared.y, (q + 1).astype(np.float32).astype(float))
 
 
 @pytest.mark.parametrize("sequential", (True, False))
