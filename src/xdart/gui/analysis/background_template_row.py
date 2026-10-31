@@ -274,8 +274,9 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         self._template, self._identity, self._file = None, None, (kind, str(path))
         with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor):
             if kind == "xye":
-                hint = xye_unit_hint(path)
-                self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(hint or "")))
+                # a name never fixes the scale (Codex REVIEW-3 F1): xdart writes iq_ for Å⁻¹ and nm⁻¹ alike, so the
+                # unit waits for the user's choice; the name's suggestion is in the reason
+                self.unit_row.editor.setCurrentIndex(0)
             else:
                 frame, mode = None, NEXUS_MODES[0]
                 displayed = self.describe_displayed() if callable(self.describe_displayed) else None
@@ -302,8 +303,11 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
                 if unit:
                     self._source = BackgroundTemplateSource("xye", path, unit=unit)
                 else:
-                    self._reason = ("BACKGROUND_TEMPLATE_UNIT_REQUIRED: choose the .xye file's x unit; its name does "
-                                    "not say it")
+                    hint = xye_unit_hint(path)
+                    suggestion = (f"its name suggests {dict(XYE_UNITS).get(hint, hint)}, but a name never fixes the "
+                                  "scale (Å⁻¹ or nm⁻¹, degrees or radians)" if hint else
+                                  "its name does not say it")
+                    self._reason = f"BACKGROUND_TEMPLATE_UNIT_REQUIRED: choose the .xye file's x unit; {suggestion}"
             else:
                 frame = self.frame_row.editor.value() if not self.frame_row.refusal() else None
                 if frame is None:

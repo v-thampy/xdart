@@ -670,6 +670,23 @@ def _displayed_input(inp: Any):
     return label, trace, None
 
 
+def _bound_template(settings: "dict[str, Any]", identity: "str | None") -> "dict[str, Any]":
+    """One batch reads one template content (NEXT-128-PEAK-FIT, Codex REVIEW-3 F2): once a fit of this analyzer has
+    read a file-named template, its later inputs carry that content identity, so a file changed mid-batch is refused
+    (BACKGROUND_TEMPLATE_CHANGED) rather than fitted with another content, or with another content's seeds."""
+    if (identity is not None and settings.get("background_template_source") is not None
+            and settings.get("background_template_identity") is None and settings.get("background_template") is None):
+        settings["background_template_identity"] = identity
+    return settings
+
+
+def _first_template_identity(current: "str | None", plan: Any, result: Any) -> "str | None":
+    """The content identity the analyzer's batch is bound to: the first one a completed fit read."""
+    if current is None and plan.background_template_source is not None and plan.background_template is None:
+        return getattr(result, "background_template_identity", "") or None
+    return current
+
+
 def _displayed_outcome(label: str, plan: Any, result: Any, params: "dict[str, float]") -> AnalysisOutcome:
     """A displayed fit's terminal as an outcome: a refusal is not ok, its code and reasons its message; a completed
     fit's overlay is its fit, background and residual on the x they were fitted on, and its markers."""
@@ -710,12 +727,15 @@ class DisplayedPeakFitAnalyzer:
     cancel_token: Any = None
     kind: str = "peak_fit"
     unit: str = "frame"
+    #: the template content this analyzer's batch reads (``_bound_template``)
+    _template_identity: "str | None" = field(default=None, init=False, repr=False)
 
     def analyze(self, inp: Any) -> AnalysisOutcome:
         from xrd_tools.analysis.display_fit_operations import DisplayedPeakFitPlan, run_displayed_peak_fit
         label, trace, _snapshot = _displayed_input(inp)
-        plan = DisplayedPeakFitPlan(trace, **dict(self.settings))
+        plan = DisplayedPeakFitPlan(trace, **_bound_template(dict(self.settings), self._template_identity))
         result = run_displayed_peak_fit(plan, cancel_token=self.cancel_token)
+        self._template_identity = _first_template_identity(self._template_identity, plan, result)
         values = dict(zip(result.parameter_names, result.parameter_values))
         errors = dict(zip(result.parameter_names, result.parameter_stderr))
         params: "dict[str, float]" = {}
@@ -751,17 +771,20 @@ class DisplayedPhaseFitAnalyzer:
     sequential: bool = False
     _seed: "tuple" = field(default=(), init=False, repr=False)
     _topology: "tuple" = field(default=(), init=False, repr=False)
+    #: the template content this analyzer's batch reads (``_bound_template``): a changed file never inherits seeds
+    _template_identity: "str | None" = field(default=None, init=False, repr=False)
 
     def analyze(self, inp: Any) -> AnalysisOutcome:
         from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan, run_displayed_phase_fit
         from xrd_tools.analysis.scan_operations import AnalysisDisposition
         label, trace, snapshot = _displayed_input(inp)
         wavelength = self.wavelength_angstrom if snapshot is None else snapshot.wavelength_angstrom
-        settings = dict(self.settings)
+        settings = _bound_template(dict(self.settings), self._template_identity)
         if self.sequential and self._seed:
             settings.update(initial_values=self._seed, initial_topology=self._topology)
         plan = DisplayedPhaseFitPlan(trace, wavelength_angstrom=wavelength, **settings)
         result = run_displayed_phase_fit(plan, cancel_token=self.cancel_token)
+        self._template_identity = _first_template_identity(self._template_identity, plan, result)
         if self.sequential and result.disposition is AnalysisDisposition.COMPLETED:
             self._seed = tuple(zip(result.parameter_names, result.parameter_values))
             self._topology = result.seed_topology

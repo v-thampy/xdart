@@ -99,7 +99,7 @@ class BackgroundTemplateSource:
     unit: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in _KEYS:
+        if type(self.kind) is not str or self.kind not in _KEYS:
             raise _refuse("INVALID_SOURCE", f"a template is a NeXus 1-D frame or an .xye file, not {self.kind!r}")
         path = os.fspath(self.path) if isinstance(self.path, (str, os.PathLike)) else None
         if type(path) is not str or not path.strip():
@@ -152,7 +152,7 @@ class BackgroundTemplateSource:
                 raise _refuse("INVALID_SOURCE", f"a template source names each field once by text, not {key!r}")
             values[key] = value
         kind = values.get("kind")
-        if kind not in _KEYS:
+        if type(kind) is not str or kind not in _KEYS:
             raise _refuse("INVALID_SOURCE", f"a template is a NeXus 1-D frame or an .xye file, not {kind!r}")
         version = values.get("version")
         if type(version) is not int or version != SOURCE_VERSION:
@@ -288,14 +288,17 @@ def _read_nexus(source: BackgroundTemplateSource, path: Path, _facts: tuple) -> 
                                               f"{', '.join(modes) or 'none'}")
             if not reader.has_frame(source.frame):
                 raise _refuse("FRAME_MISSING", f"{path.name} has no frame {source.frame}")
-            view = reader.read(source.frame, mode_1d=source.mode)
+            # the frame's 1-D rows only (Codex REVIEW-3 F3): never its 2-D result, geometry or thumbnail
+            rows = reader.read_1d_rows((source.frame,))
     except BackgroundTemplateRefused:
         raise
     except Exception as error:  # noqa: BLE001 - a template file is user input
         raise _refuse("UNREADABLE", f"{path.name} is not a readable xdart NeXus record: {error}") from None
-    if view.axis_1d is None or view.intensity_1d is None:
+    selected = next((mode for mode in rows.modes if mode.mode == source.mode), None)
+    if selected is None or source.frame not in selected.labels:
         raise _refuse("FRAME_MISSING", f"{path.name} frame {source.frame} has no 1-D curve in mode {source.mode!r}")
-    return str(view.axis_1d.unit), view.axis_1d.values, view.intensity_1d
+    return (str(selected.axis.unit), selected.axis.values,
+            selected.intensity_rows[selected.labels.index(source.frame)])
 
 
 def _admit(x: Any, y: Any) -> tuple[np.ndarray, np.ndarray]:
