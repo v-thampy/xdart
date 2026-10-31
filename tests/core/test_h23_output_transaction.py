@@ -4790,13 +4790,15 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         f"allowed route: {sorted(observed)}"
     )
     # angular_support only revalidates a snapshot; it never stages, leases or
-    # publishes.
+    # publishes. Since TERMINAL-SUPPORT-128 a sealed Run handoff's rebuild
+    # revalidates against its seal (revalidate_stream_terminal), still read-only.
     support = ast.parse((source_root / "xrd_tools/analysis/angular_support.py")
                         .read_text(encoding="utf-8"))
     assert {alias.name for node in ast.walk(support)
             if isinstance(node, ast.ImportFrom)
             and node.module == "xrd_tools.io.output_transaction"
             for alias in node.names} == {"TargetChanged",
+                                         "revalidate_stream_terminal",
                                          "revalidate_target_snapshot"}
 
 

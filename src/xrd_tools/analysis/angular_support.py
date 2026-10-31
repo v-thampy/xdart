@@ -1400,9 +1400,19 @@ class SavedSupportRequest:
     terminal: Any = None
 
     @property
+    def source_key(self) -> tuple:
+        """The admitting revision and validation domain, independent of the shown frame subset.
+
+        TargetSnapshot content equality omits ctime; terminal digests may describe writer evidence instead of file
+        bytes. Keep both revision witnesses in cache and delivery identities without changing snapshot semantics.
+        """
+        return (self.path, self.entry, self.snapshot, getattr(self.snapshot, "ctime_ns", None),
+                self.labels, self.terminal)
+
+    @property
     def key(self) -> tuple:
         """The computation's identity: the same output revision and frames give the same profiles."""
-        return (self.path, self.entry, self.snapshot, self.labels, tuple(sorted(self.selected)))
+        return (*self.source_key, tuple(sorted(self.selected)))
 
 
 def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[[], bool] | None = None
