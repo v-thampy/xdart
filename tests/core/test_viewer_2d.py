@@ -1382,7 +1382,10 @@ def _one_frame_peaks(pixels, *, encoded=0, wide=False):
     first_render = pixels * (canonical + display + 1 + (nan if wide else 0) + index + rgba)  # a NaN mask is made first
     paint = pixels * (canonical + display + nan + qimage + qt_paint)
     log_recolour = pixels * (canonical + display + qimage + nan + display + display)  # old ones alive, new copy and Log
-    return read, max(first_render, paint, log_recolour)
+    # then the new Log display's levels: finite, isfinite(raw), two ceiling comparisons and their union at once, with
+    # no temporary elision (Windows)
+    levels = pixels * (canonical + display + qimage + nan + display + 5)
+    return read, max(first_render, paint, log_recolour, levels)
 
 
 def _independent_ledger(canonical, *, encoded=17, reservation=_EXPECTED_R, snapshot=_EXPECTED_S,
@@ -2273,7 +2276,7 @@ def test_memory_ledger_charges_one_frames_working_set_and_fails_closed(monkeypat
     ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17)
     reader, renderer = _one_frame_peaks(6, encoded=17)
     assert ledger.canonical_bytes == 4 * 6
-    assert (ledger.reader_peak, ledger.renderer_peak) == (reader, renderer) == (17 + 21 * 6, 21 * 6)
+    assert (ledger.reader_peak, ledger.renderer_peak) == (reader, renderer) == (17 + 21 * 6, 22 * 6)
     assert ledger.admission == _EXPECTED_R + _EXPECTED_S + max(reader, renderer)
     assert ledger.budget == 1024**3
     big = api.viewer_2d_memory_ledger(2, 3, encoded_retained=10**6)
@@ -2281,7 +2284,7 @@ def test_memory_ledger_charges_one_frames_working_set_and_fails_closed(monkeypat
     for shape, wide in (((1, 32767), False), ((1, 32768), True), ((40000, 2), True)):
         pixels = shape[0] * shape[1]
         assert api.viewer_2d_memory_ledger(*shape).renderer_peak == _one_frame_peaks(pixels, wide=wide)[1] == (
-            36 if wide else 21) * pixels, "pyqtgraph downsamples past 32767 pixels and keeps NaN coordinates"
+            37 if wide else 22) * pixels, "pyqtgraph downsamples past 32767 pixels and keeps NaN coordinates"
 
     monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
     monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: None)
@@ -2329,9 +2332,9 @@ def test_a_16_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
 
 
 def test_a_4_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
-    """DISPLAY-FLOAT32-128: one float32 frame's working set with the loading snapshot (4096x4096: 355 MiB; Eiger2 16M:
-    381 MiB) fits the budget of an 8 GB PC on every system and of a 4 GB macOS/Linux PC (410 MiB), which refuses only
-    from 4419x4419."""
+    """DISPLAY-FLOAT32-128: one float32 frame's working set with the loading snapshot (4096x4096: 371 MiB; Eiger2 16M:
+    398 MiB) fits the budget of an 8 GB PC on every system and of a 4 GB macOS/Linux PC (410 MiB), which refuses only
+    from 4317x4317."""
     for detect, ram in (("posix", 8), ("windows", 8), ("posix", 4)):
         if detect == "posix":
             monkeypatch.setattr(api, "_physical_ram_bytes", lambda ram=ram: ram * 1024**3)
@@ -2341,17 +2344,17 @@ def test_a_4_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
             ledger = api.viewer_2d_memory_ledger(*shape)
             assert ledger.admission == _EXPECTED_R + _EXPECTED_S + max(_one_frame_peaks(shape[0] * shape[1]))
             assert ledger.admission <= ledger.budget, (detect, ram, shape)
-    assert api._admit((4418, 4418)).admission <= 4 * 1024**3 // 10
-    assert _raises(api.Viewer2DReadError, api._admit, (4419, 4419)).code is api.Viewer2DRefusalCode.MEMORY_REFUSED
+    assert api._admit((4316, 4316)).admission <= 4 * 1024**3 // 10
+    assert _raises(api.Viewer2DReadError, api._admit, (4317, 4317)).code is api.Viewer2DRefusalCode.MEMORY_REFUSED
 
 
 def test_a_frame_just_over_the_budget_is_refused(monkeypatch):
-    """Refusal only when one frame's working set does not fit: 6418x6418 fits the 884,736,000-byte budget of a PC whose
-    RAM cannot be read; 6419x6419 is over it by 85 kB and is refused."""
+    """Refusal only when one frame's working set does not fit: 6271x6271 fits the 884,736,000-byte budget of a PC whose
+    RAM cannot be read; 6272x6272 is over it by 246 kB and is refused."""
     monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
     monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: None)
-    assert api._admit((6418, 6418)).admission <= 884_736_000 < api.viewer_2d_memory_ledger(6419, 6419).admission
-    refused = _raises(api.Viewer2DReadError, api._admit, (6419, 6419))
+    assert api._admit((6271, 6271)).admission <= 884_736_000 < api.viewer_2d_memory_ledger(6272, 6272).admission
+    refused = _raises(api.Viewer2DReadError, api._admit, (6272, 6272))
     assert refused.code is api.Viewer2DRefusalCode.MEMORY_REFUSED
 
 

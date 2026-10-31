@@ -377,13 +377,15 @@ class Viewer2DFrame:
 #: (DISPLAY-FLOAT32-128, design note v3; the drawing figures are the mounted widget's measured worst). Reading: the
 #: decoded source at the widest admitted width (8, also CSV's float64 parse buffer), a contiguous copy of it (8), the
 #: float32 canonical frame (4) and a finite-value mask (1). Drawing, at its worst (recolouring a Log image): the
-#: canonical frame (4), the old display copy, its QImage and NaN mask still alive (4 + 4 + 1) while the new copy and its
-#: Log are built (4 + 4); painting needs 13 plus an allowance of 4 for Qt converting the image. Past pyqtgraph's 32767
-#: pixels the image is downsampled to the view and its NaN locations are coordinates, 16 per NaN pixel, not the
-#: widget's 1-byte mask. The page clears the shown frame before the next is read, so no second frame is charged.
+#: canonical frame (4) and the old display copy, its QImage and NaN mask (4 + 4 + 1) stay alive while the new Log
+#: display (4) gets its colour levels from five 1-byte masks at once (5), counted without numpy's temporary elision,
+#: which Windows lacks (macOS and Linux measure one less); painting needs 13 plus an allowance of 4 for Qt converting
+#: the image. Past pyqtgraph's 32767 pixels the image is downsampled to the view and its NaN locations are coordinates,
+#: 16 per NaN pixel, not the widget's 1-byte mask. The page clears the shown frame before the next is read, so no
+#: second frame is charged.
 _READ_BYTES_PER_PIXEL = 8 + 8 + 4 + 1
-_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 1 + 4 + 4
-_WIDE_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 16 + 4 + 4
+_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 1 + 4 + 5
+_WIDE_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 16 + 4 + 5
 _WIDE_DIMENSION = 2**15 - 1
 #: The loading snapshot: a screen raster of at most 2,000,000 4-byte pixels, kept while the next frame is read and drawn.
 LOADING_SNAPSHOT_RESERVATION = 2_000_000 * 4

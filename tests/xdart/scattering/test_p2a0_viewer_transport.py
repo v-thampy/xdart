@@ -64,8 +64,9 @@ def _selected_admission(catalog, label):
     # pixel from the design's per-phase table), with the loading snapshot; the previous frame is cleared first.
     pixels = shape[0] * shape[1]
     read = encoded + pixels * (8 + 8 + 4 + 1)  # decoded source, contiguous copy, canonical, finite mask
-    # a Log recolour: canonical, old display, its QImage and NaN mask (coordinates when wider than 32767), new display, Log
-    draw = pixels * (4 + 4 + 4 + (16 if max(shape) > 32767 else 1) + 4 + 4)
+    # a Log recolour's levels: canonical, old display, its QImage and NaN mask (coordinates when wider than 32767), new
+    # display, five 1-byte masks without numpy's temporary elision
+    draw = pixels * (4 + 4 + 4 + (16 if max(shape) > 32767 else 1) + 4 + 5)
     return _EXPECTED_R + 8_000_000 + max(read, draw)
 
 
