@@ -636,7 +636,7 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
     # 'Detector' is pyFAI's generic base-class name — treat it as unspecified.
     _det_name = poni.detector or ""
     detector = get_detector(_det_name) if _det_name and _det_name.lower() != "detector" else None
-    return AzimuthalIntegrator(
+    integrator = AzimuthalIntegrator(
         dist=float(poni.dist),
         poni1=float(poni.poni1),
         poni2=float(poni.poni2),
@@ -646,6 +646,11 @@ def poni_to_integrator(poni: PONI) -> AzimuthalIntegrator:
         wavelength=float(poni.wavelength) if poni.wavelength else None,
         detector=detector,
     )
+    # pyFAI runs a full gc.collect() on every geometry change unless auto_gc is off. On a worker thread that
+    # collection can finalize Qt objects off the GUI thread and deadlock (CI-VIEWERS-HANG-128); xdart's
+    # integrators free their engines by reference count, so nothing relies on it.
+    integrator.auto_gc = False
+    return integrator
 
 
 def detector_calibration_to_integrator(
@@ -705,6 +710,7 @@ def detector_calibration_to_integrator(
         wavelength=float(p.wavelength) if p.wavelength else None,
         detector=det,
     )
+    integrator.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     if cal.parallax is True:
         integrator.enable_parallax()
     return integrator
@@ -725,6 +731,7 @@ def _clone_integrator_preserving_calibration(
     source_wavelength = integrator.wavelength
     source_parallax = integrator.parallax is not None
     cloned = copy.deepcopy(integrator)
+    cloned.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     if source_parallax and cloned.parallax is None:
         cloned.enable_parallax()
     if (

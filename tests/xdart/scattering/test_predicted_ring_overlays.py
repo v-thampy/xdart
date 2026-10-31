@@ -24,6 +24,7 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
+from xdart.gui.tabs.scattering.events import CleanupStatus
 
 
 @pytest.fixture
@@ -73,7 +74,14 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
         page._refresh_shell(); qapp.processEvents()
         yield page, shell.scientific
     finally:
-        page.close(); page.deleteLater(); qapp.processEvents()
+        page.close()
+        # Finish the page's own cleanup before deleting it, so no retry timer survives into the next test, where its
+        # close would run beside that test's Run worker (CI-VIEWERS-HANG-128). Never drain DeferredDelete here.
+        deadline = time.monotonic()+30
+        while page.close_workspace().cleanup_status is not CleanupStatus.CLEANED:
+            assert time.monotonic()<deadline, "the closed page never finished its cleanup"
+            qapp.processEvents(); time.sleep(.01)
+        page.deleteLater(); qapp.processEvents()
 
 
 def _host_window(view):

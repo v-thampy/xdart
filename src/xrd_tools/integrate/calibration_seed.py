@@ -142,12 +142,13 @@ def expected_rings(integrator, calibrant, shape, mask=None) -> tuple[ExpectedRin
 
 def predict_frame_seed(record, frame, *, calibrant='LaB6', del_motor='del', nu_motor='nu', mask=None,
                        conditioning=None, saturation=None, include_rings=True,
-                       collect_garbage=True) -> FrameSeed:
+                       collect_garbage=False) -> FrameSeed:
     """The frame's geometry predicted from a goniometer calibration, with its rings (none on
     ``mask``, the calibration's mask in the frame's image).
 
-    Temporary display callers may disable forced process-wide GC on this new
-    integrator; normal Python collection and all geometry resets remain active.
+    pyFAI's forced process-wide GC on each geometry change stays off unless a
+    caller passes ``collect_garbage=True`` (CI-VIEWERS-HANG-128); normal Python
+    collection and all geometry resets remain active.
     """
     from pyFAI import units
     from xrd_tools.core.geometry import Diffractometer

@@ -163,6 +163,7 @@ def _pyfai_admitted(lo: float, hi: float, chi_disc_at_pi: bool) -> tuple[tuple[f
     """pyFAI's own normalize_azimuth_range, clipped to the χ the pixels can have, as degrees on [−180, 180)."""
     from pyFAI.geometry import Geometry
     geometry = Geometry()
+    geometry.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     if chi_disc_at_pi:
         geometry.setChiDiscAtPi()
     else:
