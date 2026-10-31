@@ -100,19 +100,21 @@ def test_the_phase_fit_dialog_shows_its_pattern_fit_and_residual_through_the_sha
             "displayed-trace-v1", 1, "run", "1", Path("/fit-view/output.nxs"), "q", 0))
         dialog.set_vnext_trace(trace)
         shown = dialog.fit_view.projection
-        assert [series.role for series in shown.upper.series] == ["data_line"]
+        # NEXT-128-PEAK-FIT (the maintainer, 2026-10-31: "the raw data should be shown with markers (same marker size
+        # as the main window) and the fits with solid lines"): the pattern's points, no longer a line
+        assert [series.role for series in shown.upper.series] == ["data"]
         assert (shown.upper.x_label, shown.upper.y_label) == ("q (Å⁻¹)", "Intensity")
         assert shown.lower.zero_line and not shown.lower.series
         dialog.set_vnext_result(DisplayedPhaseFitResult(AnalysisDisposition.COMPLETED, "OK", fit=x ** 2 + .5,
                                                         residual=x * 0, message="fit"))
         shown = dialog.fit_view.projection
         assert [(series.role, series.name) for series in shown.upper.series] == [
-            ("data_line", "data"), ("fit", "fit")]
+            ("data", "data"), ("fit", "fit")]
         assert [series.role for series in shown.lower.series] == ["residual"]
         assert [item.name() for item in dialog.plot.listDataItems()] == ["data", "fit"]
         dialog.set_vnext_trace(trace)  # a new input clears the fit and keeps the pattern
         assert not dialog.resid_plot.listDataItems()
-        assert [series.role for series in dialog.fit_view.projection.upper.series] == ["data_line"]
+        assert [series.role for series in dialog.fit_view.projection.upper.series] == ["data"]
     finally:
         dialog.close()
 

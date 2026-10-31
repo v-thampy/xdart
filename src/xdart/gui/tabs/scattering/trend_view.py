@@ -162,6 +162,7 @@ class TrendView(QtWidgets.QWidget):
         bar.addStretch(1)
         bar.addWidget(self.save)
         layout.addLayout(bar)
+        self._bar = bar
         self.note = QtWidgets.QLabel("")
         self.note.setObjectName(f"{name}Note")
         self.note.hide()
@@ -257,6 +258,10 @@ class TrendView(QtWidgets.QWidget):
     def rows(self) -> tuple[TrendRow, ...]:
         """The rows, in the order their results were first set."""
         return tuple(self._rows.values())
+
+    def add_header_widget(self, widget: QtWidgets.QWidget) -> None:
+        """A window's own control in this row, after Right (NEXT-128-PEAK-FIT: the fit view's components toggle)."""
+        self._bar.insertWidget(self._bar.indexOf(self.right_row) + 1, widget)
 
     def set_value_unit(self, unit: str) -> None:
         """The fitted pattern's coordinate (its unit or label), which the centre and width families are in."""

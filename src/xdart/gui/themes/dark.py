@@ -797,8 +797,8 @@ QPushButton#toolButton:hover {
 QPushButton#toolButton:disabled {
     color: $text_muted;
 }
-/* Active-tool "Open" affordance + the Peak Fitting popup's primary Fit button. */
-QPushButton#toolOpen, QPushButton#peakFitGo {
+/* Active-tool "Open" affordance. */
+QPushButton#toolOpen {
     background-color: $accent;
     color: $accent_on_text;
     border: 1px solid $accent;
@@ -806,9 +806,29 @@ QPushButton#toolOpen, QPushButton#peakFitGo {
     padding: $compact_action_padding;
     font-weight: 700;
 }
-QPushButton#toolOpen:hover, QPushButton#peakFitGo:hover {
+QPushButton#toolOpen:hover {
     background-color: $accent_hover;
     border-color: $accent_hover;
+}
+/* The fit windows' primary Fit button (Peak Fitter, Phase Analysis): the main window's selection accent, as its
+   selected controls have it (NEXT-128-PEAK-FIT, the maintainer: "the tool popup windows should follow the same
+   theming/styling as the main window - so the color of the Fit button for example"). */
+QPushButton#peakFitGo {
+    background-color: $selection_accent;
+    color: $selection_accent_on_text;
+    border: 1px solid $selection_accent;
+    border-radius: 0px;
+    padding: $compact_action_padding;
+    font-weight: 700;
+}
+QPushButton#peakFitGo:hover {
+    background-color: $selection_accent_hover;
+    border-color: $selection_accent_hover;
+}
+QPushButton#peakFitGo:disabled {
+    background-color: $selection_accent_muted;
+    color: $text_muted;
+    border-color: $selection_accent_muted;
 }
 QLabel#peakFitStatus {
     color: $text_muted;

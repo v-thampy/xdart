@@ -207,6 +207,9 @@ class DisplayedPeakFitResult:
     #: used an unnamed captured trace); both join the fingerprint only when the plan has a template
     background_template_source: tuple[tuple[str, Any], ...] | None = None
     background_template_identity: str = ""
+    #: the peak profile fitted (the plan's ``model``; its components are evaluated from it): pinned by the plan
+    #: fingerprint, so it stays out of the result fingerprint
+    model: str = ""
 @dataclass(frozen=True, slots=True)
 class CifAssetReceipt:
     lexical_path: Path
@@ -613,7 +616,7 @@ def run_displayed_peak_fit(
             background=background, residual=residual, marker_positions=markers,
             storage_bytes=size, result_fingerprint=fingerprint, diagnostics=notes,
             background_template_source=plan.background_template_source,
-            background_template_identity=template_identity,
+            background_template_identity=template_identity, model=plan.model,
         )
     except _Refusal as exc:
         return _peak_refusal(plan, exc.code, str(exc))

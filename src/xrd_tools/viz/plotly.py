@@ -670,16 +670,10 @@ def plot_analysis_outcome(snapshot, outcome=None, *, overlays=("fit", "backgroun
             if "components" in overlays:
                 fig.add_trace(go.Scattergl(x=convert(overlay.x), y=values, mode="lines", name=f"phase {i}"), row=1, col=1)
         if "components" in overlays and not getattr(result, "phase_components", ()):
-            from xrd_tools.analysis.fitting.fit import get_peak_model
-            from lmfit import Parameters
-            parameters = Parameters()
-            for name, value in zip(getattr(result, "parameter_names", ()), getattr(result, "parameter_values", ())):
-                parameters.add(name, value=value)
-            prefixes = sorted({name.split("_", 1)[0] + "_" for name in parameters if name.endswith("_center")})
-            for prefix in prefixes:
-                model = get_peak_model(peak_model, prefix=prefix)
-                component = model.eval(params=parameters, x=overlay.x)
-                fig.add_trace(go.Scattergl(x=convert(overlay.x), y=component, name=prefix.rstrip("_"), mode="lines"), row=1, col=1)
+            from xrd_tools.analysis.fitting.fit import peak_component_curves
+            for name, component in peak_component_curves(peak_model, getattr(result, "parameter_names", ()),
+                                                         getattr(result, "parameter_values", ()), overlay.x):
+                fig.add_trace(go.Scattergl(x=convert(overlay.x), y=component, name=name, mode="lines"), row=1, col=1)
         for center in convert(overlay.markers):
             fig.add_vline(x=center, line_dash="dot", line_width=1, row=1, col=1)
     for other in comparisons:

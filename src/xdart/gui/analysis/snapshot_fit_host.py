@@ -251,6 +251,11 @@ class SnapshotFitHost(QtCore.QObject):
                 x, markers = overlay.x, overlay.markers
             upper = tuple(FitSeries(x, values, name, name) for name, values in overlay.traces.items()
                           if name != 'residual')
+            result = outcome.result
+            if self.kind != 'phase' and getattr(result, 'model', ''):  # each fitted peak (the components toggle)
+                from xrd_tools.analysis.fitting.fit import peak_component_curves
+                upper += tuple(FitSeries(x, values, 'component', name) for name, values in peak_component_curves(
+                    result.model, result.parameter_names, result.parameter_values, overlay.x))
             lower = (FitSeries(x, overlay.traces['residual'], 'residual', 'residual'),)
             self.dialog.fit_view.reconcile(FitProjection(self.dialog._pattern_panel(*upper, markers=tuple(markers)),
                                                         FitPanel(lower, zero_line=True)))

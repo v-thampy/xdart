@@ -84,6 +84,12 @@ def _path(name):
     return ("peak_fit", name)
 
 
+def _trace_title(trace):
+    """The fit view's title for a displayed trace: its title and frame."""
+    frame = getattr(getattr(trace, "receipt", None), "frame_label", "")
+    return f"{trace.title} · frame {frame}" if frame else trace.title
+
+
 def _combo(label, name, choices):
     values = tuple(value for _text, value in choices)
     return FormRow(label=label, path=_path(name), value=values[0], kind="combo", choices=values,
@@ -117,7 +123,7 @@ class PeakFitDialog(QtWidgets.QDialog):
             self._provider = lambda: None
         self._x = None
         self._y = None
-        self._x_label = "q"
+        self._x_label, self._x_unit = "q", ""
         # Persisted fit range (in x-units); None => whole pattern.  Survives
         # Reload so stepping through frames keeps the chosen window.
         self._fit_lo = None
@@ -236,13 +242,14 @@ class PeakFitDialog(QtWidgets.QDialog):
 
         # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
         self.fit_view = FitView(self, name="peakFitView", summary=False, stretch=(3, 1), upper_min_height=240,
-                                lower_max_height=120, link_x=True)
+                                lower_max_height=120, link_x=True, top_bar=True, components=False)
         self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
         self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
         lay.addWidget(self.fit_view, 4)
 
         # Parameters vs frame (live or batch), on the shared trend; its x is the frame, not q.
         self.trend = TrendView(self, name="peakFitTrend")
+        self.trend.add_header_widget(self.fit_view.components_toggle)  # each peak's own line, off by default
         self.trend.messageChanged.connect(self.status.setText)
         lay.addWidget(self.trend, 2)
 
@@ -439,15 +446,21 @@ class PeakFitDialog(QtWidgets.QDialog):
         """The upper panel: the pattern's points ("data", the 1-D plot's markers), then ``series`` (fit,
         background) and the peak ``markers``."""
         return FitPanel((FitSeries(self._x, self._y, "data", "data"), *series), self._x_label, "Intensity",
-                        markers=markers)
+                        markers=markers, x_unit=self._x_unit)
 
-    def _show_pattern(self, x, y, x_label, *, clear_fit=False):
+    def _show_pattern(self, x, y, x_label, *, clear_fit=False, x_unit=""):
         """Draw the raw pattern and the fit range (kept across reloads, clamped to the data); set _x / _y.
-        ``clear_fit``: the last fit goes too (its residual and rows), in the same one redraw."""
+        ``clear_fit``: the last fit goes too (its residual and rows), in the same one redraw. ``x_unit``: the axis's
+        unit, labelled as Int labels it."""
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
-        self._x_label = x_label or "q"
-        self.trend.set_value_unit(self._x_label)
+        self._x_label, self._x_unit = x_label or "q", x_unit or ""
+        if self._x_unit:
+            from xdart.gui.tabs.scattering.shell_widgets import _axis_presentation
+            label, unit = _axis_presentation(self._x_label, self._x_unit)
+            self.trend.set_value_unit(unit or label)
+        else:
+            self.trend.set_value_unit(self._x_label)
         lower = FitPanel(zero_line=True) if clear_fit else self.fit_view.projection.lower
         self.fit_view.reconcile(FitProjection(self._pattern_panel(), lower))
         if clear_fit:
@@ -709,7 +722,8 @@ class PeakFitDialog(QtWidgets.QDialog):
         self.use_uncertainties.setEnabled(trace.sigma is not None)
         if trace.sigma is None:
             self.use_uncertainties.setChecked(False)
-        self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
+        self._show_pattern(trace.axis, trace.intensity, trace.label or "q", clear_fit=True, x_unit=trace.axis_unit)
+        self.fit_view.set_title(_trace_title(trace))
         self.status.setText("Displayed trace captured. Click Fit.")
 
     def clear_input(self):

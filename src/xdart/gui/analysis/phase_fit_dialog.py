@@ -199,11 +199,13 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.displays.setChildrenCollapsible(False)
         # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
         self.fit_view = FitView(self.displays, name="phaseFitView", summary=False, stretch=(3, 1),
-                                upper_min_height=220, lower_max_height=110, link_x=True)
+                                upper_min_height=220, lower_max_height=110, link_x=True, top_bar=True,
+                                components=True)
         self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
         self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
         # Parameters (fractions, lattice) against the result order or a scan column, on the shared trend.
         self.trend = TrendView(self.displays, name="phaseFitTrend")
+        self.trend.add_header_widget(self.fit_view.components_toggle)  # each phase's own line, on by default
         # Each phase's fraction and lattice, on the shared table.
         self.table = ResultsTable(PHASE_RESULT_HEADERS, self.displays, name="phaseFitTable", max_height=150)
         self.table.setToolTip("Each fitted phase's fraction and lattice; a '—' cell's tooltip says why it is empty.")
@@ -688,17 +690,22 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self._x = np.asarray(x, dtype=float)
         self._y = np.asarray(y, dtype=float)
         self._x_label = x_label or "q"
-        self.trend.set_value_unit(self._x_label)
+        if self._x_unit:
+            from xdart.gui.tabs.scattering.shell_widgets import _axis_presentation
+            label, unit = _axis_presentation(self._x_label, self._x_unit)
+            self.trend.set_value_unit(unit or label)
+        else:
+            self.trend.set_value_unit(self._x_label)
         lower = FitPanel(zero_line=True) if clear_fit else self.fit_view.projection.lower
         self.fit_view.reconcile(FitProjection(self._pattern_panel(), lower))
         if clear_fit:
             self.table.clear_rows()
 
     def _pattern_panel(self, *series, markers=()):
-        """The upper panel: the pattern as a line ("data"), then ``series`` (fit, background,
-        components) and the peak ``markers``."""
-        return FitPanel((FitSeries(self._x, self._y, "data_line", "data"), *series),
-                        self._x_label, "Intensity", markers=markers)
+        """The upper panel: the pattern's points ("data", Int's marker size), then ``series`` (fit, background,
+        components, solid lines) and the peak ``markers``."""
+        return FitPanel((FitSeries(self._x, self._y, "data", "data"), *series),
+                        self._x_label, "Intensity", markers=markers, x_unit=self._x_unit)
 
     def set_vnext_trace(self, trace, *, wavelength=None):
         self._export_trace = trace
@@ -712,7 +719,9 @@ class PhaseFitDialog(QtWidgets.QDialog):
         self.use_uncertainties.setEnabled(trace.sigma is not None)
         if trace.sigma is None:
             self.use_uncertainties.setChecked(False)
-        self._show_pattern(trace.axis, trace.intensity, trace.axis_unit or trace.label, clear_fit=True)
+        self._show_pattern(trace.axis, trace.intensity, trace.label or "q", clear_fit=True)
+        from .peak_fit_dialog import _trace_title
+        self.fit_view.set_title(_trace_title(trace))
         self._fields_to_region()
         self.status.setText(self._range_reason or "Displayed trace captured. Check the phases to fit and click Fit.")
         self._sync_actions()

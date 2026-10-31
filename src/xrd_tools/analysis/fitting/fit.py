@@ -444,6 +444,22 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
     )
 
 
+def peak_component_curves(model: str, parameter_names, parameter_values, x) -> tuple[tuple[str, np.ndarray], ...]:
+    """Each fitted peak's own curve on ``x``, as ``(name, values)`` in peak order ("p0", "p1", …): the ``model``
+    profile evaluated with the fit's parameters (a displayed fit result's names and values). One owner for the
+    notebook plot and the fit windows (NEXT-128-PEAK-FIT); a peak is any prefix with a ``_center``."""
+    from lmfit import Parameters
+    parameters = Parameters()
+    for name, value in zip(parameter_names, parameter_values):
+        parameters.add(str(name), value=float(value))
+    prefixes = sorted({name.split("_", 1)[0] + "_" for name in parameters
+                       if name.endswith("_center") and name.split("_", 1)[0][1:].isdigit()},
+                      key=lambda prefix: int(prefix[1:-1]))
+    xs = np.asarray(x, dtype=float)
+    return tuple((prefix.rstrip("_"), np.asarray(get_peak_model(model, prefix=prefix).eval(params=parameters, x=xs),
+                                                 dtype=float)) for prefix in prefixes)
+
+
 # ---------------------------------------------------------------------------
 # Legacy wrapper (backwards compatible)
 # ---------------------------------------------------------------------------
