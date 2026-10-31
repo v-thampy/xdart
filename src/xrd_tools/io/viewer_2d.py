@@ -44,6 +44,9 @@ _MAX_NPZ = 2 * 1024**3
 _MAX_FABIO = 256 * 1024**2
 #: The memory budget when the PC's RAM cannot be read.
 _UNKNOWN_RAM_BUDGET = 884_736_000
+#: The budget is this fraction of RAM, capped at 1 GiB: the ledger's about 7c matched the measured peak of switching
+#: frames (6.4-6.8c on 2048x2048 to 4148x4362), so the share, not the per-frame model, was the limit (VIEWER-2D-BUDGET-128).
+_RAM_SHARE = 10
 _HDF5_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus"})
 _RAW_DATASETS = (
     "/entry/instrument/detector/data", "/entry/instrument/detector/data_000001",
@@ -400,13 +403,13 @@ class Viewer2DMemoryLedger:
 def _memory_budget(ram_bytes=None):
     detected = _physical_ram_bytes() if ram_bytes is None else ram_bytes
     if type(detected) is int and detected > 0:
-        return min(1024**3, detected // 20)
+        return min(1024**3, detected // _RAM_SHARE)
     # Windows has no os.sysconf RAM figure, so every Windows PC got the fixed fallback and refused a 4096x4096 frame
     # (VIEWER-2D-BUDGET-128). Its own reading (GlobalMemoryStatusEx) raises a large PC to the cap and never lowers a
     # small one below the fallback it had.
     windows = _staging.windows_physical_ram_bytes() if ram_bytes is None else None
     if type(windows) is int and windows > 0:
-        return min(1024**3, max(_UNKNOWN_RAM_BUDGET, windows // 20))
+        return min(1024**3, max(_UNKNOWN_RAM_BUDGET, windows // _RAM_SHARE))
     return _UNKNOWN_RAM_BUDGET
 
 
