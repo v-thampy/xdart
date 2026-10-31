@@ -25,6 +25,9 @@ from xrd_tools.io import (
     Browse1DRowKey,
     Frame1DModeRows,
     Frame1DRows,
+    FrameFacts,
+    FrameFactsFailure,
+    FrameFactsStore,
     FrameScalarCatalog,
     FrameViewReader,
     browse_1d_row_name,
@@ -282,6 +285,8 @@ class Browse1DHydrationLane:
         self._context = context
         self._catalog = context.scalar_catalog
         self._cache = context.browse_1d_cache
+        #: The context's per-frame facts (PERF-BROWSE-OPEN-128 stage B): this lane is their only writer.
+        self._facts = context.frame_facts
         self._gate = context.commit_gate
         self._epoch = context.commit_epoch
         self._artifact = context.requested_path
@@ -378,11 +383,13 @@ class Browse1DHydrationLane:
         if (
             type(self._catalog) is not FrameScalarCatalog
             or type(self._cache) is not Browse1DCache
+            or type(self._facts) is not FrameFactsStore
             or type(self._gate) is not CommitGate
             or type(self._snapshot) is not TargetSnapshot
             or not self._snapshot.exists
             or context.scalar_catalog is not self._catalog
             or context.browse_1d_cache is not self._cache
+            or context.frame_facts is not self._facts
             or context.commit_gate is not self._gate
             or context.target_snapshot is not self._snapshot
             or getattr(
@@ -411,6 +418,7 @@ class Browse1DHydrationLane:
             and request.target_snapshot is self._snapshot
             and context.scalar_catalog is self._catalog
             and context.browse_1d_cache is self._cache
+            and context.frame_facts is self._facts
             and context.commit_gate is self._gate
             and context.target_snapshot is self._snapshot
             and context.loaded
@@ -455,6 +463,9 @@ class Browse1DHydrationLane:
                 frame, frame.work_ordinal, frame.local_frame_label,
             ))
         targets.sort(key=lambda item: item.ordinal)
+        if len(targets) > FrameFactsStore.MAX_RECORDS:
+            # Every target's facts must be resident together; the planner sends at most 257.
+            raise ValueError("Browse 1-D request exceeds the frame facts bound")
         identity = object()
         request = Browse1DHydrationRequest(
             identity,
@@ -615,7 +626,12 @@ class Browse1DHydrationLane:
 
     def _missing_targets(
         self, request: Browse1DHydrationRequest,
-    ) -> tuple[Browse1DHydrationTarget, ...]:
+    ) -> tuple[tuple[Browse1DHydrationTarget, ...], tuple[Browse1DHydrationTarget, ...]]:
+        """Return the targets whose 1-D rows, and those whose frame facts, are not resident.
+
+        Facts demand is independent of the rows: a 2-D-only frame, or one whose rows are already resident, still
+        needs its facts. A malformed frame's resident failure counts as resident, so it is not read again.
+        """
         resident = request.cache.resident_keys
         resident_by_target: dict[tuple[int, int], tuple[object, ...]] = {}
         for target in request.targets:
@@ -645,7 +661,11 @@ class Browse1DHydrationLane:
                     self._active.request is request
                 ):
                     self._known_keys.update(empty_updates)
-        return tuple(missing)
+        facts_missing = tuple(
+            target for target in request.targets
+            if self._facts.get(target.label) is None
+        )
+        return tuple(missing), facts_missing
 
     @staticmethod
     def _diagnostic(error: BaseException) -> str:
@@ -668,7 +688,10 @@ class Browse1DHydrationLane:
         self,
         task: _HydrationTask,
         labels: tuple[int, ...],
-    ) -> Frame1DRows:
+        fact_labels: tuple[int, ...],
+    ) -> tuple[Frame1DRows | None, tuple[FrameFacts | FrameFactsFailure, ...]]:
+        """Read the missing rows and the missing facts through one reader."""
+
         reader = self._open_reader(
             task.request.catalog.artifact_path,
             entry=task.request.entry,
@@ -689,13 +712,26 @@ class Browse1DHydrationLane:
         entered = enter(reader)
         if entered is not reader:
             raise RuntimeError("Browse 1-D reader changed identity")
-        rows = reader.read_1d_rows(
-            labels, cancelled=lambda: self._checkpoint(task),
-        )
+        rows = None
+        if labels:
+            rows = reader.read_1d_rows(
+                labels, cancelled=lambda: self._checkpoint(task),
+            )
+            if type(rows) is not Frame1DRows:
+                raise TypeError("Browse 1-D reader returned a foreign projection")
+        facts: tuple[FrameFacts | FrameFactsFailure, ...] = ()
+        if fact_labels:
+            facts = reader.read_frame_facts(
+                fact_labels, cancelled=lambda: self._checkpoint(task),
+            )
+            if (
+                type(facts) is not tuple
+                or tuple(getattr(item, "label", None) for item in facts) != fact_labels
+                or any(type(item) not in (FrameFacts, FrameFactsFailure) for item in facts)
+            ):
+                raise TypeError("Browse frame facts reader returned a foreign projection")
         self._close_reader(task)
-        if type(rows) is not Frame1DRows:
-            raise TypeError("Browse 1-D reader returned a foreign projection")
-        return rows
+        return rows, facts
 
     @staticmethod
     def _borrowed_by_name(
@@ -901,6 +937,8 @@ class Browse1DHydrationLane:
             self._protect_keys(task, target, expected)
 
     def _prove_requested_resident(self, task: _HydrationTask) -> None:
+        if any(self._facts.get(target.label) is None for target in task.request.targets):
+            raise RuntimeError("Browse frame facts are not jointly resident")
         resident = task.request.cache.resident_keys
         with self._lock:
             known = dict(self._known_keys)
@@ -923,9 +961,9 @@ class Browse1DHydrationLane:
         request = task.request
         if self._checkpoint(task):
             raise InterruptedError("Browse 1-D request is stale")
-        missing = self._missing_targets(request)
+        missing, facts_missing = self._missing_targets(request)
         self._protect_complete_targets(task, missing)
-        if not missing:
+        if not missing and not facts_missing:
             self._prove_requested_resident(task)
             return Browse1DHydrationStatus.ALREADY_RESIDENT
         before = self._capture_bound_snapshot(request)
@@ -934,8 +972,9 @@ class Browse1DHydrationLane:
         if self._checkpoint(task):
             raise InterruptedError("Browse 1-D request was cancelled")
         labels = tuple(target.label for target in missing)
-        rows = self._open_and_read(task, labels)
-        if (
+        fact_labels = tuple(target.label for target in facts_missing)
+        rows, facts = self._open_and_read(task, labels, fact_labels)
+        if rows is not None and (
             rows.artifact_path != request.catalog.artifact_path
             or rows.entry != request.entry
             or rows.labels != labels
@@ -955,6 +994,20 @@ class Browse1DHydrationLane:
                 if self._checkpoint(task):
                     raise InterruptedError("Browse 1-D request was superseded")
                 self._store_target(task, rows, target)
+            if facts:
+                # The request's resident facts stay recent, so this commit cannot evict its own frames.
+                fact_set = set(fact_labels)
+                # The context gate does not serialize selection supersession.
+                # Keep the bounded facts insertion atomic with submit/retire,
+                # including a supersession after the final row was stored.
+                with self._lock:
+                    if (self._active is not task or self._wanted_identity is not request.identity
+                            or self._retiring or task.cancelled.is_set()):
+                        raise InterruptedError("Browse frame facts request was superseded")
+                    self._facts.commit(facts, retain=tuple(
+                        target.label for target in request.targets
+                        if target.label not in fact_set
+                    ))
         finally:
             request.gate.leave()
         self._prove_requested_resident(task)

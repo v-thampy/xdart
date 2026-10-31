@@ -38,6 +38,8 @@ class _Request:
     column: str = ''
     destination: Path | None = None
     data_root: object = None
+    #: a phase Batch seeds each fit from the previous one (the analyzer's option, never a plan field)
+    sequential: bool = False
 
 
 def _snapshot(target, settings):
@@ -49,6 +51,9 @@ def _snapshot(target, settings):
 
 def _job(request, cancel, progress):
     settings = dict(request.settings)
+    if request.action == 'capture':  # a substrate (PHASE-ANALYSIS-128): the fit's own input, converted to Å⁻¹
+        snapshot = _snapshot(request.inputs[0], request.settings)
+        return None if cancel.is_set() else phase_fit_snapshot(snapshot).trace_input()
     if request.action in {'reload', 'export'}:
         snapshot = _snapshot(request.inputs[0], request.settings)
         if cancel.is_set():
@@ -64,8 +69,8 @@ def _job(request, cancel, progress):
                                       batch_inputs=batch_inputs(), data_root=request.data_root, trend_column=request.column,
                                       reference=getattr(request.inputs[0], 'reference', None))
         return snapshot
-    analyzer_type = DisplayedPeakFitAnalyzer if request.kind == 'peak' else DisplayedPhaseFitAnalyzer
-    analyzer = analyzer_type(settings=settings, cancel_token=cancel)
+    analyzer = (DisplayedPeakFitAnalyzer(settings=settings, cancel_token=cancel) if request.kind == 'peak' else
+                DisplayedPhaseFitAnalyzer(settings=settings, cancel_token=cancel, sequential=request.sequential))
     last, keys, xs = [None], {}, {}
 
     def load(target):
@@ -110,7 +115,11 @@ class SnapshotFitHost(QtCore.QObject):
                                    kind='combo', choices=('Result order',))
         self.column_row.editor.setEditable(True)
         self.column_row.setToolTip('Contributing-row mean of this scan column; missing values are unavailable')
-        self.dialog.layout().insertWidget(0, self.column_row)
+        if kind == 'phase':  # Phase Analysis keeps it in its Batch card, and Load settings waits for a fit
+            self.dialog.add_batch_row(self.column_row)
+            self.dialog.busy_probe = lambda: self.computing
+        else:
+            self.dialog.layout().insertWidget(0, self.column_row)
         self.column_row.setVisible(batch is not None)
         self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, parent=self)
 
@@ -133,14 +142,17 @@ class SnapshotFitHost(QtCore.QObject):
     def _request(self, action, inputs, destination=None):
         settings = self._request_settings(action)
         self.owner.forget()
-        self.dialog.status.setText('Loading…' if action == 'reload' else 'Exporting…' if action == 'export' else 'Fitting…')
+        self.dialog.status.setText({'reload': 'Loading…', 'export': 'Exporting…',
+                                    'capture': 'Capturing the substrate…'}.get(action, 'Fitting…'))
         if action == 'batch':
             self.dialog.set_batch_running(True)
         elif action == 'reload':
             self.dialog.fit_btn.setEnabled(False)
+        sequential = action == 'batch' and self.kind == 'phase' and self.dialog.sequential_batch()
         self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs),
                                 self.trend_column, destination,
-                                self.source_root() if callable(self.source_root) else self.source_root))
+                                self.source_root() if callable(self.source_root) else self.source_root,
+                                sequential=sequential))
 
     def _request_settings(self, action):
         # Frozen phase entries feed the analyzer unchanged; only FitInputKey
@@ -164,9 +176,9 @@ class SnapshotFitHost(QtCore.QObject):
             self.invalidate()
         elif action == 'reload':
             self.reload()
-        elif action == 'fit':
+        elif action in {'fit', 'capture_template'}:
             try:
-                self._request('fit', (self.current(),))
+                self._request('fit' if action == 'fit' else 'capture', (self.current(),))
             except Exception as error:
                 self.dialog.status.setText(str(error))
 
@@ -176,6 +188,10 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.set_batch_running(False)
             self.dialog.status.setText('Cancelled; the running solve is draining')
             return
+        refusal = self.dialog.fit_refusal() if self.kind == 'phase' else ''
+        if refusal:
+            self.dialog.status.setText(refusal)
+            return
         if self.batch is not None:
             targets = tuple(self.batch())
             self.set_trend_columns(n for target in targets for n in target.column_names)
@@ -184,8 +200,10 @@ class SnapshotFitHost(QtCore.QObject):
     def _done(self, request, terminal):
         self.dialog.set_batch_running(False)
         try:
+            # plain projections on both sides: a substrate compares by its trace identity, never its arrays
             unchanged = (request.scope == self.scope()
-                         and request.settings == self._request_settings(request.action))
+                         and plain_settings(dict(request.settings))
+                         == plain_settings(dict(self._request_settings(request.action))))
         except (ValueError, KeyError, OSError):
             unchanged = False
         if not unchanged:
@@ -197,11 +215,13 @@ class SnapshotFitHost(QtCore.QObject):
         if request.action == 'export':
             self.dialog.status.setText(f'Exported {terminal.payload}')
             return True
+        if request.action == 'capture':
+            return terminal.payload is not None and self.dialog.set_substrate_template(terminal.payload)
         if request.action == 'reload':
             self.snapshot = terminal.payload
             if self.snapshot is None:
                 return False
-            self.dialog.set_vnext_trace(self.snapshot.trace_input())
+            self._show_trace()
             return True
         self.outcomes, self.snapshot, self._keys, xs = terminal.payload
         self._last_settings = plain_settings(dict(request.settings))
@@ -212,7 +232,7 @@ class SnapshotFitHost(QtCore.QObject):
             return False
         outcome = self.outcomes[-1]
         if outcome.overlay is not None and self.snapshot is not None:
-            self.dialog.set_vnext_trace(self.snapshot.trace_input())
+            self._show_trace()
             overlay = outcome.overlay
             if self.kind == 'phase' and self.snapshot.axes[0].unit in {'2th_deg', '2th_rad'}:
                 from xrd_tools.core.containers import convert_radial_axis
@@ -226,10 +246,17 @@ class SnapshotFitHost(QtCore.QObject):
             lower = (FitSeries(x, overlay.traces['residual'], 'residual', 'residual'),)
             self.dialog.fit_view.reconcile(FitProjection(self.dialog._pattern_panel(*upper, markers=tuple(markers)),
                                                         FitPanel(lower, zero_line=True)))
-            self.dialog.table.show_rows(*(peak_parameter_rows(outcome.result) if self.kind == 'peak'
-                                          else phase_result_rows(outcome.result)))
-        self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
+            if self.kind == 'phase':
+                self.dialog.show_phase_result_details(outcome.result)
+            else:
+                self.dialog.table.show_rows(*peak_parameter_rows(outcome.result))
+        if self.kind != 'phase' or outcome.overlay is None:
+            self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         return outcome.ok
+
+    def _show_trace(self):
+        options = {'wavelength': self.snapshot.wavelength_angstrom} if self.kind == 'phase' else {}
+        self.dialog.set_vnext_trace(self.snapshot.trace_input(), **options)
 
     def invalidate(self):
         self.owner.release()

@@ -22,7 +22,8 @@ from pyqtgraph.Qt import QtCore
 from tests.xdart.scattering._output_slots import written
 from tests.xdart.scattering.test_detector_coordinate_overlays import choose_grid, control
 from tests.xdart.scattering.test_p1b_output_graph import _TERMINAL, _intent, _run_to_terminal, write_poni
-from tests.xdart.scattering.test_predicted_ring_overlays import choice, choose, qapp, rings, select, settle  # noqa: F401
+from tests.xdart.scattering.test_predicted_ring_overlays import (choice, choose, close_phase_window, qapp,  # noqa: F401
+                                                                 rings, select, settle)
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
@@ -502,13 +503,13 @@ def test_g2_moving_between_frames_and_outputs_keeps_each_frames_snapshot(qapp, t
         seen = {}
         for key in page._context_controller.frame_keys:
             _show(qapp, page, view, key)
-            assert rings(view.raw), view.reference_phases.rings_note.text()
+            assert rings(view.raw), view.phase_rings_reason
             seen['first', key.local_frame_label] = _curves(view.raw)
         second = _reopen(qapp, page, written(other / 'run.nexus', 'Int 2D'))
         assert second is not first and first.released and first.ring_basis is None
         for key in page._context_controller.frame_keys:
             _show(qapp, page, view, key)
-            assert rings(view.raw), view.reference_phases.rings_note.text()
+            assert rings(view.raw), view.phase_rings_reason
             seen['second', key.local_frame_label] = _curves(view.raw)
         assert not _same(seen['first', 1], seen['second', 1]) and not _same(seen['second', 1], seen['second', 2])
 
@@ -527,7 +528,7 @@ def test_g3_reopen_draws_rings_with_the_source_present_and_thumbnail_only(qapp, 
             choose(qapp, view)
             key = page._context_controller.frame_keys[0]
             _show(qapp, page, view, key)
-            assert rings(view.raw), (state, view.reference_phases.rings_note.text())
+            assert rings(view.raw), (state, view.phase_rings_reason)
             assert _near(_native_points(view.raw, SHAPE), expected) < 2.5, state
     from xrd_tools.session.readiness import ring_basis_for_record
     assert ring_basis_for_record(output, labels=_labels(output)).shape == SHAPE
@@ -546,7 +547,7 @@ def test_g3b_a_real_binned_output_places_rings_on_its_thumbnail(qapp, tmp_path):
         choice(view)
         choose(qapp, view)
         _show(qapp, page, view, page._context_controller.frame_keys[0])
-        assert rings(view.raw), view.reference_phases.rings_note.text()
+        assert rings(view.raw), view.phase_rings_reason
         assert _near(_native_points(view.raw, basis.shape), expected, tolerance=12.) < 12.
 
 
@@ -568,7 +569,7 @@ def test_g4_a_stopped_live_run_browses_with_the_energies_live_published(qapp, tm
         browse = {}
         for key in page._context_controller.frame_keys:
             _show(qapp, page, view, key)
-            assert rings(view.raw), view.reference_phases.rings_note.text()
+            assert rings(view.raw), view.phase_rings_reason
             browse[key.local_frame_label] = _curves(view.raw)
         _published(qapp, page, terminal)
         for key in page._context_controller.frame_keys:
@@ -584,7 +585,7 @@ def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration
         choose(qapp, view)
         keys = page._context_controller.frame_keys
         _show(qapp, page, view, keys[0])
-        assert rings(view.raw), view.reference_phases.rings_note.text()
+        assert rings(view.raw), view.phase_rings_reason
         before = _curves(view.raw)
         for index in (1, 2):
             (tmp_path / f'escan_{index:04d}.txt').write_text(
@@ -621,7 +622,7 @@ def test_g6_eviction_and_hydration_in_browse_keep_each_frames_snapshot(qapp, tmp
         seen = {}
         for key in (*keys, keys[0]):
             _show(qapp, page, view, key)
-            assert rings(view.raw), view.reference_phases.rings_note.text()
+            assert rings(view.raw), view.phase_rings_reason
             seen.setdefault(key.local_frame_label, []).append(_curves(view.raw))
         first, again = seen[keys[0].local_frame_label]
         assert _same(first, again) and not _same(first, seen[keys[-1].local_frame_label][0])
@@ -703,7 +704,7 @@ def test_g9_a_cif_phases_rings_appear_in_browse_with_hkl_hover(qapp, tmp_path):
         _browsing(qapp, page)
         _show(qapp, page, view, page._context_controller.frame_keys[0])
         _window(qapp, view).phase_source.set_selection(((entry.id, True),))
-        view.reference_phases.close()
+        close_phase_window(view)
         _settle(qapp, view, lambda: bool(_pane_items(view.raw, entry.id)))
         canvas, box = _pane(view.raw)
         segment = _segments(_pane_items(view.raw, entry.id)[0])[0]
@@ -721,7 +722,7 @@ def test_g10_a_gi_output_browses_with_detector_frame_rings_and_no_grid(qapp, tmp
         choice(view)
         choose(qapp, view)
         _show(qapp, page, view, page._context_controller.frame_keys[0])
-        assert rings(view.raw), view.reference_phases.rings_note.text()
+        assert rings(view.raw), view.phase_rings_reason
         editor = control(view)
         assert not editor.isEnabled() and 'GI' in editor.toolTip()
 

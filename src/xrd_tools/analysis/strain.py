@@ -439,12 +439,548 @@ def sin2psi_analysis(
     return sin2psi_regression(peak_fits, E=E, nu=nu)
 
 
+# ---------------------------------------------------------------------------
+# STRAIN-ANALYSIS-128: the qualified sin²(ψ) path
+# ---------------------------------------------------------------------------
+# The deferred ledger's STRAIN/A3 gates: ψ from the bins a sector uses, an explicit and labelled d0 (the intercept is
+# never a stress-free d0), a weighted regression with its covariance, reflection-specific elastic constants, and a
+# refraction check. Directional stress (uniaxial, shear) is refused: in one GI fiber map the +χ and −χ branches sit at
+# the in-plane directions φ and −φ, and φ changes with ψ (maintainer, 2026-10-30: "Defer directional stress
+# (Recommended)"). The functions above keep their behaviour for their headless callers.
+
+_GEOMETRY_REFUSAL = (
+    "needs each point's in-plane direction (azimuth): a GI fiber map gives only the polar angle psi, and its +chi "
+    "and -chi branches are not fixed in-plane directions, so that geometry model is deferred")
+
+
+@dataclass(frozen=True, eq=False)
+class StrainSector:
+    """One χ sector of a GI fiber map.
+
+    ``psi`` is the mean |χ| of the bins the sector uses: a narrow-sector reporting angle (sin² of a mean is not the
+    mean of sin²). ``branch`` is χ's sign. Per q row, ``intensity`` is the mean of the samples whose intensity (and σ,
+    where the map has one) is finite, and ``sigma`` is √(Σσᵢ²)/N over those same samples (None without a σ map); it
+    leaves out correlation between bins. ``excluded`` names why the sector is left out (None: it is used).
+    """
+
+    chi_center: float
+    chi_width: float
+    psi: float
+    branch: int
+    q: np.ndarray = field(repr=False)
+    intensity: np.ndarray = field(repr=False)
+    sigma: np.ndarray | None = field(repr=False)
+    finite_fraction: float
+    excluded: str | None = None
+
+
+def strain_sectors(
+    result2d: IntegrationResult2D,
+    *,
+    chi_centers=None,
+    chi_width: float = 5.0,
+    n_sectors: int | None = None,
+    chi_range: tuple[float, float] | None = None,
+    branches: tuple[int, ...] = (1,),
+    min_finite_fraction: float = 0.5,
+    q_range: tuple[float, float] | None = None,
+) -> tuple[StrainSector, ...]:
+    """The χ sectors of a GI fiber map (radial q_total, azimuthal χ_GI, intensity (nq, nχ)).
+
+    Explicit ``chi_centers`` keep their sign; otherwise ``n_sectors`` (default: as many as tile the range) of width
+    ``chi_width`` tile the |χ| range ``chi_range`` on each of ``branches`` (+1, −1). No sector spans χ = 0. A sector
+    whose finite fraction is under ``min_finite_fraction`` (the missing wedge, read from the map's own coverage, or
+    detector gaps) stays in the list with its reason. Supply the fitted ``q_range`` for quantitative analysis:
+    coverage, reporting angle and the extracted profile then use only that window. Without it the whole map is used.
+    """
+    chi = np.asarray(result2d.azimuthal, dtype=float)
+    q = np.asarray(result2d.radial, dtype=float)
+    intensity = np.asarray(result2d.intensity, dtype=float)
+    if intensity.shape != (q.size, chi.size):
+        raise ValueError(
+            f"Intensity shape {intensity.shape} does not match (len(radial), len(azimuthal)) = "
+            f"({q.size}, {chi.size})")
+    sigma = None if result2d.sigma is None else np.asarray(result2d.sigma, dtype=float)
+    if sigma is not None and sigma.shape != intensity.shape:
+        raise ValueError("the map's sigma does not match its intensity")
+    if q_range is not None:
+        low_q, high_q = sorted(float(value) for value in q_range)
+        rows = (q >= low_q) & (q <= high_q)
+        if not np.any(rows):
+            raise ValueError("the q window contains no map samples")
+        q, intensity = q[rows], intensity[rows]
+        sigma = None if sigma is None else sigma[rows]
+    width = float(chi_width)
+    if not width > 0:
+        raise ValueError("the sector width must be positive")
+    if chi_centers is not None:
+        centers = [float(center) for center in chi_centers]
+        for center in centers:
+            if center - width / 2 < 0 < center + width / 2:
+                raise ValueError(
+                    f"the sector at chi {center:g} deg spans chi = 0: keep the +chi and -chi branches apart")
+    else:
+        if chi_range is None:
+            chi_range = (0.0, float(np.nanmax(np.abs(chi))))
+        low, high = sorted(abs(float(value)) for value in chi_range)
+        if n_sectors is None:
+            n_sectors = max(1, int(np.floor((high - low) / width + 1e-9)))
+        side = tuple(int(branch) for branch in branches)
+        if not side or any(branch not in (1, -1) for branch in side):
+            raise ValueError("branches are +1 and/or -1")
+        magnitudes = np.linspace(low + width / 2, high - width / 2, int(n_sectors))
+        centers = [branch * float(magnitude) for branch in side for magnitude in magnitudes]
+    sectors = []
+    for center in centers:
+        branch = 1 if center > 0 else -1
+        columns = (chi >= center - width / 2) & (chi <= center + width / 2) & (chi >= 0 if branch > 0 else chi <= 0)
+        block = intensity[:, columns]
+        finite = np.isfinite(block)
+        sigmas = None
+        if sigma is not None:
+            sigmas = sigma[:, columns]
+            finite &= np.isfinite(sigmas)
+        count = finite.sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = np.where(count > 0, np.where(finite, block, 0.0).sum(axis=1) / count, np.nan)
+            error = None if sigmas is None else np.where(
+                count > 0, np.sqrt((np.where(finite, sigmas, 0.0) ** 2).sum(axis=1)) / count, np.nan)
+        used = np.abs(chi[columns][finite.any(axis=0)])
+        fraction = float(finite.sum() / finite.size) if finite.size else 0.0
+        excluded = None
+        if used.size == 0:
+            psi, excluded = abs(center), "no data in this sector"
+        else:
+            psi = float(np.mean(used))
+            if fraction < min_finite_fraction:
+                excluded = (f"only {fraction:.0%} of the sector has data (the missing wedge or detector gaps)")
+        sectors.append(StrainSector(center, width, psi, branch, q.copy(), mean, error, fraction, excluded))
+    return tuple(sectors)
+
+
+@dataclass(frozen=True, eq=False)
+class StrainPoint:
+    """One ψ point of a sin²ψ fit: ψ in degrees, the spacing ``d`` in Å and its standard error (None: unknown), the χ
+    branch (+1, −1), the fitted ``q`` and its error. ``excluded`` names why the point is left out."""
+
+    psi: float
+    d: float
+    d_err: float | None
+    branch: int = 1
+    q: float | None = None
+    q_err: float | None = None
+    excluded: str | None = None
+    sector: StrainSector | None = field(default=None, repr=False)
+    fit: Any = field(default=None, repr=False)
+
+    @property
+    def sin2psi(self) -> float:
+        return float(np.sin(np.deg2rad(self.psi)) ** 2)
+
+
+def _peak_screen(x: np.ndarray, y: np.ndarray, sigma: np.ndarray | None) -> tuple[float, float, float]:
+    """The window's smoothed peak height above its median, the noise of that smoothed profile (from σ when the map has
+    one, else from the spread of neighbour differences) and the smoothed argmax as the fit's start. A screening
+    heuristic for weak sectors, not a significance test."""
+    size = max(1, min(9, (len(y) // 3) | 1))
+    smooth = np.convolve(np.pad(y, size // 2, mode="edge"), np.ones(size) / size, mode="valid")
+    peak = int(np.argmax(smooth))
+    height = float(smooth[peak] - np.median(y))
+    if sigma is not None:
+        noise = float(np.median(sigma)) / np.sqrt(size)
+    else:
+        noise = float(np.median(np.abs(np.diff(y)))) / (0.6745 * np.sqrt(2.0) * np.sqrt(size))
+    return height, max(noise, np.finfo(float).tiny), float(x[peak])
+
+
+def fit_strain_sectors(
+    sectors,
+    q_range: tuple[float, float],
+    *,
+    model: str = "pseudovoigt",
+    background: str = "linear",
+    sigma_init: float | None = None,
+    sigma_bounds: tuple[float, float] | None = None,
+    center_bounds_delta: float | None = None,
+    min_height_sigma: float = 5.0,
+) -> tuple[StrainPoint, ...]:
+    """One :class:`StrainPoint` per sector, in order: the peak in ``q_range`` fitted with the shared fitter, weighted
+    by the sector's σ where it has one. Each fit starts at the window's smoothed maximum (``center_bounds_delta``
+    bounds the centre around it) and, if that fails, at its neighbour's fitted centre. A sector whose peak is under
+    ``min_height_sigma`` of its noise, or whose fit fails or leaves the window, is kept with its reason."""
+    from xrd_tools.analysis.fitting import fit_peaks
+
+    low, high = sorted(float(value) for value in q_range)
+    points: list[StrainPoint] = []
+    previous: float | None = None
+    for sector in sectors:
+        def left_out(reason: str, sector: StrainSector = sector) -> StrainPoint:
+            return StrainPoint(sector.psi, float("nan"), None, sector.branch, excluded=reason, sector=sector)
+
+        if sector.excluded:
+            points.append(left_out(sector.excluded))
+            continue
+        window = (sector.q >= low) & (sector.q <= high) & np.isfinite(sector.intensity)
+        if sector.sigma is not None:
+            window &= np.isfinite(sector.sigma) & (sector.sigma > 0)
+        if window.sum() < 5:
+            points.append(left_out("fewer than 5 points in the q window"))
+            continue
+        x, y = sector.q[window], sector.intensity[window]
+        weights = None if sector.sigma is None else 1.0 / sector.sigma[window]
+        height, noise, start = _peak_screen(x, y, None if weights is None else sector.sigma[window])
+        if not height >= min_height_sigma * noise:
+            points.append(left_out(
+                f"weak: the peak is {height / noise:.1f} times its noise, under {min_height_sigma:g}"))
+            continue
+        seeds = [start] + ([previous] if previous is not None and previous != start else [])
+        fit, reason = None, "the fit did not converge"
+        for seed in seeds:
+            try:
+                candidate = fit_peaks(
+                    x, y, positions=[seed], model=model, background=background, sigma_init=sigma_init,
+                    sigma_bounds=sigma_bounds, center_bounds_delta=center_bounds_delta,
+                    **({} if weights is None else {"weights": weights}))
+            except Exception as exc:  # noqa: BLE001 - one sector's failure is that sector's reason
+                reason = f"the fit failed: {exc}"
+                continue
+            if candidate.success and low < candidate.peak_centers[0] < high:
+                fit = candidate
+                break
+            if candidate.success:
+                reason = "the fitted peak sits outside the q window"
+        if fit is None:
+            points.append(left_out(reason))
+            continue
+        q_center = float(fit.peak_centers[0])
+        q_err = fit.peak_centers_err[0]
+        q_err = float(q_err) if q_err is not None and np.isfinite(q_err) and q_err > 0 else None
+        d = 2.0 * np.pi / q_center
+        d_err = None if q_err is None else 2.0 * np.pi / q_center ** 2 * q_err
+        points.append(StrainPoint(sector.psi, d, d_err, sector.branch, q_center, q_err, None, sector, fit))
+        previous = q_center
+    return tuple(points)
+
+
+@dataclass(frozen=True)
+class D0Reference:
+    """The stress-free spacing a strain is taken against, with where it came from: ``typed``, ``library`` (a phase's
+    hkl line: a chosen reference, not a measured stress-free value), ``reference`` (a stress-free result) or
+    ``psi_star`` (model-derived from the same fit). ``stderr`` None means its uncertainty is unknown."""
+
+    kind: str
+    value: float
+    stderr: float | None = None
+    label: str = ""
+
+    @classmethod
+    def typed(cls, value: float, stderr: float | None = None) -> "D0Reference":
+        value = float(value)
+        if not (np.isfinite(value) and value > 0):
+            raise ValueError("a typed d0 must be a positive spacing in Å")
+        return cls("typed", value, None if stderr is None else float(stderr), f"typed d0 {value:.5f} Å")
+
+
+@dataclass(frozen=True)
+class ElasticConstants:
+    """A reflection's diffraction elastic constants s1 and ½s2 (1/Pa), with their source."""
+
+    hkl: tuple[int, ...]
+    s1: float
+    half_s2: float
+    source: str = "s1 and ½s2 as given"
+
+    @classmethod
+    def from_E_nu(cls, hkl, *, E: float, nu: float) -> "ElasticConstants":
+        """The isotropic assumption: s1 = −ν/E, ½s2 = (1 + ν)/E, labelled as such for this hkl."""
+        E, nu = float(E), float(nu)
+        if not (np.isfinite(E) and E > 0 and -1.0 < nu < 0.5):
+            raise ValueError("E must be positive and nu between -1 and 0.5")
+        return cls(tuple(int(index) for index in hkl), -nu / E, (1.0 + nu) / E,
+                   f"isotropic, from E {E:.4g} Pa and nu {nu:g}")
+
+
+def d0_from_library(entry, hkl, *, wavelength_angstrom: float) -> D0Reference:
+    """d0 from a phase-library entry's line ``hkl`` at the record's wavelength (a calibrant carries no hkl)."""
+    from xrd_tools.analysis.phase_references import prepare_phase_models
+
+    if getattr(entry, "source_kind", None) == "calibrant":
+        raise ValueError("a calibrant line carries no hkl to choose: pick a CIF or lattice phase")
+    wanted = tuple(int(index) for index in hkl)
+    (model,), (reference,) = prepare_phase_models(
+        entry, wavelength_angstrom=float(wavelength_angstrom), min_intensity=0)
+    exact = [line for line in reference.reflections if wanted in tuple(tuple(h) for h in line.hkls)]
+    family = sorted(abs(index) for index in wanted)
+    # Family representatives may omit an equivalent signed/permuted hkl. A
+    # permutation alone is not an equivalence in a non-cubic lattice: never
+    # return another plane's spacing under the requested label.
+    wanted_d = float(model.lattice.d_hkl(wanted))
+    similar = [line for line in reference.reflections
+               if np.isclose(line.d_spacing, wanted_d, rtol=1e-8, atol=1e-10)
+               and any(sorted(abs(index) for index in h) == family for h in line.hkls)]
+    matches = exact or (similar if len(similar) == 1 else [])
+    text = "".join(str(index) for index in wanted)
+    if not matches:
+        raise ValueError(f"{entry.name} lists no {text} line at this wavelength")
+    return D0Reference(
+        "library", float(matches[0].d_spacing), None,
+        f"{entry.name} {text} from the phase library at {float(wavelength_angstrom):.5f} Å "
+        "(a chosen reference, not a measured stress-free value)")
+
+
+def d0_from_reference(points) -> D0Reference:
+    """d0 as a stress-free result's weighted mean spacing (the plain mean when its points carry no errors)."""
+    valid = [point for point in points if point.excluded is None and np.isfinite(point.d)]
+    if not valid:
+        raise ValueError("the stress-free reference has no usable points")
+    d = np.array([point.d for point in valid])
+    errors = [point.d_err for point in valid]
+    if all(error is not None and np.isfinite(error) and error > 0 for error in errors):
+        weights = np.array([1.0 / error ** 2 for error in errors])
+        value, stderr = float(np.sum(weights * d) / np.sum(weights)), float(1.0 / np.sqrt(np.sum(weights)))
+    else:
+        value = float(d.mean())
+        stderr = float(d.std(ddof=1) / np.sqrt(d.size)) if d.size > 1 else None
+    return D0Reference("reference", value, stderr,
+                       f"stress-free reference: mean d of {len(valid)} points")
+
+
+@dataclass(frozen=True, eq=False)
+class StrainFit:
+    """d against sin²ψ: ``slope`` and ``intercept`` with their covariance ``cov`` in (slope, intercept) order,
+    unscaled from the points' errors when ``weighted``, else residual-scaled. ``admitted`` holds the points the fit
+    used. The intercept is never a stress-free d0. ``strain`` is (d − d0)/d0 for every given point, only against an
+    independent d0. ``stress`` (Pa) is the equibiaxial in-plane stress m/(½s2·d0)."""
+
+    slope: float
+    intercept: float
+    cov: tuple[tuple[float, float], tuple[float, float]]
+    weighted: bool
+    n_used: int
+    admitted: tuple[StrainPoint, ...] = field(repr=False)
+    notice: str
+    r_squared: float
+    reading: str
+    d0: D0Reference | None = None
+    strain: tuple[float, ...] | None = None
+    stress: float | None = None
+    stress_err: float | None = None
+    sin2psi_star: float | None = None
+    shear: float | None = None
+    elastic: ElasticConstants | None = None
+    reduced_chi_squared: float | None = None
+
+    @property
+    def slope_err(self) -> float:
+        return float(np.sqrt(self.cov[0][0]))
+
+    @property
+    def intercept_err(self) -> float:
+        return float(np.sqrt(self.cov[1][1]))
+
+
+def _error_given(error) -> bool:
+    return error is not None and np.isfinite(error) and error > 0
+
+
+def strain_regression(points, *, d0=None, elastic: ElasticConstants | None = None,
+                      stress_state: str = "equibiaxial", shear: bool = False) -> StrainFit:
+    """Fit d = intercept + slope·sin²ψ over the usable points.
+
+    With three or more points carrying a finite, positive error the fit is weighted (1/σ²) on those points, naming
+    any others; otherwise it is unweighted over every usable point, with a notice. It needs three points and two
+    distinct ψ. ``d0`` is a :class:`D0Reference`, ``"psi_star"`` (model-derived from this fit, equibiaxial only) or
+    None. Uniaxial stress and a shear term are refused until a geometry model gives each point its in-plane direction.
+    """
+    if shear:
+        raise ValueError("a shear term " + _GEOMETRY_REFUSAL)
+    if stress_state != "equibiaxial":
+        raise ValueError(f"{stress_state} stress " + _GEOMETRY_REFUSAL)
+    points = tuple(points)
+    usable = [point for point in points
+              if point.excluded is None and np.isfinite(point.psi) and np.isfinite(point.d)]
+    with_errors = [point for point in usable if _error_given(point.d_err)]
+    notes: list[str] = []
+    if len(with_errors) >= 3:
+        admitted, weighted = with_errors, True
+        missing = [point for point in usable if not _error_given(point.d_err)]
+        if missing:
+            notes.append("left out of the weighted fit, no error: "
+                         + ", ".join(f"psi {point.psi:.1f} deg" for point in missing))
+    else:
+        admitted, weighted = usable, False
+        if len(usable) >= 3:
+            notes.append("unweighted fit: fewer than three points carry an error")
+    if len(admitted) < 3:
+        raise ValueError(f"a sin²ψ fit needs at least three points; {len(admitted)} are usable")
+    x = np.array([point.sin2psi for point in admitted])
+    y = np.array([point.d for point in admitted])
+    if np.unique(np.round(x, 12)).size < 2:
+        raise ValueError("the points need at least two distinct psi values (rank 2)")
+    design = np.column_stack([x, np.ones_like(x)])
+    weights = (np.array([1.0 / point.d_err ** 2 for point in admitted]) if weighted else np.ones_like(x))
+    inverse = np.linalg.inv(design.T @ (weights[:, None] * design))
+    beta = inverse @ (design.T @ (weights * y))
+    residual = y - design @ beta
+    ss_res = float(np.sum(weights * residual ** 2))
+    reduced_chi_squared = ss_res / (len(admitted) - 2) if weighted else None
+    if reduced_chi_squared is not None and reduced_chi_squared > 1.0:
+        notes.append(f"weighted chi²_red = {reduced_chi_squared:.3g}: excess scatter; formal errors are "
+                     "conditional on the point errors and linear model, not inflated for this scatter")
+    cov = inverse if weighted else inverse * (ss_res / (len(admitted) - 2))
+    mean = float(np.sum(weights * y) / np.sum(weights))
+    ss_tot = float(np.sum(weights * (y - mean) ** 2))
+    slope, intercept = float(beta[0]), float(beta[1])
+    star = None if elastic is None else -2.0 * elastic.s1 / elastic.half_s2
+    reference, strain, stress, stress_err = None, None, None, None
+    if isinstance(d0, str):
+        if d0 != "psi_star":
+            raise ValueError("d0 is a D0Reference, 'psi_star' or None")
+        if elastic is None:
+            raise ValueError("psi* needs the reflection's elastic constants")
+        value = intercept + star * slope
+        gradient = np.array([star, 1.0])
+        reference = D0Reference(
+            "psi_star", value, float(np.sqrt(gradient @ cov @ gradient)),
+            f"psi* d0 from this fit, equibiaxial (sin²psi* = {star:.4f}); model-derived, not independent")
+        stress = slope / (elastic.half_s2 * value)
+        gradient = np.array([intercept, -slope]) / (elastic.half_s2 * value ** 2)
+        stress_err = float(np.sqrt(gradient @ cov @ gradient))
+    elif d0 is not None:
+        if not isinstance(d0, D0Reference):
+            raise TypeError("d0 is a D0Reference, 'psi_star' or None")
+        reference = d0
+        strain = tuple(float((point.d - d0.value) / d0.value) for point in points)
+        if elastic is not None:
+            stress = slope / (elastic.half_s2 * d0.value)
+            variance = cov[0, 0] / (elastic.half_s2 * d0.value) ** 2
+            if d0.stderr:
+                variance += (stress * d0.stderr / d0.value) ** 2
+            else:
+                notes.append("the stress error leaves out d0's uncertainty, which is not given")
+            stress_err = float(np.sqrt(variance))
+    sign = slope if stress is None else stress
+    return StrainFit(
+        slope=slope, intercept=intercept, cov=tuple(tuple(float(v) for v in row) for row in cov),
+        weighted=weighted, n_used=len(admitted), admitted=tuple(admitted), notice="; ".join(notes),
+        r_squared=float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 1.0,
+        reading="tensile" if sign > 0 else "compressive" if sign < 0 else "none",
+        d0=reference, strain=strain, stress=stress, stress_err=stress_err, sin2psi_star=star, elastic=elastic,
+        reduced_chi_squared=reduced_chi_squared)
+
+
+def combined_stress(fits) -> tuple[float, float]:
+    """Several reflections' stresses as one inverse-variance mean and its error. It assumes independent reflection
+    errors and one stress model; shared calibration, reference or model errors do not shrink with the count."""
+    fits = tuple(fits)
+    if not fits or any(fit.stress is None or not _error_given(fit.stress_err) for fit in fits):
+        raise ValueError("every reflection needs a stress and its error to combine")
+    weights = np.array([1.0 / fit.stress_err ** 2 for fit in fits])
+    values = np.array([fit.stress for fit in fits])
+    return float(np.sum(weights * values) / np.sum(weights)), float(1.0 / np.sqrt(np.sum(weights)))
+
+
+@dataclass(frozen=True)
+class RefractionEstimate:
+    """How much refraction alone would move the fitted slope (Å), on the fit's own points and weights; ``apparent``
+    when the stress should be read as apparent. ``slope`` is None when it cannot be estimated (``notice`` says why).
+    No correction is applied: that is C3."""
+
+    slope: float | None
+    apparent: bool
+    alpha_c_deg: float | None
+    min_exit_deg: float | None
+    notice: str
+
+
+def refraction_estimate(points, fit: StrainFit, *, incident_angle_deg: float, energy_eV: float, material,
+                        density_kg_m3: float | None = None, ratio: float = 0.10,
+                        critical_factor: float = 3.0) -> RefractionEstimate:
+    """Refraction's change of the sin²ψ slope through the shared GI correction owner, on the points ``fit`` admitted.
+
+    Apparent when the incidence or any point's exit angle is under ``critical_factor``·α_c, or when the change is at
+    least ``ratio`` of the measured slope (screening thresholds, not physical bounds). An unknown material or a ray
+    outside the reflection geometry gives an apparent stress with no estimate.
+    """
+    from xrd_tools.corrections.grazing import GICorrectionStack
+
+    if not material:
+        return RefractionEstimate(None, True, None, None,
+                                  "refraction unknown: no optical material chosen; stress is apparent")
+    try:
+        stack = GICorrectionStack(material=material, energy_eV=float(energy_eV), density_kg_m3=density_kg_m3)
+        constants = stack.optical_constants()
+    except Exception as exc:  # noqa: BLE001 - an unknown medium is a reason, never a guess
+        return RefractionEstimate(None, True, None, None,
+                                  f"refraction unknown: no optical material {material!r} ({exc}); stress is apparent")
+    alpha_c = float(constants["ac_rad"])
+    alpha_c_deg = float(np.rad2deg(alpha_c))
+    incidence = np.deg2rad(float(incident_angle_deg))
+    chosen = fit.admitted
+    psi = np.deg2rad(np.array([point.psi for point in chosen]))
+    d = np.array([point.d for point in chosen])
+    q = 2.0 * np.pi / d
+    q_z = q * np.cos(psi)
+    sin_exit = q_z / float(constants["k0_per_A"]) - np.sin(incidence)
+    if not np.all(np.isfinite(sin_exit)) or np.any(sin_exit < 0) or np.any(sin_exit >= 1):
+        return RefractionEstimate(None, True, alpha_c_deg, None,
+                                  "refraction unknown: a point's exit ray lies outside the reflection geometry "
+                                  "(below the sample horizon); stress is apparent")
+    exit_angle = np.arcsin(sin_exit)
+    corrected = stack.refract_q(incident_angle_deg=float(incident_angle_deg), alpha_f_rad=exit_angle,
+                                q_total=q, q_z=q_z)
+    delta = 2.0 * np.pi / corrected - d
+    x = np.sin(psi) ** 2
+    weights = np.array([1.0 / point.d_err ** 2 for point in chosen]) if fit.weighted else np.ones_like(x)
+    design = np.column_stack([x, np.ones_like(x)])
+    slope = float(np.linalg.solve(design.T @ (weights[:, None] * design), design.T @ (weights * delta))[0])
+    reasons = []
+    if incidence < critical_factor * alpha_c:
+        reasons.append(f"the incidence {np.rad2deg(incidence):.2f} deg is under {critical_factor:g} alpha_c "
+                       f"({critical_factor * alpha_c_deg:.2f} deg)")
+    lowest = float(np.min(exit_angle))
+    if lowest < critical_factor * alpha_c:
+        reasons.append(f"an exit angle ({np.rad2deg(lowest):.2f} deg) is under {critical_factor:g} alpha_c")
+    if abs(slope) >= ratio * abs(fit.slope) and not (slope == 0.0 and fit.slope == 0.0):
+        reasons.append(f"refraction alone moves the slope by {slope:.2e} A, at least {ratio:.0%} of it")
+    notice = ("apparent stress: " + "; ".join(reasons)) if reasons else (
+        f"refraction alone moves the slope by {slope:.2e} A, under {ratio:.0%} of it")
+    return RefractionEstimate(slope, bool(reasons), alpha_c_deg, float(np.rad2deg(lowest)), notice)
+
+
+@dataclass(frozen=True, eq=False)
+class StrainAnalysisResult:
+    """One frame's strain analysis: its sectors, the points fitted from them, the fit over both branches, each
+    branch's own descriptive fit (no stress claim), and the refraction estimate (explicitly unknown when incidence
+    or energy is absent)."""
+
+    sectors: tuple[StrainSector, ...] = field(repr=False)
+    points: tuple[StrainPoint, ...] = field(repr=False)
+    fit: StrainFit
+    branch_fits: "dict[int, StrainFit]" = field(default_factory=dict)
+    refraction: RefractionEstimate | None = None
+
+
 __all__ = [
     "ChiSector",
+    "D0Reference",
+    "ElasticConstants",
     "PeakFitResult",
+    "RefractionEstimate",
     "Sin2PsiResult",
+    "StrainAnalysisResult",
+    "StrainFit",
+    "StrainPoint",
+    "StrainSector",
+    "combined_stress",
+    "d0_from_library",
+    "d0_from_reference",
     "extract_chi_sectors",
     "fit_peak_vs_psi",
+    "fit_strain_sectors",
+    "refraction_estimate",
     "sin2psi_regression",
     "sin2psi_analysis",
+    "strain_regression",
+    "strain_sectors",
 ]

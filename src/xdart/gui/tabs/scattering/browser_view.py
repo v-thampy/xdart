@@ -16,6 +16,7 @@ from .browser_catalog import BrowserCatalogEntry
 from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
+    ALL_FRAMES_PLOT_MODES,
     BrowserProjection,
     FrameSelectionIntent,
     FrameNavigationProjection,
@@ -32,6 +33,11 @@ _ACCUMULATING_PLOT_MODES = frozenset(
     {"Overlay", "Waterfall", "Sum", "Average"}
 )
 _VISIT_ACCUMULATING_PLOT_MODES = frozenset({"Overlay", "Waterfall"})
+_ALL_FRAMES_TIP = (
+    "All frames: when on, each result you open in Single, Overlay or Waterfall shows every one of its frames. In "
+    "Overlay and Waterfall, earlier results' curves stay, as always, until Clear. Step through results with the Up "
+    "and Down arrow keys in the list. Leaving a frame out turns it off: a Ctrl-click or Shift-click, or in Single a "
+    "plain click. Greyed out in Average and Sum. Remembered between sessions.")
 _FRAME_SELECTION_SETTLE_MS = 100
 _FRAME_NAVIGATION_KEYS = frozenset(
     {
@@ -142,6 +148,37 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
         )
         self._set_selection_intent(None, None, None)
         return True
+
+
+class _ResultRecheckFilter(QtCore.QObject):
+    """Remember whether a mouse press lands on the result row already selected (BROWSE-CLICK-128).
+
+    Qt reports no selection change for that click, so without this it would do nothing.
+    """
+
+    def __init__(self, owner: "BrowserView") -> None:
+        super().__init__(owner.scans)
+        self._owner = owner
+        self.pressed_row = -1
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            try:
+                scans = self._owner.scans
+                item = scans.itemAt(event.position().toPoint())
+                # Only a plain click in single selection: a modifier or multi-selection click is a selection gesture.
+                plain = (
+                    event.button() == QtCore.Qt.MouseButton.LeftButton
+                    and event.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier
+                    and scans.selectionMode() == QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+                )
+                self.pressed_row = (
+                    scans.row(item)
+                    if plain and item is not None and item.isSelected() and not item.data(_DIRECTORY_ROLE) else -1
+                )
+            except (AttributeError, RuntimeError):
+                self.pressed_row = -1
+        return False
 
 
 class _FrameSelectionCadenceFilter(QtCore.QObject):
@@ -650,11 +687,14 @@ class BrowserView(QtWidgets.QFrame):
 
         actions = QtWidgets.QHBoxLayout()
         self._actions_layout = actions
-        self.show_all = QtWidgets.QPushButton("Show All")
+        # The "Show All" action, now the persistent All frames toggle (ALL-FRAMES-128; the profile key stays)
+        self.show_all = QtWidgets.QPushButton("All frames")
         self.metadata = QtWidgets.QPushButton("Metadata")
         self.auto_last = QtWidgets.QPushButton("Auto Last")
         for button in (self.show_all, self.metadata, self.auto_last):
             button.setObjectName("e3BrowserCompactButton")
+        self.show_all.setCheckable(True)
+        self.show_all.setToolTip(_ALL_FRAMES_TIP)
         self.auto_last.setCheckable(True)
         self._action_buttons = {"Show All": self.show_all, "Metadata": self.metadata,
                                 "Auto Last": self.auto_last}
@@ -700,9 +740,16 @@ class BrowserView(QtWidgets.QFrame):
         elif self.profile.results:
             self.scans.currentItemChanged.connect(self._result_selected)
         else:
+            self.scans_label.setToolTip(
+                "Click a result to open it. Click the selected result again to check whether its saved file "
+                "changed and reload it if needed, keeping the current frame when it still exists."
+            )
             self.scans.itemSelectionChanged.connect(self._scan_selected)
             self.scans.itemClicked.connect(self._activate_directory)
             self.scans.itemActivated.connect(self._activate_directory)
+            self._result_recheck_filter = _ResultRecheckFilter(self)
+            self.scans.viewport().installEventFilter(self._result_recheck_filter)
+            self.scans.itemClicked.connect(self._recheck_selected_result)
         if self.profile.results:  # after the page has heard of the change
             self.scans.currentItemChanged.connect(self._viewed_result_changed)
             self.scans.itemSelectionChanged.connect(self._viewed_result_changed)
@@ -720,8 +767,10 @@ class BrowserView(QtWidgets.QFrame):
                     None if current is None else current.data(_USER_ROLE),
                 )
             )
-        self.show_all.clicked.connect(
-            lambda: self._emit(ShellCommandKind.SHOW_ALL)
+        self.show_all.toggled.connect(
+            lambda checked: self._emit(
+                ShellCommandKind.SET_ALL_FRAMES, bool(checked)
+            )
         )
         self.metadata.clicked.connect(
             lambda: self._emit(ShellCommandKind.SHOW_METADATA)
@@ -1294,6 +1343,7 @@ class BrowserView(QtWidgets.QFrame):
                 self.scans,
                 self.date_sort,
                 self.auto_last,
+                self.show_all,
             )
         ]
         self.directory_label.set_path(state.directory)
@@ -1451,6 +1501,8 @@ class BrowserView(QtWidgets.QFrame):
         self._reconciling_frames = False
         self.date_sort.setChecked(state.date_sorted)
         self.auto_last.setChecked(state.auto_last)
+        self.show_all.setChecked(state.all_frames)
+        self.show_all.setEnabled(plot_mode in ALL_FRAMES_PLOT_MODES)
         del blockers
 
     def _visit_artifact(
@@ -1594,6 +1646,16 @@ class BrowserView(QtWidgets.QFrame):
             frame=current, frames=frames, intent=FrameSelectionIntent.EXACT,
         ))
         self._frame_selection_coalescer.trigger()
+
+    def _recheck_selected_result(self, item) -> None:
+        """A click on the result already open asks the page to reload it if its file changed (BROWSE-CLICK-128)."""
+        pressed = self._result_recheck_filter.pressed_row
+        self._result_recheck_filter.pressed_row = -1
+        if item is None or pressed < 0 or self.scans.row(item) != pressed:
+            return
+        value = item.data(_USER_ROLE)
+        if type(value) is str and value:
+            self._emit(ShellCommandKind.SELECT_SCAN, value, path=("artifact", "recheck"))
 
     def _activate_directory(self, item) -> None:
         if item.data(_DIRECTORY_ROLE) and len(self.scans.selectedItems()) == 1:

@@ -239,6 +239,7 @@ def _browse(
     prepared_offer = prepare_reintegrate_bundle(
         None, entry=catalog.entry, labels=catalog.labels,
     )
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=context_token,
         load_generation=generation,
@@ -255,6 +256,7 @@ def _browse(
         record_store=records,
         scalar_catalog=catalog,
         browse_1d_cache=Browse1DCache(1 << 20),
+        frame_facts=FrameFactsStore(),
         target_entry=catalog.entry,
         loaded_labels=catalog.labels,
         target_snapshot=TargetSnapshot(True, 1, 1, 1, 1, "a" * 64),

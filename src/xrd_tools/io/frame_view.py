@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from os.path import isabs, normcase, normpath
 from pathlib import Path
@@ -222,17 +222,15 @@ def _validate_1d_result_projection(
 
 @dataclass(frozen=True, slots=True, eq=False)
 class FrameScalarRow:
-    """Array-free immutable catalog facts for one persisted frame."""
+    """Array-free immutable catalog facts for one persisted frame.
+
+    The per-frame geometry, source locator, thumbnail and averaged facts are not here: Browse reads them on demand
+    as :class:`FrameFacts` (PERF-BROWSE-OPEN-128 stage B), so a catalog never visits a frame node.
+    """
 
     label: int
     metadata_raw: Mapping[str, object] = field(default_factory=dict)
     metadata_numeric: Mapping[str, float] = field(init=False)
-    geometry: FrameGeometry | None = None
-    source_path: str | None = None
-    source_frame_index: int | None = None
-    has_thumbnail: bool = False
-    mask_baked: bool = False
-    averaged: bool = False
     modes_1d: tuple[str, ...] = ()
     modes_2d: tuple[str, ...] = ()
     active_mode_1d: str | None = None
@@ -245,40 +243,6 @@ class FrameScalarRow:
         raw, numeric = _frozen_scalar_metadata(self.metadata_raw)
         object.__setattr__(self, "metadata_raw", raw)
         object.__setattr__(self, "metadata_numeric", numeric)
-
-        geometry = self.geometry
-        if geometry is not None:
-            if type(geometry) is not FrameGeometry or geometry.poni is not None:
-                raise TypeError("geometry must be an exact array-free FrameGeometry")
-            for name in ("rot1", "rot2", "rot3", "incident_angle"):
-                scalar = getattr(geometry, name)
-                if scalar is not None and type(scalar) is not float:
-                    raise TypeError(
-                        "geometry values must be exact floats or None"
-                    )
-                if scalar is not None and not math.isfinite(scalar):
-                    raise ValueError(
-                        "geometry values must be finite floats or None"
-                    )
-
-        if self.source_path is not None:
-            if type(self.source_path) is not str or not self.source_path:
-                raise TypeError("source_path must be an exact nonempty string or None")
-            if len(self.source_path.encode("utf-8")) > _MAX_SOURCE_PATH_BYTES:
-                raise ValueError("source_path exceeds the scalar path limit")
-        if self.source_frame_index is not None and (
-            type(self.source_frame_index) is not int
-            or self.source_frame_index < 0
-        ):
-            raise TypeError(
-                "source_frame_index must be an exact nonnegative integer or None"
-            )
-        if (
-            type(self.has_thumbnail) is not bool
-            or type(self.mask_baked) is not bool
-            or type(self.averaged) is not bool
-        ):
-            raise TypeError("frame marker facts must be exact booleans")
 
         modes_1d = _exact_mode_tuple(self.modes_1d, role="modes_1d")
         modes_2d = _exact_mode_tuple(self.modes_2d, role="modes_2d")
@@ -312,6 +276,96 @@ class FrameScalarRow:
         if len(kinds) != len(modes_2d):
             raise ValueError("two_d_kinds must cover every 2-D mode")
         object.__setattr__(self, "two_d_kinds", tuple(kinds))
+
+
+_MAX_FRAME_FACTS_REASON_CHARS = 512
+
+
+def _frame_facts_reason(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"[:_MAX_FRAME_FACTS_REASON_CHARS]
+
+
+def _bounded_reason_text(value: object, *, role: str) -> None:
+    if (
+        type(value) is not str
+        or not value
+        or len(value) > _MAX_FRAME_FACTS_REASON_CHARS
+    ):
+        raise ValueError(f"{role} must be nonempty text of at most 512 characters")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrameFacts:
+    """One persisted frame's array-free facts, read only when Browse shows it.
+
+    Absence and malformation stay distinct: a frame without a thumbnail has ``has_thumbnail=False`` and no
+    ``thumbnail_failure``; a malformed thumbnail keeps the frame usable, names its reason in ``thumbnail_failure``
+    and claims neither a thumbnail nor a baked mask.
+    """
+
+    label: int
+    geometry: FrameGeometry | None = None
+    source_path: str | None = None
+    source_frame_index: int | None = None
+    has_thumbnail: bool = False
+    mask_baked: bool = False
+    averaged: bool = False
+    thumbnail_failure: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.label) is not int or self.label < 0:
+            raise TypeError("label must be an exact nonnegative integer")
+        geometry = self.geometry
+        if geometry is not None:
+            if type(geometry) is not FrameGeometry or geometry.poni is not None:
+                raise TypeError("geometry must be an exact array-free FrameGeometry")
+            for name in ("rot1", "rot2", "rot3", "incident_angle"):
+                scalar = getattr(geometry, name)
+                if scalar is not None and type(scalar) is not float:
+                    raise TypeError(
+                        "geometry values must be exact floats or None"
+                    )
+                if scalar is not None and not math.isfinite(scalar):
+                    raise ValueError(
+                        "geometry values must be finite floats or None"
+                    )
+        if self.source_path is not None:
+            if type(self.source_path) is not str or not self.source_path:
+                raise TypeError("source_path must be an exact nonempty string or None")
+            if len(self.source_path.encode("utf-8")) > _MAX_SOURCE_PATH_BYTES:
+                raise ValueError("source_path exceeds the scalar path limit")
+        if self.source_frame_index is not None and (
+            type(self.source_frame_index) is not int
+            or self.source_frame_index < 0
+        ):
+            raise TypeError(
+                "source_frame_index must be an exact nonnegative integer or None"
+            )
+        if (
+            type(self.has_thumbnail) is not bool
+            or type(self.mask_baked) is not bool
+            or type(self.averaged) is not bool
+        ):
+            raise TypeError("frame marker facts must be exact booleans")
+        if self.thumbnail_failure is not None:
+            _bounded_reason_text(self.thumbnail_failure, role="thumbnail_failure")
+            if self.has_thumbnail or self.mask_baked:
+                raise ValueError(
+                    "thumbnail_failure claims neither a thumbnail nor a baked mask"
+                )
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FrameFactsFailure:
+    """One frame whose persisted facts are malformed; the other frames stay readable."""
+
+    label: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.label) is not int or self.label < 0:
+            raise TypeError("label must be an exact nonnegative integer")
+        _bounded_reason_text(self.reason, role="reason")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -2321,24 +2375,30 @@ class FrameViewReader:
 
     def _scalar_catalog_frame_facts(
         self, frame: int,
-    ) -> tuple[str | None, int | None, bool, bool]:
-        """Read source and thumbnail facts through one qualified frame group."""
+    ) -> tuple[h5py.Group | None, str | None, int | None]:
+        """Read the source locator through one qualified frame group, returned for its thumbnail facts."""
 
         frames = self._frames
         if frames is None:
-            return None, None, False, False
+            return None, None, None
         frame_name = f"frame_{frame:04d}"
         group = _required_direct_group(
             frames, frame_name, role=f"{frames.name}/{frame_name}",
         )
         if group is None:
-            return None, None, False, False
+            return None, None, None
         source_path, source_index = self._persisted_source_in_group(group)
+        return group, source_path, source_index
+
+    @staticmethod
+    def _scalar_catalog_thumbnail_facts(group: h5py.Group) -> tuple[bool, bool]:
+        """Qualify one frame's thumbnail without reading its pixels: (present, mask baked)."""
+
         thumbnail = _required_direct_dataset(
             group, "thumbnail", role=f"{group.name}/thumbnail",
         )
         if thumbnail is None:
-            return source_path, source_index, False, False
+            return False, False
         if (
             thumbnail.ndim != 2
             or not all(1 <= int(part) <= 256 for part in thumbnail.shape)
@@ -2352,10 +2412,84 @@ class FrameViewReader:
             "mask_baked",
             role=f"{thumbnail.name} mask marker",
         )
-        return (
-            source_path, source_index, True,
-            True if mask_baked is None else mask_baked,
-        )
+        return True, True if mask_baked is None else mask_baked
+
+    def _frame_facts_for_label(
+        self, frame: int, average_frame_one: bool,
+    ) -> FrameFacts | FrameFactsFailure:
+        """One frame's facts: a malformed frame fails alone; a malformed thumbnail only flags its frame."""
+
+        try:
+            geometry = self._scalar_catalog_geometry_for_frame(frame)
+            group, source_path, source_index = self._scalar_catalog_frame_facts(frame)
+            facts = FrameFacts(
+                label=frame,
+                geometry=geometry,
+                source_path=source_path,
+                source_frame_index=source_index,
+                averaged=average_frame_one and frame == 1 and source_path is None,
+            )
+        except (TypeError, ValueError) as error:
+            return FrameFactsFailure(frame, _frame_facts_reason(error))
+        if group is None:
+            return facts
+        try:
+            has_thumbnail, mask_baked = self._scalar_catalog_thumbnail_facts(group)
+        except (TypeError, ValueError) as error:
+            return replace(facts, thumbnail_failure=_frame_facts_reason(error))
+        return replace(facts, has_thumbnail=has_thumbnail, mask_baked=mask_baked)
+
+    def read_frame_facts(
+        self,
+        labels: tuple[int, ...],
+        *,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[FrameFacts | FrameFactsFailure, ...]:
+        """Read the requested frames' facts in label order, with atomic cache effects.
+
+        The one decoder of per-frame facts (PERF-BROWSE-OPEN-128 stage B): Browse calls it only for the frames it
+        shows. Each label yields its :class:`FrameFacts`, or a :class:`FrameFactsFailure` when that frame's
+        persisted facts are malformed; a cancelled read publishes nothing.
+        """
+
+        self._require_reader_open()
+        if cancelled is not None and not callable(cancelled):
+            raise TypeError("cancelled must be callable or None")
+        if type(labels) is not tuple or not labels:
+            raise TypeError("frame facts labels must be a nonempty exact tuple")
+        previous = -1
+        for label in labels:
+            if type(label) is not int or label < 0:
+                raise TypeError("frame facts labels must be exact nonnegative integers")
+            if label <= previous:
+                raise ValueError("frame facts labels must be strictly increasing")
+            previous = label
+        with _ReaderArrayBundle(self) as bundle:
+
+            def checkpoint() -> None:
+                if cancelled is None:
+                    return
+                decision = bundle._callback(cancelled)
+                if type(decision) is not bool:
+                    raise TypeError("cancelled must return an exact boolean")
+                if decision:
+                    raise InterruptedError("Frame facts read cancelled")
+
+            checkpoint()
+            if self.target_frame is not None:
+                raise ValueError("Frame facts require a full-inventory reader")
+            average_frame_one = bundle._callback(
+                _is_current_average_frame_one, self._entry,
+            )
+            facts: list[FrameFacts | FrameFactsFailure] = []
+            for label in labels:
+                checkpoint()
+                facts.append(bundle._callback(
+                    self._frame_facts_for_label, label, average_frame_one,
+                ))
+            checkpoint()
+            bundle.finish()
+            return tuple(facts)
 
     def read_scalar_catalog(
         self,
@@ -2383,9 +2517,6 @@ class FrameViewReader:
                 raise ValueError(
                     "Frame scalar catalog requires a full-inventory reader"
                 )
-            average_frame_one = bundle._callback(
-                _is_current_average_frame_one, self._entry,
-            )
             lower_bound, column_count, mode_memberships = bundle._callback(
                 self._scalar_catalog_projection_counts,
             )
@@ -2412,13 +2543,6 @@ class FrameViewReader:
             for label in labels:
                 checkpoint()
                 metadata = self._scalar_metadata_for_frame(label, columns)
-                geometry = bundle._callback(
-                    self._scalar_catalog_geometry_for_frame, label,
-                )
-                frame_facts = bundle._callback(
-                    self._scalar_catalog_frame_facts, label,
-                )
-                source_path, source_index, has_thumbnail, mask_baked = frame_facts
                 modes_1d = tuple(
                     mode
                     for mode, mode_map in self._map_1d_modes.items()
@@ -2445,16 +2569,6 @@ class FrameViewReader:
                     FrameScalarRow,
                     label=label,
                     metadata_raw=metadata,
-                    geometry=geometry,
-                    source_path=source_path,
-                    source_frame_index=source_index,
-                    has_thumbnail=has_thumbnail,
-                    mask_baked=mask_baked,
-                    averaged=(
-                        average_frame_one
-                        and label == 1
-                        and source_path is None
-                    ),
                     modes_1d=modes_1d,
                     modes_2d=modes_2d,
                     active_mode_1d=active_1d,
@@ -3764,6 +3878,9 @@ def read_contributing_frame_view(
             raw, raw_reason = None, "raw source unavailable"
     if _stat_revision(os.stat(path)) != inspection.storage_revision:
         raise AnalysisArtifactInvalid("artifact changed during frame hydration")
+    # Full Raw feeds Stitch's reconstruction: it is float64 here, a float32 source included, because FrameView keeps
+    # a float32 raw as it is for display arrays (DISPLAY-FLOAT32-128).
+    raw = None if raw is None else np.asarray(raw, dtype=float)
     return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
         mask_baked=selected["mask_baked"], metadata_raw=(dict(selected["identity"],
             point_images=selected["point_images"]) if point is not None else selected["identity"]),

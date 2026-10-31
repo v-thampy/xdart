@@ -658,7 +658,13 @@ def _failure(transfer, stage, diagnostic):
 def viewer_1d_budget():
     try: ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (AttributeError, OSError, ValueError): ram = 0
-    return VIEWER_1D_FALLBACK_B if ram <= 0 else min(1024**3, ram // 20)
+    if ram > 0:
+        return min(1024**3, ram // 20)
+    # Windows has no os.sysconf RAM figure, so every Windows PC got the fallback (VIEWER-1D-RAM-128). Its own reading
+    # (GlobalMemoryStatusEx) raises a large PC to the cap and never lowers a small one below the fallback it had.
+    from xrd_tools.core import staging
+    windows = staging.windows_physical_ram_bytes() or 0
+    return VIEWER_1D_FALLBACK_B if windows <= 0 else min(1024**3, max(VIEWER_1D_FALLBACK_B, windows // 20))
 
 
 def mint_viewer_1d_transfer(request, receipt, issuer):

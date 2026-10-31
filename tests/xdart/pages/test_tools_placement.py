@@ -9,8 +9,8 @@ from tests.xdart.pages.test_stitch_page import _Status, qapp  # noqa: F401
 
 
 @pytest.mark.parametrize("mode, names", (
-    # REFERENCE-PHASES-20261011 added Stitch's launcher (9f42d07d)
-    ("stitch", ("peak_fit", "phase_fit", "reference_phases")),
+    # REFERENCE-PHASES-20261011 added Stitch's launcher (9f42d07d); PHASE-ANALYSIS-128 folded both into one.
+    ("stitch", ("peak_fit", "phase_analysis")),
     ("rsm", ("lineout", "fit2d", "fit3d")),
 ))
 def test_native_fit_tools_mount_ints_column_and_leave_display_controls_in_place(qapp, mode, names):
@@ -51,9 +51,10 @@ def test_int_tools_keep_their_existing_buttons_and_command_kind(qapp):
     shell.commandRequested.connect(commands.append)
     try:
         # Plot Metadata left Int's tools column for the shared metadata popup (2fa82580);
-        # REFERENCE-PHASES-20261011 added its launcher after Phase Fitting (9f42d07d).
+        # REFERENCE-PHASES-20261011 added its launcher after Phase Fitting (9f42d07d); PHASE-ANALYSIS-128 folded
+        # Phase Fitting and Reference Phases into one Phase Analysis launcher.
         assert tuple(shell.tools._tool_buttons) == (
-            "peak_fitting", "phase_fitting", "reference_phases", "roi_statistics",
+            "peak_fitting", "phase_analysis", "roi_statistics",
             "nexpy_selected", "silx_h5viewer")
         shell.tools._tool_buttons["peak_fitting"].click()
         assert commands == [ShellCommand(ShellCommandKind.LAUNCH_TOOL, "peak_fitting")]

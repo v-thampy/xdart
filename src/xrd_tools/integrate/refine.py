@@ -556,6 +556,7 @@ def refine_goniometer(
                 rot1=rotations[0], rot2=rotations[1], rot3=rotations[2],
                 detector=det, wavelength=wl_m,
             )
+            ai.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
             if base_parallax is True:
                 ai.enable_parallax()
             q_pred = ai.qArray()[f.rows, f.cols] / 10.0  # pyFAI q is nm⁻¹ → Å⁻¹
@@ -757,6 +758,7 @@ def refine_stacked_arm(
     q_ring = _resolve_calibrant_q(calibrant, wl_m, max_ring)
     targets = [q_ring[f.rings] for f in frames]
     geometry = AzimuthalIntegrator(detector=det, wavelength=wl_m)
+    geometry.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     runtime = None
     if base_parallax is True:
         from xrd_tools.integrate.calibration import (  # noqa: PLC0415

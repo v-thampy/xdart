@@ -114,6 +114,7 @@ def _fiber_from_integrator(
             "FiberIntegrator requires pyFAI >= 2025.01. "
             "Upgrade with: pip install -U pyFAI"
         ) from exc
+    fi.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     if source_parallax:
         fi.enable_parallax()
     if (

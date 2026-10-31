@@ -118,8 +118,15 @@ def _ceiling_safe_levels(
             (raw_arr == sat_ceil) | (raw_arr >= _UINT32_CEIL))
         if ceiling.any() and (finite & ~ceiling).any():
             pop_mask = finite & ~ceiling
+        del ceiling
+    del finite
     population = _level_population(disp, pop_mask)
-    lo, hi = np.nanpercentile(population, pct)
+    # Boolean indexing made a private population. Reuse it for percentile's
+    # partition instead of copying it: if the stride grid is entirely masked,
+    # this fallback can contain almost the whole frame, not just p/16 pixels.
+    # pop_mask already excludes nonfinite values; nanpercentile would allocate
+    # another population-sized mask needlessly.
+    lo, hi = np.percentile(population, pct, overwrite_input=True)
     # Sparse cakes can contain far fewer non-zero bins than the upper-tail
     # percentile (for example 49 positive bins in a 500x500 image).  In that
     # case both percentile endpoints are zero even though real intensity is
@@ -274,7 +281,10 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
     def _display_array_for_scale(self, scale):
         if scale == 'Linear':
             return np.asarray(self.raw_image)
-        return np.array(self.raw_image, dtype=float, copy=True)
+        # The transformed copy keeps a float32 display array float32; any other input is transformed in float64 as
+        # before, so a float64 cake is never downcast (DISPLAY-FLOAT32-128).
+        source = np.asarray(self.raw_image)
+        return np.array(source, dtype=np.float32 if source.dtype == np.float32 else float, copy=True)
 
     def _cached_levels(
             self, scale, cmap, pct, data_range, *, expand_degenerate=False):
@@ -323,6 +333,9 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         perf = bool(os.environ.get("XDART_PERF"))
         t0 = time.perf_counter() if perf else 0.0
         self.displayed_image = self._display_array_for_scale(scale)
+        # pyqtgraph turns downsampling on for an image wider than 32767 pixels and leaves it on; set it for each image,
+        # so the next ordinary one is drawn pixel for pixel again (DISPLAY-FLOAT32-128).
+        downsample = max(self.displayed_image.shape[:2], default=0) > 2**15 - 1
         self._percentile_cache = None
         t_copy = time.perf_counter() if perf else 0.0
         # All-NaN / empty images poison every nanpercentile below (RuntimeWarning
@@ -331,7 +344,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         # explicit levels and bail.
         if (self.displayed_image.size == 0
                 or not np.isfinite(self.displayed_image).any()):
-            self.imageItem.setImage(self.displayed_image)
+            self.imageItem.setImage(self.displayed_image, autoDownsample=downsample)
             if perf:
                 logger.info(
                     "[PERF] image_widget render: copy=%.0fms transform=0ms "
@@ -353,9 +366,13 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
         self._expand_degenerate_levels = expand_degenerate
         if scale == 'Log':
             min_val = np.nanmin(self.displayed_image)
-            if min_val < 1:
-                self.displayed_image -= (min_val - 1)
-            self.displayed_image = np.log10(self.displayed_image)
+            # Display arithmetic at the copy's precision (DISPLAY-FLOAT32-128): in float32 a frame spanning more than
+            # 3.4e38 overflows the shift, so its largest pixels become +inf (top of the scale), and below -2**24 the
+            # shift's +1 is lost, so its smallest become -inf (bottom); float64 does the same past 1.8e308 and -2**53.
+            with np.errstate(over="ignore", divide="ignore"):
+                if min_val < 1:
+                    self.displayed_image -= (min_val - 1)
+                self.displayed_image = np.log10(self.displayed_image)
 
             pct = (0.1, 99.9)
 
@@ -402,6 +419,7 @@ class pgImageWidget(Qt.QtWidgets.QWidget):
             low = min(low, levels[0])
             high = max(high, levels[1])
         t_levels = time.perf_counter() if perf else 0.0
+        kwargs.setdefault("autoDownsample", downsample)
         self.imageItem.setImage(self.displayed_image, levels=levels, **kwargs)
         t_setimage = time.perf_counter() if perf else 0.0
         self.histogram.setColorMap(cm)

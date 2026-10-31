@@ -331,6 +331,7 @@ def test_context_refuses_release_or_foreign_detach_while_cache_attached(
     cache = Browse1DCache(1 << 20)
     foreign = Browse1DCache(1 << 20)
     request = BrowseLoadRequest("direct-release", 1, str(path))
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=request.token,
         load_generation=request.load_generation,
@@ -347,6 +348,7 @@ def test_context_refuses_release_or_foreign_detach_while_cache_attached(
         record_store={},
         scalar_catalog=catalog,
         browse_1d_cache=cache,
+        frame_facts=FrameFactsStore(),
         loaded_labels=catalog.labels,
     )
     context.mark_loaded()

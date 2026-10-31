@@ -257,10 +257,12 @@ def _as_fiber(ai: Any) -> Any:
     from pyFAI.integrator.fiber import FiberIntegrator  # noqa: PLC0415
     if isinstance(ai, FiberIntegrator):
         return ai
-    return FiberIntegrator(
+    fiber = FiberIntegrator(
         dist=ai.dist, poni1=ai.poni1, poni2=ai.poni2,
         rot1=ai.rot1, rot2=ai.rot2, rot3=ai.rot3,
         detector=ai.detector, wavelength=ai.wavelength)
+    fiber.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
+    return fiber
 
 
 def pyfai_gi_q_frames(

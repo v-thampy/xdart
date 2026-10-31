@@ -85,6 +85,7 @@ from .browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
     BrowseLoadStatus,
+    BrowseLoadTiming,
     LoadedBrowseCapture,
 )
 from .contracts import (
@@ -174,12 +175,14 @@ from .scientific_axes import (
     native_1d_plot_axis,
     resolve_gi_display_axes,
     resolve_norm_presentation,
+    resolve_standard_display_axes,
     shown_slice_pin,
     slice_pins_for_plot_axis as _slice_pins_for_plot_axis,
 )
 from .scientific_plot_options import waterfall_should_be_active
 from .scientific_preferences import scientific_preference_updates
 from .shell_values import (
+    ALL_FRAMES_PLOT_MODES,
     ArtifactProgress,
     DirectoryFileProgress,
     new_frames_note,
@@ -260,6 +263,36 @@ from .workspace_operations import (
 
 
 _LOG = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _ClickBrowsePerf:
+    """One click open's timing under XDART_PERF (BROWSE-CLICK-128): the request identity and floats only."""
+
+    request: BrowseLoadRequest
+    started_at: float
+    worker: BrowseLoadTiming | None = None
+    first_trace_s: float | None = None
+    image_s: float | None = None
+
+
+def _click_perf_enabled() -> bool:
+    return bool(os.environ.get("XDART_PERF"))
+
+
+def _log_click_perf(perf: _ClickBrowsePerf, endpoint: str, seconds: float) -> None:
+    """One endpoint of one click, with the loader's own stage times; logging never changes behaviour."""
+    worker = perf.worker
+    try:
+        _LOG.info(
+            "[PERF-BROWSE-CLICK] source=%s token=%s generation=%d records=%d | click→%s=%.3fs | worker=%.3fs "
+            "seal=%.3fs scan-open=%.3fs record-iteration=%.3fs presentation-read=%.3fs context-build=%.3fs",
+            perf.request.source_path, perf.request.token, perf.request.load_generation, worker.record_count,
+            endpoint, seconds, worker.worker_total_s, worker.initial_seal_s, worker.scan_open_s,
+            worker.record_iteration_s, worker.presentation_read_s, worker.context_build_s,
+        )
+    except Exception:
+        pass
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _DEFAULT_LIVE_PLOT_INTERVAL_MS = 250
 _LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
@@ -714,6 +747,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._deferred_browse_selection: _DeferredBrowseSelection | None = None
         self._deferred_browse_reopen: _DeferredBrowseReopen | None = None
+        # The latest Browse open a click admitted: All frames applies to its READY adoption alone (ALL-FRAMES-128)
+        self._all_frames_open: BrowseLoadRequest | None = None
+        # A changed file's reopen after a re-click and the frame labels it returns to (BROWSE-CLICK-128)
+        self._recheck_reload: tuple[BrowseLoadRequest, int, tuple[int, ...]] | None = None
+        # The latest click's timing under XDART_PERF; a newer click or a failed open drops it unlogged
+        self._click_perf: _ClickBrowsePerf | None = None
         self._pending_viewer_2d_path: str | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
@@ -1310,8 +1349,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         elif target == "peak": self._peak_result = None
         elif target == "phase":
             self._phase_result = None
-            # Nothing a CIF still being read returns reaches this Fitter (it deletes on close); the view keeps its
-            # Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            # The list stays the view's plot options (PHASE-ANALYSIS-128): the window's binding leaves the current
+            # view before the window is deleted. Nothing a CIF still being read returns reaches this window; the view
+            # keeps its Add CIF… worker until it stops, and the page's close waits for it through the view's.
+            self._shell.scientific.detach_phase_list(dialog.phase_binding)
             dialog.phase_source.shutdown()
             self._shell.scientific.retire_phase_worker(dialog.phase_source.add_worker)
 
@@ -1332,6 +1373,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             else:
                 from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
                 dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
+                dialog.busy_probe = lambda: self._analysis_target == "phase" and self._analysis_identity is not None
+                # its list is this view's reference phases, attached before it opens (PHASE-ANALYSIS-128)
+                self._shell.scientific.attach_phase_list(dialog.phase_binding)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
             setattr(self, field, dialog)
             if target in {"peak", "phase"}:
@@ -1457,11 +1501,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             target="scan_roi", request=analysis_request_facts(plan))
 
     def _refresh_fit_trace(self, kind):
-        trace, _anchor = self._capture_analysis_trace(kind)
+        trace, anchor = self._capture_analysis_trace(kind)
         dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
         if trace is None or dialog is None:
             self._notice("Select one displayed 1-D trace first."); return None
-        dialog.set_vnext_trace(trace); return trace
+        from .analysis_mount import phase_wavelength_angstrom
+        options = ({'wavelength': phase_wavelength_angstrom(self._context_controller, anchor.frame)}
+                   if kind == 'phase' and anchor is not None else {})
+        dialog.set_vnext_trace(trace, **options); return trace
 
     def _fit_export_snapshot(self, kind):
         """Detach the current displayed trace and controls, never an earlier fit's input."""
@@ -1492,6 +1539,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if action == "close":
             self._analysis_dialog_closed("phase", self._phase_dialog); return
         if action == "reload": self._refresh_fit_trace("phase"); return
+        if action == "capture_template":
+            # the substrate, through the fit's own displayed input (PHASE-ANALYSIS-128)
+            trace, _anchor = self._capture_analysis_trace("phase")
+            if self._phase_dialog is None: return
+            if trace is None:
+                self._phase_dialog.status.setText("Select one displayed 1-D trace first: it becomes the substrate.")
+                return
+            self._phase_dialog.set_substrate_template(trace); return
         if action != "fit": return
         trace, anchor = self._capture_analysis_trace("phase")
         from .analysis_mount import phase_wavelength_angstrom
@@ -3281,9 +3336,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             )
             return
-        if kind is ShellCommandKind.LAUNCH_TOOL and command.value == "reference_phases":
-            self._shell.scientific.show_reference_phases()  # a view-owned window, not an analysis mount
-            return
         if kind in {ShellCommandKind.SHOW_METADATA, ShellCommandKind.LAUNCH_TOOL,
                     ShellCommandKind.ANALYSIS_ACTION}:
             from .analysis_mount import mount_target
@@ -3426,23 +3478,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._request_browser_catalog()
             return
         if kind is ShellCommandKind.SHOW_ALL:
-            self._retire_batch_presentation()
-            self._retain_outgoing_display = False
-            ScatteringWorkspace._clear_presentation_targets(self)
-            self._shell.browser.cancel_pending_frame_selection()
-            navigation = self._context_controller.navigation
-            if (
-                navigation.frames
-                and self._context_controller.select_navigation(
-                    navigation.current, navigation.frames
-                )
-            ):
+            if ScatteringWorkspace._select_every_frame(self):
                 self._refresh_shell()
             return
         if kind is ShellCommandKind.SELECT_SCAN:
             value = command.value
             if command.path == ("directory",):
                 self._select_scan(value, is_directory=True)
+                return
+            if command.path == ("artifact", "recheck"):
+                ScatteringWorkspace._recheck_scan(self, value)
                 return
             self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
@@ -4799,8 +4844,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             and self._context_controller.select_browser_target(value)
         ):
             self._notice("")
+            ScatteringWorkspace._show_every_browse_frame(self)
             self._refresh_shell()
             return
+        click_started = time.perf_counter()
         try:
             request = self._context_controller.begin_browse(
                 value,
@@ -4825,6 +4872,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if self._context_controller.browse_pending:
                 self._ensure_timer()
             return
+        self._all_frames_open = request
+        self._click_perf = _ClickBrowsePerf(request, click_started) if _click_perf_enabled() else None
         if terminal_request is not None and request is not terminal_request:
             self._processed_browser.retire_terminal(
                 terminal_request
@@ -4887,6 +4936,124 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._select_scan(deferred.value, reopen=deferred.reopen, retry=deferred)
         return True
 
+    def _select_every_frame(self) -> bool:
+        """Show All's selection, the one-shot and the All frames toggle turned on alike: every frame the shown context
+        holds, through the navigation owner, with no paint of its own (the caller refreshes)."""
+        self._retire_batch_presentation()
+        self._retain_outgoing_display = False
+        ScatteringWorkspace._clear_presentation_targets(self)
+        self._shell.browser.cancel_pending_frame_selection()
+        navigation = self._context_controller.navigation
+        return bool(navigation.frames) and self._context_controller.select_navigation(
+            navigation.current, navigation.frames)
+
+    def _all_frames_applies(self) -> bool:
+        """All frames is on, the plot is Single, Overlay or Waterfall and a Browse result is shown (ALL-FRAMES-128). A
+        Run's own frames keep their rules: each arrival already joins an Overlay/Waterfall. An owner without Browser
+        state reads it as off, as the preference editor reads its other optional parts."""
+        if getattr(getattr(self, "_processed_browser", None), "all_frames", False) is not True:
+            return False
+        selection = self._context_controller.selection
+        return (self._preferences.plot_mode in ALL_FRAMES_PLOT_MODES
+                and selection is not None and selection.kind is ContextKind.BROWSE)
+
+    def _recheck_scan(self, value: object) -> None:
+        """A click on the shown result: reopen it only if its file changed since it was loaded (BROWSE-CLICK-128)."""
+        if type(value) is not str or not value:
+            return
+        controller = self._context_controller
+        request = None
+        started = time.perf_counter()
+        if not (controller.viewer_1d_owned or controller.viewer_2d_owned):
+            try:
+                request = controller.begin_browse_recheck(value)
+            except RuntimeError:
+                return  # another open or a cleanup is pending; the click changes nothing
+        if request is None:
+            # Not the shown result: an ordinary click on it.
+            self._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, value, path=("artifact",)))
+            return
+        self._click_perf = _ClickBrowsePerf(request, started) if _click_perf_enabled() else None
+        self._ensure_timer()
+
+    def _finish_recheck(self, outcome: BrowseLoadOutcome) -> None:
+        """Keep an unchanged result exactly as it is; reopen a changed one on the frame shown ("Keep my frame")."""
+        perf = self._click_perf
+        if perf is not None and perf.request is outcome.request:
+            self._click_perf = None
+            if outcome.status is BrowseLoadStatus.UNCHANGED:
+                try:
+                    _LOG.info(
+                        "[PERF-BROWSE-CLICK] source=%s token=%s generation=%d recheck=unchanged t=%.3fs",
+                        outcome.request.source_path, outcome.request.token, outcome.request.load_generation,
+                        time.perf_counter() - perf.started_at,
+                    )
+                except Exception:
+                    pass
+        if outcome.status is not BrowseLoadStatus.CHANGED:
+            return
+        navigation = self._context_controller.navigation
+        current = navigation.current
+        labels = tuple(frame.local_frame_label for frame in navigation.selected)
+        before = self._all_frames_open
+        self._select_scan(outcome.request.display_path or outcome.request.source_path, reopen=True)
+        request = self._all_frames_open
+        self._recheck_reload = (
+            None if current is None or request is None or request is before
+            else (request, current.local_frame_label, labels)
+        )
+
+    def _restore_rechecked_frame(self, request: BrowseLoadRequest, ready: bool) -> None:
+        """Return a changed result's reopen to the frame it showed, if that frame is still in the file."""
+        pending = self._recheck_reload
+        if pending is None or pending[0] is not request:
+            return
+        self._recheck_reload = None
+        if not ready:
+            return
+        _request, label, labels = pending
+        navigation = self._context_controller.navigation
+        by_label = {frame.local_frame_label: frame for frame in navigation.frames}
+        current = by_label.get(label)
+        if current is None:
+            return  # that frame left the file: the open's own first frame
+        selected = (
+            navigation.frames if ScatteringWorkspace._all_frames_applies(self)
+            else tuple(by_label[item] for item in labels if item in by_label) or (current,)
+        )
+        self._context_controller.select_navigation(current, selected)
+
+    def _stamp_click_perf(self, traced: bool, imaged: bool) -> None:
+        """Log a click's first painted trace and its current image once each, for that click's own context."""
+        perf = self._click_perf
+        if perf is None or perf.worker is None:
+            return
+        if self._context_controller.capture_loaded_browse(perf.request) is None:
+            return
+        elapsed = time.perf_counter() - perf.started_at
+        if traced and perf.first_trace_s is None:
+            perf.first_trace_s = elapsed
+            _log_click_perf(perf, "first-trace", elapsed)
+        if imaged and perf.image_s is None:
+            perf.image_s = elapsed
+            _log_click_perf(perf, "image", elapsed)
+        if perf.first_trace_s is not None and perf.image_s is not None:
+            self._click_perf = None
+
+    def _show_every_browse_frame(self) -> bool:
+        """Every frame of the shown Browse result where All frames applies; no paint of its own, and earlier results'
+        curves stay (maintainer: "overlay/waterfall mode should alway overlay. even when all frames is toggled")."""
+        if not ScatteringWorkspace._all_frames_applies(self):
+            return False
+        navigation = self._context_controller.navigation
+        if not navigation.frames or not self._context_controller.select_navigation(
+                navigation.current, navigation.frames):
+            return False
+        # An accepted result choice supersedes an earlier debounced frame gesture, including when the
+        # result is reselected in place. A refused selection must leave pending intent untouched.
+        self._shell.browser.cancel_pending_frame_selection()
+        return True
+
     def _select_frames(self, command: ShellCommand) -> None:
         frame = command.frame
         frames = command.frames
@@ -4941,6 +5108,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         if frame is not None and frame is not latest:
             self._processed_browser.set_auto_last(False)
+        if (ScatteringWorkspace._all_frames_applies(self)
+                and {id(item) for item in navigation.selected} != {id(item) for item in navigation.frames}):
+            # A frame left out (Ctrl-click, Shift-click, a plain click in Single) turns All frames off; an Overlay or
+            # Waterfall visit keeps every frame drawn.
+            self._processed_browser.set_all_frames(False)
         handoff = self._processed_browser.terminal_handoff
         request = None if handoff is None else handoff.request
         terminal_artifact = (
@@ -5041,6 +5213,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._processed_browser.finish_poll_timing(
                         terminal_request, poll_started
                     )
+            if type(outcome) is BrowseLoadOutcome and outcome.status in {
+                    BrowseLoadStatus.UNCHANGED, BrowseLoadStatus.CHANGED}:
+                ScatteringWorkspace._finish_recheck(self, outcome)
+                outcome = None
+                changed = True
             if outcome is not None:
                 load_outcome = (
                     outcome if type(outcome) is BrowseLoadOutcome else None
@@ -5092,6 +5269,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     if (detail or self._deferred_browse_reopen is None) and (
                             detail or not self._progress.terminal or not self._notice_text):
                         self._notice(detail)
+                perf = self._click_perf
+                if load_outcome is not None and perf is not None and load_outcome.request is perf.request:
+                    if load_outcome.status is BrowseLoadStatus.READY and type(load_outcome.timing) is BrowseLoadTiming:
+                        perf.worker = load_outcome.timing
+                    else:
+                        self._click_perf = None
+                if load_outcome is not None and load_outcome.request is self._all_frames_open:
+                    self._all_frames_open = None
+                    if load_outcome.status is BrowseLoadStatus.READY and not successor_settled:
+                        ScatteringWorkspace._show_every_browse_frame(self)
+                    ScatteringWorkspace._restore_rechecked_frame(
+                        self, load_outcome.request,
+                        load_outcome.status is BrowseLoadStatus.READY and not successor_settled,
+                    )
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
@@ -5099,6 +5290,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 changed = True
         if self._retire_lost_reintegrate_successor():
             changed = True
+        perf = self._click_perf
+        if perf is not None and not self._context_controller.owns_browse_request(perf.request):
+            self._click_perf = None
         handoff = self._processed_browser.terminal_handoff
         if (
             handoff is not None
@@ -6745,6 +6939,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             catalog = browse.scalar_catalog
             row = None if catalog is None else catalog.row(navigation.current.local_frame_label)
             if row is not None:
+                # Match the shared projection: Share Axis follows only a cake
+                # actually offered in Int 2D, never an absent/hidden map.
+                allow_cake = intent.processing_mode == "Int 2D" and row.active_mode_2d is not None
+                share_cake_axis = self._preferences.share_axis and allow_cake
+                requested_plot_axis = self._preferences.plot_axis
+                if share_cake_axis:
+                    requested_plot_axis = (
+                        share_plot_axis_for_image(self._preferences.image_axis) or requested_plot_axis
+                    )
                 native_axis = next((
                     native_1d_plot_axis(unit)
                     for mode, _label, unit, _log in catalog.axes_1d
@@ -6754,11 +6957,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     image_axis, requested_plot_axis = resolve_gi_display_axes(
                         row.active_mode_2d, row.modes_2d, native_axis,
                         self._preferences.image_axis, requested_plot_axis,
-                        allow_cake=intent.processing_mode != "Int 1D",
+                        allow_cake=allow_cake,
                         chi_axis=("chi" if dict(row.two_d_kinds).get("q_chi")
                                   is TwoDKind.Q_CHI else "chi_gi"),
                     )
-                    if self._preferences.share_axis:
+                    if share_cake_axis:
                         requested_plot_axis = (
                             share_plot_axis_for_image(image_axis) or requested_plot_axis
                         )
@@ -6766,6 +6969,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         self._preferences, image_axis=image_axis,
                         plot_axis=requested_plot_axis,
                     )
+                else:
+                    # A selection a GI result left (Qᵢₚ, a GI map) is not offered here: without this its 1-D
+                    # trace was asked for Qᵢₚ and never drawn (BROWSE-1D-128). An offered one stays untouched.
+                    image_axis, plot_axis = resolve_standard_display_axes(
+                        native_axis, self._preferences.image_axis, self._preferences.plot_axis,
+                        allow_cake=allow_cake,
+                    )
+                    if (image_axis, plot_axis) != (self._preferences.image_axis, self._preferences.plot_axis):
+                        self._preferences = replace(
+                            self._preferences, image_axis=image_axis, plot_axis=plot_axis,
+                        )
+                        requested_plot_axis = (
+                            share_plot_axis_for_image(image_axis) or plot_axis
+                            if share_cake_axis else plot_axis
+                        )
                 cake_axis_requested = requested_plot_axis != native_axis and not (
                     {requested_plot_axis, native_axis} <= {"Q", "2theta"}
                 )
@@ -6980,6 +7198,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             viewer_waterfall_active=self._shell.scientific.bottom_waterfall_active,
             date_sorted=browser.date_sorted,
             auto_last=browser.auto_last,
+            all_frames=browser.all_frames,
             executor_available=self._run_executor is not None,
             start_permitted=permitted,
             start_blocker=blocker,
@@ -7168,6 +7387,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
+            # A resident preview can precede the sparse rows, or a pending browser
+            # gesture can preserve outgoing paint. Only stamp the projection the
+            # shared shell actually reconciled, never the independently read payload.
+            if (not preserve_display and not preserve_scientific
+                    and not self._shell.browser.frame_selection_pending):
+                heavy = projection.scientific.heavy
+                ScatteringWorkspace._stamp_click_perf(
+                    self,
+                    cache_trace_snapshot is not None and bool(projection.scientific.traces),
+                    heavy is not None and heavy.frame is navigation.current and (
+                        heavy.cake is not None
+                        or heavy.raw is not None and projection.scientific.processing_mode != "Int 1D"
+                    ),
+                )
             comparison_notice = self._shell.scientific.browse_comparison_notice
             if comparison_notice and comparison_notice != self._notice_text:
                 self._notice(comparison_notice)
@@ -7889,6 +8122,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             requested = bool(value)
             self._processed_browser.set_date_sorted(requested)
             return True
+        elif kind is ShellCommandKind.SET_ALL_FRAMES:
+            requested = bool(value)
+            self._processed_browser.set_all_frames(requested)
+            if requested and self._preferences.plot_mode in ALL_FRAMES_PLOT_MODES:
+                ScatteringWorkspace._select_every_frame(self)  # as Show All did, the Run's frames too
+            return True
         elif kind is ShellCommandKind.SET_AUTO_LAST:
             requested = bool(value)
             if self._processed_browser.set_auto_last(requested):
@@ -7911,9 +8150,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.browser.cancel_pending_frame_selection()
             self._shell.scientific.clear_trace_history()
             current = self._context_controller.navigation.current
-            self._context_controller.select_navigation(
+            if self._context_controller.select_navigation(
                 current, () if current is None else (current,)
-            )
+            ):
+                # All frames on: the fresh overlay holds every frame of the shown result
+                ScatteringWorkspace._show_every_browse_frame(self)
             if self._preferences.slice_pins:
                 self._preferences = replace(
                     self._preferences,
@@ -7935,6 +8176,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     "slice_center", "slice_width"))):
             self._shell.scientific.clear_trace_history()
         self._preferences = replace(self._preferences, **updates)
+        if kind is ShellCommandKind.SET_PLOT_MODE:
+            # All frames: back in Single, Overlay or Waterfall, every frame again
+            ScatteringWorkspace._show_every_browse_frame(self)
         return True
 
     def _render_start_outcome(self, outcome: object) -> None:

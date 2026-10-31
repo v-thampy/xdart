@@ -146,7 +146,10 @@ jobs:
           - group: viewers-analysis
             tests: tests/xdart/scattering/test_p*.py
           - group: scattering-other
-            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
+            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py --ignore=tests/xdart/scattering/test_live_revalidation_cost_run.py
+          # About 19 minutes on hosted CI by itself (2026-10-31); its own job keeps scattering-other inside its budget.
+          - group: live-revalidation
+            tests: tests/xdart/scattering/test_live_revalidation_cost_run.py
           - group: application
             tests: >-
               tests/xdart --ignore=tests/xdart/scattering
@@ -161,7 +164,8 @@ jobs:
               tests/xdart/test_text_selection_contrast.py
               tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
-    # scattering-other took 49 minutes on hosted CI; leave room for setup/preflight.
+    # scattering-other took about 70 minutes on hosted CI (2026-10-31) until test_live_revalidation_cost_run.py
+    # (about 19 of them) moved to its own group; leave room for setup/preflight.
     timeout-minutes: ${{ matrix.group == 'scattering-other' && 75 || 45 }}
     steps:
       - uses: actions/checkout@v6
@@ -185,10 +189,15 @@ jobs:
         # NB `|| code=$?`: GitHub runs bash with -e, so the previous bare
         # `pytest; code=$?` aborted the step on the first non-zero exit and
         # this loop's retry/guard logic never executed at all.
+        # faulthandler_timeout: a test still running at 480 s dumps every
+        # thread's stack to this log. Run 40996196112's viewers-analysis hung
+        # 38 min with no traceback: --timeout=600's SIGALRM never ran, so the
+        # main thread was blocked in native code, which faulthandler's watchdog
+        # thread still reaches.
         run: |
           for attempt in 1 2 3; do
             code=0
-            python scripts/ci_pytest.py ${{ matrix.tests }} -x -vv --tb=short --timeout=600 --junitxml="xdart-attempt-$attempt.xml" || code=$?
+            python scripts/ci_pytest.py ${{ matrix.tests }} -x -vv --tb=short --timeout=600 -o faulthandler_timeout=480 --junitxml="xdart-attempt-$attempt.xml" || code=$?
             [ "$code" -eq 0 ] && exit 0
             if grep -qE '(failures|errors)="[1-9][0-9]*"' "xdart-attempt-$attempt.xml" 2>/dev/null; then
               echo "::error::pytest tests/xdart reported real failures (not a segfault flake)"

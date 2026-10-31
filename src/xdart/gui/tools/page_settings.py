@@ -205,13 +205,16 @@ class PageSettings:
     working), and ``close()`` is the page's own close. The page keeps the surface both pages have: ``_status(text,
     ready=)``, ``_readiness``, ``_value("project_root")`` (where the chooser starts without a remembered folder),
     ``_closing``, and ``_settings_path_chooser(action, start)``, which returns the path chosen or None (tests
-    replace it)."""
+    replace it). ``snapshot`` and ``restore`` (PHASE-ANALYSIS-128; optional) keep in-memory state the document does
+    not hold, a captured substrate, across a document that cannot apply."""
 
     def __init__(self, page, kind: SettingsKind, *, document: Callable, apply: Callable,
-                 busy: Callable[[], bool | str], close: Callable[[], CloseReceipt]):
+                 busy: Callable[[], bool | str], close: Callable[[], CloseReceipt],
+                 snapshot: Callable[[], Any] | None = None, restore: Callable[[Any], None] | None = None):
         self._page = page
         self.kind = kind
         self._document, self._apply, self._busy, self._close = document, apply, busy, close
+        self._snapshot, self._restore = snapshot, restore
         self._closing_settings = None  # captured at the first close, saved once the page is clean
         self._remembered = False
 
@@ -219,12 +222,15 @@ class PageSettings:
         return self._document(self._page)
 
     def apply(self, document) -> None:
-        """Restore a document; one that cannot apply leaves the inputs as they were."""
+        """Restore a document; one that cannot apply leaves the inputs as they were (and the ``snapshot``)."""
         before = self.settings()
+        state = None if self._snapshot is None else self._snapshot()
         try:
             self._apply(self._page, document)
         except Exception:
             self._apply(self._page, before)
+            if self._restore is not None:
+                self._restore(state)
             raise
 
     def choose_path(self, action: str, start: str):

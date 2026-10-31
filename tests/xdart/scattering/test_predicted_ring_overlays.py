@@ -3,6 +3,8 @@
 REFERENCE-PHASES-20261011 successor (declared in its kickoff): calibrant rings now come from calibrant entries in
 the Tools-panel Reference Phases window, through the shared phase worker, instead of Plot Options' Calibrant row.
 Every scientific assertion of the eight original rows is kept; helpers keep their names for D and DP.
+PHASE-ANALYSIS-128 successor (2026-10-29): the window is Phase Analysis, opened through the view's host page
+(Int's Tools command, Stitch's page tool); `phase_window` and `close_phase_window` are the shared helpers.
 """
 from contextlib import contextmanager
 from dataclasses import replace
@@ -22,6 +24,7 @@ from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
+from xdart.gui.tabs.scattering.events import CleanupStatus
 
 
 @pytest.fixture
@@ -71,14 +74,52 @@ def run_page(qapp, root, energies=(16, 17), mode='Int 2D', poni_text=None, sourc
         page._refresh_shell(); qapp.processEvents()
         yield page, shell.scientific
     finally:
-        page.close(); page.deleteLater(); qapp.processEvents()
+        page.close()
+        # Finish the page's own cleanup before deleting it, so no retry timer survives into the next test, where its
+        # close would run beside that test's Run worker (CI-VIEWERS-HANG-128). Never drain DeferredDelete here.
+        deadline = time.monotonic()+30
+        while page.close_workspace().cleanup_status is not CleanupStatus.CLEANED:
+            assert time.monotonic()<deadline, "the closed page never finished its cleanup"
+            qapp.processEvents(); time.sleep(.01)
+        page.deleteLater(); qapp.processEvents()
+
+
+def _host_window(view):
+    """The Phase Analysis window the view's host has open, or None."""
+    host = view.window()
+    if hasattr(host, "_phase_dialog"):
+        return host._phase_dialog
+    fit_host = getattr(host, "_fit_hosts", {}).get("phase")
+    return None if fit_host is None else fit_host.dialog
+
+
+def phase_window(view):
+    """Phase Analysis through the view's host page: Int's real Tools command or Stitch's page tool."""
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    host = view.window()
+    if hasattr(host, "_phase_dialog"):
+        host._shell.commandRequested.emit(ShellCommand(ShellCommandKind.LAUNCH_TOOL, "phase_analysis"))
+    else:
+        host.tools.page_tool("phase_analysis").click()
+    QtWidgets.QApplication.processEvents()
+    window = _host_window(view)
+    assert window is not None and window.isVisible() and window.windowTitle() == "Phase Analysis"
+    assert view.phase_list is window.phase_binding
+    return window
+
+
+def close_phase_window(view):
+    """Close the host's Phase Analysis window (an Int window deletes itself; Stitch keeps its host)."""
+    window = _host_window(view)
+    if window is not None:
+        window.close()
+    QtWidgets.QApplication.processEvents()
 
 
 def choice(view):
     """The window whose calibrant chooser replaced Plot Options' Calibrant row."""
-    view.show_reference_phases()
-    window = view.reference_phases
-    assert window.isVisible() and window.phase_source.calibrant_row.editor.toolTip()
+    window = phase_window(view)
+    assert window.phase_source.calibrant_row.editor.toolTip()
     return window
 
 
@@ -242,7 +283,8 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
         view = shell.scientific
         assert not rings(view.raw)
         if mode.startswith('Int') or mode in ('Average', 'Reintegrate'):
-            window = choice(view)
+            # declared oracle repair (PHASE-ANALYSIS-128): a bare shell has no host page to open the window, so the
+            # view's own rings notice is read (an attached window's note line shows it)
             options = replace(state.scientific.plot_options, phase_references=(('calibrant:LaB6', True),))
             shell.apply_state(replace(state, scientific=replace(state.scientific, plot_options=options)))
             settle(qapp, view)
@@ -250,7 +292,7 @@ def test_empty_overlays_preserve_every_pane_consumer(qapp, mode):
             # BROWSE-REFERENCE-RINGS-20261013 (superseded text): saved Int outputs now carry ring geometry, so the
             # generic reason no longer says that frames opened from a file cannot.
             from xrd_tools.geometry_figures import RUN_RING_REASON
-            assert window.rings_note.text() == RUN_RING_REASON and 'opened from a file' not in RUN_RING_REASON
+            assert view.phase_rings_reason == RUN_RING_REASON and 'opened from a file' not in RUN_RING_REASON
         view.show_raw_popup('Contributing raw')
         raw = np.arange(35.).reshape(5,7)
         view.show_raw_image(raw, status='source', color_map='Default', log_scale=False)
@@ -323,3 +365,29 @@ def test_same_energy_step_to_an_evicted_frame_reuses_the_prediction(qapp, tmp_pa
         monkeypatch.setattr(provider, 'build_phase_references', count)
         select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(view.raw))
         assert rings(view.raw) and not calls
+
+
+def test_run_page_deletes_its_page_only_after_its_cleanup(qapp, tmp_path, monkeypatch):
+    """A refused first cleanup must not leave the page and its retry timer alive into the next test, where its
+    close would run beside that test's Run worker (CI-VIEWERS-HANG-128)."""
+    import shiboken6
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+
+    real = ScatteringWorkspace.close_workspace
+    refusals = [2]
+
+    def refusing(self):
+        receipt = real(self)
+        if refusals[0]:
+            refusals[0] -= 1
+            return replace(receipt, cleanup_status=CleanupStatus.CLEANUP_PENDING)
+        return receipt
+
+    with run_page(qapp, tmp_path / 'teardown') as (page, _view):
+        monkeypatch.setattr(ScatteringWorkspace, 'close_workspace', refusing)
+    assert refusals == [0], "run_page returned before its page finished cleanup"
+    # Qt deletes the page later (processEvents runs no deferred delete); by then nothing is left to clean.
+    assert not shiboken6.isValid(page) or (
+        page.close_workspace().cleanup_status is CleanupStatus.CLEANED
+        and not page._deferred_delete_retry_timer.isActive()
+    )

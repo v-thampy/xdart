@@ -939,6 +939,9 @@ class HydrationTransport:
         if (type(receipt) is Viewer2DCleanupReceipt
                 and receipt.token is disposal.token
                 and receipt.state is Viewer2DCleanupState.CLEANED):
+            # Cleaned, as after a retried cleanup: the entry lets the refused value go too, so it is gone before the
+            # worker reads the next frame (DISPLAY-FLOAT32-128).
+            entry.disposal = None
             return outcome, diagnostic
         with self._lock:
             entry.cleanup_token = HydrationTransportCleanupToken()

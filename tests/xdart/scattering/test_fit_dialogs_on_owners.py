@@ -112,7 +112,7 @@ def test_an_analyzer_fit_of_a_frame_is_a_row_of_the_shared_trend(qapp):
         dialog.close()
 
 
-def test_the_phase_fit_mounts_the_shared_owners_and_its_phases_are_a_keyed_list(qapp, monkeypatch):
+def test_the_phase_fit_mounts_the_shared_owners_and_its_phases_are_a_keyed_list(qapp, monkeypatch, tmp_path):
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     dialog = PhaseFitDialog(vnext_submit=lambda *_args: None)
     try:
@@ -124,21 +124,25 @@ def test_the_phase_fit_mounts_the_shared_owners_and_its_phases_are_a_keyed_list(
         # and per-row cutoffs on the shared phase source).
         assert dialog.phase_source.isAncestorOf(dialog.min_intensity) and not dialog.advanced.isAncestorOf(
             dialog.min_intensity) and isinstance(dialog.max_nfev, IntegerLineEdit)
-        picks = iter(("/tmp/alpha.cif", "/tmp/beta.cif"))
-        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (next(picks), "CIF"))
-        dialog._add_cif(); dialog._add_cif()
+        # PHASE-ANALYSIS-128: the list is the library-keyed reference list (the deferred-path rows retired)
+        from tests.xdart.scattering.test_phase_reference_overlays import _cif
+        from xrd_tools.analysis.phase_references import PhaseLibrary
+        monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+        dialog.phase_source.library = PhaseLibrary()
+        alpha, beta = dialog.phase_source.add_cif_paths((str(_cif(tmp_path, "alpha", 4.1)),
+                                                         str(_cif(tmp_path, "beta", 4.25))))
         assert [dialog.cif_list.item(row).text() for row in range(dialog.cif_list.count())] == ["alpha", "beta"]
-        dialog.cif_browser.set_current_result("0", keep_selection=False)
+        dialog.cif_browser.set_current_result(alpha.id, keep_selection=False)
         dialog.remove_cif_btn.click()
-        assert dialog._phases == [("/tmp/beta.cif", "beta")]
+        assert [entry.name for entry in dialog.phase_source.selected_entries()] == ["beta"]
         assert [dialog.cif_list.item(row).text() for row in range(dialog.cif_list.count())] == ["beta"]
-        assert dialog.vnext_fit_values()["cif_paths"] == ("/tmp/beta.cif",)
+        assert dialog.vnext_fit_values()["phase_entries"] == (beta,)
     finally:
         dialog.close()
 
 
 @pytest.mark.parametrize("kind", ("peak", "phase"))
-def test_fit_pressed_before_any_trace_was_shown_takes_the_displayed_trace_first(qapp, monkeypatch, kind):
+def test_fit_pressed_before_any_trace_was_shown_takes_the_displayed_trace_first(qapp, monkeypatch, kind, tmp_path):
     """Pre-existing (d352977f): a fit window opened before a 1-D trace was displayed, then Fit pressed once one is,
     fitted the page's trace and raised drawing the result on the window's empty pattern. Fit now takes the displayed
     trace first, as Reload does, and the result is drawn on it."""
@@ -155,10 +159,13 @@ def test_fit_pressed_before_any_trace_was_shown_takes_the_displayed_trace_first(
         dialog = getattr(page, f"_{kind}_dialog")
         assert dialog._x is None
         captured["trace"] = (trace, anchor)  # the user displays a frame, then presses Fit
-        if kind == "phase":
-            monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
-                                lambda *args, **kwargs: ("/nonexistent/alpha.cif", "CIF"))
-            dialog._add_cif()
+        if kind == "phase":  # PHASE-ANALYSIS-128: a library CIF whose stored copy is gone is the missing CIF
+            from tests.xdart.scattering.test_phase_reference_overlays import _cif
+            from xrd_tools.analysis.phase_references import PhaseLibrary
+            monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+            dialog.phase_source.library = PhaseLibrary()
+            added, = dialog.phase_source.add_cif_paths((str(_cif(tmp_path, "alpha", 4.1)),))
+            added.cif_path.unlink()
         dialog.fit_btn.click()
         assert dialog._x is not None and page._analysis_identity is not None
         assert page._consume_analysis_update(_settle(page))

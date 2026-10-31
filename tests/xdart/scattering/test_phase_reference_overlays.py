@@ -16,7 +16,7 @@ import pytest
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from tests.xdart.scattering.test_predicted_ring_overlays import run_page, select, choose
+from tests.xdart.scattering.test_predicted_ring_overlays import run_page, select, choose, phase_window
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 
 #: REFERENCE-PHASES-20261011 moved the phase controls from Plot Options to the Tools-panel window and made
@@ -35,10 +35,10 @@ def isolated_library(tmp_path, monkeypatch):
 
 
 def _phase_section(view):
-    """The Reference Phases window (successor of Plot Options' Reference phases section)."""
-    view.show_reference_phases()
-    window = view.reference_phases
-    assert window.isVisible() and window.toolTip()
+    """The Phase Analysis window (PHASE-ANALYSIS-128 successor of the Reference Phases window, itself the successor
+    of Plot Options' Reference phases section), opened through the view's host page."""
+    window = phase_window(view)
+    assert window.toolTip()
     return window
 
 
@@ -126,11 +126,14 @@ def _stitch(qapp, root, *, two_dimensional=False):
 
 
 def test_phase_fitter_adds_cif_and_lattice_phases_through_the_shared_source(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    """PHASE-ANALYSIS-128 successor: the Phase Analysis window mounted by Int's page; the one displayed fit path,
+    once from the mounted library entry and once from the exact CIF, gives the same fit."""
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
     from xdart.gui.tabs.scattering.browser_view import BrowserView
-    dialog = PhaseFitDialog()
-    comparison = None
-    try:
+    from xrd_tools.analysis.display_fit_operations import (DisplayedPhaseFitPlan, DisplayedTraceInput,
+                                                           DisplayedTraceReceipt, run_displayed_phase_fit)
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         # Parent failure is the visible missing action, not a missing owner import.
         buttons = [button for button in dialog.findChildren(QtWidgets.QPushButton)
                    if button.text().replace('…', '').strip() == 'Add lattice']
@@ -142,40 +145,34 @@ def test_phase_fitter_adds_cif_and_lattice_phases_through_the_shared_source(qapp
         assert buttons[0].toolTip()
         path = _cif(tmp_path)
         dialog.phase_source.add_cif_paths((str(path),))
-        assert len(dialog._phases) == 1
+        assert len(dialog.phase_source.selection) == 1
         entry_id = dialog.phase_source.selection[0][0]
         entry = dialog.phase_source.library.resolve(entry_id).entry
         assert entry.cif_bytes == path.read_bytes()
-        # Same real fit path, once from the mounted library and once from the
-        # exact CIF as the tool accepted before promotion; no optimizer fake.
+        # Same real fit path, once from the mounted library and once from the exact CIF; no optimizer fake.
         model = PhaseModel.from_cif(path)
         q = np.linspace(1., 4., 301)
         y = np.full(q.shape, 10.)
         for peak in model.peaks:
             if 1. < peak.q < 4.:
                 y += peak.intensity * np.exp(-.5*((q-peak.q)/.025)**2)
-        dialog._show_pattern(q, y, 'q', clear_fit=True)
-        comparison = PhaseFitDialog()
-        comparison._phases = [(str(path), model)]
-        comparison._show_pattern(q, y, 'q', clear_fit=True)
-        request = dialog.build_fit_request()
-        reference = comparison.build_fit_request()
-        assert request is not None and reference is not None
-        actual = request[1].analyze(request[0])
-        expected = reference[1].analyze(reference[0])
-        assert actual.ok and expected.ok
-        np.testing.assert_allclose(actual.overlay.traces['fit'], expected.overlay.traces['fit'], rtol=1e-10, atol=1e-10)
+        trace = DisplayedTraceInput(q, y, 'q', '1/angstrom', 'q', 1, DisplayedTraceReceipt(
+            'displayed-trace-v1', 1, 'run', '1', tmp_path / 'output.nxs', 'q', 0))
+        values = dialog.vnext_fit_values()
+        assert values['phase_entries'] == (entry,)
+        mounted = DisplayedPhaseFitPlan(trace, wavelength_angstrom=1.5406, **values)
+        exact = DisplayedPhaseFitPlan(trace, wavelength_angstrom=1.5406, **dict(
+            values, phase_entries=(), cif_paths=(path,), expected_hashes=(None,)))
+        actual, expected = run_displayed_phase_fit(mounted), run_displayed_phase_fit(exact)
+        assert actual.code == expected.code == 'OK', (actual.diagnostics, expected.diagnostics)
+        np.testing.assert_allclose(actual.fit, expected.fit, rtol=1e-10, atol=1e-10)
         dialog.phase_source.add_lattice('Cubic positions', a=4.1, space_group=221)
         assert len(dialog.phase_source.selection) == 2
-        assert len(dialog._phases) == 2
+        assert len(dialog.vnext_fit_values()['phase_entries']) == 2
         assert dialog.phase_source.library.resolve(dialog.phase_source.selection[-1][0]).entry.source_kind == 'lattice'
         for child in dialog.phase_source.findChildren(QtWidgets.QWidget):
             if isinstance(child, (QtWidgets.QPushButton, QtWidgets.QLineEdit, QtWidgets.QComboBox)):
                 assert child.toolTip(), child.objectName()
-    finally:
-        if comparison is not None:
-            comparison.close(); comparison.deleteLater()
-        dialog.close(); dialog.deleteLater(); qapp.processEvents()
 
 
 def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path, monkeypatch):
@@ -186,7 +183,7 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
         from xdart.gui.tabs.scattering.scientific_plot_options import plot_option_update
         from xrd_tools.analysis.phase import XRDCalculator
         entries = _entries(tmp_path)
-        dialog = view.reference_phases
+        dialog = _phase_section(view)
         assert isinstance(dialog.phase_source, PhaseSourceWidget)
         assert isinstance(dialog.phase_source.global_row, FormRow)
         assert dialog.phase_source.global_row.current_value() == 5.
@@ -205,7 +202,8 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
         _edit(qapp, view, entries, floor=20.)
         assert len(calls) == prior, 'editing the floor must reuse listed reflections'
         assert page._preferences.plot_options.phase_min_intensity == 20.
-        dialog.close_button.click(); qapp.processEvents()  # live apply: closing keeps what was applied
+        dialog.close(); qapp.processEvents()  # live apply: closing keeps what was applied
+        dialog = _phase_section(view)  # PHASE-ANALYSIS-128: the reopened window lists what was applied
         assert dialog.phase_source.selection == selection
         assert dialog.phase_source.global_row.current_value() == 20.
         assert page._preferences.plot_options.phase_min_intensity == 20.
@@ -220,15 +218,15 @@ def test_plot_options_phase_selection_is_shared_by_int_and_stitch(qapp, tmp_path
     with _stitch(qapp, tmp_path/'stitch') as (page, view, _payload):
         _phase_section(view)
         _edit(qapp, view, entries, floor=20.)
-        assert view.reference_phases.projection.phase_references == selection
-        assert view.reference_phases.projection.phase_min_intensity == 20.
+        assert view.phase_list.projection.phase_references == selection
+        assert view.phase_list.projection.phase_min_intensity == 20.
         assert view.phase_families
     import xrd_tools.analysis.phase as phase_owner
     with run_page(qapp, tmp_path/'dependency', energies=(16, 16)) as (page, view):
         _phase_section(view)
         monkeypatch.setattr(phase_owner, 'HAS_PYMATGEN', False)
         page._refresh_shell(); qapp.processEvents()
-        source = view.reference_phases.phase_source
+        source = _phase_section(view).phase_source
         # Calibrants need no pymatgen (as P3a's rings never did); CIF and lattice sources say why they are off.
         assert not source.add_cif_btn.isEnabled() and 'pymatgen' in source.add_cif_btn.toolTip().lower()
         assert not source.add_lattice_btn.isEnabled() and 'pymatgen' in source.add_lattice_btn.toolTip().lower()
@@ -411,7 +409,7 @@ def test_phase_rings_on_ints_detector_image_follow_p3a(qapp, tmp_path, monkeypat
             return build_phase_references(*args, **kwargs)
         monkeypatch.setattr(references, 'build_phase_references', blocked)
         try:
-            source = view.reference_phases.phase_source
+            source = _phase_section(view).phase_source
             source.set_selection(((entries[0].id, True),)); qapp.processEvents()
             assert entered.wait(5)
             source.set_selection(((entries[1].id, True),)); qapp.processEvents()
@@ -449,7 +447,7 @@ def test_several_phases_have_colours_legend_and_independent_families(qapp, tmp_p
             assert _markers(view, entry)
         legend_names = tuple(label.text for _item, label in view.curve.getPlotItem().legend.items)
         assert all(entry.name in legend_names for entry in entries)
-        source = view.reference_phases.phase_source
+        source = _phase_section(view).phase_source
         source.set_selection(tuple((entry.id, True) for entry in entries[1:]) + ((LAB6, True),))
         _settle(qapp, view)
         assert not _phase_items(view.raw, entries[0])
@@ -502,12 +500,12 @@ def test_phase_selection_and_library_persist_across_restart(qapp, tmp_path, monk
         assert settings['phase_references']['references'] == [[entries[0].id, True]]
         assert settings['phase_references']['min_intensity'] == 13.
         _edit(qapp, view, ()); page.apply_settings(settings); _settle(qapp, view)
-        assert view.reference_phases.projection.phase_references == ((entries[0].id, True),)
-        assert view.reference_phases.projection.phase_min_intensity == 13.
-        missing = replace(view.reference_phases.projection, phase_references=(('f'*64, True),))
+        assert view.phase_list.projection.phase_references == ((entries[0].id, True),)
+        assert view.phase_list.projection.phase_min_intensity == 13.
+        missing = replace(view.phase_list.projection, phase_references=(('f'*64, True),))
         page._view_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, missing.phase_references,
                                        ('other', 'phase_references')))
         _settle(qapp, view)
         assert not view.phase_families
-        assert 'missing' in view.reference_phases.phase_source.toolTip().lower()
+        assert 'missing' in _phase_section(view).phase_source.toolTip().lower()
     assert str(PhaseLibrary().path).startswith(str(tmp_path))

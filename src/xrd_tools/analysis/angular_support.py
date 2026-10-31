@@ -163,6 +163,7 @@ def _pyfai_admitted(lo: float, hi: float, chi_disc_at_pi: bool) -> tuple[tuple[f
     """pyFAI's own normalize_azimuth_range, clipped to the χ the pixels can have, as degrees on [−180, 180)."""
     from pyFAI.geometry import Geometry
     geometry = Geometry()
+    geometry.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     if chi_disc_at_pi:
         geometry.setChiDiscAtPi()
     else:
@@ -1389,6 +1390,7 @@ class SavedSupportRequest:
 
     ``path``/``entry`` name the output Browse loaded and ``snapshot`` its load's ``TargetSnapshot``, revalidated around
     every read; ``labels`` are its frames and ``selected`` the ones to rebuild, in one job sharing one basis.
+    ``terminal`` is the Run handoff's stream seal when the load was sealed: reads then revalidate against it.
     """
 
     path: str
@@ -1396,11 +1398,22 @@ class SavedSupportRequest:
     snapshot: Any
     labels: tuple[int, ...]
     selected: tuple[int, ...]
+    terminal: Any = None
+
+    @property
+    def source_key(self) -> tuple:
+        """The admitting revision and validation domain, independent of the shown frame subset.
+
+        TargetSnapshot content equality omits ctime; terminal digests may describe writer evidence instead of file
+        bytes. Keep both revision witnesses in cache and delivery identities without changing snapshot semantics.
+        """
+        return (self.path, self.entry, self.snapshot, getattr(self.snapshot, "ctime_ns", None),
+                self.labels, self.terminal)
 
     @property
     def key(self) -> tuple:
         """The computation's identity: the same output revision and frames give the same profiles."""
-        return (self.path, self.entry, self.snapshot, self.labels, tuple(sorted(self.selected)))
+        return (*self.source_key, tuple(sorted(self.selected)))
 
 
 def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[[], bool] | None = None
@@ -1420,17 +1433,28 @@ def reconstruct_saved_support(request: SavedSupportRequest, *, cancel: Callable[
             for label in selected}
 
 
+def _requalify(request: SavedSupportRequest) -> None:
+    """Revalidate ``request``'s output in the domain its load used, as the 1-D lane does: a sealed Run handoff against
+    its stream seal, any other load against its snapshot. A seal's snapshot has no ctime, so the snapshot path re-hashed
+    the whole file and refused a held stream, whose seal digest is not the file's SHA (TERMINAL-SUPPORT-128)."""
+    from xrd_tools.io.output_transaction import TargetChanged, revalidate_stream_terminal, revalidate_target_snapshot
+    if request.terminal is None:
+        revalidate_target_snapshot(request.path, request.snapshot)
+    elif revalidate_stream_terminal(request.path, request.terminal) != request.snapshot:
+        raise TargetChanged("target changed since its load")
+
+
 def _saved_support_basis(request: SavedSupportRequest) -> "tuple[SavedSupportBasis, Any] | AngularSupportProfile":
     """The shared basis and saved axis of ``request``'s output, or the refusal every frame carries."""
     from xrd_tools.io.browse_presentation import read_ring_record, read_saved_support_facts
-    from xrd_tools.io.output_transaction import TargetChanged, revalidate_target_snapshot
+    from xrd_tools.io.output_transaction import TargetChanged
     from xrd_tools.session.readiness import RingBasis, ring_basis_from_saved
 
     def refused(reason: SupportReason, detail: str = "") -> AngularSupportProfile:
         return AngularSupportProfile.unavailable(reason, origin=SupportOrigin.RECONSTRUCTED, detail=detail)
 
     try:
-        revalidate_target_snapshot(request.path, request.snapshot)
+        _requalify(request)
         record = read_ring_record(request.path, entry=request.entry)
         if record.kind != "run":
             basis = support_basis_from_saved(None, None, labels=request.labels, mask=SavedSupportMask(False),
@@ -1443,7 +1467,7 @@ def _saved_support_basis(request: SavedSupportRequest) -> "tuple[SavedSupportBas
             return refused(SupportReason.LEGACY_INSUFFICIENT, str(getattr(ring, "reason", "") or ""))
         facts = read_saved_support_facts(request.path, entry=request.entry, run_configuration=record.run_configuration,
                                          pixels=int(ring.shape[0]) * int(ring.shape[1]))
-        revalidate_target_snapshot(request.path, request.snapshot)
+        _requalify(request)
     except (TargetChanged, OSError, TypeError, ValueError, KeyError) as error:
         return refused(SupportReason.LEGACY_INSUFFICIENT, f"the output could not be read: {error}"[:200])
     if facts.axis_values is None:

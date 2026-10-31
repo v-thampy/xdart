@@ -24,11 +24,11 @@ def test_project_root_source_identity_matches_hydrated_output_subdir_member(
     from xdart.gui.tabs.scattering.browse_values import (
         canonical_browse_source_identity,
     )
-    from xrd_tools.io import FrameScalarCatalog, FrameScalarRow
+    from xrd_tools.io import FrameFacts, FrameScalarCatalog, FrameScalarRow
 
     project = tmp_path / "project"
     artifact = project / "xdart_processed_data" / "scan.nxs"
-    persisted = FrameScalarRow(
+    persisted = FrameFacts(
         label=9,
         source_path="eiger/master.h5",
         source_frame_index=651,
@@ -36,7 +36,7 @@ def test_project_root_source_identity_matches_hydrated_output_subdir_member(
     catalog = FrameScalarCatalog(
         str(artifact),
         "entry",
-        (persisted,),
+        (FrameScalarRow(label=9),),
         source_base=str(project),
     )
     hydrated = SimpleNamespace(
@@ -70,6 +70,7 @@ def _scope(
     *,
     budget=1 << 20,
     retain_1d_on_eviction=False,
+    facts=None,
 ):
     from xdart.gui.tabs.scattering.browse_1d_hydration import (
         Browse1DHydrationLane,
@@ -80,7 +81,9 @@ def _scope(
     from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
     from xdart.modules.display_context import BrowseContext, DisplaySelection
     from xdart.modules.frame_publication import PublicationStore
-    from xrd_tools.io import Browse1DCache, FrameScalarCatalog
+    from xrd_tools.io import (
+        Browse1DCache, FrameFacts, FrameFactsStore, FrameScalarCatalog,
+    )
     from xrd_tools.io.output_transaction import capture_target_snapshot
 
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -91,6 +94,12 @@ def _scope(
         source_base=str(tmp_path),
     )
     cache = Browse1DCache(budget)
+    # Resident frame facts as the lane would have read them; absent by default.
+    frame_facts = FrameFactsStore()
+    frame_facts.commit(
+        tuple(facts) if facts is not None
+        else tuple(FrameFacts(label=row.label) for row in scalar_rows)
+    )
     publications = PublicationStore(
         max_items=16,
         max_heavy_items=16,
@@ -117,6 +126,7 @@ def _scope(
         target_entry=catalog.entry,
         loaded_labels=catalog.labels,
         target_snapshot=capture_target_snapshot(path),
+        frame_facts=frame_facts,
     )
     context.adopt_load_request(request)
     context.mark_loaded()
@@ -260,7 +270,7 @@ def test_active_standard_and_gi_modes_preserve_borrowed_array_identity(
         Browse1DProjectionStatus,
     )
     from xrd_tools.core import ViewFrameGeometry
-    from xrd_tools.io import FrameScalarRow, browse_1d_row_name
+    from xrd_tools.io import FrameFacts, FrameScalarRow, browse_1d_row_name
 
     persisted_geometry = (
         None if geometry is None else ViewFrameGeometry(incident_angle=0.2)
@@ -268,14 +278,17 @@ def test_active_standard_and_gi_modes_preserve_borrowed_array_identity(
     row = FrameScalarRow(
         1,
         metadata_raw={"motor": 2.5},
-        geometry=persisted_geometry,
-        source_path="detector.tif",
-        source_frame_index=4,
         modes_1d=modes,
         active_mode_1d=active,
     )
+    facts = FrameFacts(
+        1,
+        geometry=persisted_geometry,
+        source_path="detector.tif",
+        source_frame_index=4,
+    )
     axes = tuple((mode, mode.upper(), "A^-1", False) for mode in modes)
-    scope = _scope(tmp_path, (row,), axes)
+    scope = _scope(tmp_path, (row,), axes, facts=(facts,))
     arrays = _seed_label(
         scope[7], scope[5], scope[4], 1, 1,
         sigma_modes=sigma_modes,
@@ -321,18 +334,17 @@ def test_average_row_projects_averaged_title_without_relabeling_other_rows(
     from xdart.gui.tabs.scattering.browse_1d_projection import (
         Browse1DProjectionStatus,
     )
-    from xrd_tools.io import FrameScalarRow
+    from xrd_tools.io import FrameFacts, FrameScalarRow
 
     rows = (
-        FrameScalarRow(
-            1, modes_1d=("q",), active_mode_1d="q", averaged=True,
-        ),
+        FrameScalarRow(1, modes_1d=("q",), active_mode_1d="q"),
         FrameScalarRow(2, modes_1d=("q",), active_mode_1d="q"),
     )
     scope = _scope(
         tmp_path,
         rows,
         (("q", "Q", "A^-1", False),),
+        facts=(FrameFacts(1, averaged=True), FrameFacts(2)),
     )
     _seed_label(scope[7], scope[5], scope[4], 1, 1)
     _seed_label(scope[7], scope[5], scope[4], 2, 2)
@@ -518,7 +530,7 @@ def test_optional_current_publication_valid_shapes_do_not_block_cached_1d(
     )
     from xdart.modules.frame_publication import FramePublication
     from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
-    from xrd_tools.io import FrameScalarRow, browse_1d_row_name
+    from xrd_tools.io import FrameFacts, FrameScalarRow, browse_1d_row_name
 
     source_path = "detector.tif" if shape == "empty-record-proven-raw" else None
     source_index = 7 if source_path is not None else None
@@ -528,20 +540,24 @@ def test_optional_current_publication_valid_shapes_do_not_block_cached_1d(
     has_2d_mode = shape == "retain-one-d-shell"
     row = FrameScalarRow(
         1,
-        source_path=source_path,
-        source_frame_index=source_index,
-        has_thumbnail=has_thumbnail,
         modes_1d=("q",),
         active_mode_1d="q",
         modes_2d=("map",) if has_2d_mode else (),
         active_mode_2d="map" if has_2d_mode else None,
         two_d_kinds=(("map", TwoDKind.Q_CHI),) if has_2d_mode else (),
     )
+    facts = FrameFacts(
+        1,
+        source_path=source_path,
+        source_frame_index=source_index,
+        has_thumbnail=has_thumbnail,
+    )
     scope = _scope(
         tmp_path,
         (row,),
         (("q", "Q", "A^-1", False),),
         retain_1d_on_eviction=has_2d_mode,
+        facts=(facts,),
     )
     arrays = _seed_label(scope[7], scope[5], scope[4], 1, 1)
     raw = _readonly([[1.0, 2.0], [3.0, 4.0]])
@@ -595,7 +611,7 @@ def test_optional_current_publication_valid_shapes_do_not_block_cached_1d(
             view,
             record=record,
             source_identity=canonical_browse_source_identity(
-                row, scope[0].requested_path,
+                facts, scope[0].requested_path,
                 source_base=scope[4].source_base,
             ),
             source_base=scope[4].source_base,
@@ -640,19 +656,18 @@ def test_current_heavy_requires_exact_scalar_source_and_record(
     )
     from xdart.modules.frame_publication import FramePublication
     from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
-    from xrd_tools.io import FrameScalarRow
+    from xrd_tools.io import FrameFacts, FrameScalarRow
 
     row = FrameScalarRow(
         1,
-        source_path="detector.tif",
-        source_frame_index=7,
         modes_1d=("q",),
         active_mode_1d="q",
         modes_2d=("map",),
         active_mode_2d="map",
         two_d_kinds=(("map", TwoDKind.Q_CHI),),
     )
-    scope = _scope(tmp_path, (row,), (("q", "Q", "A^-1", False),))
+    facts = FrameFacts(1, source_path="detector.tif", source_frame_index=7)
+    scope = _scope(tmp_path, (row,), (("q", "Q", "A^-1", False),), facts=(facts,))
     _seed_label(scope[7], scope[5], scope[4], 1, 1)
     view = FrameView(
         1,
@@ -661,9 +676,9 @@ def test_current_heavy_requires_exact_scalar_source_and_record(
         intensity_2d=_readonly([[5.0, 6.0], [7.0, 8.0]]),
         source_path=(
             "foreign-detector.tif"
-            if sabotage == "top-source" else row.source_path
+            if sabotage == "top-source" else facts.source_path
         ),
-        source_frame_index=row.source_frame_index,
+        source_frame_index=facts.source_frame_index,
     )
     record = FrameRecord(
         2 if sabotage == "record-label" else 1,
@@ -671,7 +686,7 @@ def test_current_heavy_requires_exact_scalar_source_and_record(
         active_mode_2d="map",
     )
     source = canonical_browse_source_identity(
-        row,
+        facts,
         scope[0].requested_path,
         source_base=scope[4].source_base,
     )
@@ -835,7 +850,7 @@ def test_first_preview_hydration_stamps_scalar_catalog_named_modes(
     )
     from xdart.modules.display_context import HydrationRequest
     from xrd_tools.core import Axis, FrameView, TwoDKind
-    from xrd_tools.io import FrameScalarRow
+    from xrd_tools.io import FrameFacts, FrameScalarRow
     from xrd_tools.io.frame_preview import FramePreview
     from xrd_tools.session.hydration import (
         HydrationOutcome,
@@ -847,7 +862,6 @@ def test_first_preview_hydration_stamps_scalar_catalog_named_modes(
 
     row = FrameScalarRow(
         1,
-        has_thumbnail=True,
         modes_1d=("q_ip",),
         active_mode_1d="q_ip",
         modes_2d=("q_ip_q_oop",),
@@ -858,6 +872,7 @@ def test_first_preview_hydration_stamps_scalar_catalog_named_modes(
         tmp_path,
         (row,),
         (("q_ip", "Q-ip", "A^-1", False),),
+        facts=(FrameFacts(1, has_thumbnail=True),),
     )
     context = scope[0]
     view = FrameView(

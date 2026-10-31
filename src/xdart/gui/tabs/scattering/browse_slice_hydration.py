@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import os
 from threading import Event, Lock, Thread
 
 import numpy as np
 
 from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
-from xrd_tools.io import FrameScalarCatalog, FrameViewReader
+from xrd_tools.io import FrameFacts, FrameFactsStore, FrameScalarCatalog, FrameViewReader
 from xrd_tools.io.output_transaction import (
-    TargetSnapshot, revalidate_stream_terminal,
+    TargetSnapshot, revalidate_stream_terminal, revalidate_target_snapshot,
     stream_terminal_object_revision,
 )
 
@@ -74,6 +73,8 @@ class BrowseSliceLane:
 
         self._browse = browse
         self._catalog = browse.scalar_catalog
+        #: Read-only here: slices can span every selected frame, so they never fill the 1-D lane's bounded store.
+        self._facts = browse.frame_facts
         self._gate = browse.commit_gate
         self._epoch = browse.commit_epoch
         self._snapshot = browse.target_snapshot
@@ -90,19 +91,15 @@ class BrowseSliceLane:
         self._retiring = False
         if not self._context_live():
             raise RuntimeError("Browse slice context is not exactly admitted")
-        self._revision = self._stat_revision()
-        if self._revision[:4] != (
-            self._snapshot.device, self._snapshot.inode,
-            self._snapshot.size, self._snapshot.mtime_ns,
-        ):
-            raise RuntimeError("Browse slice saved artifact changed after loading")
 
     def _context_live(self) -> bool:
         browse, catalog = self._browse, self._catalog
         return bool(
             type(catalog) is FrameScalarCatalog
+            and type(self._facts) is FrameFactsStore
             and type(self._snapshot) is TargetSnapshot and self._snapshot.exists
             and browse.scalar_catalog is catalog
+            and browse.frame_facts is self._facts
             and browse.target_snapshot is self._snapshot
             and browse.load_request is self._load_request
             and browse.commit_gate is self._gate
@@ -201,20 +198,15 @@ class BrowseSliceLane:
 
     def _validate_snapshot(self) -> None:
         terminal = self._terminal
-        unchanged = (
-            revalidate_stream_terminal(self._catalog.artifact_path, terminal) == self._snapshot
+        # Both domains stay bound to the loader's observation, never a new
+        # pathname revision sampled when this lazy lane happens to be created.
+        observed = (
+            revalidate_stream_terminal(self._catalog.artifact_path, terminal)
             if stream_terminal_object_revision(terminal) is not None
-            else self._stat_revision() == self._revision
+            else revalidate_target_snapshot(self._catalog.artifact_path, self._snapshot)
         )
-        if not unchanged:
+        if observed != self._snapshot:
             raise RuntimeError("Browse slice saved artifact changed after loading")
-
-    def _stat_revision(self) -> tuple[int, ...]:
-        # The loader already hashed this admitted file. Display reads only
-        # requalify its object/stat identity, including the observed ctime.
-        observed = os.stat(self._catalog.artifact_path)
-        return (observed.st_dev, observed.st_ino, observed.st_size,
-                observed.st_mtime_ns, observed.st_ctime_ns)
 
     def _cut(self, payload, axis, sliced, center, width, norm):
         native_axis = native_1d_plot_axis(
@@ -274,9 +266,14 @@ class BrowseSliceLane:
                                    mode_2d=shown if direct else row.active_mode_2d)
                 if self._cancelled(task):
                     return BrowseSliceResult()
+                # The frame's resident facts, else the same codec on this reader for that frame alone.
+                facts = self._facts.get(row.label)
+                if facts is None:
+                    (facts,) = reader.read_frame_facts((row.label,), cancelled=lambda: self._cancelled(task))
                 payload = StandardDisplayPayload(
                     request.selection.display_generation, frame, "", view,
-                    status="browse", wavelength_m=self._wavelength, averaged=row.averaged,
+                    status="browse", wavelength_m=self._wavelength,
+                    averaged=type(facts) is FrameFacts and facts.averaged,
                     legend_scan=self._catalog.artifact_family or "",
                 )
                 if shown == DERIVED_Q_CHI and row.active_mode_2d == "qip_qoop":

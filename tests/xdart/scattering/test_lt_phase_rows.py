@@ -9,7 +9,7 @@ delivers a press a disabled child does not take. Setup (adding phases, the share
 owners' own paths.
 """
 import pytest
-from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 from tests.xdart.scattering.test_help_residuals_gui import _phases_button
 from tests.xdart.scattering.test_phase_reference_overlays import _cif, _settle
@@ -54,6 +54,17 @@ def _label_point(scans, item):
 def _click(qapp, widget, point=None):
     QtTest.QTest.mouseClick(widget, LEFT, NONE, point if point is not None else widget.rect().center())
     qapp.processEvents()
+
+
+def _focus_name(widget):
+    return None if widget is None else f'{type(widget).__name__}:{widget.objectName() or "-"}'
+
+
+def _focus_state(qapp, window, editor, line):
+    """Where the keyboard focus is, for a failure message (CI-REDS diagnosis, 2026-10-29)."""
+    return dict(platform=QtGui.QGuiApplication.platformName(), focus=_focus_name(qapp.focusWidget()),
+                active=_focus_name(qapp.activeWindow()), window_active=window.isActiveWindow(),
+                editor_focus=editor.hasFocus(), line_focus=line.hasFocus(), text=line.text(), value=editor.value())
 
 
 def _selected(source):
@@ -194,6 +205,8 @@ def test_p1_include_checks_follow_real_indicator_clicks_and_space(qapp, tmp_path
         reopened = _window(qapp, view)
         assert _row(reopened.phase_source, a.id).checkState() != CHECKED
         assert _row(reopened.phase_source, b.id).checkState() == CHECKED and _flags(page)[a.id] is False
+        # declared oracle repair (PHASE-ANALYSIS-128): Int's window deletes on close, so its list is the reopened one
+        source, scans = reopened.phase_source, reopened.phase_source.browser.scans
 
         # A double-click on B's indicator behaves exactly as Qt's own checkable list does (B starts checked).
         changes, checked_after = _plain_double_click()
@@ -208,7 +221,7 @@ def test_p2_remove_acts_only_on_the_selected_phase_in_the_window(qapp, tmp_path)
     library = PhaseLibrary()
     a, b = (library.add_cif(_cif(tmp_path, name, a)) for name, a in (('phaseA', 4.1), ('phaseB', 4.25)))
     with run_page(qapp, tmp_path / 'int', energies=(16, 16)) as (page, view):
-        view.reference_phases.phase_source.set_selection(((a.id, True), (b.id, True), (LAB6, True)))
+        _window(qapp, view).phase_source.set_selection(((a.id, True), (b.id, True), (LAB6, True)))
         _settle(qapp, view)
         window = _window(qapp, view)  # its first show, with three phases listed
         window.activateWindow()
@@ -270,10 +283,11 @@ def test_p2_remove_acts_only_on_the_selected_phase_in_the_window(qapp, tmp_path)
 
 
 def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    # PHASE-ANALYSIS-128: the window Int's page mounts (the standalone constructor is retired)
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
     paths = tuple(str(_cif(tmp_path, name, a)) for name, a in (('CubicA', 4.0), ('CubicB', 4.5), ('CubicC', 5.0)))
-    dialog = PhaseFitDialog()
-    try:
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         source = dialog.phase_source
         source.add_cif_paths(paths)
         dialog.show()
@@ -300,13 +314,9 @@ def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
         _click(qapp, source.remove_btn)
         assert _ids(source) == [ids[1]] and fitted() == [ids[1]]
         _remove_follows_selection(source)
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
-    fresh = PhaseFitDialog()
-    try:
+    with empty_page(qapp) as other:  # a fresh page: its own, empty reference list
+        fresh = _open(qapp, other)
         fresh.phase_source.add_cif_paths(paths[:2])
         fresh.show()
         qapp.processEvents()
@@ -314,17 +324,13 @@ def test_p2_phase_fitter_remove_acts_only_on_the_selected_phase(qapp, tmp_path):
         _remove_follows_selection(fresh.phase_source)
         _click(qapp, fresh.phase_source.remove_btn)
         assert len(_ids(fresh.phase_source)) == 2
-    finally:
-        fresh.close()
-        fresh.deleteLater()
-        qapp.processEvents()
 
 
 def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_path):
     from xrd_tools.analysis.phase_references import PhaseLibrary
     tin = PhaseLibrary().add_lattice(TIN, a=4.24, space_group=225)
     with run_page(qapp, tmp_path / 'int', energies=(16, 16)) as (page, view):
-        view.reference_phases.phase_source.set_selection(((LAB6, True), (tin.id, True)))
+        _window(qapp, view).phase_source.set_selection(((LAB6, True), (tin.id, True)))
         _settle(qapp, view)
         window = _window(qapp, view)  # its first show, with the reported pair listed
         source, scans = window.phase_source, window.phase_source.browser.scans
@@ -358,19 +364,16 @@ def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_p
 
 
 def test_p3_phase_fitter_rows_fit_with_a_long_name(qapp, tmp_path):
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = PhaseFitDialog()
-    try:
+    # PHASE-ANALYSIS-128: the window Int's page mounts (the standalone constructor is retired)
+    from tests.xdart.scattering.test_phase_analysis_window import _open, empty_page
+    with empty_page(qapp) as page:
+        dialog = _open(qapp, page)
         source = dialog.phase_source
         source.add_lattice(TIN, a=4.24, space_group=225)
         source.add_lattice('Ti2AlN_mp-1234_conventional_standard_' + 'superlattice' * 8, a=3.0, space_group=221)
         dialog.show()
         qapp.processEvents()
         _rows_fit(qapp, source)
-    finally:
-        dialog.close()
-        dialog.deleteLater()
-        qapp.processEvents()
 
 
 def test_p3_row_editor_commits_once_and_keeps_its_draft(qapp, tmp_path):
@@ -402,9 +405,27 @@ def test_p3_row_editor_commits_once_and_keeps_its_draft(qapp, tmp_path):
         assert len(_of(commands, 'phase_floors')) == 1 and floor() == 2., 'Return commits once'
         commands.clear()
         edit('3')
-        QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Tab)
-        _settle(qapp, view)
-        assert len(_of(commands, 'phase_floors')) == 1 and floor() == 3., 'leaving the box commits once'
+        # CI-REDS diagnosis (2026-10-29): on Linux CI this Tab sent no commit (run 40996196112); record where the
+        # focus went, so a recurrence names its cause in the failure message.
+        moves = []
+
+        def record(old, new):
+            moves.append((_focus_name(old), _focus_name(new)))
+
+        def changed(value):  # the box's own commit, before BrowserView's same-value guard
+            moves.append(('valueChanged', value))
+        qapp.focusChanged.connect(record)
+        editor.valueChanged.connect(changed)
+        try:
+            before = _focus_state(qapp, window, editor, line)
+            QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Tab)
+            _settle(qapp, view)
+            after = _focus_state(qapp, window, editor, line)
+        finally:
+            qapp.focusChanged.disconnect(record)
+            editor.valueChanged.disconnect(changed)
+        assert len(_of(commands, 'phase_floors')) == 1 and floor() == 3., (
+            f'leaving the box commits once; before={before} after={after} moves={moves} commands={len(commands)}')
         commands.clear()
         _click(qapp, line)
         QtTest.QTest.keyClick(line, QtCore.Qt.Key.Key_Up)

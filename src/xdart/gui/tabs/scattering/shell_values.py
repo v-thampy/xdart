@@ -37,6 +37,7 @@ class ShellCommandKind(str, Enum):
     SHOW_ALL = "show_all"
     SHOW_METADATA = "show_metadata"
     SET_AUTO_LAST = "set_auto_last"
+    SET_ALL_FRAMES = "set_all_frames"
     LAUNCH_TOOL = "launch_tool"
     LAUNCH_EXTERNAL_VIEWER = "launch_external_viewer"
     SET_NORM_CHANNEL = "set_norm_channel"
@@ -286,6 +287,12 @@ class FrameNavigationProjection:
                 )
 
 
+#: The plot modes All frames acts in (ALL-FRAMES-128). Single draws a multi-frame selection together, as Show All did
+#: there (maintainer, 2026-10-30: "Same as Overlay (Recommended)"); Browse draws nothing in Average and Sum (the page's
+#: "Browse cache display is unavailable for Average/Sum" refusal).
+ALL_FRAMES_PLOT_MODES = frozenset({"Single", "Overlay", "Waterfall"})
+
+
 @dataclass(frozen=True, slots=True)
 class BrowserProjection:
     directory: str = ""
@@ -298,6 +305,9 @@ class BrowserProjection:
     multi_artifact_selection: bool = False
     #: Why the scan list is closed now, as its tooltip ("" while it is open): a running Run keeps other scans shut.
     scans_locked: str = ""
+    #: All frames (ALL-FRAMES-128): each result opened in Overlay/Waterfall shows every one of its frames; last, so
+    #: positional constructions keep their meaning
+    all_frames: bool = False
 
     def __post_init__(self) -> None:
         if type(self.scans_locked) is not str:
@@ -785,20 +795,22 @@ def restore_phase_references(options: ScientificPlotOptions, document) -> Scient
 @dataclass(frozen=True, slots=True, eq=False)
 class SavedSupportSource:
     """A Browse Int output's facts a frame's angular coverage may be rebuilt from (COVERAGE-SUPPORT-20261013, D5):
-    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames. Scalars
-    only: no handle, frame or array crosses into the reconstruction."""
+    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames, and the
+    Run handoff's stream seal when the load was sealed (``terminal``). Scalars only: no handle, frame or array crosses
+    into the reconstruction."""
 
     artifact: str
     path: str
     entry: str
     snapshot: object
     labels: tuple[int, ...]
+    terminal: object = None
 
     def request(self, labels):
         """The one reconstruction request for the output's shown frames ``labels``."""
         from xrd_tools.analysis.angular_support import SavedSupportRequest
         return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels,
-                                   tuple(sorted(int(label) for label in labels)))
+                                   tuple(sorted(int(label) for label in labels)), self.terminal)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1047,6 +1059,7 @@ def _scalar_is_valid(value: object) -> bool:
 
 
 __all__ = [
+    "ALL_FRAMES_PLOT_MODES",
     "ArtifactProgress",
     "AxisProjection",
     "BrowserProjection",

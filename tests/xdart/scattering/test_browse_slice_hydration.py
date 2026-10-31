@@ -24,7 +24,7 @@ from xrd_tools.io import Browse1DCache, FrameViewReader
 from xrd_tools.io.nexus import write_integrated_stack, write_scan_metadata
 from xrd_tools.io.nexus_record import ensure_frames_container, write_frame_record
 from xrd_tools.io.output_transaction import (
-    StreamTerminal, capture_target_snapshot, revalidate_stream_terminal,
+    StreamTerminal, capture_target_revision, capture_target_snapshot, revalidate_stream_terminal,
 )
 
 
@@ -65,24 +65,32 @@ def saved(tmp_path, request):
             {"I0": [float(n) for n in labels], "epoch": [float(n + 10) for n in labels]},
             index=labels,
         ), labels)
+        if getattr(request, "param", None) == "bad facts":
+            source = entry["frames/frame_0005"].create_group("source")
+            source.create_dataset("path", data=np.bytes_(b"x" * 5000))
+            source.create_dataset("frame_index", data=np.int64(1))
     with FrameViewReader(path, include_thumbnail=False, resolve_source=False) as reader:
         catalog = reader.read_scalar_catalog()
     snapshot = capture_target_snapshot(path)
+    if getattr(request, "param", None) == "revision":
+        snapshot = capture_target_revision(path)
     terminal = None
     if getattr(request, "param", None) == "terminal":
-        stat = path.stat()
+        with path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
         terminal = StreamTerminal(str(path.resolve()), stat.st_size, snapshot.digest,
                                   len(labels), stat.st_dev, stat.st_ino,
                                   stat.st_mtime_ns, stat.st_ctime_ns)
         snapshot = revalidate_stream_terminal(path, terminal)
     request = BrowseLoadRequest("browse-slice", 1, str(path.resolve()), terminal)
     cache = Browse1DCache(1 << 20)
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=request.token, load_generation=request.load_generation,
         operation=request, requested_path=request.source_path, scan_key="scan",
         scan=object(), frame=None, frame_ids=catalog.labels, frames={},
         viewer_rows_1d={}, viewer_rows_2d={}, publication_store=PublicationStore(),
-        record_store={}, scalar_catalog=catalog, browse_1d_cache=cache,
+        record_store={}, scalar_catalog=catalog, browse_1d_cache=cache, frame_facts=FrameFactsStore(),
         target_entry=catalog.entry, loaded_labels=catalog.labels,
         target_snapshot=snapshot,
         calibration_identity='{"wavelength_m": 1e-10}',
@@ -119,6 +127,29 @@ def test_full_chi_without_saved_cake_never_substitutes_native_q(saved):
     result = _project(saved, ScientificPreferences(plot_axis="chi"))
     assert not result.traces
     assert "no saved 2-D data" in result.diagnostic
+
+
+@pytest.mark.parametrize("saved", ["bad facts"], indirect=True)
+@pytest.mark.parametrize("resident", [False, True])
+def test_malformed_frame_facts_refuse_slice_with_frame_reason(saved, resident):
+    from xrd_tools.io import FrameFactsFailure
+
+    path, context, frames, _selection, _lane = saved
+    with FrameViewReader(path, resolve_source=False) as reader:
+        (failure,) = reader.read_frame_facts((5,))
+    assert type(failure) is FrameFactsFailure
+    if resident:
+        context.frame_facts.commit((failure,))
+    before = context.frame_facts.resident_labels
+    result = _project(saved, ScientificPreferences(slice_enabled=True, slice_center=0.0,
+                                                   slice_width=0.1), selected=(frames[1],))
+    assert not result.traces
+    assert failure.reason in result.diagnostic
+    assert "frame_0005" in result.diagnostic
+    assert context.frame_facts.resident_labels == before, "the slice lane never populates facts"
+    valid = _project(saved, ScientificPreferences(slice_enabled=True, slice_center=0.0,
+                                                  slice_width=0.1), selected=(frames[0],))
+    assert valid.diagnostic == "" and len(valid.traces) == 1
 
 
 @pytest.mark.parametrize("mode", ["Single", "Overlay", "Waterfall"])
@@ -316,7 +347,40 @@ def test_changed_target_during_read_discards_entire_batch(saved, monkeypatch):
     assert "changed" in result.diagnostic and not result.traces
 
 
-@pytest.mark.parametrize("saved", [True, "terminal"], indirect=True)
+@pytest.mark.parametrize("saved", [True, "revision", "terminal"], indirect=True)
+def test_same_stat_rewrite_before_lazy_lane_creation_refuses_saved_cuts(saved, monkeypatch):
+    path, context, frames, selection, old_lane = saved
+    _wait(old_lane.release)
+    before = path.stat()
+    with h5py.File(path, "r+") as handle:
+        intensity = handle["entry/integrated_2d/intensity"]
+        intensity[...] = intensity[...] + 100
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = capture_target_revision(path)
+    assert (after.size, after.mtime_ns, after.device, after.inode) == (
+        before.st_size, before.st_mtime_ns, before.st_dev, before.st_ino)
+    terminal = context.load_request.terminal_commit_identity
+    loaded_ctime = terminal.ctime_ns if terminal is not None else context.target_snapshot.ctime_ns
+    assert after.ctime_ns != loaded_ctime
+    reads = []
+    real_read = FrameViewReader.read
+
+    def read(reader, *args, **kwargs):
+        reads.append(args)
+        return real_read(reader, *args, **kwargs)
+
+    monkeypatch.setattr(FrameViewReader, "read", read)
+    lane = BrowseSliceLane(context)
+    try:
+        result = _project((path, context, frames, selection, lane),
+                          ScientificPreferences(slice_enabled=True))
+        assert "changed" in result.diagnostic and not result.traces
+        assert not reads, "refuse the changed revision before reading new scientific data"
+    finally:
+        _wait(lane.release)
+
+
+@pytest.mark.parametrize("saved", [True, "revision", "terminal"], indirect=True)
 def test_display_requalification_never_rehashes_loaded_artifact(saved, monkeypatch):
     import xrd_tools.io.output_transaction as transaction
 

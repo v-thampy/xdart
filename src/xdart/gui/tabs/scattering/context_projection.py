@@ -432,6 +432,7 @@ class ContextProjection:
         viewer_waterfall_active: bool = False,
         date_sorted: bool,
         auto_last: bool,
+        all_frames: bool = False,
         executor_available: bool,
         start_permitted: bool,
         start_blocker: str,
@@ -564,6 +565,7 @@ class ContextProjection:
                 browser_directory=browser_directory,
                 date_sorted=date_sorted,
                 auto_last=auto_last,
+                all_frames=all_frames,
                 catalog=browser_catalog,
                 catalog_index=browser_catalog_index,
                 transient_frame=browser_transient_frame,
@@ -788,15 +790,17 @@ def attach_saved_rings(scientific: ScientificProjection, basis, current) -> Scie
 def attach_saved_support_source(scientific: ScientificProjection, browse: BrowseContext) -> ScientificProjection:
     """A Browse Int output's own facts, from which the strip may rebuild a frame's angular coverage when the output
     saved none (COVERAGE-SUPPORT-20261013, D5): its frames' name, file, entry, load snapshot and labels."""
+    from .browse_values import sealed_load_terminal
     from .shell_values import SavedSupportSource
 
     catalog = browse.scalar_catalog
     if (scientific.processing_mode not in {"Int 1D", "Int 2D"} or browse.target_snapshot is None
             or catalog is None or not catalog.labels):
         return scientific
+    # A sealed Run handoff's snapshot is revalidated against its seal, as the 1-D lane does (TERMINAL-SUPPORT-128).
     return replace(scientific, saved_support_source=SavedSupportSource(
         browse.requested_path, catalog.artifact_path, browse.target_entry or catalog.entry, browse.target_snapshot,
-        tuple(catalog.labels)))
+        tuple(catalog.labels), sealed_load_terminal(browse.load_request)))
 
 
 def _browse_payload(

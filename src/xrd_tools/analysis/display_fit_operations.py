@@ -42,6 +42,23 @@ _MAX_FIT_PARAMETERS, _MAX_PARAMETER_NAME_BYTES = 512, 256
 _MAX_PARAMETER_NAMES_BYTES = 64 * 1024
 _MAX_DIAGNOSTIC_BYTES = 1024
 _PEAK_POLICY_VERSION = "p37-peak-selection-v1"
+#: PHASE-ANALYSIS-128: the notebook's canonical choices (the kernel's ``_PHASE_PROFILE_SPEC`` and model specs)
+_PHASE_PROFILES = frozenset({"gaussian", "lorentzian", "pseudovoigt", "voigt", "lorentzian_squared", "pearson7",
+                             "splitlorentzian", "moffat", "pearson4", "studentst", "skewedgaussian"})
+_WIDTH_MODELS = frozenset({"caglioti", "scherrer", "fixed"})
+_TEXTURES = frozenset({"none", "march_dollase", "free"})
+_FIT_BACKGROUNDS = frozenset({"none", "linear", "polynomial", "chebyshev", "spline", "template", "template+linear",
+                              "template+polynomial", "template+chebyshev"})
+_AMORPHOUS_PROFILES = frozenset({"none", "gaussian", "pseudovoigt", "lorentzian", "voigt", "lorentzian_squared"})
+_RANGE_UNITS = frozenset({"q_A^-1", "2th_deg", "2th_rad"})
+#: each new option's default: only a value that differs joins the plan's identity, so earlier plans keep theirs
+_PHASE_OPTION_DEFAULTS = (
+    ("width_model", "caglioti"), ("width_limits", (None, None)), ("texture", "none"), ("march_axis", (0, 0, 1)),
+    ("free_height_range", (0.0, 10.0)), ("q_shift_bound", 0.05), ("lock_cross_phase", False), ("snip_width", None),
+    ("fit_background", "none"), ("fit_background_degree", 3), ("amorphous_peak", "none"), ("amorphous_center", 1.5),
+    ("amorphous_sigma", 0.3), ("fit_range", None), ("fit_range_unit", "q_A^-1"), ("initial_values", ()),
+    ("initial_topology", ()),
+)
 def _tuple_once(value: Any) -> tuple[Any, ...]:
     if type(value) is tuple:
         return value
@@ -175,6 +192,11 @@ class CifAssetReceipt:
     pre_state: tuple[int, int, int, int, int, int]
     post_state: tuple[int, int, int, int, int, int]
     receipt_fingerprint: str
+def _nested_tuple(value: Any) -> Any:
+    """A JSON-loaded sequence (lists) as the plan keeps it: tuples all the way down."""
+    if type(value) in {tuple, list}:
+        return tuple(_nested_tuple(item) for item in value)
+    return value
 @dataclass(frozen=True, slots=True)
 class DisplayedPhaseFitPlan:
     trace: DisplayedTraceInput
@@ -192,12 +214,40 @@ class DisplayedPhaseFitPlan:
     #: each phase's own minimum intensity, aligned with ``phase_names`` (REFERENCE-PHASES-20261011); empty: every
     #: phase uses ``min_intensity``. A lattice phase's value is ignored (it has no intensities).
     phase_min_intensities: tuple[float, ...] = ()
+    #: PHASE-ANALYSIS-128: the HZO notebook's options. Each default reproduces the earlier fit, and only a value that
+    #: differs from its default joins the plan's identity (``_phase_plan_value``).
+    width_model: str = "caglioti"
+    width_limits: tuple[float | None, float | None] = (None, None)
+    texture: str = "none"
+    march_axis: tuple[int, int, int] = (0, 0, 1)
+    free_height_range: tuple[float, float] = (0.0, 10.0)
+    q_shift_bound: float = 0.05
+    lock_cross_phase: bool = False
+    snip_width: int | None = None
+    fit_background: str = "none"
+    fit_background_degree: int = 3
+    #: the substrate's pattern, captured through the fit's own input path (a q trace)
+    background_template: DisplayedTraceInput | None = None
+    amorphous_peak: str = "none"
+    amorphous_center: float = 1.5
+    amorphous_sigma: float = 0.3
+    #: the solve's interval in ``fit_range_unit`` (the whole finite trace is still prepared and returned)
+    fit_range: tuple[float, float] | None = None
+    fit_range_unit: str = "q_A^-1"
+    #: a Sequential batch's seed: the previous completed fit's (name, value) pairs and its phase/reflection topology
+    initial_values: tuple[tuple[str, float], ...] = ()
+    initial_topology: tuple[Any, ...] = ()
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
         object.__setattr__(self, "phase_names", _tuple_once(self.phase_names))
         object.__setattr__(self, "phase_entries", _tuple_once(self.phase_entries))
         object.__setattr__(self, "phase_min_intensities", _tuple_once(self.phase_min_intensities))
+        for name in ("width_limits", "march_axis", "free_height_range"):
+            object.__setattr__(self, name, _tuple_once(getattr(self, name)))
+        object.__setattr__(self, "fit_range", _optional_tuple_once(self.fit_range))
+        object.__setattr__(self, "initial_values", tuple(_tuple_once(pair) for pair in _tuple_once(self.initial_values)))
+        object.__setattr__(self, "initial_topology", _nested_tuple(self.initial_topology))
 @dataclass(frozen=True, slots=True)
 class DisplayedPhaseFitResult:
     disposition: AnalysisDisposition
@@ -227,6 +277,12 @@ class DisplayedPhaseFitResult:
     result_fingerprint: str = ""
     phase_names: tuple[str, ...] = ()
     phase_fractions_reason: str = ""
+    #: PHASE-ANALYSIS-128: the fitted background and the amorphous peak (None when the fit has none)
+    fit_background: np.ndarray | None = None
+    amorphous: np.ndarray | None = None
+    #: each fitted phase's (id, kind, ordered reflection hkls): a Sequential seed applies only to the same listing.
+    #: Derived from the pinned inputs, so it stays out of the result fingerprint.
+    seed_topology: tuple[Any, ...] = ()
 class _Refusal(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -521,6 +577,11 @@ def _phase_plan_value(
         value += (("phase_entries", tuple((entry.id, entry.name, entry.source_kind, entry.lattice) for entry in plan.phase_entries)),)
     if plan.phase_min_intensities:
         value += (("phase_min_intensities", plan.phase_min_intensities),)
+    value += tuple((name, getattr(plan, name)) for name, default in _PHASE_OPTION_DEFAULTS
+                   if getattr(plan, name) != default)
+    if plan.background_template is not None:
+        template = plan.background_template
+        value += (("background_template", template.trace_fingerprint, _receipt_value(template.receipt)),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     if not isinstance(plan, DisplayedPhaseFitPlan):
@@ -541,7 +602,7 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid expected hash")
     if not _valid_number(plan.wavelength_angstrom) or plan.wavelength_angstrom <= 0:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid wavelength")
-    if type(plan.prefit_background) is not str or plan.prefit_background not in {"none", "snip", "chebyshev"} or type(plan.phase_profile) is not str or plan.phase_profile not in {"pseudovoigt", "gaussian", "lorentzian", "voigt"}:
+    if type(plan.prefit_background) is not str or plan.prefit_background not in {"none", "snip", "chebyshev"} or type(plan.phase_profile) is not str or plan.phase_profile not in _PHASE_PROFILES:
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase option")
     if not _valid_number(plan.lattice_pct, minimum=0, maximum=0.25) or not _valid_number(plan.min_intensity, minimum=0, maximum=100):
         raise _Refusal("INVALID_PHASE_PLAN", "invalid phase numeric option")
@@ -554,7 +615,147 @@ def _validate_phase(plan: DisplayedPhaseFitPlan) -> float:
     _fit_sigma(plan, finite)
     if np.count_nonzero(finite) < 10:
         raise _Refusal("INSUFFICIENT_FIT_POINTS", "phase fit needs ten finite points")
+    _validate_phase_options(plan, finite)
     return float(plan.wavelength_angstrom)
+def _invalid(field: str) -> _Refusal:
+    return _Refusal("INVALID_PHASE_PLAN", f"invalid {field}")
+def _choice(value: Any, choices: frozenset) -> bool:
+    return type(value) is str and value in choices
+def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> None:
+    """PHASE-ANALYSIS-128: each notebook option checked by name before any backend work."""
+    if any(getattr(entry, "source_kind", "") == "calibrant" for entry in plan.phase_entries):
+        raise _Refusal("INVALID_PHASE_PLAN", "calibrants are reference lines only and are not fitted")
+    if not _choice(plan.width_model, _WIDTH_MODELS):
+        raise _invalid("width_model")
+    limits = plan.width_limits
+    if len(limits) != 2 or any(value is not None and not (_valid_number(value) and value > 0) for value in limits) or (
+            None not in limits and not limits[0] < limits[1]):
+        raise _invalid("width_limits")
+    # The kernel fills each omitted bound independently, using the full finite trace (not the solve mask).
+    floor = 1e-5 if limits[0] is None else limits[0]
+    cap = float(np.ptp(plan.trace.axis[finite])) / 4 if limits[1] is None else limits[1]
+    if not floor < cap or (plan.width_model == "caglioti" and not max(floor ** 2, 1e-12) < cap ** 2):
+        raise _invalid("width_limits")
+    if not _choice(plan.texture, _TEXTURES):
+        raise _invalid("texture")
+    axis = plan.march_axis
+    if len(axis) != 3 or any(type(value) is not int or abs(value) > 20 for value in axis) or (
+            plan.texture == "march_dollase" and not any(axis)):
+        raise _invalid("march_axis")
+    heights = plan.free_height_range
+    if len(heights) != 2 or not all(_valid_number(value) for value in heights) or not 0 <= heights[0] < heights[1]:
+        raise _invalid("free_height_range")
+    if not _valid_number(plan.q_shift_bound) or not plan.q_shift_bound > 0:
+        raise _invalid("q_shift_bound")  # zero is refused: equal bounds cannot be fitted
+    if type(plan.lock_cross_phase) is not bool:
+        raise _invalid("lock_cross_phase")
+    if plan.snip_width is not None and (type(plan.snip_width) is not int
+                                        or not 1 <= plan.snip_width <= int(np.count_nonzero(finite))):
+        raise _invalid("snip_width")
+    if not _choice(plan.fit_background, _FIT_BACKGROUNDS):
+        raise _invalid("fit_background")
+    if type(plan.fit_background_degree) is not int or not 2 <= plan.fit_background_degree <= 15:
+        raise _invalid("fit_background_degree")
+    if plan.fit_background.startswith("template") != (plan.background_template is not None):
+        raise _invalid("background_template")
+    if plan.background_template is not None:
+        _template_arrays(plan.background_template)
+    if not _choice(plan.amorphous_peak, _AMORPHOUS_PROFILES):
+        raise _invalid("amorphous_peak")
+    if not _valid_number(plan.amorphous_center):
+        raise _invalid("amorphous_center")
+    if not _valid_number(plan.amorphous_sigma) or not plan.amorphous_sigma > 0:
+        raise _invalid("amorphous_sigma")
+    if plan.amorphous_peak != "none":
+        axis_values = plan.trace.axis[finite]
+        if not float(np.min(axis_values)) <= plan.amorphous_center <= float(
+                np.max(axis_values)):
+            raise _invalid("amorphous_center")
+    if not _choice(plan.fit_range_unit, _RANGE_UNITS):
+        raise _invalid("fit_range_unit")
+    if plan.fit_range is not None:
+        if len(plan.fit_range) != 2 or not all(_valid_number(value) for value in plan.fit_range) or not (
+                plan.fit_range[0] < plan.fit_range[1]):
+            raise _invalid("fit_range")
+        if np.count_nonzero(_solve_mask(plan, finite)) < 10:
+            raise _Refusal("INSUFFICIENT_FIT_POINTS", "the fit range holds fewer than ten finite points")
+    seeds = plan.initial_values
+    if seeds:
+        if (len(seeds) > _MAX_FIT_PARAMETERS or any(len(pair) != 2 or type(pair[0]) is not str or not pair[0]
+                                                   or len(pair[0].encode("utf-8")) > _MAX_PARAMETER_NAME_BYTES
+                                                   or not _valid_number(pair[1]) for pair in seeds)
+                or len({name for name, _value in seeds}) != len(seeds)
+                or sum(len(name.encode("utf-8")) for name, _value in seeds) > _MAX_PARAMETER_NAMES_BYTES):
+            raise _invalid("initial_values")
+        if not plan.initial_topology:
+            raise _invalid("initial_topology")
+    topology = plan.initial_topology
+    if type(topology) is not tuple:
+        raise _invalid("initial_topology")
+    if topology:
+        if len(topology) > _MAX_PHASES:
+            raise _invalid("initial_topology")
+        reflections = 0
+        for phase in topology:
+            if (type(phase) is not tuple or len(phase) != 3 or type(phase[0]) is not str or not phase[0]
+                    or len(phase[0].encode("utf-8")) > 256 or phase[1] not in ("cif", "lattice")
+                    or type(phase[2]) is not tuple or len(phase[2]) > _MAX_REFLECTIONS_PER_PHASE
+                    or any(type(hkl) is not tuple or len(hkl) != 3 or any(
+                        type(v) is not int or abs(v) > 2**31 - 1 for v in hkl)
+                           for hkl in phase[2])):
+                raise _invalid("initial_topology")
+            reflections += len(phase[2])
+        if reflections > _MAX_REFLECTIONS_TOTAL:
+            raise _invalid("initial_topology")
+def _q_bounds(plan: DisplayedPhaseFitPlan) -> tuple[float, float] | None:
+    """The fit range in Å⁻¹ (a 2θ range converted with the plan's wavelength), or None."""
+    if plan.fit_range is None:
+        return None
+    if plan.fit_range_unit == "q_A^-1":
+        low, high = plan.fit_range
+    else:
+        from xrd_tools.core.containers import convert_radial_axis
+        low, high = (float(value) for value in convert_radial_axis(
+            np.asarray(plan.fit_range, dtype=float), plan.fit_range_unit, "q_A^-1", plan.wavelength_angstrom))
+    return (min(low, high), max(low, high))
+def _solve_mask(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> np.ndarray:
+    low, high = _q_bounds(plan)
+    return finite & (plan.trace.axis >= low) & (plan.trace.axis <= high)
+def _template_arrays(template: Any) -> tuple[np.ndarray, np.ndarray]:
+    """A substrate admitted as the trace is (limits, Å⁻¹), keeping finite paired points: at least two distinct q."""
+    if not isinstance(template, DisplayedTraceInput):
+        raise _invalid("background_template")
+    try:
+        _fit_trace(template)
+        require_inverse_angstrom(template.axis_unit, operation="a substrate template")
+    except (_Refusal, ValueError) as exc:
+        raise _invalid("background_template") from exc
+    keep = np.isfinite(template.axis) & np.isfinite(template.intensity)
+    x, y = np.asarray(template.axis)[keep], np.asarray(template.intensity)[keep]
+    order = np.argsort(x, kind="stable")
+    x, y = x[order], y[order]
+    if x.size < 2 or np.any(np.diff(x) <= 0):
+        raise _invalid("background_template")
+    return x, y
+def _fit_background_spec(plan: DisplayedPhaseFitPlan) -> str | None:
+    degree = plan.fit_background_degree
+    return {"none": None, "linear": "polynomial1", "polynomial": f"polynomial{degree}",
+            "chebyshev": f"chebyshev{degree}", "spline": f"spline{max(4, degree)}", "template": "template",
+            "template+linear": "template+polynomial1", "template+polynomial": f"template+polynomial{degree}",
+            "template+chebyshev": f"template+chebyshev{degree}"}[plan.fit_background]
+def _seed_topology(fitter: Any, entries: list) -> tuple[Any, ...]:
+    """Each fitted phase's (id, kind, ordered reflection hkls): a seed's parameters name reflections by position."""
+    return tuple((entry.id, entry.source_kind, hkls) for entry, hkls in zip(entries, fitter.reflection_hkls(),
+                                                                            strict=True))
+def _apply_seed(params: Any, seeds: tuple[tuple[str, float], ...]) -> None:
+    """Start independent varying parameters at the previous fit's values, kept inside their bounds."""
+    for name, value in seeds:
+        parameter = params.get(name)
+        if parameter is None or not parameter.vary or parameter.expr is not None:
+            continue
+        low = parameter.min if math.isfinite(parameter.min) else -math.inf
+        high = parameter.max if math.isfinite(parameter.max) else math.inf
+        parameter.set(value=min(max(float(value), low), high))
 def _file_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (value.st_mode, value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 def _capture_cif(path: Path, name: str, expected: str | None) -> tuple[bytes, CifAssetReceipt]:
@@ -641,25 +842,51 @@ def run_displayed_phase_fit(
             code = "PHASE_REFLECTION_LIMIT_EXCEEDED" if "reflection limit" in str(exc) else "CIF_PARSE_FAILED"
             raise _Refusal(code, str(exc)) from exc
         markers.extend(peak.q for reference in references for peak in reference.reflections)
-        profile_extra = 1 if plan.phase_profile in {"pseudovoigt", "voigt"} else 0
-        heights = sum(len(phase.peaks) for phase in phases if getattr(phase, "source_kind", "") == "lattice")
+        profile_extra = {"pseudovoigt": 1, "voigt": 1, "pearson7": 1, "splitlorentzian": 1, "moffat": 1,
+                         "skewedgaussian": 1, "pearson4": 2}.get(plan.phase_profile, 0)
+        # an early guard only: free heights (every lattice peak; every CIF peak with free texture), not the
+        # background or amorphous terms, which the exact count on the built parameters (``_parameters``) catches
+        heights = sum(len(phase.peaks) for phase in phases
+                      if getattr(phase, "source_kind", "") == "lattice" or plan.texture == "free")
         if 1 + len(phases) * (8 + 3 + profile_extra + 2) + heights > _MAX_FIT_PARAMETERS:
             raise _Refusal("FIT_PARAMETER_LIMIT_EXCEEDED", "predicted fit parameter limit exceeded")
         sigma = _fit_sigma(plan, finite)
-        fitter = PhaseFitter(x, y, prefit_background=plan.prefit_background) if sigma is None else PhaseFitter(
-            x, y, sigma, prefit_background=plan.prefit_background)
+        options = {"prefit_background": plan.prefit_background}
+        if plan.snip_width is not None:
+            options["prefit_background_kwargs"] = {"snip_width": plan.snip_width}
+        spec = _fit_background_spec(plan)
+        if spec is not None:
+            options["fit_background"] = spec
+        if plan.background_template is not None:
+            options["fit_background_template"] = _template_arrays(plan.background_template)
+        if plan.amorphous_peak != "none":
+            options.update(amorphous_peak=plan.amorphous_peak, amorphous_init={
+                "center": float(plan.amorphous_center), "sigma": float(plan.amorphous_sigma)})
+        fitter = PhaseFitter(x, y, **options) if sigma is None else PhaseFitter(x, y, sigma, **options)
         floors = plan.phase_min_intensities or (plan.min_intensity,) * len(phases)
         for phase, floor in zip(phases, floors):  # the same per-phase value at both filter sites
             fitter.add_phase(phase, q_range=q_range, min_intensity=floor)
         params = fitter.build_parameters(
-            lattice_pct=plan.lattice_pct, phase_profile=plan.phase_profile,
-            texture="none",
+            lattice_pct=plan.lattice_pct, phase_profile=plan.phase_profile, texture=plan.texture,
+            march_axis=plan.march_axis, pk_scale_range=plan.free_height_range, width_model=plan.width_model,
+            width_min=plan.width_limits[0], width_max=plan.width_limits[1],
+            lock_cross_phase=plan.lock_cross_phase, q_shift_bound=plan.q_shift_bound,
         )
+        topology, diagnostics = _seed_topology(fitter, entries), ()
+        if plan.initial_values:
+            if plan.initial_topology == topology:
+                _apply_seed(params, plan.initial_values)
+            else:
+                diagnostics = ("PHASE_SEED_DROPPED: the previous fit's reflections differ, so this fit started "
+                               "from the defaults",)
         names, values, errors = _parameters(params)
         fit_kwargs = {} if plan.max_nfev is None else {"max_nfev": plan.max_nfev}
+        bounds = _q_bounds(plan)
+        if bounds is not None:
+            fit_kwargs["q_range"] = bounds  # the solve only: the whole finite trace is prepared and returned
         backend = fitter.fit(
             params=params, phase_profile=plan.phase_profile,
-            lattice_pct=plan.lattice_pct, texture="none", **fit_kwargs,
+            lattice_pct=plan.lattice_pct, texture=plan.texture, **fit_kwargs,
         )
         if cancel_token is not None and cancel_token.is_set():
             return _cancelled_phase(plan)
@@ -674,7 +901,7 @@ def run_displayed_phase_fit(
         )
         success = bool(backend.success)
         scalar_floor = (
-            "completed", "OK", (), plan.trace.trace_fingerprint,
+            "completed", "OK", diagnostics, plan.trace.trace_fingerprint,
             _receipt_value(plan.trace.receipt), plan_fp, policy_fp,
             wavelength_angstrom, receipt_values, success, "",
             plan.trace.label, plan.trace.axis_unit, names, values, errors,
@@ -726,7 +953,7 @@ def run_displayed_phase_fit(
             lattice_values.append(entry)
         lattice = tuple(lattice_values)
         scalar = (
-            "completed", "OK", (), plan.trace.trace_fingerprint,
+            "completed", "OK", diagnostics, plan.trace.trace_fingerprint,
             _receipt_value(plan.trace.receipt), plan_fp, policy_fp,
             wavelength_angstrom, receipt_values, success, message,
             plan.trace.label, plan.trace.axis_unit, names, values, errors,
@@ -752,6 +979,14 @@ def run_displayed_phase_fit(
             component_values.append(component)
         components = tuple(component_values)
         arrays = (fit, background, residual, marker_array, *components)
+        extra = {}
+        for name, requested in (("fit_background", spec is not None), ("amorphous", plan.amorphous_peak != "none")):
+            if requested:  # evaluated only when the plan asks for the component
+                values_array = (fitter.eval_fit_background(backend.params) if name == "fit_background"
+                                else fitter.eval_amorphous(backend.params))
+                extra[name] = _result_array(values_array, x.size)
+                size = _result_add(size, extra[name])
+                arrays += ((name, extra[name]),)  # joins the fingerprint only when present
         fingerprint = _digest((scalar, arrays))
         _progress(progress_callback, len(sources) + 1, len(sources) + 1)
         if cancel_token is not None and cancel_token.is_set():
@@ -770,7 +1005,9 @@ def run_displayed_phase_fit(
             lattice_parameters=lattice, phase_components=components,
             fit=fit, background=background, residual=residual,
             marker_positions=marker_array, storage_bytes=size,
-            result_fingerprint=fingerprint,
+            result_fingerprint=fingerprint, diagnostics=diagnostics,
+            fit_background=extra.get("fit_background"), amorphous=extra.get("amorphous"),
+            seed_topology=topology,
         )
     except _Refusal as exc:
         return _phase_refusal(plan, exc.code, str(exc))

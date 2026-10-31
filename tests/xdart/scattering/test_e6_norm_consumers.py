@@ -400,6 +400,7 @@ def _browse_parts(
         for metadata in rows:
             draft = fold_norm_metadata(draft, metadata)
         aggregate = next_norm_revision(draft)
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=token,
         load_generation=generation,
@@ -412,6 +413,7 @@ def _browse_parts(
         loaded_labels=catalog.labels,
         scalar_catalog=catalog,
         browse_1d_cache=Browse1DCache(budget_bytes=1024),
+        frame_facts=FrameFactsStore(),
         frames={},
         viewer_rows_1d={},
         viewer_rows_2d={},

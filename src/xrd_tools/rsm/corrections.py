@@ -44,12 +44,14 @@ def detector_header_to_ai(header: Any, *, wavelength_m: float = 1.0e-10):
     p2 = float(header.pwidth2) * 1.0e-3
     det = Detector(pixel1=p1, pixel2=p2,
                    max_shape=(int(header.Nch1), int(header.Nch2)))
-    return AzimuthalIntegrator(
+    integrator = AzimuthalIntegrator(
         dist=float(header.distance) * 1.0e-3,
         poni1=float(header.cch1) * p1,
         poni2=float(header.cch2) * p2,
         rot1=0.0, rot2=0.0, rot3=0.0,
         detector=det, wavelength=wavelength_m)
+    integrator.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
+    return integrator
 
 
 def gi_grid_weight(
@@ -94,6 +96,7 @@ def gi_grid_weight(
         poni2=float(h.cch2) * p2, rot1=0.0, rot2=0.0, rot3=0.0,
         detector=Detector(pixel1=p1, pixel2=p2, max_shape=shape),
         wavelength=wavelength)
+    fi.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     air = float(np.radians(incident_angle_deg))
     tilt = float(np.radians(tilt_deg))
     fi.reset_integrator(incident_angle=air, tilt_angle=tilt,

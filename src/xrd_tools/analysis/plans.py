@@ -1327,6 +1327,82 @@ def run_sin2psi(plan: Sin2PsiPlan, result2d: IntegrationResult2D) -> AnalysisRes
     return AnalysisResult(kind="sin2psi", payload=payload, provenance={"plan": _plan_dict(plan)})
 
 
+@dataclass(frozen=True, slots=True)
+class StrainPlan:
+    """One frame's strain analysis (STRAIN-ANALYSIS-128): the sectors, the per-sector peak fit, the sectors the user
+    left out (by their signed χ centre, in degrees, so a batch leaves out the same sector in every frame), the d0
+    policy (a ``D0Reference``, ``"psi_star"`` or None), the reflection's elastic constants and the optical material
+    for the refraction check. Only equibiaxial stress is offered; uniaxial stress waits for a geometry model."""
+
+    q_range: tuple[float, float]
+    chi_range: tuple[float, float] | None = None
+    chi_centers: tuple[float, ...] | None = None
+    chi_width: float = 5.0
+    n_sectors: int | None = None
+    branches: tuple[int, ...] = (1,)
+    min_finite_fraction: float = 0.5
+    model: str = "pseudovoigt"
+    background: str = "linear"
+    sigma_init: float | None = None
+    sigma_bounds: tuple[float, float] | None = None
+    center_bounds_delta: float | None = None
+    min_height_sigma: float = 5.0
+    excluded_chi: tuple[float, ...] = ()
+    d0: Any = None
+    elastic: Any = None
+    stress_state: str = "equibiaxial"
+    material: str | None = None
+    density_kg_m3: float | None = None
+
+
+def run_strain(plan: StrainPlan, result2d: IntegrationResult2D, *, incident_angle_deg: float | None = None,
+               energy_eV: float | None = None) -> AnalysisResult:
+    """The strain analysis of one GI fiber map; missing refraction context is explicitly apparent/unknown."""
+    from xrd_tools.analysis.axis_units import require_inverse_angstrom
+    from xrd_tools.analysis.strain import (
+        RefractionEstimate, StrainAnalysisResult, fit_strain_sectors, refraction_estimate, strain_regression,
+        strain_sectors,
+    )
+
+    require_inverse_angstrom(result2d.unit)
+    sectors = strain_sectors(
+        result2d, chi_centers=plan.chi_centers, chi_width=plan.chi_width, n_sectors=plan.n_sectors,
+        chi_range=plan.chi_range, branches=plan.branches, min_finite_fraction=plan.min_finite_fraction,
+        q_range=plan.q_range)
+    points = fit_strain_sectors(
+        sectors, plan.q_range, model=plan.model, background=plan.background, sigma_init=plan.sigma_init,
+        sigma_bounds=plan.sigma_bounds, center_bounds_delta=plan.center_bounds_delta,
+        min_height_sigma=plan.min_height_sigma)
+    if plan.excluded_chi:
+        points = tuple(
+            replace(point, excluded="left out by you")
+            if point.excluded is None and point.sector is not None
+            and any(abs(point.sector.chi_center - chi) < 1e-6 for chi in plan.excluded_chi) else point
+            for point in points)
+    usable = [point for point in points if point.excluded is None]
+    fit = strain_regression(usable, d0=plan.d0, elastic=plan.elastic, stress_state=plan.stress_state)
+    branch_fits = {}
+    observed_branches = sorted({point.branch for point in usable})
+    for branch in observed_branches:
+        side = [point for point in usable if point.branch == branch]
+        if len(observed_branches) > 1 and len(side) >= 3:
+            try:
+                branch_fits[branch] = strain_regression(side)
+            except ValueError:
+                pass
+    missing = [name for name, value in (("incidence", incident_angle_deg), ("energy", energy_eV)) if value is None]
+    refraction = RefractionEstimate(None, True, None, None,
+                                   "refraction unknown: missing " + " and ".join(missing) + "; stress is apparent")
+    if incident_angle_deg is not None and energy_eV is not None:
+        refraction = refraction_estimate(
+            points, fit, incident_angle_deg=incident_angle_deg, energy_eV=energy_eV, material=plan.material,
+            density_kg_m3=plan.density_kg_m3)
+    payload = StrainAnalysisResult(sectors, points, fit, branch_fits, refraction)
+    return AnalysisResult(kind="strain", payload=payload, provenance={
+        "plan": _plan_dict(plan), "incident_angle_deg": incident_angle_deg, "energy_eV": energy_eV,
+        "sigma_recorded": result2d.sigma is not None})
+
+
 def make_phase_fitter(
     result: IntegrationResult1D | tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray | None],
     **kwargs: Any,

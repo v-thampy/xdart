@@ -374,6 +374,8 @@ class ContextController:
         self._viewer_2d = _TwoDViewerOwner(self)
         self._viewer_2d_standalone: HydrationTransport | None = None
         self._browse_request: BrowseLoadRequest | None = None
+        #: A re-click's revision check of the shown context (BROWSE-CLICK-128); it never releases that context.
+        self._browse_recheck: BrowseLoadRequest | None = None
         self._reintegrate_successor_browse = None
         self._retired_browse_cleanup = None
         self._browse_hydration_owner: _BrowseHydrationOwner | None = None
@@ -487,6 +489,7 @@ class ContextController:
     def browse_pending(self) -> bool:
         return bool(
             self._browse_request is not None
+            or self._browse_recheck is not None
             or self._cleanup_receipt is not None
             or self._retired_browse_cleanup is not None
         )
@@ -1612,12 +1615,60 @@ class ContextController:
         self._browse_request = request
         return request
 
+    def begin_browse_recheck(self, source_path: str) -> BrowseLoadRequest | None:
+        """Ask the loader whether the shown result's file changed since it was loaded (BROWSE-CLICK-128).
+
+        The shown context stays live and selected: an unchanged file keeps everything as it is. Returns ``None``
+        when ``source_path`` is not the shown, revision-keyed Browse result, so the caller opens it as a click.
+        """
+
+        browse = self._runtime.browse_context
+        if (
+            type(source_path) is not str
+            or not source_path
+            or browse is None
+            or browse.invalidated
+            or browse.released
+            or browse.load_revision is None
+            or os.path.normcase(os.path.abspath(os.path.expanduser(source_path))) != browse.requested_path
+        ):
+            return None
+        if self._browse_request is not None or self._browse_recheck is not None:
+            raise RuntimeError("another Browse open is pending")
+        load_request = browse.load_request
+        request = self._begin_browse_loader(
+            source_path,
+            terminal_commit_identity=None,
+            source_root=getattr(load_request, "source_root", None),
+            expected_revision=browse.load_revision,
+        )
+        self._browse_recheck = request
+        return request
+
+    def _poll_browse_recheck(self) -> BrowseLoadOutcome | None:
+        """The pending recheck's outcome once; a newer click that superseded it simply drops it."""
+
+        recheck = self._browse_recheck
+        if recheck is None:
+            return None
+        outcome = self._browse_loader.poll(recheck)
+        if outcome is None:
+            if not self._browse_loader.owns_request(recheck):
+                self._browse_recheck = None
+            return None
+        if outcome.request is not recheck or not self._browse_loader.owns_outcome(outcome):
+            return None
+        self._browse_loader.consume(outcome)
+        self._browse_recheck = None
+        return outcome
+
     def _begin_browse_loader(
         self,
         source_path: str,
         *,
         terminal_commit_identity: StreamTerminal | None,
         source_root: str | None,
+        expected_revision: tuple | None = None,
     ) -> BrowseLoadRequest:
         if self.viewer_1d_owned:
             raise RuntimeError("1D Viewer cleanup remains pending")
@@ -1669,6 +1720,7 @@ class ContextController:
             terminal_commit_identity,
             source_root,
             display_path=display_path,
+            expected_revision=expected_revision,
         )
         accepted = self._browse_loader.begin(request)
         if accepted is not request:
@@ -1766,6 +1818,9 @@ class ContextController:
                 return None
             self._runtime.finish_replacement(request)
             return receipt
+        recheck = self._poll_browse_recheck()
+        if recheck is not None:
+            return recheck
         request = self._browse_request
         if request is None:
             return None
@@ -1958,6 +2013,7 @@ class ContextController:
                     failures = released.cleanup_failures
                 return self._set_close(expected, failures)
         self._browse_request = None
+        self._browse_recheck = None
         self._cleanup_receipt = None
         self._runtime.close_selection()
         self._close = BrowseCleanupReceipt(
@@ -2038,6 +2094,10 @@ class ContextController:
         )
 
     def _invalidate_browse_request(self) -> bool:
+        recheck = self._browse_recheck
+        self._browse_recheck = None
+        if recheck is not None:
+            self._retain_cancel(recheck)
         request = self._browse_request
         self._browse_request = None
         if request is None:

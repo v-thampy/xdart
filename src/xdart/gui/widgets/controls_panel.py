@@ -395,7 +395,10 @@ class SectionCard(QtWidgets.QFrame):
         self.toggle.setText("▸" if self._collapsed else "▾")
         self.toggle.setToolTip("Expand section" if self._collapsed else "Collapse section")
 
-    def set_status_text(self, text: str = "") -> None:
+    def set_status_text(self, text: str = "", *, tooltip: str | None = None) -> None:
+        """The header's status; ``tooltip`` (PHASE-ANALYSIS-128) explains it, and None keeps the one it has."""
+        if tooltip is not None and self.status.toolTip() != tooltip:
+            self.status.setToolTip(tooltip)
         if self.status.text() == text and self.status.isVisible() == bool(text):
             return
         self.status.setText(text)
@@ -1014,9 +1017,13 @@ class FormRow(QtWidgets.QWidget):
 
     def set_number(self, value) -> None:
         """A float row's projection: silent; a changed value is authoritative, an equal one keeps a draft being
-        typed (REFERENCE-PHASES-20261011)."""
+        typed (REFERENCE-PHASES-20261011). A whole-number row's (PHASE-ANALYSIS-128): its text as code sets it, with
+        no draft and no commit (None: blank)."""
+        if self._kind == "int":
+            self.editor.setValue(None if value is None else int(value))
+            return
         if self._kind != "float":
-            raise TypeError("set_number needs a float row")
+            raise TypeError("set_number needs a float or whole-number row")
         value = float(value)
         if value == self._number:
             return
@@ -1305,6 +1312,9 @@ class RangeRow(QtWidgets.QWidget):
         self._display_decimals = display_decimals
         self._model_text_by_path: dict[tuple[str, ...], str] = {}
         self._display_label = str(label)
+        #: the row's purpose (``set_purpose_tooltip``) and each bound's disabled reason, kept apart as FormRow's
+        self._purpose_tooltip = ""
+        self._reasons: dict[tuple[str, ...], str] = {}
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(PROCESSING_ROW_GAP)
@@ -1368,7 +1378,8 @@ class RangeRow(QtWidgets.QWidget):
         edit.setEnabled(bool(spec.get("enabled", True)))
         # Same tooltip rule as _apply_edit: a full render must not leave the
         # bounds without their hover text until the first state UPDATE.
-        edit.setToolTip(_field_tooltip(path, spec.get("reason", "")))
+        self._reasons[path] = spec.get("reason", "") or ""
+        edit.setToolTip(self._bound_tooltip(path))
         if spec.get("placeholder") is not None:
             edit.setPlaceholderText(spec["placeholder"])
         edit.editingFinished.connect(
@@ -1390,6 +1401,27 @@ class RangeRow(QtWidgets.QWidget):
     def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
         """Append a widget to the right of the row (a fit range's Full button), as ``FormRow`` does."""
         self.layout().addWidget(widget, stretch)
+
+    def _bound_tooltip(self, path: tuple[str, ...]) -> str:
+        """A bound's tip: its disabled reason, else the row's purpose, else the field's help text."""
+        return self._reasons.get(path, "") or self._purpose_tooltip or _field_tooltip(path)
+
+    def set_purpose_tooltip(self, text: str) -> None:
+        """Explain the row (PHASE-ANALYSIS-128, as ``FormRow`` does): on the row, its label and each bound without
+        a disabled reason of its own; ``apply_fields`` keeps it."""
+        self._purpose_tooltip = str(text)
+        for widget in (self, self.label):
+            widget.setToolTip(self._purpose_tooltip)
+        for edit, path in ((self._low, self._low_path), (self._high, self._high_path)):
+            edit.setToolTip(self._bound_tooltip(path))
+
+    def set_help_topic(self, topic_id: str, *, button: bool = False) -> None:
+        """Bind F1 without changing the row's tips; opt in to a trailing "?" action, as ``FormRow`` does."""
+        from .context_help import bind_topic
+        bind_topic(self, topic_id)
+        if button and not hasattr(self, "help_button"):
+            self.help_button = ActionButton.for_help(self, topic_id)
+            self.add_trailing_widget(self.help_button)
 
     @staticmethod
     def _model_text(value) -> str:
@@ -1490,7 +1522,8 @@ class RangeRow(QtWidgets.QWidget):
         field: ControlFormField,
     ) -> None:
         edit.setEnabled(bool(field.enabled))
-        edit.setToolTip(_field_tooltip(field.path, field.reason))
+        self._reasons[tuple(field.path)] = field.reason or ""
+        edit.setToolTip(self._bound_tooltip(tuple(field.path)))
         if field.placeholder is not None:
             edit.setPlaceholderText(field.placeholder)
         path = tuple(field.path)

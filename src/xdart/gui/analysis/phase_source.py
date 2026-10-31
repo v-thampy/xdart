@@ -27,6 +27,13 @@ _NO_INTENSITY_TIP = {'lattice': 'Lattice phases have no structural intensities; 
 #: Add CIF…'s busy reason while the chosen files are read (R1, D1)
 _ADD_BUSY_TIP = 'Reading the chosen CIF files on a worker; Add CIF is available again once they are added.'
 _REMOVE_NONE_TIP = 'Select a phase in the list first: Remove acts only on the selected phase.'
+#: a calibrant row's own tooltip (PHASE-ANALYSIS-128: reference lines only, never fitted)
+_CALIBRANT_DETAIL = ('{name}: a built-in calibrant, drawn as reference lines and detector rings only. It has '
+                     'positions but no intensities, so it is never fitted.')
+
+
+def _detail(kind, name):
+    return _CALIBRANT_DETAIL.format(name=name) if kind == 'calibrant' else f'{kind} phase: {name}'
 
 
 @dataclass(frozen=True, eq=False)
@@ -70,8 +77,11 @@ class PhaseSourceWidget(QtWidgets.QWidget):
     messageChanged = QtCore.Signal(str)
     #: a user's minimum-intensity edit (row, global switch or global value), as the new ``PhaseCutoffs``
     cutoffsChanged = QtCore.Signal(object)
+    #: an explicit library read (``refresh_library``: a window's open) or a successful CIF or lattice add: a
+    #: consumer's own lookups of these ids are stale (PHASE-ANALYSIS-128); a reconcile never emits it
+    libraryRefreshed = QtCore.Signal()
 
-    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True, key_by_index=False,
+    def __init__(self, parent=None, *, library=None, checkable=True, show_library=True,
                  calibrants=False, cutoffs=False, status_visible=True):
         super().__init__(parent)
         from xrd_tools.analysis.phase_references import PhaseLibrary
@@ -81,7 +91,6 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._resolved = {}
         self._show_library = bool(show_library)
         self._checkable = bool(checkable)
-        self._key_by_index = bool(key_by_index)
         self._shown_ids = ()
         self._details = {}
         self._reason = ''
@@ -101,7 +110,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.browser.setObjectName('phaseSourceBrowser')
         self.browser.setMaximumHeight(150)
         self.browser.setToolTip(_SOURCE_TIP)
-        self.browser.scans.setToolTip('Phases in library order. Check a phase to show its reference overlay.'
+        self.browser.scans.setToolTip('Phases in list order. Check a phase to draw it on the plots and fit it; '
+                                      'built-in calibrants are reference lines only and are never fitted.'
                                       if checkable else 'The phases selected for this fit, in order.')
         self.browser.scans_label.setToolTip('Persistent CIF and lattice entries available to this tool.')
         # The keyed profile hides Int's file actions, but they remain children of
@@ -205,7 +215,16 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.browser.scans.itemSelectionChanged.connect(self._sync_remove)
         if checkable:
             self.browser.checksChanged.connect(self._checks_changed)
-        self.refresh_library()
+        self._refresh_library()
+
+    def set_help_topic(self, topic_id):
+        """F1 and a "?" on this list's own rows and on its lattice form, for a host's help topic (PHASE-ANALYSIS-128)."""
+        from xdart.gui.widgets.context_help import bind_topic
+        bind_topic(self, topic_id)
+        for row in (self.calibrant_row, self.library_row, self.global_switch, self.global_row):
+            if row is not None:
+                row.set_help_topic(topic_id, button=True)
+        self.lattice_form.set_help_topic(topic_id)
 
     @property
     def selection(self):
@@ -283,8 +302,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         """The listed phase's row editor (None: not listed, or no cutoffs)."""
         if identifier not in self._shown_ids:
             return None
-        key = str(self._shown_ids.index(identifier)) if self._key_by_index else identifier
-        return self.browser.result_value_editor(key)
+        return self.browser.result_value_editor(identifier)
 
     def refresh_cutoffs(self):
         """Re-project the cutoff rows and Remove's readiness after a host reconciled this source's list itself."""
@@ -299,17 +317,16 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             return
         cutoffs, available = self._cutoffs, self.isEnabled() and not self._availability_reason
         own, rows = dict(cutoffs.per_phase), {}
-        for index, identifier in enumerate(self._shown_ids):
+        for identifier in self._shown_ids:
             entry = self._resolved.get(identifier)
             if entry is None:
                 continue
-            key = str(index) if self._key_by_index else identifier
             if entry.source_kind != 'cif':
-                rows[key] = (cutoffs.global_value, False, _NO_INTENSITY_TIP.get(entry.source_kind, _ROW_TIP))
+                rows[identifier] = (cutoffs.global_value, False, _NO_INTENSITY_TIP.get(entry.source_kind, _ROW_TIP))
             else:
                 value = cutoffs.global_value if cutoffs.global_on else own.get(identifier, cutoffs.global_value)
                 tip = _ROW_TIP + (' ' + _SAME_TIP if cutoffs.global_on else '')
-                rows[key] = (value, available and not cutoffs.global_on, tip)
+                rows[identifier] = (value, available and not cutoffs.global_on, tip)
         self.browser.reconcile_result_values(rows)
         blocked = self.global_switch.editor.blockSignals(True)
         try:
@@ -356,8 +373,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._sync_cutoff_rows()
         self.cutoffsChanged.emit(self._cutoffs)
 
-    def _row_edited(self, key, value):
-        identifier = self._shown_ids[int(key)] if self._key_by_index else key
+    def _row_edited(self, identifier, value):
         own = dict(self._cutoffs.per_phase)
         if own.get(identifier) == value:
             return
@@ -377,13 +393,18 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         if selection == self._selection:
             return
         self._selection = selection
-        self.refresh_library()
+        self._refresh_library()
         if self._cutoffs_enabled:
             self._adjust_cutoffs()
             self._sync_cutoff_rows()
         self.changed.emit(self._selection)
 
     def refresh_library(self):
+        """An explicit read of the library (a window's open, a library edit), then ``libraryRefreshed``."""
+        self._refresh_library()
+        self.libraryRefreshed.emit()
+
+    def _refresh_library(self):
         """Read the library once for the list and the selection (user actions, never reconciles)."""
         selected = dict(self._selection)
         # Only the selected entries are resolved (read and verified); the library is listed from its catalogue.
@@ -396,12 +417,10 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._resolved = {identifier: lookup.entry for identifier, lookup in lookups.items()
                           if lookup.entry is not None}
         self._shown_ids = tuple(identifier for identifier, _name, _kind in listed)
-        rows = tuple(BrowserResult(str(index) if self._key_by_index else identifier, name,
-                                   self._details.get(identifier, f'{kind} phase: {name}'))
-                     for index, (identifier, name, kind) in enumerate(listed))
+        rows = tuple(BrowserResult(identifier, name, self._details.get(identifier, _detail(kind, name)))
+                     for identifier, name, kind in listed)
         if self._checkable:
-            checked = tuple(row.identifier for row, identifier in zip(rows, self._shown_ids)
-                            if selected.get(identifier, False))
+            checked = tuple(identifier for identifier in self._shown_ids if selected.get(identifier, False))
             self.browser.reconcile_checked_results(rows, checked)
         else:
             self.browser.reconcile_results(rows, self.browser.current_result())
@@ -439,19 +458,18 @@ class PhaseSourceWidget(QtWidgets.QWidget):
 
     def set_details(self, details):
         self._details = dict(details)
-        self.refresh_library()
+        self._refresh_library()
 
     def _checks_changed(self, checked):
         checked = set(checked)
-        visible_ids = {identifier for index, identifier in enumerate(self._shown_ids)
-                       if (str(index) if self._key_by_index else identifier) in checked}
+        visible_ids = {identifier for identifier in self._shown_ids if identifier in checked}
         known_ids = {identifier for identifier, _visible in self._selection}
         selected = tuple((identifier, identifier in visible_ids)
                          for identifier, _visible in self._selection)
         selected += tuple((identifier, True) for identifier in self._shown_ids
                           if identifier in visible_ids and identifier not in known_ids)
         if len(selected) > 8:
-            self._message('Choose at most eight phases.'); self.refresh_library(); return
+            self._message('Choose at most eight phases.'); self._refresh_library(); return
         self.set_selection(selected)
 
     def _add_entry(self, entry):
@@ -464,7 +482,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
             self.set_selection(tuple((identifier, visible or identifier == entry.id)
                                      for identifier, visible in before))
         if self._selection == before:
-            self.refresh_library()  # the library entry itself may have been rewritten
+            self._refresh_library()  # the library entry itself may have been rewritten
         return entry
 
     def add_cif_paths(self, paths):
@@ -477,6 +495,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                 added.append(self._add_entry(entry))
             except (OSError, ValueError, ImportError) as error:
                 self._message(str(error)); break
+        if added:
+            self.libraryRefreshed.emit()
         return tuple(added)
 
     def add_calibrant(self, name):
@@ -525,10 +545,12 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         try:
             if len(self._selection) >= 8:
                 raise ValueError('Choose at most eight phases.')
-            return self._add_entry(self.library.add_lattice(name, **lattice))
+            entry = self._add_entry(self.library.add_lattice(name, **lattice))
         except (ValueError, ImportError) as error:
             self._message(str(error))
             return None
+        self.libraryRefreshed.emit()
+        return entry
 
     def remove_current(self):
         """Remove the selected phase (its library entry stays); with none selected, nothing."""
@@ -566,6 +588,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
                     except ValueError as cap:
                         error = str(cap)
                         break
+                if entries:
+                    self.libraryRefreshed.emit()
             else:
                 error = str(terminal.failure_message or 'Adding the CIF files failed.')
             if error:

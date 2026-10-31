@@ -16,6 +16,7 @@ from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core.staging import browse_publication_max_items
 from xrd_tools.io import (
     Browse1DCache,
+    FrameFactsStore,
     FrameScalarCatalog,
     FrameViewReader,
     ProcessedScan,
@@ -24,10 +25,12 @@ from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 from xrd_tools.io.browse_presentation import read_browse_presentation
 from xrd_tools.io.output_transaction import (
     TargetSnapshot,
+    capture_target_revision,
     capture_target_snapshot,
     revalidate_target_snapshot,
     revalidate_stream_terminal,
     stream_terminal_object_revision,
+    target_revision_key,
 )
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.scan_norm import (
@@ -434,6 +437,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or type(context.frame_facts) is not FrameFactsStore
                 or context.prepared_reintegrate_offer is None
             ):
                 return None
@@ -462,6 +466,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or type(context.frame_facts) is not FrameFactsStore
                 or context.prepared_reintegrate_offer is None
             ):
                 return None
@@ -876,6 +881,14 @@ class BrowseLoader:
             elif not Path(request.source_path).is_file():
                 status = BrowseLoadStatus.REFUSED
                 detail = "Processed browse artifact is unavailable."
+            elif request.expected_revision is not None:
+                # A recheck of the shown result reads no file content and builds no context (BROWSE-CLICK-128).
+                current = target_revision_key(capture_target_revision(Path(request.source_path)))
+                status = (
+                    BrowseLoadStatus.UNCHANGED
+                    if current == request.expected_revision
+                    else BrowseLoadStatus.CHANGED
+                )
             elif not cancelled.is_set():
                 context = self._read_context(
                     request,
@@ -994,14 +1007,23 @@ class BrowseLoader:
                 "terminal" if sealed_terminal is not None else "snapshot"
             )
         started = stage_start()
+        # A read-only open seals the file revision, not its content: hashing the whole output was most of a large
+        # file's open time, and the final fence below already trusts this revision (PERF-BROWSE-OPEN-128).
         before = (
-            capture_target_snapshot(path)
+            capture_target_revision(path)
             if sealed_terminal is None
             else revalidate_stream_terminal(path, sealed_terminal)
         )
         stage_finish("initial_seal_s", started)
         if type(before) is not TargetSnapshot or not before.exists:
             raise ValueError("processed browse target is unavailable")
+        # The revision a later re-click compares (BROWSE-CLICK-128), taken before any read, so a change during the
+        # load only causes one more reload. A modern terminal seal already carries the file's object revision,
+        # which revalidate_stream_terminal has just verified: no extra capture (terminal Browse keeps its two fences).
+        load_revision = (
+            target_revision_key(before) if sealed_terminal is None
+            else (True, *stream_terminal_object_revision(sealed_terminal))
+        )
         if cancelled.is_set():
             return None
         started = stage_start()
@@ -1129,8 +1151,11 @@ class BrowseLoader:
                 target_entry=target_entry,
                 loaded_labels=labels,
                 target_snapshot=after,
+                load_revision=load_revision,
                 prepared_reintegrate_offer=prepared_offer,
                 ring_basis=ring_basis,
+                # Per-frame facts are read only for the frames Browse shows (PERF-BROWSE-OPEN-128 stage B).
+                frame_facts=FrameFactsStore(),
             )
             context.adopt_load_request(request)
             context.stamp_provenance(

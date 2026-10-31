@@ -9,12 +9,16 @@ from xdart.gui.widgets import file_dialogs
 
 def plain_settings(values):
     """Detach current controls into the snapshot's plain, comparable settings."""
+    from xrd_tools.analysis.display_fit_operations import DisplayedTraceInput
     from xrd_tools.analysis.phase_references import PhaseEntry
     def plain(value):
         if isinstance(value, PhaseEntry):
             # The library ID pins CIF bytes; manual cells remain part of the
             # request identity. This is a key projection, not a recipe format.
             return ('phase', value.id, value.name, value.source_kind, plain(value.lattice))
+        if isinstance(value, DisplayedTraceInput):
+            # A captured substrate (PHASE-ANALYSIS-128) by its trace identity, never its arrays.
+            return ('template', value.trace_fingerprint, value.label, value.axis_unit)
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, (list, tuple)):

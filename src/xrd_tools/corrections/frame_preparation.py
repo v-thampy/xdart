@@ -157,6 +157,7 @@ def flat_detector_solid_angle(shape, *, distance: float, cch, pixel_size) -> np.
     detector = Detector(pixel1=pixel1, pixel2=pixel2, max_shape=shape)
     integrator = AzimuthalIntegrator(dist=float(distance) * unit, poni1=(float(cch[0]) + 0.5) * pixel1,
                                      poni2=(float(cch[1]) + 0.5) * pixel2, detector=detector)
+    integrator.auto_gc = False  # no pyFAI gc.collect() on each geometry change (CI-VIEWERS-HANG-128)
     with PYFAI_NUMEXPR_LOCK:
         values = np.ascontiguousarray(CorrectionStack().normalization(integrator, shape), dtype=np.float64)
     if values.shape != shape or not np.isfinite(values).all() or np.any(values <= 0):

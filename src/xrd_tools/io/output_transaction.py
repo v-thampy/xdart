@@ -756,6 +756,53 @@ def capture_target_snapshot(path: Path | str) -> TargetSnapshot:
     return _capture_target(os.path.realpath(os.fspath(path)))
 
 
+def capture_target_revision(path: Path | str) -> TargetSnapshot:
+    """Return one stable file-revision observation, with no content digest, for read-only Browse.
+
+    The same pathname/descriptor brackets as the content capture, without reading the file: identity, size, mtime
+    and the descriptor's change time (``ctime_ns``). It certifies the filesystem revision, not content equality
+    (PERF-BROWSE-OPEN-128); ``revalidate_target_snapshot`` holds it through the same revision fence. Writers keep
+    their existing admission policies. A missing target is the absent snapshot; disagreeing observations raise
+    ``TargetChanged``. This does not lock the file: consumers must revalidate across their reads.
+    """
+    target = os.path.realpath(os.fspath(path))
+    try:
+        before = os.stat(target)
+    except FileNotFoundError:
+        try:
+            os.stat(target)
+        except FileNotFoundError:
+            return TargetSnapshot(False, None, None, None, None, None)
+        raise TargetChanged(f"target appeared while admitting {target}")
+    try:
+        descriptor = os.open(target, os.O_RDONLY)
+    except FileNotFoundError as exc:
+        raise TargetChanged(f"target disappeared while admitting {target}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        finished = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        after = os.stat(target)
+    except FileNotFoundError as exc:
+        raise TargetChanged(f"target disappeared while admitting {target}") from exc
+    if len({_stat_identity(before), _stat_identity(opened), _stat_identity(finished), _stat_identity(after)}) != 1 \
+            or _descriptor_identity(opened) != _descriptor_identity(finished):
+        raise TargetChanged(f"target mutated while observing {target}")
+    return TargetSnapshot(True, int(after.st_size), int(after.st_mtime_ns), int(after.st_dev), int(after.st_ino), None,
+                          int(finished.st_ctime_ns))
+
+
+def target_revision_key(snapshot: TargetSnapshot) -> tuple:
+    """One snapshot's explicit file revision (exists, device, inode, size, mtime, descriptor ctime) for comparisons
+    and keys. Never use ``TargetSnapshot`` equality for that: its ``ctime_ns`` is compare=False and a read-only
+    revision carries no digest, so two revisions of one path could compare equal (PERF-BROWSE-OPEN-128)."""
+    if type(snapshot) is not TargetSnapshot:
+        raise TypeError("a revision key needs a TargetSnapshot")
+    return (snapshot.exists, snapshot.device, snapshot.inode, snapshot.size, snapshot.mtime_ns, snapshot.ctime_ns)
+
+
 def revalidate_target_snapshot(
     path: Path | str, snapshot: TargetSnapshot,
 ) -> TargetSnapshot:
@@ -763,11 +810,13 @@ def revalidate_target_snapshot(
 
     This uses the same filesystem revision as stream-terminal revalidation;
     ctime also detects in-place edits that restore the previous size/mtime.
-    Snapshots without that observation retain the full content check.
+    A read-only revision (``capture_target_revision``: no digest, a descriptor
+    ctime) holds through the same fence. Snapshots without a ctime retain the
+    full content check.
     """
     if type(snapshot) is not TargetSnapshot or not snapshot.exists:
         raise TypeError("target revalidation requires an existing TargetSnapshot")
-    if snapshot.ctime_ns is None or snapshot.digest is None:
+    if snapshot.ctime_ns is None:
         current = capture_target_snapshot(path)
         if current != snapshot:
             raise TargetChanged("target changed since its content snapshot")
@@ -4704,10 +4753,12 @@ __all__ = [
     "TargetChanged",
     "TargetLease",
     "TargetSnapshot",
+    "capture_target_revision",
     "capture_target_snapshot",
     "revalidate_target_snapshot",
     "revalidate_stream_terminal",
     "stream_terminal_object_revision",
+    "target_revision_key",
     "TransactionPhase",
     "TransactionSnapshot",
     "TransactionStateError",

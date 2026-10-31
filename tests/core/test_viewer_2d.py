@@ -20,9 +20,18 @@ _EXPECTED_R = 11_546_624
 
 try:
     _PHYSICAL_RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    _WINDOWS_RAM = 0
 except (ValueError, OSError, AttributeError):
-    _PHYSICAL_RAM = 0
-_EXPECTED_B = 884_736_000 if _PHYSICAL_RAM <= 0 else min(1024**3, _PHYSICAL_RAM // 20)
+    # Windows has no sysconf: the viewer reads GlobalMemoryStatusEx there, never below the fallback
+    # (VIEWER-2D-BUDGET-128).
+    from xrd_tools.core.staging import windows_physical_ram_bytes
+    _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
+if _PHYSICAL_RAM > 0:
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 10)
+elif _WINDOWS_RAM > 0:
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 10))
+else:
+    _EXPECTED_B = 884_736_000
 
 
 @pytest.fixture(autouse=True)
@@ -145,10 +154,11 @@ def _assert_changed(operation, *args, **kwargs):
 
 
 def _assert_canonical(frame, expected):
+    # The canonical frame is float32 (DISPLAY-FLOAT32-128): the source's values rounded once to float32.
     array = frame.array
-    assert np.array_equal(array, np.asarray(expected, dtype=float), equal_nan=True)
-    assert array.dtype == np.dtype(float)
-    assert frame.provenance.canonical_dtype == np.dtype(float).str
+    assert np.array_equal(array, np.asarray(expected).astype(np.float32), equal_nan=True)
+    assert array.dtype == np.dtype(np.float32)
+    assert frame.provenance.canonical_dtype == np.dtype(np.float32).str
     assert array.ndim == 2 and array.flags.c_contiguous and array.flags.owndata
     assert not array.flags.writeable and array.base is None
     assert frame.provenance.canonical_sha256
@@ -1359,15 +1369,31 @@ def test_non_hdf_selected_read_failure_closes_fenced_descriptor(
     assert len(opened) == 1 and opened[0].closed
 
 
-def _independent_ledger(canonical, *, encoded=17, reservation=_EXPECTED_R,
+_EXPECTED_S = 2_000_000 * 4  # the loading snapshot's capped screen raster
+
+
+def _one_frame_peaks(pixels, *, encoded=0, wide=False):
+    """One frame's working set from the arrays alive at each phase's peak, in bytes (DISPLAY-FLOAT32-128 design v3 §2),
+    written apart from the implementation's constants. The page clears the previous frame before the next read."""
+    canonical, widest_source, finite_mask = 4, 8, 1
+    read = encoded + pixels * (widest_source + widest_source + canonical + finite_mask)  # decode, contiguous copy
+    display, qimage, rgba, index, qt_paint = 4, 4, 4, 1, 4
+    nan = 16 if wide else 1  # NaN coordinates past 32767 pixels (pyqtgraph downsamples), else the widget's mask
+    first_render = pixels * (canonical + display + 1 + (nan if wide else 0) + index + rgba)  # a NaN mask is made first
+    paint = pixels * (canonical + display + nan + qimage + qt_paint)
+    log_recolour = pixels * (canonical + display + qimage + nan + display + display)  # old ones alive, new copy and Log
+    # then the new Log display's levels: finite, isfinite(raw), two ceiling comparisons and their union at once, with
+    # no temporary elision (Windows)
+    levels = pixels * (canonical + display + qimage + nan + display + 5)
+    return read, max(first_render, paint, log_recolour, levels)
+
+
+def _independent_ledger(canonical, *, encoded=17, reservation=_EXPECTED_R, snapshot=_EXPECTED_S,
                         budget=_EXPECTED_B):
-    reader = max(3 * canonical, encoded + 4 * canonical)
-    concurrent = 6 * canonical
-    total = reservation + max(reader, concurrent)
+    reader, renderer = _one_frame_peaks(canonical // 4, encoded=encoded)
     return api.Viewer2DMemoryLedger(
-        canonical, reservation, encoded, reader, 5 * canonical // 2,
-        7 * canonical // 2, 9 * canonical // 2, 5 * canonical,
-        5 * canonical, concurrent, total, canonical + total, budget,
+        (1, canonical // 4), canonical, reservation, snapshot, encoded, reader, renderer,
+        reservation + snapshot + max(reader, renderer), budget,
     )
 
 
@@ -1762,7 +1788,7 @@ def test_exported_values_reject_local_malformed_values(tmp_path):
     _raises(TypeError, replace, catalog, frame_labels=(0, 0))
     _raises(TypeError, replace, catalog, canonical_path=str(tmp_path / "forged.npy"))
     _raises(TypeError, replace, frame.provenance, frame_index=-1)
-    _raises(TypeError, replace, ledger, total=ledger.total + 1,
+    _raises(TypeError, replace, ledger, renderer_peak=ledger.renderer_peak + 1,
             admission=ledger.admission + 1)
     yielded = []
 
@@ -1780,16 +1806,18 @@ def test_exported_values_reject_local_malformed_values(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("canonical", "reservation", "budget"),
-    [(0, _EXPECTED_R, _EXPECTED_B), (10, _EXPECTED_R, _EXPECTED_B),
-     (48, _EXPECTED_R + 1, _EXPECTED_B), (48, _EXPECTED_R, _EXPECTED_B - 1)],
+    ("canonical", "reservation", "snapshot", "budget"),
+    [(0, _EXPECTED_R, _EXPECTED_S, _EXPECTED_B), (10, _EXPECTED_R, _EXPECTED_S, _EXPECTED_B),
+     (48, _EXPECTED_R + 1, _EXPECTED_S, _EXPECTED_B), (48, _EXPECTED_R, _EXPECTED_S - 1, _EXPECTED_B),
+     (48, _EXPECTED_R, _EXPECTED_S, _EXPECTED_B - 1)],
     ids=("missing-ledger-zero-c", "missing-ledger-unaligned-c",
-         "missing-ledger-wrong-r", "missing-ledger-wrong-b"),
+         "missing-ledger-wrong-r", "missing-ledger-wrong-s", "missing-ledger-wrong-b"),
 )
-def test_memory_ledger_rejects_each_isolated_invariant(canonical, reservation, budget):
+def test_memory_ledger_rejects_each_isolated_invariant(canonical, reservation, snapshot, budget):
+    assert _independent_ledger(48) == api.viewer_2d_memory_ledger(1, 12, encoded_retained=17)
     _raises(TypeError, _independent_ledger, canonical,
             encoded=0 if canonical == 0 else 17,
-            reservation=reservation, budget=budget)
+            reservation=reservation, snapshot=snapshot, budget=budget)
 
 
 @pytest.mark.parametrize(
@@ -2240,25 +2268,105 @@ def test_primary_same_size_aba_and_dependency_change_refuse_without_publication(
     _assert_changed(api.read_viewer_2d_frame, catalog, 0)
 
 
-def test_memory_ledger_uses_raw_only_r7_arithmetic_and_fails_closed(monkeypatch):
+def test_memory_ledger_charges_one_frames_working_set_and_fails_closed(monkeypatch):
+    """DISPLAY-FLOAT32-128: the canonical frame is float32 and admission is one frame's working set, its read or its
+    drawing, whichever is larger; no second frame is charged (the maintainer: "As long as there is enough memory to
+    hold one frame in the memory budget there shouldn't be a memory budget error")."""
     monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 10**12)
     ledger = api.viewer_2d_memory_ledger(2, 3, encoded_retained=17)
-    assert ledger.canonical_bytes == 48
-    assert ledger.reader_peak == max(3 * 48, 17 + 4 * 48)
-    assert ledger.renderer_slack_raw == 5 * 48 // 2
-    assert ledger.renderer_linear == 7 * 48 // 2
-    assert ledger.renderer_log_update == 9 * 48 // 2
-    assert ledger.renderer_paint == 5 * 48
-    assert ledger.renderer_peak == 5 * 48
-    assert ledger.concurrent_frame_bytes == 6 * 48
-    assert ledger.total == ledger.catalog_reservation + max(
-        ledger.reader_peak, ledger.concurrent_frame_bytes
-    )
-    assert ledger.admission == ledger.canonical_bytes + ledger.total
+    reader, renderer = _one_frame_peaks(6, encoded=17)
+    assert ledger.canonical_bytes == 4 * 6
+    assert (ledger.reader_peak, ledger.renderer_peak) == (reader, renderer) == (17 + 21 * 6, 22 * 6)
+    assert ledger.admission == _EXPECTED_R + _EXPECTED_S + max(reader, renderer)
     assert ledger.budget == 1024**3
+    big = api.viewer_2d_memory_ledger(2, 3, encoded_retained=10**6)
+    assert big.admission == _EXPECTED_R + _EXPECTED_S + 10**6 + 21 * 6, "a large encoded file makes the read the peak"
+    for shape, wide in (((1, 32767), False), ((1, 32768), True), ((40000, 2), True)):
+        pixels = shape[0] * shape[1]
+        assert api.viewer_2d_memory_ledger(*shape).renderer_peak == _one_frame_peaks(pixels, wide=wide)[1] == (
+            37 if wide else 22) * pixels, "pyqtgraph downsamples past 32767 pixels and keeps NaN coordinates"
 
     monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: None)
     assert api.viewer_2d_memory_ledger(1, 1).budget == 884_736_000
+
+
+def _as_windows(monkeypatch, ram_bytes):
+    """A Windows PC: no os.sysconf RAM figure, GlobalMemoryStatusEx reports ``ram_bytes``."""
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: ram_bytes)
+
+
+def test_windows_budget_uses_the_pcs_own_ram(monkeypatch):
+    """VIEWER-2D-BUDGET-128, his beamline report: "I just ran into an error on the beamline PC in 2d viewer mode
+    trying to load a tiff file that was about 32mb. The memory budget was exceeded" (a Windows PC, 32 GB or more).
+    Windows has no os.sysconf RAM figure, so the budget fell back to 884,736,000 bytes on every Windows PC."""
+    _as_windows(monkeypatch, 32 * 1024**3)
+    ledger = api.viewer_2d_memory_ledger(4096, 4096, encoded_retained=32 * 1024**2)
+    assert ledger.budget == 1024**3, "a 32 GB Windows PC gets the 1 GiB cap, not the fixed fallback"
+    assert ledger.admission <= ledger.budget, "a 4096x4096 frame fits it"
+    _as_windows(monkeypatch, 16 * 1024**3)
+    assert api.viewer_2d_memory_ledger(1, 1).budget == 1024**3, "16 GB reaches the cap at a tenth of RAM"
+
+
+@pytest.mark.parametrize("ram_gib", [7, 8], ids=["hosted-7-gib", "pc-8-gib"])
+def test_a_small_windows_pc_keeps_the_budget_it_had(monkeypatch, ram_gib):
+    """Reading Windows RAM must not take anything away: a 7/8 GiB Windows PC had the 884,736,000-byte fallback, where a
+    9-megapixel Eiger2 frame (3108x3262) is admitted; a tenth of its RAM (751/819 MiB) is still below it."""
+    _as_windows(monkeypatch, ram_gib * 1024**3)
+    ledger = api.viewer_2d_memory_ledger(3108, 3262, encoded_retained=40 * 1024**2)
+    assert ledger.budget == 884_736_000 and ledger.admission <= ledger.budget
+
+
+def test_a_16_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
+    """His choice "A tenth of RAM (Recommended)": the budget is a tenth of RAM, capped at 1 GiB. A 16 GB PC, on any
+    system, admits both frames."""
+    for detect in ("posix", "windows"):
+        if detect == "posix":
+            monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 16 * 1024**3)
+        else:
+            _as_windows(monkeypatch, 16 * 1024**3)
+        for shape, encoded in (((4096, 4096), 32 * 1024**2), ((4148, 4362), 69 * 1024**2)):
+            ledger = api.viewer_2d_memory_ledger(*shape, encoded_retained=encoded)
+            assert ledger.budget == 1024**3 and ledger.admission <= ledger.budget, (detect, shape)
+
+
+def test_a_4_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
+    """DISPLAY-FLOAT32-128: one float32 frame's working set with the loading snapshot (4096x4096: 371 MiB; Eiger2 16M:
+    398 MiB) fits the budget of an 8 GB PC on every system and of a 4 GB macOS/Linux PC (410 MiB), which refuses only
+    from 4317x4317."""
+    for detect, ram in (("posix", 8), ("windows", 8), ("posix", 4)):
+        if detect == "posix":
+            monkeypatch.setattr(api, "_physical_ram_bytes", lambda ram=ram: ram * 1024**3)
+        else:
+            _as_windows(monkeypatch, ram * 1024**3)
+        for shape in ((4096, 4096), (4148, 4362), (3108, 3262)):
+            ledger = api.viewer_2d_memory_ledger(*shape)
+            assert ledger.admission == _EXPECTED_R + _EXPECTED_S + max(_one_frame_peaks(shape[0] * shape[1]))
+            assert ledger.admission <= ledger.budget, (detect, ram, shape)
+    assert api._admit((4316, 4316)).admission <= 4 * 1024**3 // 10
+    assert _raises(api.Viewer2DReadError, api._admit, (4317, 4317)).code is api.Viewer2DRefusalCode.MEMORY_REFUSED
+
+
+def test_a_frame_just_over_the_budget_is_refused(monkeypatch):
+    """Refusal only when one frame's working set does not fit: 6271x6271 fits the 884,736,000-byte budget of a PC whose
+    RAM cannot be read; 6272x6272 is over it by 246 kB and is refused."""
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: None)
+    assert api._admit((6271, 6271)).admission <= 884_736_000 < api.viewer_2d_memory_ledger(6272, 6272).admission
+    refused = _raises(api.Viewer2DReadError, api._admit, (6272, 6272))
+    assert refused.code is api.Viewer2DRefusalCode.MEMORY_REFUSED
+
+
+def test_windows_pc_reads_a_4096_square_16_bit_tiff(tmp_path, monkeypatch):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "frame_4096.tif"
+    tifffile.imwrite(path, (np.arange(4096 * 4096, dtype=np.uint32) % 65521).astype(np.uint16).reshape(4096, 4096))
+    assert 32 * 1024**2 <= path.stat().st_size < 34 * 1024**2, "about 32 MB on disk, as at the beamline"
+    _as_windows(monkeypatch, 32 * 1024**3)
+    catalog = api.catalog_viewer_2d(path)
+    frame = api.read_viewer_2d_frame(catalog, 0)
+    assert frame.array.shape == (4096, 4096)
 
 
 def test_suffix_set_is_closed_and_viewer_only(tmp_path):

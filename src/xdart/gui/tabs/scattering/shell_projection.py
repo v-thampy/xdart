@@ -78,6 +78,7 @@ def build_browser_projection(
     browser_directory: str,
     date_sorted: bool,
     auto_last: bool,
+    all_frames: bool = False,
     catalog: tuple[BrowserCatalogEntry, ...] = (),
     catalog_index: BrowserScanIndex | None = None,
     transient_frame: DisplayFrameKey | None = None,
@@ -170,6 +171,7 @@ def build_browser_projection(
         selected_scan=selected_scan,
         date_sorted=date_sorted,
         auto_last=auto_last,
+        all_frames=all_frames,
         frames=frames,
         selected_artifacts=tuple(
             seen_artifacts.get(normcase(path), path) for path in selected_artifacts

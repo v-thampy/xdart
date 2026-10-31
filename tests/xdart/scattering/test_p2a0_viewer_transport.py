@@ -20,9 +20,16 @@ _EXPECTED_R = 11_546_624
 
 try:
     _PHYSICAL_RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    _WINDOWS_RAM = 0
 except (ValueError, OSError, AttributeError):
-    _PHYSICAL_RAM = 0
-_EXPECTED_B = 884_736_000 if _PHYSICAL_RAM <= 0 else min(1024**3, _PHYSICAL_RAM // 20)
+    from xrd_tools.core.staging import windows_physical_ram_bytes
+    _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
+if _PHYSICAL_RAM > 0:
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 10)
+elif _WINDOWS_RAM > 0:
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 10))
+else:
+    _EXPECTED_B = 884_736_000
 
 
 @pytest.fixture(autouse=True)
@@ -53,9 +60,14 @@ def _selected_admission(catalog, label):
     shape = fact.shape if fact is not None else catalog.source_shape[-2:]
     encoded = (catalog.primary_revision.size if catalog.format_name in
                {"edf", "cbf", "img", "mar3450"} else 0)
-    canonical = 8 * shape[0] * shape[1]
-    peak = max(3 * canonical, encoded + 4 * canonical)
-    return canonical + _EXPECTED_R + max(peak, 6 * canonical)
+    # DISPLAY-FLOAT32-128: one float32 frame's working set, its read or its drawing, whichever is larger (bytes per
+    # pixel from the design's per-phase table), with the loading snapshot; the previous frame is cleared first.
+    pixels = shape[0] * shape[1]
+    read = encoded + pixels * (8 + 8 + 4 + 1)  # decoded source, contiguous copy, canonical, finite mask
+    # a Log recolour's levels: canonical, old display, its QImage and NaN mask (coordinates when wider than 32767), new
+    # display, five 1-byte masks without numpy's temporary elision
+    draw = pixels * (4 + 4 + 4 + (16 if max(shape) > 32767 else 1) + 4 + 5)
+    return _EXPECTED_R + 8_000_000 + max(read, draw)
 
 
 class _Port:

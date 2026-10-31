@@ -87,9 +87,10 @@ def recipe_analyzer(recipe: FitNotebookRecipe, *, data_root: str | Path):
         return DisplayedPeakFitAnalyzer(settings)
     if recipe.tool == "phase":
         settings.pop("fit_bounds", None)  # a native selection mask, applied before central phase conversion
+        sequential = bool(settings.pop("sequential", False))  # an analyzer option: it seeds across a batch
         paths = settings.get("cif_paths", ())
         settings["cif_paths"] = tuple(Path(path) if Path(path).is_absolute() else Path(data_root) / path for path in paths)
-        return DisplayedPhaseFitAnalyzer(settings)
+        return DisplayedPhaseFitAnalyzer(settings, sequential=sequential)
     from xrd_tools.analysis.fitting.region import PeakSeed
     from xrd_tools.analysis.fitting.region_analyzers import Region2DFitAnalyzer, Region3DFitAnalyzer
     # Seed tuples: stable ID, centre, optional FWHMs, optional height, all native coordinates.
@@ -99,15 +100,46 @@ def recipe_analyzer(recipe: FitNotebookRecipe, *, data_root: str | Path):
     return analyzer(seeds=seeds, **settings)
 
 
-def analyze_recipe_snapshot(recipe, snapshot, *, data_root):
-    """Adapt native selection coordinates through the shared source owner, then call the public analyzer."""
+def native_fit_range(settings, snapshot):
+    """A notebook slider's bounds in its input's native axis; legacy bounds are already native."""
+    import numpy as np
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    from xrd_tools.core.containers import convert_radial_axis
+    bounds = settings.get("fit_range")
+    if bounds is None:
+        return settings.get("fit_bounds")
+    unit = canonical_q_unit(snapshot.axes[0].unit)
+    converted = convert_radial_axis(np.asarray(bounds), settings.get("fit_range_unit", "q_A^-1"),
+                                    unit, snapshot.wavelength_angstrom)
+    return tuple(float(value) for value in converted)
+
+
+def apply_native_fit_range(settings, bounds, snapshot):
+    """Commit a native slider edit without mixing legacy pre-crop and phase solve-mask semantics."""
+    from xrd_tools.analysis.axis_units import canonical_q_unit
+    settings = dict(settings)
+    if "fit_range" in settings:
+        settings.pop("fit_bounds", None)
+        settings.update(fit_range=tuple(bounds), fit_range_unit=canonical_q_unit(snapshot.axes[0].unit))
+    else:
+        settings["fit_bounds"] = tuple(bounds)
+    return settings
+
+
+def analyze_recipe_snapshot(recipe, snapshot, *, data_root, analyzer=None):
+    """Adapt native selection coordinates through the shared source owner, then call the public analyzer
+    (``analyzer``: a batch's one analyzer, so a Sequential batch carries its seed)."""
     from dataclasses import replace
     from xrd_tools.analysis.runner import Overlay
     import numpy as np
     native = snapshot
     if recipe.tool == "phase":
         from xrd_tools.analysis.fit_sources import phase_fit_snapshot
-        bounds = dict(recipe.settings).get("fit_bounds")
+        settings = dict(recipe.settings)
+        if settings.get("fit_bounds") is not None and settings.get("fit_range") is not None:
+            raise ValueError("FIT_RANGE_AMBIGUOUS: a phase recipe gives fit_bounds (a native mask) or fit_range "
+                             "(the solve's interval), not both")
+        bounds = settings.get("fit_bounds")
         if bounds is not None:
             if len(bounds) != 2 or not bounds[0] < bounds[1]:
                 raise ValueError("FIT_BOUNDS_INVALID: native low must be less than high")
@@ -115,7 +147,7 @@ def analyze_recipe_snapshot(recipe, snapshot, *, data_root):
             valid = np.ones(axis.shape, dtype=bool) if snapshot.mask is None else snapshot.mask
             snapshot = replace(snapshot, mask=valid & (axis >= bounds[0]) & (axis <= bounds[1]))
         snapshot = phase_fit_snapshot(snapshot)
-    analyzer = recipe_analyzer(recipe, data_root=data_root)
+    analyzer = recipe_analyzer(recipe, data_root=data_root) if analyzer is None else analyzer
     outcome = analyzer.analyze(_region_input(recipe, snapshot) if recipe.tool.startswith("region") else snapshot)
     if recipe.tool == "phase" and native.axes[0].unit in {"2th_deg", "2th_rad"} and outcome.overlay is not None:
         from xrd_tools.core.containers import convert_radial_axis
@@ -179,11 +211,13 @@ def run_recipe_batch(recipe: FitNotebookRecipe, references=None, *, bundle_root:
                      should_cancel=None, on_frame=None):
     """Lazy hydrate-fit-release batch using the existing compact runner; no arrays retained in descriptors."""
     from xrd_tools.analysis.runner import run_batch
+    root = bundle_root if data_root is None else data_root
+    shared = recipe_analyzer(recipe, data_root=root)  # one analyzer for the batch (Sequential seeds across it)
     class RecipeAnalyzer:
         unit = "frame"
         kind = recipe.tool
         def analyze(self, snapshot):
-            return analyze_recipe_snapshot(recipe, snapshot, data_root=bundle_root if data_root is None else data_root)
+            return analyze_recipe_snapshot(recipe, snapshot, data_root=root, analyzer=shared)
     analyzer = RecipeAnalyzer()
     def descriptor(reference):
         def load():

@@ -751,3 +751,36 @@ def test_r12_npz_label_and_named_array_envelope(tmp_path, kind):
     _, transport, port, completion = _load((path,))
     assert completion.outcome is HydrationOutcome.FAILED and port.holder is None
     assert transport.retire(join_timeout=1)
+
+
+def _viewer_1d_on_windows(monkeypatch, ram_bytes):
+    """A Windows PC: no os.sysconf RAM figure, GlobalMemoryStatusEx reports ``ram_bytes`` (VIEWER-1D-RAM-128)."""
+    from types import SimpleNamespace
+    from xrd_tools.session import viewer_1d as session
+
+    def no_sysconf(name):
+        raise AttributeError("Windows has no os.sysconf")
+
+    monkeypatch.setattr(session, "os", SimpleNamespace(sysconf=no_sysconf))
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: ram_bytes)
+    return session
+
+
+def test_viewer_1d_budget_reads_windows_ram_and_never_lowers_a_pc(monkeypatch):
+    """His words: "fix this first" (the 1D Viewer had the 2D Viewer's Windows problem). Windows has no os.sysconf, so
+    every Windows PC got the 884,736,000-byte fallback. A large PC now reaches the 1 GiB cap; a small one keeps the
+    fallback it had; unknown RAM still fails closed."""
+    session = _viewer_1d_on_windows(monkeypatch, 32 * 1024**3)
+    assert session.viewer_1d_budget() == 1024**3
+    for ram in (16 * 1024**3, 8 * 1024**3, None):
+        session = _viewer_1d_on_windows(monkeypatch, ram)
+        assert session.viewer_1d_budget() == session.VIEWER_1D_FALLBACK_B == 884_736_000, ram
+
+
+def test_viewer_1d_budget_on_posix_is_unchanged(monkeypatch):
+    from types import SimpleNamespace
+    from xrd_tools.session import viewer_1d as session
+
+    pages = {"SC_PHYS_PAGES": 16 * 1024**3 // 4096, "SC_PAGE_SIZE": 4096}
+    monkeypatch.setattr(session, "os", SimpleNamespace(sysconf=pages.__getitem__))
+    assert session.viewer_1d_budget() == 16 * 1024**3 // 20, "a twentieth of RAM, as before"
