@@ -116,7 +116,10 @@ class FrameView:
         object.__setattr__(self, "sigma_1d", _readonly_array(self.sigma_1d))
         object.__setattr__(self, "intensity_2d", _readonly_array(self.intensity_2d))
         object.__setattr__(self, "sigma_2d", _readonly_array(self.sigma_2d))
-        object.__setattr__(self, "raw", _readonly_array(self.raw))
+        # A float32 raw is a display array (the 2D Viewer's frame, the detector preview) and is kept as it is, so
+        # its owners see the same array; every other raw becomes float64 as before (DISPLAY-FLOAT32-128).
+        object.__setattr__(self, "raw", _readonly_array(
+            self.raw, dtype=np.float32 if getattr(self.raw, "dtype", None) == np.float32 else float))
         object.__setattr__(self, "thumbnail", _readonly_array(self.thumbnail, dtype=None))
         object.__setattr__(self, "metadata_raw", _readonly_mapping(self.metadata_raw))
         object.__setattr__(self, "metadata_numeric", _readonly_mapping(self.metadata_numeric))

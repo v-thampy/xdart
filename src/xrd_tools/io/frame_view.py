@@ -3764,6 +3764,9 @@ def read_contributing_frame_view(
             raw, raw_reason = None, "raw source unavailable"
     if _stat_revision(os.stat(path)) != inspection.storage_revision:
         raise AnalysisArtifactInvalid("artifact changed during frame hydration")
+    # Full Raw feeds Stitch's reconstruction: it is float64 here, a float32 source included, because FrameView keeps
+    # a float32 raw as it is for display arrays (DISPLAY-FLOAT32-128).
+    raw = None if raw is None else np.asarray(raw, dtype=float)
     return FrameView(label=frame, raw=raw, thumbnail=thumbnail,
         mask_baked=selected["mask_baked"], metadata_raw=(dict(selected["identity"],
             point_images=selected["point_images"]) if point is not None else selected["identity"]),

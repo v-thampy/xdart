@@ -188,8 +188,12 @@ def _masked_detector(raw, projection):
     if projection.apply_threshold:
         if projection.threshold_min is not None: mask |= source < projection.threshold_min
         if projection.threshold_max is not None: mask |= source > projection.threshold_max
-    result = np.asarray(source, dtype=float).copy()
+    # Every class above was decided on the native values; the display copy is one float32 frame (DISPLAY-FLOAT32-128).
+    with np.errstate(over="ignore"):  # an overflow is refused just below
+        result = np.array(source, dtype=np.float32)
     result[mask] = np.nan
+    if source.dtype.kind == "f" and source.dtype.itemsize > 4 and (np.isinf(result) & np.isfinite(source)).any():
+        raise ValueError("raw values exceed the float32 display range")
     result.setflags(write=False)
     return result
 def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: DetectorPreviewProjection | None = None, entry: str = "entry") -> FramePreview:
@@ -264,6 +268,12 @@ def read_frame_preview(read_key: HydrationReadKey, *, detector_projection: Detec
                     if point is not None:
                         from xrd_tools.io.read import _point_raw_frame
                         raw = _point_raw_frame(artifact, point, source_base=source_base, source_root=read_key.source_root, execution=execution, native_transform=lambda native: _masked_detector(native, detector_projection))
+                        # The point combination is float64 science; its display result is one float32 frame.
+                        with np.errstate(over="ignore"):  # an overflow is refused just below
+                            combined, raw = raw, np.array(raw, dtype=np.float32)
+                        if (np.isinf(raw) & np.isfinite(combined)).any():
+                            raise ValueError("raw values exceed the float32 display range")
+                        del combined
                         raw.setflags(write=False)
                     else:
                         source = read_image(resolved, frame=source_index, dataset_path=dataset_path, preserve_dtype=True, exact_frame=True)

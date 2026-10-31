@@ -44,9 +44,10 @@ _MAX_NPZ = 2 * 1024**3
 _MAX_FABIO = 256 * 1024**2
 #: The memory budget when the PC's RAM cannot be read.
 _UNKNOWN_RAM_BUDGET = 884_736_000
-#: The budget is this fraction of RAM, capped at 1 GiB: the ledger's about 7c matched the measured peak of switching
-#: frames (6.4-6.8c on 2048x2048 to 4148x4362), so the share, not the per-frame model, was the limit (VIEWER-2D-BUDGET-128).
+#: The budget is this fraction of RAM, capped at 1 GiB (VIEWER-2D-BUDGET-128, the maintainer's choice).
 _RAM_SHARE = 10
+#: The canonical frame is a display array: float32 is precise enough for everything shown (DISPLAY-FLOAT32-128).
+_CANONICAL = np.dtype(np.float32)
 _HDF5_SUFFIXES = frozenset({".h5", ".hdf5", ".nxs", ".nexus"})
 _RAW_DATASETS = (
     "/entry/instrument/detector/data", "/entry/instrument/detector/data_000001",
@@ -89,6 +90,12 @@ def _refuse(code, message):
 
 def _reject_if(condition, code, message):
     if condition: _refuse(code, message)
+
+
+def _buffer_sha256(array):
+    # The digest of a C-contiguous array's bytes, read in place: the same digest as tobytes() without its frame-sized
+    # copy (hashlib refuses a non-contiguous buffer).
+    return hashlib.sha256(array).hexdigest()
 
 
 def _sha256_text(value):
@@ -291,8 +298,8 @@ class Viewer2DFrameProvenance:
                 if type(value) is Viewer2DDependency:
                     value.__post_init__()
         _malformed(type(self.canonical_shape) is not tuple or len(self.canonical_shape) != 2
-            or self.canonical_dtype != np.dtype(float).str or type(self.canonical_nbytes) is not int
-            or self.canonical_nbytes != math.prod(self.canonical_shape) * np.dtype(float).itemsize
+            or self.canonical_dtype != _CANONICAL.str or type(self.canonical_nbytes) is not int
+            or self.canonical_nbytes != math.prod(self.canonical_shape) * _CANONICAL.itemsize
             or not all(_sha256_text(value) for value in
                 (self.canonical_sha256, self.source_sha256))
             or _source_dtype(self.source_dtype).str != self.source_dtype
@@ -356,47 +363,60 @@ class Viewer2DFrame:
         if type(self.provenance) is Viewer2DFrameProvenance:
             self.provenance.__post_init__()
         _malformed(type(self.catalog_identity) is not str or type(self.label) is not int
-            or type(value) is not np.ndarray or value.dtype != np.dtype(float) or value.ndim != 2
+            or type(value) is not np.ndarray or value.dtype != _CANONICAL or value.ndim != 2
             or not value.flags.c_contiguous or not value.flags.owndata or value.flags.writeable
             or value.base is not None or type(self.provenance) is not Viewer2DFrameProvenance
             or self.provenance.catalog_identity != self.catalog_identity
             or self.provenance.frame_label != self.label
             or self.provenance.canonical_shape != value.shape
             or self.provenance.canonical_nbytes != value.nbytes
-            or self.provenance.canonical_sha256 != hashlib.sha256(
-                value.tobytes(order="C")).hexdigest(), "canonical frame")
+            or self.provenance.canonical_sha256 != _buffer_sha256(value), "canonical frame")
+
+
+#: One frame's working set, in bytes per pixel, from the widths and lifetimes of the arrays alive at each peak
+#: (DISPLAY-FLOAT32-128, design note v3; the drawing figures are the mounted widget's measured worst). Reading: the
+#: decoded source at the widest admitted width (8, also CSV's float64 parse buffer), a contiguous copy of it (8), the
+#: float32 canonical frame (4) and a finite-value mask (1). Drawing, at its worst (recolouring a Log image): the
+#: canonical frame (4), the old display copy, its QImage and NaN mask still alive (4 + 4 + 1) while the new copy and its
+#: Log are built (4 + 4); painting needs 13 plus an allowance of 4 for Qt converting the image. Past pyqtgraph's 32767
+#: pixels the image is downsampled to the view and its NaN locations are coordinates, 16 per NaN pixel, not the
+#: widget's 1-byte mask. The page clears the shown frame before the next is read, so no second frame is charged.
+_READ_BYTES_PER_PIXEL = 8 + 8 + 4 + 1
+_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 1 + 4 + 4
+_WIDE_DRAW_BYTES_PER_PIXEL = 4 + 4 + 4 + 16 + 4 + 4
+_WIDE_DIMENSION = 2**15 - 1
+#: The loading snapshot: a screen raster of at most 2,000,000 4-byte pixels, kept while the next frame is read and drawn.
+LOADING_SNAPSHOT_RESERVATION = 2_000_000 * 4
 
 
 @dataclass(frozen=True, slots=True)
 class Viewer2DMemoryLedger:
+    shape: tuple[int, int]
     canonical_bytes: int
     catalog_reservation: int
+    snapshot_reservation: int
     encoded_retained: int
     reader_peak: int
-    renderer_slack_raw: int
-    renderer_linear: int
-    renderer_log_update: int
-    renderer_paint: int
     renderer_peak: int
-    concurrent_frame_bytes: int
-    total: int
     admission: int
     budget: int
 
     def __post_init__(self):
-        values = tuple(getattr(self, item) for item in self.__dataclass_fields__)
-        c = self.canonical_bytes
+        shape = self.shape
+        _malformed(type(shape) is not tuple or len(shape) != 2
+                   or any(type(value) is not int or value <= 0 for value in shape), "memory ledger")
+        values = tuple(getattr(self, item) for item in self.__dataclass_fields__ if item != "shape")
+        pixels = shape[0] * shape[1]
+        draw = _WIDE_DRAW_BYTES_PER_PIXEL if max(shape) > _WIDE_DIMENSION else _DRAW_BYTES_PER_PIXEL
         _malformed(any(type(value) is not int or value < 0 for value in values)
-            or c <= 0 or c % 8 or self.catalog_reservation != CATALOG_RESERVATION
+            or self.canonical_bytes != _CANONICAL.itemsize * pixels
+            or self.catalog_reservation != CATALOG_RESERVATION
+            or self.snapshot_reservation != LOADING_SNAPSHOT_RESERVATION
             or self.budget != _memory_budget()
-            or self.reader_peak != max(3 * c, self.encoded_retained + 4 * c)
-            or self.renderer_slack_raw != 5 * c // 2
-            or self.renderer_linear != 7 * c // 2
-            or self.renderer_log_update != 9 * c // 2
-            or self.renderer_paint != 5 * c or self.renderer_peak != 5 * c
-            or self.concurrent_frame_bytes != 6 * c
-            or self.total != self.catalog_reservation + max(self.reader_peak, 6 * c)
-            or self.admission != c + self.total,
+            or self.reader_peak != self.encoded_retained + _READ_BYTES_PER_PIXEL * pixels
+            or self.renderer_peak != draw * pixels
+            or self.admission != self.catalog_reservation + self.snapshot_reservation
+            + max(self.reader_peak, self.renderer_peak),
             "memory ledger")
 
 
@@ -419,15 +439,14 @@ def viewer_2d_memory_ledger(height, width, *, encoded_retained=0, ram_bytes=None
     _shape_fhw((height, width))
     if type(encoded_retained) is not int or encoded_retained < 0:
         raise TypeError("encoded retention must be a nonnegative integer")
-    c = 8 * height * width
-    q = max(3 * c, encoded_retained + 4 * c)
-    concurrent = 6 * c
-    total = CATALOG_RESERVATION + max(q, concurrent)
-    budget = _memory_budget(ram_bytes)
+    pixels = height * width
+    reader = encoded_retained + _READ_BYTES_PER_PIXEL * pixels
+    renderer = (_WIDE_DRAW_BYTES_PER_PIXEL if max(height, width) > _WIDE_DIMENSION
+                else _DRAW_BYTES_PER_PIXEL) * pixels
     return Viewer2DMemoryLedger(
-        c, CATALOG_RESERVATION, encoded_retained, q, 5 * c // 2,
-        7 * c // 2, 9 * c // 2, 5 * c, 5 * c, concurrent, total,
-        c + total, budget,
+        (height, width), _CANONICAL.itemsize * pixels, CATALOG_RESERVATION, LOADING_SNAPSHOT_RESERVATION,
+        encoded_retained, reader, renderer,
+        CATALOG_RESERVATION + LOADING_SNAPSHOT_RESERVATION + max(reader, renderer), _memory_budget(ram_bytes),
     )
 
 
@@ -1856,17 +1875,22 @@ def _validate_values(array):
         _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "selected source frame is not two-dimensional")
     if value.dtype.kind in "iu" and value.size:
         if int(value.min()) < -(2**53) or int(value.max()) > 2**53:
-            _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "integer source is not exactly representable")
+            _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "integer source exceeds the 2D Viewer's ±2^53 limit")
     if value.dtype.kind == "f" and np.isinf(value).any():
         _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "infinite values are not supported")
     source = np.ascontiguousarray(value)
-    canonical = (source if type(source) is np.ndarray
-        and source.dtype == np.dtype(float) and source.flags.c_contiguous
-        and source.flags.owndata and source.base is None
-        else np.array(source, dtype=float, order="C", copy=True))
+    if (type(source) is np.ndarray and source.dtype == _CANONICAL and source.flags.c_contiguous
+            and source.flags.owndata and source.base is None):
+        canonical = source
+    else:
+        with np.errstate(over="ignore"):  # an overflow is refused just below
+            canonical = np.array(source, dtype=_CANONICAL, order="C", copy=True)
+    # The source had no infinity, so one here is a finite float64 value beyond float32's range: refused (the
+    # maintainer's "Refuse with a reason").
+    if dtype.kind == "f" and dtype.itemsize > _CANONICAL.itemsize and np.isinf(canonical).any():
+        _refuse(Viewer2DRefusalCode.FORMAT_INVALID, "values exceed the 2D Viewer's float32 display range")
     canonical.setflags(write=False)
-    return (canonical, hashlib.sha256(source.tobytes(order="C")).hexdigest(),
-            dtype.str, source.nbytes)
+    return canonical, _buffer_sha256(source), dtype.str, source.nbytes
 
 
 def _finish(catalog, label, index, array, source_digest, *, kind=None, raw="",
@@ -1884,7 +1908,7 @@ def _finish(catalog, label, index, array, source_digest, *, kind=None, raw="",
     canonical, selected_digest, source_dtype, source_nbytes = _validate_values(value)
     source_dtype = source_dtype if source_dtype_override is None else source_dtype_override
     source_nbytes = source_nbytes if source_nbytes_override is None else source_nbytes_override
-    digest = hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
+    digest = _buffer_sha256(canonical)
     provenance = Viewer2DFrameProvenance(
         catalog.canonical_path, catalog.catalog_identity, catalog.format_name,
         label, index, canonical.shape, canonical.dtype.str, canonical.nbytes,
@@ -2066,7 +2090,14 @@ def _read_hdf5(catalog, label, policy, walk):
             vmin, vmax = (float(_hattr(dataset, name, walk))
                           for name in ("vmin", "vmax"))
             scale = 65535.0 if encoded.dtype == np.dtype("uint16") else 255.0
-            array = vmin + encoded.astype(float) / scale * (vmax - vmin)
+            # Dequantised in float64 an eighth of the rows at a time into one float32 frame: endpoints anywhere in
+            # float32's range cannot overflow, the values are the float64 dequantisation's rounded once, and no float64
+            # frame is made.
+            array = np.empty(encoded.shape, dtype=_CANONICAL)
+            rows = max(1, encoded.shape[0] // 8)
+            for start in range(0, encoded.shape[0], rows):
+                block = slice(start, start + rows)
+                array[block] = vmin + encoded[block].astype(float) / scale * (vmax - vmin)
             mask = _hget(dataset.parent, "thumbnail_mask", walk)
             if mask is not None:
                 if (not isinstance(mask, h5py.Dataset) or mask.dtype.kind != "b"
@@ -2076,7 +2107,7 @@ def _read_hdf5(catalog, label, policy, walk):
                 array[np.asarray(mask[()], dtype=bool)] = np.nan
         value = (array, fact.source_kind, "", None, None, True,
                  "Thumbnail preview; raw source unavailable.",
-                 hashlib.sha256(encoded.tobytes(order="C")).hexdigest(),
+                 _buffer_sha256(encoded),
                  encoded.dtype.str, encoded.nbytes)
     else:
         index = catalog.frame_labels.index(label)

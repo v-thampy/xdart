@@ -137,6 +137,7 @@ ANGULAR_SUPPORT_STRIP_TOOLTIP = (
 _NO_ANGULAR_SUPPORT = "This trace carries no angular coverage."
 _NO_TRACE_SUPPORT = "No 1-D profile is shown."
 MAX_WATERFALL_DISPLAY_ROWS = 256
+#: The 2D Viewer's ledger charges this snapshot, 4 bytes per pixel, as viewer_2d.LOADING_SNAPSHOT_RESERVATION.
 MAX_VIEWER_LOADING_SNAPSHOT_PIXELS = 2_000_000
 _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
 #: the top bar's Phases toggle (C6)
