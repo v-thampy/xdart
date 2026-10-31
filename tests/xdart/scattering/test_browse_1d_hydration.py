@@ -105,6 +105,7 @@ def _scope(
     request = BrowseLoadRequest(
         "browse-1d", 1, str(path.resolve()), terminal_receipt,
     )
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=request.token,
         load_generation=request.load_generation,
@@ -121,6 +122,7 @@ def _scope(
         record_store={},
         scalar_catalog=catalog,
         browse_1d_cache=cache,
+        frame_facts=FrameFactsStore(),
         target_entry=catalog.entry,
         loaded_labels=catalog.labels,
         target_snapshot=target_snapshot,
@@ -198,6 +200,12 @@ class _Reader:
         self.factory.cancel_observations.append(cancelled())
         return _rows(self.factory.catalog, labels, len(self.factory.read_labels))
 
+    def read_frame_facts(self, labels, *, cancelled):
+        from xrd_tools.io import FrameFacts
+
+        self.factory.facts_labels.append(labels)
+        return tuple(FrameFacts(label) for label in labels)
+
     def __exit__(self, _exc_type, _exc, _tb):
         if not self.factory.allow_close.is_set():
             self.factory.close_failures += 1
@@ -210,6 +218,7 @@ class _ReaderFactory:
     def __init__(self, catalog):
         self.catalog = catalog
         self.read_labels = []
+        self.facts_labels = []
         self.enter_threads = []
         self.cancel_observations = []
         self.read_started = Event()
@@ -267,24 +276,34 @@ def test_651_labels_read_once_then_fully_resident_avoids_io(tmp_path) -> None:
         Browse1DHydrationLane,
     )
 
+    from xdart.gui.tabs.scattering.browse_1d_target_plan import (
+        MAX_BROWSE_1D_DISPLAY_TARGETS,
+    )
+
     context, selection, frames, catalog, cache = _scope(tmp_path, 651)
     factory = _ReaderFactory(catalog)
     main_thread = get_ident()
     lane = Browse1DHydrationLane(context, open_reader=factory)
+    # One request is bounded by its resident frame facts (PERF-BROWSE-OPEN-128
+    # stage B); the planner sends at most its display targets plus the current.
+    assert lane.submit(selection, frames) is None
+    planned = frames[:MAX_BROWSE_1D_DISPLAY_TARGETS + 1]
+    labels = tuple(frame.local_frame_label for frame in planned)
 
-    assert lane.submit(selection, frames) is not None
+    assert lane.submit(selection, planned) is not None
     assert _drain(lane)
-    assert factory.read_labels == [catalog.labels]
+    assert factory.read_labels == [labels]
+    assert factory.facts_labels == [labels]
     assert len(factory.enter_threads) == 1
     assert factory.enter_threads[0] != main_thread
     assert factory.close_count == 1
-    assert len(cache.resident_keys) == 2 * len(catalog.labels)
+    assert len(cache.resident_keys) == 2 * len(labels)
     assert context.publication_store == {}
     assert context.record_store == {}
 
-    assert lane.submit(selection, frames) is not None
+    assert lane.submit(selection, planned) is not None
     assert not _drain(lane)
-    assert factory.read_labels == [catalog.labels]
+    assert factory.read_labels == [labels]
     assert factory.close_count == 1
     assert lane.release()
     cache.close()

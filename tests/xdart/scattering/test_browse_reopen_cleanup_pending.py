@@ -109,9 +109,9 @@ def test_one_click_opens_a_scan_while_the_shown_scans_1d_read_is_in_flight(tmp_p
         # Hold the shown scan's next 1-D read in flight: its Browse context cannot be released until it ends.
         real_read = Browse1DHydrationLane._open_and_read
 
-        def held_read(self, task, labels):
+        def held_read(self, task, labels, fact_labels):
             hold.wait(10)
-            return real_read(self, task, labels)
+            return real_read(self, task, labels, fact_labels)
 
         monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
         _click_frame(qapp, page._shell, 1, settle=False)
@@ -216,9 +216,9 @@ def test_refresh_cancels_the_kept_click_and_its_waiting_notice(tmp_path, monkeyp
     hold = threading.Event()
     real_read = Browse1DHydrationLane._open_and_read
 
-    def held_read(self, task, labels):
+    def held_read(self, task, labels, fact_labels):
         assert hold.wait(10)
-        return real_read(self, task, labels)
+        return real_read(self, task, labels, fact_labels)
 
     try:
         _click_scan(page, first)

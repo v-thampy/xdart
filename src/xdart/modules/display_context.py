@@ -1351,6 +1351,10 @@ class BrowseContext(_WriteOnceIdentity):
     #: The output's own detached ring basis or refusal (BROWSE-REFERENCE-RINGS-20261013), read once inside the
     #: load's seals; the concrete headless type is admitted by BrowseLoader. Invalidation and release clear it.
     ring_basis: object = None
+    #: The bounded resident per-frame facts of the frames this Browse has shown (PERF-BROWSE-OPEN-128 stage B):
+    #: created empty by the loader, filled only by the context's 1-D lane, read by display code. Its concrete
+    #: headless type is admitted by its consumers; release clears and detaches it with the scalar catalog.
+    frame_facts: object = None
 
     _IDENTITY_FIELDS = frozenset({
         "context_token", "load_generation", "operation", "requested_path",
@@ -1369,7 +1373,7 @@ class BrowseContext(_WriteOnceIdentity):
         if (
             name in {
                 "scalar_catalog", "browse_1d_cache", "loaded",
-                "prepared_reintegrate_offer", "ring_basis",
+                "prepared_reintegrate_offer", "ring_basis", "frame_facts",
             }
             and getattr(self, name, _UNSET) is not _UNSET
         ):
@@ -1567,6 +1571,7 @@ class BrowseContext(_WriteOnceIdentity):
             self.frames,
             self.viewer_rows_1d,
             self.viewer_rows_2d,
+            self.frame_facts,
         ):
             _clear(owned)
         # The catalog and its exact shared labels detach together only after
@@ -1577,6 +1582,7 @@ class BrowseContext(_WriteOnceIdentity):
         object.__setattr__(self, "frame_ids", empty_labels)
         object.__setattr__(self, "loaded_labels", empty_labels)
         object.__setattr__(self, "scalar_catalog", None)
+        object.__setattr__(self, "frame_facts", None)
         object.__setattr__(self, "prepared_reintegrate_offer", None)
         object.__setattr__(self, "ring_basis", None)
         self.released = True

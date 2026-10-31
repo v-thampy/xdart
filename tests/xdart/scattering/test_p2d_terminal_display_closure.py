@@ -196,9 +196,10 @@ def _browse_three(mount):
             view, record=record, source_identity=source, scan_key=context.scan_key))
     catalog = FrameScalarCatalog(request.source_path, "entry", tuple(
         FrameScalarRow(label) for label in (1, 2, 3)))
+    from xrd_tools.io import FrameFactsStore
     context = replace(
         context, frame_ids=catalog.labels, loaded_labels=catalog.labels,
-        scalar_catalog=catalog, loaded=False,
+        scalar_catalog=catalog, loaded=False, frame_facts=FrameFactsStore(),
         prepared_reintegrate_offer=prepare_reintegrate_bundle(
             None, entry=catalog.entry, labels=catalog.labels),
     )

@@ -16,6 +16,7 @@ from xdart.modules.frame_publication import PublicationStore
 from xrd_tools.core.staging import browse_publication_max_items
 from xrd_tools.io import (
     Browse1DCache,
+    FrameFactsStore,
     FrameScalarCatalog,
     FrameViewReader,
     ProcessedScan,
@@ -435,6 +436,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or type(context.frame_facts) is not FrameFactsStore
                 or context.prepared_reintegrate_offer is None
             ):
                 return None
@@ -463,6 +465,7 @@ class BrowseLoader:
             if context is not None and (
                 type(context.scalar_catalog) is not FrameScalarCatalog
                 or type(context.browse_1d_cache) is not Browse1DCache
+                or type(context.frame_facts) is not FrameFactsStore
                 or context.prepared_reintegrate_offer is None
             ):
                 return None
@@ -1134,6 +1137,8 @@ class BrowseLoader:
                 target_snapshot=after,
                 prepared_reintegrate_offer=prepared_offer,
                 ring_basis=ring_basis,
+                # Per-frame facts are read only for the frames Browse shows (PERF-BROWSE-OPEN-128 stage B).
+                frame_facts=FrameFactsStore(),
             )
             context.adopt_load_request(request)
             context.stamp_provenance(

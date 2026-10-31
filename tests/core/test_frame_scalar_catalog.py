@@ -211,15 +211,6 @@ def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
         "monitor": 10.0,
         "numeric_text": 1.5,
     }
-    assert first.geometry is not None
-    assert (
-        first.geometry.rot1,
-        first.geometry.rot2,
-        first.geometry.rot3,
-        first.geometry.incident_angle,
-    ) == tuple(float(np.float32(value)) for value in (2.1, 2.2, 2.3, 2.4))
-    assert (first.source_path, first.source_frame_index) == ("raw_2.h5", 102)
-    assert (first.has_thumbnail, first.mask_baked) == (True, True)
     assert first.modes_1d == ("q_total", "q_oop")
     assert first.modes_2d == ("qip_qoop", "q_chi")
     assert first.active_mode_1d == "q_total"
@@ -232,93 +223,12 @@ def test_scalar_catalog_projects_all_rows_modes_and_deeply_frozen_facts(
     assert middle is not None
     assert middle.modes_1d == ("q_total",)
     assert middle.modes_2d == ("qip_qoop",)
-    assert (middle.has_thumbnail, middle.mask_baked) == (False, False)
-    last = catalog.row(9)
-    assert last is not None
-    assert (last.has_thumbnail, last.mask_baked) == (True, False)
+    assert catalog.row(9) is not None
     _assert_array_free(catalog)
     with pytest.raises(FrozenInstanceError):
         catalog.rows = ()
     with pytest.raises(TypeError):
         first.metadata_raw["monitor"] = 0.0
-
-    # The returned graph owns exact immutable strings, never a live source/HDF
-    # alias.  Later source mutation cannot rewrite the catalog.
-    with h5py.File(path, "r+") as handle:
-        source = handle["entry/frames/frame_0002/source"]
-        del source["path"]
-        source.create_dataset("path", data=np.bytes_("changed.h5"))
-    assert first.source_path == "raw_2.h5"
-
-
-def test_scalar_catalog_qualifies_frame_nodes_once(tmp_path, monkeypatch) -> None:
-    path = tmp_path / "one_frame_lookup.nexus"
-    _catalog_file(path)
-    expected = {
-        f"/entry/frames/frame_{label:04d}{suffix}": 1
-        for label in (2, 5, 9)
-        for suffix in (
-            "", "/source", "/source/path", "/source/frame_index", "/thumbnail",
-        )
-    }
-    inspections: dict[str, int] = {}
-    real_get = h5py.Group.get
-
-    def tracked_get(group, name, *args, **kwargs):
-        node_path = f"{group.name}/{name}"
-        if kwargs.get("getlink") and node_path in expected:
-            inspections[node_path] = inspections.get(node_path, 0) + 1
-        return real_get(group, name, *args, **kwargs)
-
-    with FrameViewReader(path, resolve_source=False) as reader:
-        monkeypatch.setattr(h5py.Group, "get", tracked_get)
-        catalog = reader.read_scalar_catalog()
-    assert tuple(
-        (row.source_path, row.source_frame_index, row.has_thumbnail, row.mask_baked)
-        for row in catalog.rows
-    ) == (
-        ("raw_2.h5", 102, True, True),
-        ("raw_5.h5", 105, False, False),
-        ("raw_9.h5", 109, True, False),
-    )
-    assert inspections == expected
-
-
-def test_scalar_catalog_marks_current_average_capability(tmp_path) -> None:
-    path = tmp_path / "average.nexus"
-    record = FrameRecord.from_view(_view(1, 1.0))
-    with h5py.File(path, "w") as handle:
-        entry = current_entry(handle)
-        write_frame_records(entry, (record,))
-        frame = entry.create_group("frames").create_group("frame_0001")
-        frame.create_dataset(
-            "finite_counts", data=np.ones((2, 3), dtype=np.uint32),
-        )
-        counts = frame["finite_counts"]
-        counts.attrs["average_scan_policy"] = np.bytes_(b"average_scan_v1")
-        counts.attrs["contributor_extent"] = np.uint32(1)
-        counts.attrs["finite_counts_sha256"] = np.bytes_(b"0" * 64)
-        counts.attrs["finite_counts_min"] = np.uint32(1)
-        counts.attrs["finite_counts_max"] = np.uint32(1)
-        counts.attrs["finite_counts_zero_count"] = np.uint64(0)
-
-    with FrameViewReader(
-        path, resolve_source=False, include_thumbnail=False,
-    ) as reader:
-        catalog = reader.read_scalar_catalog()
-
-    assert catalog.labels == (1,)
-    assert catalog.rows[0].averaged is True
-
-    with h5py.File(path, "r+") as handle:
-        handle["entry/frames"].create_group("frame_0002")
-    with FrameViewReader(
-        path, resolve_source=False, include_thumbnail=False,
-    ) as reader:
-        appended = reader.read_scalar_catalog()
-    assert appended.labels == (1, 2)
-    assert appended.rows[0].averaged is True
-    assert appended.rows[1].averaged is False
 
 
 def test_scalar_catalog_never_reads_scientific_or_thumbnail_payloads(
@@ -419,7 +329,7 @@ def test_scalar_catalog_mid_vlen_cancellation_rolls_back_and_retries(
         assert catalog.row(9).metadata_raw["sample"] == "gamma"
 
 
-def test_scalar_catalog_uses_exact_persisted_source_without_path_probes(
+def test_scalar_catalog_makes_no_path_probes(
     tmp_path, monkeypatch,
 ) -> None:
     path = tmp_path / "persisted_source.nexus"
@@ -440,9 +350,7 @@ def test_scalar_catalog_uses_exact_persisted_source_without_path_probes(
         monkeypatch.setattr(Path, "stat", forbidden_probe)
         catalog = reader.read_scalar_catalog()
     assert probes == []
-    assert tuple(
-        (row.source_path, row.source_frame_index) for row in catalog.rows
-    ) == (("raw_2.h5", 102), ("raw_5.h5", 105), ("raw_9.h5", 109))
+    assert catalog.labels == (2, 5, 9)
 
 
 def test_scalar_catalog_projection_preflight_refuses_before_inventory_or_rows(
@@ -474,23 +382,6 @@ def test_scalar_catalog_projection_preflight_refuses_before_inventory_or_rows(
         assert inventory_calls == 0
         assert reader._scan_data_columns is None
         assert {key: id(value) for key, value in reader._read_cache.items()} == baseline
-
-
-def test_scalar_catalog_normalizes_nonfinite_persisted_geometry(tmp_path) -> None:
-    path = tmp_path / "nonfinite_geometry.nexus"
-    _catalog_file(path)
-    with h5py.File(path, "r+") as handle:
-        group = handle["entry/per_frame_geometry"]
-        group["rot1"][0] = np.nan
-        group["rot2"][0] = np.inf
-        group["rot3"][0] = -np.inf
-    with FrameViewReader(path, resolve_source=False) as reader:
-        row = reader.read_scalar_catalog().row(2)
-    assert row is not None and row.geometry is not None
-    assert row.geometry.rot1 is None
-    assert row.geometry.rot2 is None
-    assert row.geometry.rot3 is None
-    assert row.geometry.incident_angle == float(np.float32(2.4))
 
 
 def test_scalar_catalog_explicitly_refuses_partial_target_frame_reader(
@@ -581,28 +472,6 @@ def test_live_scalar_catalog_read_blocks_close_before_hdf_mutation(
         ),
         (
             lambda: FrameScalarRow(
-                label=0, geometry=FrameGeometry(poni={"distance": 1.0}),
-            ),
-            "array-free FrameGeometry",
-        ),
-        (
-            lambda: FrameScalarRow(
-                label=0, geometry=FrameGeometry(rot1=np.float32(1)),
-            ),
-            "exact floats",
-        ),
-        (
-            lambda: FrameScalarRow(
-                label=0, geometry=FrameGeometry(rot1=float("nan")),
-            ),
-            "finite floats",
-        ),
-        (
-            lambda: FrameScalarRow(label=0, source_path=Path("raw.tif")),
-            "source_path",
-        ),
-        (
-            lambda: FrameScalarRow(
                 label=0,
                 modes_2d=("q_chi",),
                 two_d_kinds=(("q_chi", "q_chi"),),
@@ -622,10 +491,6 @@ def test_live_scalar_catalog_read_blocks_close_before_hdf_mutation(
                 (FrameScalarRow(2), FrameScalarRow(1)),
             ),
             "strictly increasing",
-        ),
-        (
-            lambda: FrameScalarRow(1, averaged=1),
-            "marker facts",
         ),
     ],
 )

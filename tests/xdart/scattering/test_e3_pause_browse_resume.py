@@ -143,16 +143,23 @@ def test_default_browse_retains_all_651_scalar_rows_without_eager_frames(
         assert context.record_store.labels() == ()
         assert context.browse_1d_cache.resident_keys == ()
 
-        for label in (labels[0], labels[len(labels) // 2], labels[-1]):
+        # The open read no frame facts; they are read on demand, frame by frame.
+        assert context.frame_facts.record_count == 0
+        shown = (labels[0], labels[len(labels) // 2], labels[-1])
+        with FrameViewReader(catalog.artifact_path, resolve_source=False) as reader:
+            facts = reader.read_frame_facts(tuple(sorted(set(shown))))
+        by_label = {item.label: item for item in facts}
+        for label in shown:
             row = catalog.row(label)
             assert type(row) is FrameScalarRow
             assert row.active_mode_1d in row.modes_1d
             assert row.active_mode_2d in row.modes_2d
-            assert row.source_path is not None
-            assert Path(row.source_path).name == _raw.name
-            assert row.source_frame_index == 0
-            assert row.has_thumbnail is True
-            assert row.mask_baked is True
+            item = by_label[label]
+            assert item.source_path is not None
+            assert Path(item.source_path).name == _raw.name
+            assert item.source_frame_index == 0
+            assert item.has_thumbnail is True
+            assert item.mask_baked is True
     finally:
         if context is not None:
             loader.release_context(context)

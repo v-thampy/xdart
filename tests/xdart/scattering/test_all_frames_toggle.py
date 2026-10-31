@@ -414,10 +414,10 @@ def test_af13_pending_read_cleanup_replay_replacement_and_refresh(
     entered, release = Event(), Event()
     real_read = Browse1DHydrationLane._open_and_read
 
-    def held_read(self, task, labels):
+    def held_read(self, task, labels, fact_labels):
         entered.set()
         assert release.wait(10)
-        return real_read(self, task, labels)
+        return real_read(self, task, labels, fact_labels)
 
     monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
     try:

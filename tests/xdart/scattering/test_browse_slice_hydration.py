@@ -80,12 +80,13 @@ def saved(tmp_path, request):
         snapshot = revalidate_stream_terminal(path, terminal)
     request = BrowseLoadRequest("browse-slice", 1, str(path.resolve()), terminal)
     cache = Browse1DCache(1 << 20)
+    from xrd_tools.io import FrameFactsStore
     context = BrowseContext(
         context_token=request.token, load_generation=request.load_generation,
         operation=request, requested_path=request.source_path, scan_key="scan",
         scan=object(), frame=None, frame_ids=catalog.labels, frames={},
         viewer_rows_1d={}, viewer_rows_2d={}, publication_store=PublicationStore(),
-        record_store={}, scalar_catalog=catalog, browse_1d_cache=cache,
+        record_store={}, scalar_catalog=catalog, browse_1d_cache=cache, frame_facts=FrameFactsStore(),
         target_entry=catalog.entry, loaded_labels=catalog.labels,
         target_snapshot=snapshot,
         calibration_identity='{"wavelength_m": 1e-10}',

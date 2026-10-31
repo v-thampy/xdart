@@ -20,22 +20,19 @@ def _rig(tmp_path, count: int, *, norm_channels=None):
     from xdart.gui.tabs.scattering.context_runtime import _ContextRuntime
     from xdart.modules.display_context import BrowseContext
     from xdart.modules.frame_publication import PublicationStore
-    from xrd_tools.io import Browse1DCache, FrameScalarCatalog, FrameScalarRow
+    from xrd_tools.io import (
+        Browse1DCache, FrameFactsStore, FrameScalarCatalog, FrameScalarRow,
+    )
     from xrd_tools.io.output_transaction import capture_target_snapshot
     from xrd_tools.session import ScanNormAggregate
 
     path = tmp_path / f"plan-{count}.nxs"
     path.write_bytes(b"stable scalar-catalog artifact")
     rows = tuple(
-        FrameScalarRow(
-            label,
-            source_path="detector.tif",
-            source_frame_index=label - 1,
-            modes_1d=("q",),
-            active_mode_1d="q",
-        )
+        FrameScalarRow(label, modes_1d=("q",), active_mode_1d="q")
         for label in range(1, count + 1)
     )
+    frame_facts = FrameFactsStore()
     catalog = FrameScalarCatalog(
         str(path.resolve()),
         "entry",
@@ -78,6 +75,7 @@ def _rig(tmp_path, count: int, *, norm_channels=None):
         target_entry=catalog.entry,
         loaded_labels=catalog.labels,
         target_snapshot=capture_target_snapshot(path),
+        frame_facts=frame_facts,
     )
     context.adopt_load_request(request)
     context.mark_loaded()
@@ -112,7 +110,7 @@ def _plan(rig, preferences, *, was_active=False, navigation=None,
 
 def _seed(rig, owner, frames) -> None:
     from xrd_tools.core import Axis
-    from xrd_tools.io import Frame1DModeRows, Frame1DRows
+    from xrd_tools.io import FrameFacts, Frame1DModeRows, Frame1DRows
 
     context, _runtime, _selection, _all_frames, catalog, cache = rig
     lane = owner._one_d_lane
@@ -143,6 +141,11 @@ def _seed(rig, owner, frames) -> None:
         )
         with lane._lock:
             lane._known_keys[(frame.work_ordinal, label)] = tuple(keys)
+    context.frame_facts.commit(tuple(
+        FrameFacts(frame.local_frame_label, source_path="detector.tif",
+                   source_frame_index=frame.local_frame_label - 1)
+        for frame in frames
+    ))
 
 
 def _close(rig, owner=None) -> None:

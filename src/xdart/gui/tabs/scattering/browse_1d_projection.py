@@ -19,7 +19,9 @@ from xdart.modules.display_context import (
 )
 from xdart.modules.frame_publication import FramePublication, PublicationStore
 from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
-from xrd_tools.io import Browse1DCache, FrameScalarCatalog
+from xrd_tools.io import (
+    Browse1DCache, FrameFacts, FrameFactsFailure, FrameFactsStore, FrameScalarCatalog,
+)
 from xrd_tools.io.browse_1d_cache import Browse1DBorrow
 from xrd_tools.io.output_transaction import TargetSnapshot
 
@@ -159,6 +161,7 @@ class _ProjectionScope:
     hydration: Browse1DHydrationLane
     catalog: FrameScalarCatalog
     cache: Browse1DCache
+    facts: FrameFactsStore
     gate: CommitGate
     epoch: int
     artifact: str
@@ -179,6 +182,7 @@ def _scope_is_live(scope: _ProjectionScope) -> bool:
     return bool(
         context.scalar_catalog is scope.catalog
         and context.browse_1d_cache is scope.cache
+        and context.frame_facts is scope.facts
         and context.commit_gate is scope.gate
         and context.commit_epoch == scope.epoch
         and context.requested_path == scope.artifact
@@ -220,6 +224,7 @@ def _admit_scope(
         or len({id(item) for item in targets}) != len(targets)
         or type(context.scalar_catalog) is not FrameScalarCatalog
         or type(context.browse_1d_cache) is not Browse1DCache
+        or type(context.frame_facts) is not FrameFactsStore
         or type(context.commit_gate) is not CommitGate
         or type(context.commit_epoch) is not int
         or context.commit_epoch < 1
@@ -236,6 +241,7 @@ def _admit_scope(
         hydration,
         context.scalar_catalog,
         context.browse_1d_cache,
+        context.frame_facts,
         context.commit_gate,
         context.commit_epoch,
         context.requested_path,
@@ -376,20 +382,20 @@ def _two_d_completeness(view: FrameView) -> bool:
     return True
 
 
-def _detector_source_is_exact(view: FrameView, scalar_row) -> bool:
+def _detector_source_is_exact(view: FrameView, facts: FrameFacts) -> bool:
     return bool(
         type(view.source_path) is str
         and view.source_path
-        and type(scalar_row.source_path) is str
-        and scalar_row.source_path
-        and view.source_path == scalar_row.source_path
+        and type(facts.source_path) is str
+        and facts.source_path
+        and view.source_path == facts.source_path
         and type(view.source_frame_index) is int
-        and type(scalar_row.source_frame_index) is int
-        and view.source_frame_index == scalar_row.source_frame_index
+        and type(facts.source_frame_index) is int
+        and view.source_frame_index == facts.source_frame_index
     )
 
 
-def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
+def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row, facts: FrameFacts):
     if frame is not scope.navigation.current:
         return None
     store = scope.context.publication_store
@@ -400,8 +406,12 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
         return None
     if type(publication) is not FramePublication:
         raise _Refused("Browse sparse publication is foreign")
+    # The frame's own facts name it: the row carries no source locator, and a getattr fallback would silently
+    # name ``artifact#label`` instead.
+    if type(facts) is not FrameFacts or facts.label != scalar_row.label:
+        raise _Refused("Browse sparse frame facts are foreign")
     expected_source = canonical_browse_source_identity(
-        scalar_row,
+        facts,
         scope.artifact,
         source_base=scope.catalog.source_base,
         source_root=scope.context.load_request.source_root,
@@ -478,9 +488,9 @@ def _current_heavy(scope: _ProjectionScope, frame: DisplayFrameKey, scalar_row):
     raw = view.raw
     thumbnail = view.thumbnail
     if not witnesses:
-        if thumbnail is not None and not scalar_row.has_thumbnail:
+        if thumbnail is not None and not facts.has_thumbnail:
             thumbnail = None
-        if raw is not None and not _detector_source_is_exact(view, scalar_row):
+        if raw is not None and not _detector_source_is_exact(view, facts):
             raw = None
     if not top_complete and raw is None and thumbnail is None:
         return None
@@ -510,8 +520,8 @@ def _two_d_kind(scalar_row, heavy: _QualifiedHeavy | None) -> TwoDKind:
 _GI_MODE_KEYS = frozenset({"q_total", "q_ip", "q_oop", "exit_angle", "chi_gi", "qip_qoop", "q_chi", "exit_angles"})
 
 
-def _is_gi(scalar_row, kind: TwoDKind) -> bool:
-    geometry = scalar_row.geometry
+def _is_gi(scalar_row, facts: FrameFacts, kind: TwoDKind) -> bool:
+    geometry = facts.geometry
     return bool(
         kind is not TwoDKind.Q_CHI
         or geometry is not None and geometry.incident_angle is not None
@@ -525,6 +535,7 @@ def _payload(
     frame: DisplayFrameKey,
     inventory: Browse1DLabelInventory,
     borrowed: dict[str, Browse1DBorrow],
+    facts: FrameFacts,
 ) -> StandardDisplayPayload:
     from .context_projection import _browse_wavelength
 
@@ -569,9 +580,11 @@ def _payload(
         if mode_inventory.angular_support is not None and (
                 support is None or support.supported_deg is not support_borrow.array):
             raise _Refused("Browse 1-D angular support lost its resident row")
-    heavy = _current_heavy(scope, frame, scalar_row)
+    if type(facts) is not FrameFacts or facts.label != scalar_row.label:
+        raise _Refused("Browse frame facts are foreign")
+    heavy = _current_heavy(scope, frame, scalar_row, facts)
     kind = _two_d_kind(scalar_row, heavy)
-    geometry = scalar_row.geometry
+    geometry = facts.geometry
     view = FrameView(
         label=scalar_row.label,
         axis_1d=axis,
@@ -584,26 +597,26 @@ def _payload(
         two_d_kind=kind,
         raw=None if heavy is None else heavy.raw,
         thumbnail=None if heavy is None else heavy.thumbnail,
-        mask_baked=scalar_row.mask_baked,
+        mask_baked=facts.mask_baked,
         metadata_raw=scalar_row.metadata_raw,
         metadata_numeric=scalar_row.metadata_numeric,
         incident_angle=(None if geometry is None else geometry.incident_angle),
         geometry=geometry,
-        source_path=scalar_row.source_path,
-        source_frame_index=scalar_row.source_frame_index,
+        source_path=facts.source_path,
+        source_frame_index=facts.source_frame_index,
         angular_support=support,
     )
     if intensity is not None and view.intensity_1d is not intensity:
         raise _Refused("Browse 1-D view copied its intensity borrow")
     if sigma is not None and view.sigma_1d is not sigma:
         raise _Refused("Browse 1-D view copied its sigma borrow")
-    gi = _is_gi(scalar_row, kind)
+    gi = _is_gi(scalar_row, facts, kind)
     return StandardDisplayPayload(
         scope.generation,
         frame,
         (
             f"Browse · {scope.context.scan_key} · [averaged]"
-            if scalar_row.averaged
+            if facts.averaged
             else f"Browse · {scope.context.scan_key} · frame {scalar_row.label}"
         ),
         view,
@@ -614,7 +627,7 @@ def _payload(
         gi_resolved_motor="Manual" if gi else "",
         gi_mode_1d=(scalar_row.active_mode_1d or "") if gi else "",
         gi_mode_2d=(scalar_row.active_mode_2d or "") if gi else "",
-        averaged=scalar_row.averaged,
+        averaged=facts.averaged,
         legend_scan=getattr(getattr(scope.context, "scalar_catalog", None), "artifact_family", None) or "",
         # The current frame's other direct maps ride with its heavy view; the
         # publication was ownership-checked by ``_current_heavy`` just above.
@@ -687,6 +700,17 @@ def project_browse_1d(
                 raise _Refused("Browse scalar target disappeared")
             inventories.append(inventory)
             modes.append(_active_mode(inventory, scalar_row))
+        facts_by_target: list[FrameFacts] = []
+        for frame in scope.targets:
+            label = frame.local_frame_label
+            facts = scope.facts.get(label)
+            if facts is None:
+                raise _Incomplete("Browse frame facts are not hydrated")
+            if type(facts) is FrameFactsFailure:
+                raise _Refused(f"Browse frame {label}: {facts.reason}")
+            if type(facts) is not FrameFacts or facts.label != label:
+                raise _Refused("Browse frame facts owner returned a foreign fact")
+            facts_by_target.append(facts)
 
         by_target: list[dict[str, Browse1DBorrow]] = []
         for frame, mode_inventory in zip(scope.targets, modes):
@@ -730,9 +754,9 @@ def project_browse_1d(
                 raise _Refused("Browse 1-D inventory drifted during acquire")
 
         payloads = tuple(
-            _payload(scope, frame, inventory, named)
-            for frame, inventory, named in zip(
-                scope.targets, inventories, by_target,
+            _payload(scope, frame, inventory, named, facts)
+            for frame, inventory, named, facts in zip(
+                scope.targets, inventories, by_target, facts_by_target,
             )
         )
         if not _scope_is_live(scope):
