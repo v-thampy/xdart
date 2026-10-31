@@ -638,7 +638,7 @@ class PeakFitDialog(QtWidgets.QDialog):
             "fraction_init": 0.5 if fraction is None else fraction,
             "max_nfev": int(nfev) if nfev else None,
         }
-        if self.use_uncertainties.isChecked():
+        if self.use_uncertainties.isChecked() and self.use_uncertainties.isEnabled():
             values['use_uncertainties'] = True
         if values["background"].startswith("template"):
             values.update(self.background_template_row.values())
@@ -793,8 +793,10 @@ class PeakFitDialog(QtWidgets.QDialog):
                            lambda value: self.bkg_combo.setCurrentIndex(self.bkg_combo.findData(value))),
             "auto": (self.auto_row, self.auto_check.isChecked, self.auto_check.setChecked),
             "n_peaks": (self.count_row, self.npeaks_spin.value, self.count_row.set_number),
-            "range_low": (self.range_row, lambda: self._fit_lo, lambda value: self._set_range_bound(0, value)),
-            "range_high": (self.range_row, lambda: self._fit_hi, lambda value: self._set_range_bound(1, value)),
+            "range_low": (self.range_row, lambda: self._saved_range_bound(0),
+                          lambda value: self._set_range_bound(0, value)),
+            "range_high": (self.range_row, lambda: self._saved_range_bound(1),
+                           lambda value: self._set_range_bound(1, value)),
             "centers": (rows["centers"], *text(self.adv_centers)),
             "sigma_init": (rows["sigma_init"], *text(self.adv_sigma_init)),
             "sigma_min": (rows["sigma_bounds"], *text(self.adv_sigma_min)),
@@ -837,6 +839,15 @@ class PeakFitDialog(QtWidgets.QDialog):
         if key in ("n_peaks", "max_nfev") and row.refusal():
             raise ValueError(f"{row.label.text()}: {row.refusal()}")
         return get()
+
+    def _saved_range_bound(self, index):
+        """A fit-range bound as saved: None (the whole trace) when it is the shown trace's own end, so a document
+        restored on a wider trace fits all of it; else the bound kept exactly."""
+        value = self._fit_lo if index == 0 else self._fit_hi
+        if value is not None and self._x is not None and math.isclose(value, self._data_extent()[index],
+                                                                        rel_tol=1e-12, abs_tol=0.0):
+            return None
+        return value
 
     def _set_range_bound(self, index, value):
         """A saved fit-range bound: kept exactly, shown as the Range row shows a dragged one, and drawn."""
