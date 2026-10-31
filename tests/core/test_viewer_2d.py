@@ -2289,10 +2289,11 @@ def test_windows_budget_uses_the_pcs_own_ram(monkeypatch):
     assert api.viewer_2d_memory_ledger(1, 1).budget == 884_736_000, "16 GB keeps the fallback it had (819 MiB < 844)"
 
 
-def test_a_small_windows_pc_keeps_the_budget_it_had(monkeypatch):
-    """Reading Windows RAM must not take anything away: an 8 GB Windows PC had the 884,736,000-byte fallback, where a
+@pytest.mark.parametrize("ram_gib", [7, 8], ids=["hosted-7-gib", "pc-8-gib"])
+def test_a_small_windows_pc_keeps_the_budget_it_had(monkeypatch, ram_gib):
+    """Reading Windows RAM must not take anything away: a 7/8 GiB Windows PC had the 884,736,000-byte fallback, where a
     9-megapixel Eiger2 frame (3108x3262) is admitted; a twentieth of its RAM (410 MiB) would refuse it."""
-    _as_windows(monkeypatch, 8 * 1024**3)
+    _as_windows(monkeypatch, ram_gib * 1024**3)
     ledger = api.viewer_2d_memory_ledger(3108, 3262, encoded_retained=40 * 1024**2)
     assert ledger.budget == 884_736_000 and ledger.admission <= ledger.budget
 

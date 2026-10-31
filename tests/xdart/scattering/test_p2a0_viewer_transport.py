@@ -20,9 +20,16 @@ _EXPECTED_R = 11_546_624
 
 try:
     _PHYSICAL_RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    _WINDOWS_RAM = 0
 except (ValueError, OSError, AttributeError):
-    _PHYSICAL_RAM = 0
-_EXPECTED_B = 884_736_000 if _PHYSICAL_RAM <= 0 else min(1024**3, _PHYSICAL_RAM // 20)
+    from xrd_tools.core.staging import windows_physical_ram_bytes
+    _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
+if _PHYSICAL_RAM > 0:
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 20)
+elif _WINDOWS_RAM > 0:
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 20))
+else:
+    _EXPECTED_B = 884_736_000
 
 
 @pytest.fixture(autouse=True)
