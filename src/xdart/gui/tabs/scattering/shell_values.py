@@ -795,20 +795,22 @@ def restore_phase_references(options: ScientificPlotOptions, document) -> Scient
 @dataclass(frozen=True, slots=True, eq=False)
 class SavedSupportSource:
     """A Browse Int output's facts a frame's angular coverage may be rebuilt from (COVERAGE-SUPPORT-20261013, D5):
-    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames. Scalars
-    only: no handle, frame or array crosses into the reconstruction."""
+    the name its frames carry (``artifact``), the file read, its entry, the load's snapshot and its frames, and the
+    Run handoff's stream seal when the load was sealed (``terminal``). Scalars only: no handle, frame or array crosses
+    into the reconstruction."""
 
     artifact: str
     path: str
     entry: str
     snapshot: object
     labels: tuple[int, ...]
+    terminal: object = None
 
     def request(self, labels):
         """The one reconstruction request for the output's shown frames ``labels``."""
         from xrd_tools.analysis.angular_support import SavedSupportRequest
         return SavedSupportRequest(self.path, self.entry, self.snapshot, self.labels,
-                                   tuple(sorted(int(label) for label in labels)))
+                                   tuple(sorted(int(label) for label in labels)), self.terminal)
 
 
 @dataclass(frozen=True, slots=True)

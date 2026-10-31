@@ -790,15 +790,18 @@ def attach_saved_rings(scientific: ScientificProjection, basis, current) -> Scie
 def attach_saved_support_source(scientific: ScientificProjection, browse: BrowseContext) -> ScientificProjection:
     """A Browse Int output's own facts, from which the strip may rebuild a frame's angular coverage when the output
     saved none (COVERAGE-SUPPORT-20261013, D5): its frames' name, file, entry, load snapshot and labels."""
+    from xrd_tools.io.output_transaction import stream_terminal_object_revision
     from .shell_values import SavedSupportSource
 
     catalog = browse.scalar_catalog
     if (scientific.processing_mode not in {"Int 1D", "Int 2D"} or browse.target_snapshot is None
             or catalog is None or not catalog.labels):
         return scientific
+    # A sealed Run handoff's snapshot is revalidated against its seal, as the 1-D lane does (TERMINAL-SUPPORT-128).
+    terminal = getattr(browse.load_request, "terminal_commit_identity", None)
     return replace(scientific, saved_support_source=SavedSupportSource(
         browse.requested_path, catalog.artifact_path, browse.target_entry or catalog.entry, browse.target_snapshot,
-        tuple(catalog.labels)))
+        tuple(catalog.labels), terminal if stream_terminal_object_revision(terminal) is not None else None))
 
 
 def _browse_payload(
