@@ -416,6 +416,35 @@ class ChebyshevModel(Model):
         return update_param_vals(pars, self.prefix, **kwargs)
 
 
+def template_background_model(x_ref, y_ref, prefix: str = "bg_") -> Model:
+    """A one-parameter scaled-template background: ``A * np.interp(x, x_ref, y_ref)`` with ``A ≥ 0``.
+
+    The reference (a substrate's pattern) is sorted once and interpolated onto whatever x the fit uses, held flat
+    beyond its ends; ``A`` (``bg_A`` by default) starts at 1. Phase Analysis's fitted template and the Peak Fitter's
+    template backgrounds are this one model (NEXT-128-PEAK-FIT), whatever file or trace the reference came from.
+    """
+    x_arr = np.asarray(x_ref, dtype=float)
+    y_arr = np.asarray(y_ref, dtype=float)
+    if x_arr.shape != y_arr.shape:
+        raise ValueError(
+            f"Template x and y must have the same shape, got "
+            f"{x_arr.shape} vs {y_arr.shape}"
+        )
+    # Pre-sort once so np.interp is valid at eval time
+    order = np.argsort(x_arr)
+    x_sorted = x_arr[order]
+    y_sorted = y_arr[order]
+
+    def _template(x, A=1.0):
+        return float(A) * np.interp(
+            np.asarray(x, dtype=float), x_sorted, y_sorted,
+        )
+
+    model = Model(_template, prefix=prefix)
+    model.set_param_hint(f"{prefix}A", value=1.0, min=0.0)
+    return model
+
+
 def make_chebyshev_model(
     degree: int,
     prefix: str = "",

@@ -58,7 +58,15 @@ _PHASE_OPTION_DEFAULTS = (
     ("fit_background", "none"), ("fit_background_degree", 3), ("amorphous_peak", "none"), ("amorphous_center", 1.5),
     ("amorphous_sigma", 0.3), ("fit_range", None), ("fit_range_unit", "q_A^-1"), ("initial_values", ()),
     ("initial_topology", ()),
+    # NEXT-128-PEAK-FIT: a file-named template's canonical source pairs and its recorded content identity
+    ("background_template_source", None), ("background_template_identity", None),
 )
+#: NEXT-128-PEAK-FIT (PLAN decision 8): Int's displayed axis is its file's float32 axis within 2.4e-7, its intensities
+#: exact, so a captured trace is its file's curve when both arrays agree within this relative tolerance
+_TEMPLATE_CAPTURE_RTOL = 1e-6
+_PEAK_MODELS = frozenset({"pseudovoigt", "gaussian", "lorentzian", "voigt", "pearson7", "split_pseudovoigt"})
+_PEAK_BACKGROUNDS = frozenset({"linear", "constant", "none", "chebyshev3", "template", "template+linear",
+                               "template+chebyshev3"})
 def _tuple_once(value: Any) -> tuple[Any, ...]:
     if type(value) is tuple:
         return value
@@ -73,6 +81,12 @@ def _optional_tuple_once(value: Any, *, scalar: bool = False) -> Any:
     if scalar and type(value) in {bool, int, float}:
         return value
     raise InvalidCanonicalValue("plan values require an exact tuple, list, or scalar")
+def _source_pairs_once(value: Any) -> Any:
+    """A template source as plans keep it: a mapping or JSON lists as nested tuples; anything else is kept for the
+    validator to refuse by name (never raised here)."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), item) for key, item in value.items()))
+    return _nested_tuple(value)
 def _receipt_value(receipt: "DisplayedTraceReceipt") -> tuple[Any, ...]:
     return (
         receipt.schema_version, receipt.run_generation, receipt.run_fingerprint,
@@ -148,8 +162,16 @@ class DisplayedPeakFitPlan:
     fraction_init: float = 0.5
     max_nfev: int | None = None
     use_uncertainties: bool = False
+    #: NEXT-128-PEAK-FIT: a template background's template. A captured displayed trace ("Use displayed"), and/or a
+    #: file-named source as canonical pairs (``BackgroundTemplateSource.to_pairs``) with its recorded content identity,
+    #: None until a first fit binds it. The fit job reads the file; a captured trace with a source is fitted as the
+    #: file's curve only when the file reproduces it.
+    background_template: DisplayedTraceInput | None = None
+    background_template_source: tuple[tuple[str, Any], ...] | None = None
+    background_template_identity: str | None = None
     def __post_init__(self) -> None:
         object.__setattr__(self, "manual_centers", _tuple_once(self.manual_centers))
+        object.__setattr__(self, "background_template_source", _source_pairs_once(self.background_template_source))
         for name in ("fit_bounds", "sigma_bounds", "amplitude_bounds"):
             object.__setattr__(
                 self, name, _optional_tuple_once(getattr(self, name)),
@@ -181,6 +203,10 @@ class DisplayedPeakFitResult:
     marker_positions: np.ndarray | None = None
     storage_bytes: int = 0
     result_fingerprint: str = ""
+    #: NEXT-128-PEAK-FIT: the plan's template source echoed, and the content identity the fit read ("" when the fit
+    #: used an unnamed captured trace); both join the fingerprint only when the plan has a template
+    background_template_source: tuple[tuple[str, Any], ...] | None = None
+    background_template_identity: str = ""
 @dataclass(frozen=True, slots=True)
 class CifAssetReceipt:
     lexical_path: Path
@@ -237,8 +263,12 @@ class DisplayedPhaseFitPlan:
     #: a Sequential batch's seed: the previous completed fit's (name, value) pairs and its phase/reflection topology
     initial_values: tuple[tuple[str, float], ...] = ()
     initial_topology: tuple[Any, ...] = ()
+    #: NEXT-128-PEAK-FIT: the substrate named by its file (as ``DisplayedPeakFitPlan``'s) and its recorded identity
+    background_template_source: tuple[tuple[str, Any], ...] | None = None
+    background_template_identity: str | None = None
     def __post_init__(self) -> None:
         object.__setattr__(self, "cif_paths", tuple(Path(p) for p in _tuple_once(self.cif_paths)))
+        object.__setattr__(self, "background_template_source", _source_pairs_once(self.background_template_source))
         object.__setattr__(self, "expected_hashes", _tuple_once(self.expected_hashes))
         object.__setattr__(self, "phase_names", _tuple_once(self.phase_names))
         object.__setattr__(self, "phase_entries", _tuple_once(self.phase_entries))
@@ -283,6 +313,9 @@ class DisplayedPhaseFitResult:
     #: each fitted phase's (id, kind, ordered reflection hkls): a Sequential seed applies only to the same listing.
     #: Derived from the pinned inputs, so it stays out of the result fingerprint.
     seed_topology: tuple[Any, ...] = ()
+    #: NEXT-128-PEAK-FIT: as ``DisplayedPeakFitResult``'s
+    background_template_source: tuple[tuple[str, Any], ...] | None = None
+    background_template_identity: str = ""
 class _Refusal(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -314,6 +347,14 @@ def _fit_plan_value(plan: DisplayedPeakFitPlan) -> tuple[Any, ...]:
         plan.amplitude_bounds, plan.center_bounds_delta, plan.fraction_init,
         plan.max_nfev,
     )
+    # NEXT-128-PEAK-FIT: each template fact joins only when present, so a plan without one keeps its identity
+    if plan.background_template is not None:
+        template = plan.background_template
+        value += (("background_template", template.trace_fingerprint, _receipt_value(template.receipt)),)
+    if plan.background_template_source is not None:
+        value += (("background_template_source", plan.background_template_source),)
+    if plan.background_template_identity is not None:
+        value += (("background_template_identity", plan.background_template_identity),)
     return value + (("use_uncertainties", True),) if plan.use_uncertainties else value
 
 def _fit_sigma(plan, mask: np.ndarray) -> np.ndarray | None:
@@ -335,6 +376,8 @@ def _terminal(result_type, disposition, plan: Any, code: str, message: str):
         wavelength = getattr(plan, "wavelength_angstrom", None)
         if _valid_number(wavelength) and wavelength > 0:
             keywords["wavelength_angstrom"] = float(wavelength)
+    if getattr(plan, "background_template_source", None) is not None:
+        keywords["background_template_source"] = plan.background_template_source
     return result_type(
         disposition, code, (message,),
         trace_fingerprint=getattr(trace, "trace_fingerprint", ""),
@@ -394,8 +437,9 @@ def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, 
     _fit_trace(plan.trace)
     if type(plan.selection_mode) is not str or plan.selection_mode not in {"auto", "count"} or type(plan.n_peaks) is not int or not 1 <= plan.n_peaks <= 12:
         raise _Refusal("INVALID_PEAK_PLAN", "invalid peak selection")
-    if type(plan.model) is not str or plan.model not in {"pseudovoigt", "gaussian", "lorentzian", "voigt"} or type(plan.background) is not str or plan.background not in {"linear", "constant", "none", "chebyshev3"}:
+    if type(plan.model) is not str or plan.model not in _PEAK_MODELS or type(plan.background) is not str or plan.background not in _PEAK_BACKGROUNDS:
         raise _Refusal("INVALID_PEAK_PLAN", "invalid peak model")
+    _validate_template(plan, plan.background.startswith("template"), "INVALID_PEAK_PLAN", inverse_angstrom=False)
     finite_axis = plan.trace.axis[np.isfinite(plan.trace.axis)]
     if finite_axis.size == 0:
         raise _Refusal("INVALID_PEAK_PLAN", "trace has no finite axis")
@@ -500,6 +544,11 @@ def run_displayed_peak_fit(
         _progress(progress_callback, 0, 1)
         if cancel_token is not None and cancel_token.is_set():
             return _cancelled_peak(plan)
+        captured = (None if plan.background_template is None else
+                    _captured_arrays(plan.background_template, "INVALID_PEAK_PLAN", inverse_angstrom=False))
+        template, template_identity, notes = _resolve_template(plan, plan.trace.axis_unit, captured)
+        if cancel_token is not None and cancel_token.is_set():
+            return _cancelled_peak(plan)
         try:
             PeakFitPlan, runner = _load_peak_backend()
         except ImportError:
@@ -517,7 +566,7 @@ def run_displayed_peak_fit(
             amplitude_bounds=plan.amplitude_bounds,
             center_bounds_delta=plan.center_bounds_delta,
             fraction_init=plan.fraction_init,
-            fit_kwargs=fit_kwargs,
+            fit_kwargs=fit_kwargs, background_template=template,
         )
         try:
             payload = runner(backend_plan, x, y).payload
@@ -529,11 +578,13 @@ def run_displayed_peak_fit(
         names, values, errors = _parameters(payload.params)
         plan_fp, policy_fp = _digest(_fit_plan_value(plan)), _digest((_PEAK_POLICY_VERSION,))
         scalar = (
-            "completed", "OK", (), plan.trace.trace_fingerprint,
+            "completed", "OK", notes, plan.trace.trace_fingerprint,
             _receipt_value(plan.trace.receipt), plan_fp, policy_fp, bool(payload.success),
             _fit_message(fit_result.message), plan.trace.label, plan.trace.axis_unit,
             names, values, errors,
         )
+        if plan.background_template is not None or plan.background_template_source is not None:
+            scalar += (("background_template", plan.background_template_source, template_identity),)
         size = _result_base(scalar)
         fit = _result_array(payload.best_fit, x.size); size = _result_add(size, fit)
         components = fit_result.eval_components(x=x)
@@ -560,7 +611,9 @@ def run_displayed_peak_fit(
             axis_unit=plan.trace.axis_unit, parameter_names=names,
             parameter_values=values, parameter_stderr=errors, fit=fit,
             background=background, residual=residual, marker_positions=markers,
-            storage_bytes=size, result_fingerprint=fingerprint,
+            storage_bytes=size, result_fingerprint=fingerprint, diagnostics=notes,
+            background_template_source=plan.background_template_source,
+            background_template_identity=template_identity,
         )
     except _Refusal as exc:
         return _peak_refusal(plan, exc.code, str(exc))
@@ -656,10 +709,7 @@ def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> 
         raise _invalid("fit_background")
     if type(plan.fit_background_degree) is not int or not 2 <= plan.fit_background_degree <= 15:
         raise _invalid("fit_background_degree")
-    if plan.fit_background.startswith("template") != (plan.background_template is not None):
-        raise _invalid("background_template")
-    if plan.background_template is not None:
-        _template_arrays(plan.background_template)
+    _validate_template(plan, plan.fit_background.startswith("template"), "INVALID_PHASE_PLAN", inverse_angstrom=True)
     if not _choice(plan.amorphous_peak, _AMORPHOUS_PROFILES):
         raise _invalid("amorphous_peak")
     if not _valid_number(plan.amorphous_center):
@@ -721,22 +771,88 @@ def _q_bounds(plan: DisplayedPhaseFitPlan) -> tuple[float, float] | None:
 def _solve_mask(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> np.ndarray:
     low, high = _q_bounds(plan)
     return finite & (plan.trace.axis >= low) & (plan.trace.axis <= high)
-def _template_arrays(template: Any) -> tuple[np.ndarray, np.ndarray]:
-    """A substrate admitted as the trace is (limits, Å⁻¹), keeping finite paired points: at least two distinct q."""
+def _captured_arrays(template: Any, code: str = "INVALID_PHASE_PLAN", *,
+                     inverse_angstrom: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    """A captured template admitted as the trace is (limits; Å⁻¹ for a phase fit), keeping finite paired points: at
+    least two distinct x."""
     if not isinstance(template, DisplayedTraceInput):
-        raise _invalid("background_template")
+        raise _Refusal(code, "invalid background_template")
     try:
         _fit_trace(template)
-        require_inverse_angstrom(template.axis_unit, operation="a substrate template")
+        if inverse_angstrom:
+            require_inverse_angstrom(template.axis_unit, operation="a substrate template")
     except (_Refusal, ValueError) as exc:
-        raise _invalid("background_template") from exc
+        raise _Refusal(code, "invalid background_template") from exc
     keep = np.isfinite(template.axis) & np.isfinite(template.intensity)
     x, y = np.asarray(template.axis)[keep], np.asarray(template.intensity)[keep]
     order = np.argsort(x, kind="stable")
     x, y = x[order], y[order]
     if x.size < 2 or np.any(np.diff(x) <= 0):
-        raise _invalid("background_template")
+        raise _Refusal(code, "invalid background_template")
     return x, y
+def _template_arrays(template: Any) -> tuple[np.ndarray, np.ndarray]:
+    """A substrate admitted as the trace is (limits, Å⁻¹), keeping finite paired points: at least two distinct q."""
+    return _captured_arrays(template)
+def _template_source(plan: Any) -> Any:
+    """The plan's file-named template (a ``BackgroundTemplateSource``) or None; a malformed one refused by its code."""
+    if plan.background_template_source is None:
+        return None
+    from .background_template import BackgroundTemplateRefused, BackgroundTemplateSource
+    try:
+        return BackgroundTemplateSource.from_pairs(plan.background_template_source)
+    except BackgroundTemplateRefused as exc:
+        raise _Refusal(exc.code, str(exc)) from exc
+def _validate_template(plan: Any, templated: bool, code: str, *, inverse_angstrom: bool) -> None:
+    """NEXT-128-PEAK-FIT, before any backend work: a template background has a template and a template has one; a
+    source parses; an identity is recorded only for a file-named source; a captured trace is admitted."""
+    captured, identity = plan.background_template, plan.background_template_identity
+    if templated != (captured is not None or plan.background_template_source is not None):
+        raise _Refusal(code, "invalid background_template: a template background needs a template, and a template "
+                             "needs a template background")
+    _template_source(plan)
+    if identity is not None:
+        from .background_template import is_template_identity
+        if not is_template_identity(identity) or plan.background_template_source is None or captured is not None:
+            raise _Refusal(code, "invalid background_template_identity: it records a file template's content")
+    if captured is not None:
+        _captured_arrays(captured, code, inverse_angstrom=inverse_angstrom)
+def _resolve_template(plan: Any, target_unit: str, captured: tuple[np.ndarray, np.ndarray] | None):
+    """The template a fit scales, on the fit's ``target_unit`` axis, the content identity it read ("" when unnamed)
+    and any diagnostics, or (None, "", ()) for no template; refused by name. Blocking (the fit job's worker): a file
+    is read through the one owner, ``prepare_background_template`` (cached by its stat facts).
+
+    - A file source alone is read, checked against a recorded identity, and aligned.
+    - A captured trace with a source (the displayed trace and the file and frame behind it) is fitted as the file's
+      curve, and binds the identity, only when that curve reproduces the captured arrays within
+      ``_TEMPLATE_CAPTURE_RTOL``; otherwise the captured arrays are fitted and the diagnostics say why
+      (BACKGROUND_TEMPLATE_UNREPRODUCIBLE), so the template stays unnamed.
+    - A captured trace alone is fitted as captured."""
+    if captured is None and plan.background_template_source is None:
+        return None, "", ()
+    from .background_template import BackgroundTemplateRefused, align_template, prepare_background_template
+    source = _template_source(plan)
+    try:
+        if captured is None:
+            prepared = prepare_background_template(source, expected_identity=plan.background_template_identity)
+            return prepared.on_axis(target_unit), prepared.identity, ()
+        unit = plan.background_template.axis_unit
+        notes = ()
+        if source is not None:
+            try:
+                prepared = prepare_background_template(source)
+                file_x, file_y = prepared.on_axis(unit)
+                if file_x.shape == captured[0].shape and np.allclose(
+                        file_x, captured[0], rtol=_TEMPLATE_CAPTURE_RTOL, atol=0.0) and np.allclose(
+                        file_y, captured[1], rtol=_TEMPLATE_CAPTURE_RTOL, atol=0.0):
+                    return prepared.on_axis(target_unit), prepared.identity, ()
+                why = "its curve differs from the captured trace"
+            except BackgroundTemplateRefused as exc:
+                why = str(exc)
+            notes = (f"BACKGROUND_TEMPLATE_UNREPRODUCIBLE: {source.describe()} does not reproduce the captured "
+                     f"trace ({why}), so the fit used the captured trace and the template stays unnamed",)
+        return align_template(*captured, unit, target_unit), "", notes
+    except BackgroundTemplateRefused as exc:
+        raise _Refusal(exc.code, str(exc)) from exc
 def _fit_background_spec(plan: DisplayedPhaseFitPlan) -> str | None:
     degree = plan.fit_background_degree
     return {"none": None, "linear": "polynomial1", "polynomial": f"polynomial{degree}",
@@ -800,6 +916,10 @@ def run_displayed_phase_fit(
         wavelength_angstrom = _validate_phase(plan)
         if cancel_token is not None and cancel_token.is_set():
             return _cancelled_phase(plan)
+        template, template_identity, notes = _resolve_template(
+            plan, "q_A^-1", None if plan.background_template is None else _template_arrays(plan.background_template))
+        if cancel_token is not None and cancel_token.is_set():
+            return _cancelled_phase(plan)
         try:
             Structure, PhaseModel, PhaseFitter = _load_phase_backend()
         except ImportError:
@@ -857,8 +977,8 @@ def run_displayed_phase_fit(
         spec = _fit_background_spec(plan)
         if spec is not None:
             options["fit_background"] = spec
-        if plan.background_template is not None:
-            options["fit_background_template"] = _template_arrays(plan.background_template)
+        if template is not None:
+            options["fit_background_template"] = template
         if plan.amorphous_peak != "none":
             options.update(amorphous_peak=plan.amorphous_peak, amorphous_init={
                 "center": float(plan.amorphous_center), "sigma": float(plan.amorphous_sigma)})
@@ -872,13 +992,13 @@ def run_displayed_phase_fit(
             width_min=plan.width_limits[0], width_max=plan.width_limits[1],
             lock_cross_phase=plan.lock_cross_phase, q_shift_bound=plan.q_shift_bound,
         )
-        topology, diagnostics = _seed_topology(fitter, entries), ()
+        topology, diagnostics = _seed_topology(fitter, entries), notes
         if plan.initial_values:
             if plan.initial_topology == topology:
                 _apply_seed(params, plan.initial_values)
             else:
-                diagnostics = ("PHASE_SEED_DROPPED: the previous fit's reflections differ, so this fit started "
-                               "from the defaults",)
+                diagnostics = notes + ("PHASE_SEED_DROPPED: the previous fit's reflections differ, so this fit "
+                                       "started from the defaults",)
         names, values, errors = _parameters(params)
         fit_kwargs = {} if plan.max_nfev is None else {"max_nfev": plan.max_nfev}
         bounds = _q_bounds(plan)
@@ -961,6 +1081,8 @@ def run_displayed_phase_fit(
         )
         if fractions_reason:
             scalar += (("phase_fractions_reason", fractions_reason),)
+        if plan.background_template is not None or plan.background_template_source is not None:
+            scalar += (("background_template", plan.background_template_source, template_identity),)
         size = _result_base(scalar)
         fit = _result_array(fitter.eval_model(backend.params), x.size)
         size = _result_add(size, fit)
@@ -1007,7 +1129,8 @@ def run_displayed_phase_fit(
             marker_positions=marker_array, storage_bytes=size,
             result_fingerprint=fingerprint, diagnostics=diagnostics,
             fit_background=extra.get("fit_background"), amorphous=extra.get("amorphous"),
-            seed_topology=topology,
+            seed_topology=topology, background_template_source=plan.background_template_source,
+            background_template_identity=template_identity,
         )
     except _Refusal as exc:
         return _phase_refusal(plan, exc.code, str(exc))

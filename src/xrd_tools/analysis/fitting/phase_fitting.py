@@ -851,27 +851,13 @@ def _make_fit_background_template_model(
     prefix : str
         Parameter prefix.  Default ``"bg_"`` so the amplitude becomes
         ``bg_A`` alongside the other fit parameters.
+
+    The evaluator is the shared :func:`~xrd_tools.analysis.fitting.models.template_background_model` (NEXT-128-PEAK-FIT:
+    the Peak Fitter's template backgrounds use the same one); this phase fitter keeps its own composition and
+    median-ratio initialisation.
     """
-    x_arr = np.asarray(x_ref, dtype=float)
-    y_arr = np.asarray(y_ref, dtype=float)
-    if x_arr.shape != y_arr.shape:
-        raise ValueError(
-            f"Template x and y must have the same shape, got "
-            f"{x_arr.shape} vs {y_arr.shape}"
-        )
-    # Pre-sort once so np.interp is valid at eval time
-    order = np.argsort(x_arr)
-    x_sorted = x_arr[order]
-    y_sorted = y_arr[order]
-
-    def _template(x, A=1.0):
-        return float(A) * np.interp(
-            np.asarray(x, dtype=float), x_sorted, y_sorted,
-        )
-
-    m = Model(_template, prefix=prefix)
-    m.set_param_hint(f"{prefix}A", value=1.0, min=0.0)
-    return m
+    from xrd_tools.analysis.fitting.models import template_background_model
+    return template_background_model(x_ref, y_ref, prefix=prefix)
 
 
 def _make_fit_background_model(

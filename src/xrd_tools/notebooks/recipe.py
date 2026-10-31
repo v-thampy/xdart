@@ -79,10 +79,28 @@ def recipe_from_json(text: str) -> FitNotebookRecipe:
     return FitNotebookRecipe(**value)
 
 
+def _rooted_template_source(settings, data_root):
+    """A file template named relative to the notebook's DATA_ROOT, as CIF paths are (NEXT-128-PEAK-FIT); a malformed
+    source is left for the fit to refuse by name."""
+    pairs = settings.get("background_template_source")
+    if pairs is None:
+        return
+    from dataclasses import replace
+    from xrd_tools.analysis.background_template import BackgroundTemplateRefused, BackgroundTemplateSource
+    try:
+        source = BackgroundTemplateSource.from_pairs(pairs)
+    except BackgroundTemplateRefused:
+        return
+    if not Path(source.path).expanduser().is_absolute():
+        settings["background_template_source"] = replace(source, path=str(Path(data_root) / source.path)).to_pairs()
+
+
 def recipe_analyzer(recipe: FitNotebookRecipe, *, data_root: str | Path):
-    """Public analyzer with literal admitted settings; external CIF paths have an explicit root."""
+    """Public analyzer with literal admitted settings; external CIF and template paths have an explicit root."""
     from xrd_tools.analysis.runner import DisplayedPeakFitAnalyzer, DisplayedPhaseFitAnalyzer
     settings = dict(recipe.settings)
+    if recipe.tool in {"peak", "phase"}:
+        _rooted_template_source(settings, data_root)
     if recipe.tool == "peak":
         return DisplayedPeakFitAnalyzer(settings)
     if recipe.tool == "phase":

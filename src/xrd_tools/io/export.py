@@ -71,9 +71,14 @@ def _replace_dataset(group: h5py.Group, name: str, data: np.ndarray) -> None:
 
 def read_xye(
     path: Path | str,
+    *,
+    strict: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Read a ``.xye`` file (tab- or space-delimited, 2 or 3 columns).
+
+    ``strict`` (NEXT-128-PEAK-FIT, the background-template loader) refuses a file without data rows or with other
+    than two or three columns (ValueError), rather than reading the first three columns of any table.
 
     Returns
     -------
@@ -84,6 +89,12 @@ def read_xye(
     sigma : ndarray or None
         Error column, if present.
     """
+    if strict:
+        data = np.loadtxt(_as_path(path), ndmin=2)
+        columns = data.shape[1] if data.size else 0
+        if columns not in (2, 3):
+            raise ValueError(f"an .xye file holds two or three columns; this one holds {columns}")
+        return data[:, 0], data[:, 1], data[:, 2] if columns == 3 else None
     data = np.loadtxt(_as_path(path))
     if data.ndim == 1:
         # single row

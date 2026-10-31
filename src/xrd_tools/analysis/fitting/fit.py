@@ -40,6 +40,7 @@ from xrd_tools.analysis.fitting.models import (
     LorentzianSquared2DModel,
     PseudoVoigt2DModel,
     ChebyshevModel,
+    template_background_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -220,6 +221,7 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
     amplitude_bounds: tuple[float, float] | None = None,
     center_bounds_delta: float | None = None,
     fraction_init: float = 0.5,
+    background_template: tuple[np.ndarray, np.ndarray] | None = None,
     **fit_kwargs: Any,
 ) -> PeakFitResult1D:
     """
@@ -244,7 +246,8 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
         *positions* is given.
     background : str
         Background model: 'linear', 'constant', 'chebyshev2'..'chebyshev4',
-        'polynomial2'..'polynomial7', or 'none'.
+        'polynomial2'..'polynomial7', or 'none'; or 'template', alone or plus an additive model
+        ('template+linear', 'template+chebyshev3', ...), which needs ``background_template``.
     sigma_init : float or list of float or None
         Initial sigma for each peak.  Scalar → same for all peaks.
         None → auto-estimate from data range.
@@ -259,6 +262,12 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
         position.  None → no bounds on centres beyond the data range.
     fraction_init : float
         Initial pseudo-Voigt mixing fraction (only for 'pseudovoigt').
+    background_template : (x, y) or None
+        A template background's reference curve, in the units of ``x`` (NEXT-128-PEAK-FIT): scaled by one amplitude
+        ``bg_A`` >= 0 (``models.template_background_model``, Phase Analysis's evaluator), any additive part under
+        the prefix ``bgx_``. ``bg_A`` starts at the ratio of the data's median to the template's median on ``x``,
+        clipped to [1e-3, 10] (1 when either is not positive), and the additive part at zero. The fit function is
+        agnostic to where the curve came from.
     **fit_kwargs
         Passed to ``lmfit.Model.fit()`` (e.g. ``method='leastsq'``).
 
@@ -266,6 +275,12 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
     -------
     PeakFitResult1D
     """
+    templated = background.lower().strip() == "template" or background.lower().strip().startswith("template+")
+    if templated and background_template is None:
+        raise ValueError(f"background={background!r} needs background_template=(x, y)")
+    if background_template is not None and not templated:
+        raise ValueError("background_template needs a template background ('template' or 'template+…')")
+
     # Clean NaN / inf
     valid = np.isfinite(x) & np.isfinite(y)
     x = np.asarray(x, dtype=float)[valid]
@@ -311,11 +326,17 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
         amplitude_bounds = (0, None)
 
     # Build composite model
-    bg_model = _get_background_model(
-        background,
-        prefix="bg_",
-        x_range=(float(np.nanmin(x)), float(np.nanmax(x))),
-    )
+    x_range = (float(np.nanmin(x)), float(np.nanmax(x)))
+    if templated:
+        # the scaled template under bg_ (Phase Analysis's evaluator), any additive part under bgx_
+        template_x, template_y = (np.asarray(values, dtype=float) for values in background_template)
+        bg_model = template_background_model(template_x, template_y, prefix="bg_")
+        extra = background.lower().strip().split("+", 1)[1] if "+" in background else ""
+        extra_model = _get_background_model(extra, prefix="bgx_", x_range=x_range) if extra else None
+        if extra_model is not None:
+            bg_model = bg_model + extra_model
+    else:
+        bg_model = _get_background_model(background, prefix="bg_", x_range=x_range)
     composite = bg_model
 
     for i in range(n_peaks):
@@ -330,7 +351,17 @@ def fit_peaks( #TODO - this should include ability to fix certain parameters
     pars = composite.make_params()
 
     # Background init
-    if bg_model is not None:
+    if templated:
+        order = np.argsort(template_x)
+        on_x = np.interp(x, template_x[order], template_y[order])
+        template_median, data_median = float(np.nanmedian(on_x)), float(np.nanmedian(y))
+        scale = (min(max(data_median / template_median, 1e-3), 10.0)
+                 if template_median > 0 and np.isfinite(data_median) and data_median > 0 else 1.0)
+        pars["bg_A"].set(value=scale, min=0.0)
+        for key in pars:
+            if key.startswith("bgx_"):
+                pars[key].set(value=0.0)
+    elif bg_model is not None:
         if "bg_slope" in pars:
             pars["bg_slope"].set(value=0)
             pars["bg_intercept"].set(value=float(np.nanmin(y)))

@@ -1233,6 +1233,8 @@ class PeakFitPlan:
     center_bounds_delta: float | None = None
     fraction_init: float = 0.5
     fit_kwargs: dict[str, Any] = field(default_factory=dict)
+    #: a template background's (x, y) reference curve, on the fit's x units (NEXT-128-PEAK-FIT)
+    background_template: tuple[np.ndarray, np.ndarray] | None = None
 
 
 def run_peak_fit(plan: PeakFitPlan, x: np.ndarray, y: np.ndarray) -> AnalysisResult:
@@ -1249,9 +1251,14 @@ def run_peak_fit(plan: PeakFitPlan, x: np.ndarray, y: np.ndarray) -> AnalysisRes
         amplitude_bounds=plan.amplitude_bounds,
         center_bounds_delta=plan.center_bounds_delta,
         fraction_init=plan.fraction_init,
+        background_template=plan.background_template,
         **plan.fit_kwargs,
     )
-    return AnalysisResult(kind="peak_fit", payload=payload, provenance={"plan": _plan_dict(plan)})
+    # the provenance names the template by its size: its arrays are the caller's input, as x and y are
+    template = plan.background_template
+    provenance = _plan_dict(replace(plan, background_template=None))
+    provenance["background_template"] = None if template is None else {"points": int(np.size(template[0]))}
+    return AnalysisResult(kind="peak_fit", payload=payload, provenance={"plan": provenance})
 
 
 @dataclass(frozen=True, slots=True)

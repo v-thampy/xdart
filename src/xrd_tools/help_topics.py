@@ -501,15 +501,17 @@ Steps
    trace) or Chebyshev; it is subtracted before the fit and has no free parameters.
 2. Fitted background: Linear, Polynomial, Chebyshev or Spline of the chosen degree
    (Spline uses at least four knots), refined with the phases.
-3. Substrate: show the substrate's pattern, click Use displayed as substrate, then
-   choose Substrate (one free amplitude) or Substrate plus linear, polynomial or
-   Chebyshev. Clear substrate forgets it.
+3. Substrate: in the template row, Use displayed captures the displayed pattern
+   (named by its file, frame and mode once a fit confirms that file holds it), or
+   Choose file… takes a NeXus result or an .xye file. Then choose Substrate (one free
+   amplitude) or Substrate plus linear, polynomial or Chebyshev. Clear forgets it.
 4. Amorphous peak: Gaussian, pseudo-Voigt, Lorentzian, Voigt or Lorentzian², with a
    starting centre and σ.
 
 Units and conventions
-The substrate template is captured in q (Å⁻¹) through the same input path as the fit;
-centre and σ are in Å⁻¹. Outside the template's q range its value is held flat.
+A captured substrate is in q (Å⁻¹), through the same input path as the fit; a file's
+unit must convert to Å⁻¹ (nm⁻¹ does, 2θ does not). Centre and σ are in Å⁻¹. Outside
+the template's q range its value is held flat.
 
 Assumptions
 The substrate pattern scales as a whole; its shape does not change between samples.
@@ -519,8 +521,9 @@ The fitted background and the amorphous peak are drawn as their own curves. A te
 amplitude near the substrate's share of the scattering is expected.
 
 Diagnostics
-A substrate choice without a captured template refuses Fit by name. A template must be
-in Å⁻¹ with at least two distinct finite points.
+A substrate choice without a template refuses Fit by name. A template needs at least
+two distinct finite points; BACKGROUND_TEMPLATE_ codes name a file that is missing,
+changed or in another unit.
 
 Common mistakes and corrective actions
 An amorphous peak can absorb broad crystalline intensity: start its centre on the
@@ -589,8 +592,9 @@ Steps
 2. Sequential seeds each fit from the previous fit's values; a fit whose reflections
    differ starts fresh, and a refused fit leaves the seed as it was.
 3. The Trend column plots a scan column instead of the result order.
-4. Save settings… writes every option and the phase list; Load settings… restores
-   them. The substrate template and seeds are not saved.
+4. Save settings… writes every option, the phase list and the substrate's file once a
+   fit has named it; Load settings… restores them. A substrate captured but not named
+   by its file, and Sequential's seeds, are not saved.
 
 Units and conventions
 Saved settings are a versioned JSON document. The trend's x is the result order or
@@ -604,11 +608,12 @@ With Sequential on, each fit starts near its neighbour's answer and converges fa
 
 Diagnostics
 A foreign or newer settings file is refused and nothing changes; missing phases are
-named. PHASE_TEMPLATE_NOTEBOOK_UNAVAILABLE: export a notebook without a substrate.
+named. BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE: export waits for a substrate named by
+its file and recorded by a fit.
 
 Common mistakes and corrective actions
 Sequential across a phase change carries the old values: turn it off there. After
-Load settings, capture the substrate again before fitting with it.
+Load settings, a substrate whose file has moved says so: choose it again.
 
 Worked example
 A composition series: fit the first result, check it, then Batch with Sequential on;
@@ -617,6 +622,213 @@ save the settings to repeat the series later or in a notebook.
 References
 xdart/gui/analysis/snapshot_fit_host.py — Batch and the trend.
 xrd_tools/notebooks/recipe.py — exported fit recipes.
+"""),
+    HelpTopic("peak-fit.model", "Peak Fitter: peak model", """Purpose
+Choose the profile fitted to every peak: Gaussian, Lorentzian, pseudo-Voigt, Voigt,
+Pearson VII or split pseudo-Voigt.
+
+Required inputs
+A displayed 1-D trace with resolved peaks.
+
+Steps
+1. Model: Pseudo-Voigt (the default), Gaussian, Lorentzian, Voigt, Pearson VII or
+   Split pseudo-Voigt.
+2. PV fraction (Advanced) starts the Lorentzian fraction of a pseudo-Voigt or split
+   pseudo-Voigt, from 0 to 1; it is fitted within those bounds.
+3. Fit, then read each peak's centre, width and area in the table.
+
+Units and conventions
+Centres and widths are in the displayed axis unit. A split pseudo-Voigt fits a left
+width σ and a right width σ_r.
+
+Assumptions
+One profile describes every peak in the fit range.
+
+Expected observations
+Pearson VII and split pseudo-Voigt follow heavy-tailed or asymmetric peaks that a
+Gaussian or Lorentzian cannot; without a σ start they start from the data's half
+maximum.
+
+Diagnostics
+A fit that does not converge says so in the status line; its values are the best
+effort reached.
+
+Common mistakes and corrective actions
+A Lorentzian on a Gaussian peak overestimates the tails and the area: compare the
+residuals. Use split pseudo-Voigt only for visibly asymmetric peaks.
+
+Worked example
+A strained film reflection with a low-q tail: Split pseudo-Voigt, then compare σ
+with σ_r.
+
+References
+xrd_tools/analysis/fitting/fit.py — fit_peaks and its profiles.
+xrd_tools/analysis/fitting/models.py — the split pseudo-Voigt model.
+"""),
+    HelpTopic("peak-fit.background", "Peak Fitter: background and templates", """Purpose
+Model the intensity under the peaks: a constant, linear or Chebyshev background, or a
+measured template (a substrate's or an empty holder's pattern) scaled by one
+amplitude, alone or plus a linear or Chebyshev correction.
+
+Required inputs
+For a template: the bare background's displayed trace, or its file: a NeXus result
+(a frame and a 1-D mode) or an .xye file with its x unit.
+
+Steps
+1. Background: Linear, Constant, None or Chebyshev (3); or Template, Template plus
+   linear, or Template plus Chebyshev (3).
+2. Template row: Use displayed captures the displayed trace and names it by its
+   file, frame and mode; Choose file… takes a NeXus file (enter the frame; a single
+   result's mode is default) or an .xye file (confirm its unit). Clear forgets it.
+3. Fit. The first fit reads the file and records its content; the row then names
+   the template, which is saved with the settings and exported to notebooks.
+
+Units and conventions
+A template's x must be in the fit's unit or convert to it without other data: Å⁻¹
+and nm⁻¹ of the same axis, or degrees and radians; 2θ never converts to q here.
+Outside its range the template is held flat. Its amplitude bg_A is at least 0, and a
+correction is fitted under bgx_ names.
+
+Assumptions
+The template has the background's shape; only its scale changes. Uncertainties are
+conditional on the template: its own noise (an .xye σ column) is not propagated.
+
+Expected observations
+bg_A near the background's share of the scattering, and a flat residual away from
+the peaks.
+
+Diagnostics
+BACKGROUND_TEMPLATE_UNIT_UNSUPPORTED: the template's unit does not convert to the
+fit's. BACKGROUND_TEMPLATE_CHANGED: the file changed since its content was recorded;
+choose it again. BACKGROUND_TEMPLATE_UNREPRODUCIBLE: the displayed trace's file does
+not hold that curve, so the capture stays unnamed (usable, not saved or exported).
+BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE: export waits for a named, recorded file.
+
+Common mistakes and corrective actions
+A template processed with another calibration or mask does not match the sample:
+process it with the same settings. A missing .xye unit is never guessed: choose it.
+
+Worked example
+A film on silicon: process the bare wafer, choose its NeXus result (frame 0, mode
+default), choose Template plus linear, Fit, then export a notebook that reads the
+same file.
+
+References
+xrd_tools/analysis/background_template.py — sources, reading and units.
+xrd_tools/analysis/fitting/models.py — the scaled template model.
+"""),
+    HelpTopic("peak-fit.peaks", "Peak Fitter: peaks and starting values", """Purpose
+Choose which peaks are fitted and where each fit starts: automatic detection, a peak
+count or typed centers, with optional width starts and bounds.
+
+Required inputs
+A displayed 1-D trace and a fit range that holds the peaks.
+
+Steps
+1. Auto finds up to twelve peaks in the fit range; turn it off to fit a count of 1
+   to 12 peaks spread across the range.
+2. Peak centers (Advanced), comma-separated, seed the fit and override Auto and the
+   count.
+3. σ initial starts every width; σ min / max bound it.
+4. Center ± delta keeps each centre within that distance of its start.
+5. Max iterations caps the solver's evaluations; blank or 0 is lmfit's default.
+
+Units and conventions
+Centers, σ and the delta are in the displayed axis unit.
+
+Assumptions
+Each detected or typed centre is one peak of the chosen profile.
+
+Expected observations
+One fitted marker per peak; with a delta, each centre stays near its start.
+
+Diagnostics
+PEAKS_NOT_FOUND: Auto found no peak in the range. INSUFFICIENT_FIT_POINTS: fewer
+than five points, or three per peak, in the range.
+
+Common mistakes and corrective actions
+For overlapping peaks, type both centers rather than relying on Auto. A tight σ
+bound can pin a width at its bound: widen it.
+
+Worked example
+Two overlapping reflections near 2.10 and 2.15 Å⁻¹: centers 2.10, 2.15, σ initial
+0.01 and center ± 0.02.
+
+References
+xrd_tools/analysis/display_fit_operations.py — peak selection and validation.
+xrd_tools/analysis/fitting/fit.py — starting values and bounds.
+"""),
+    HelpTopic("peak-fit.range", "Peak Fitter: fit range", """Purpose
+Choose the interval of the displayed trace that is fitted.
+
+Required inputs
+A displayed 1-D trace.
+
+Steps
+1. Drag the shaded range on the plot, or type its low and high values.
+2. Full resets the range to the whole trace.
+3. The range is kept across Reload and clamped to each new trace.
+
+Units and conventions
+The range is in the displayed axis unit; only finite points inside it are fitted.
+
+Assumptions
+The range holds every peak and enough background on both sides to define it.
+
+Expected observations
+The fit, background and residual are drawn over the range; the data outside it stay
+visible.
+
+Diagnostics
+INVALID_PEAK_PLAN (invalid fit bounds): the range lies outside the trace or its low
+is not below its high.
+
+Common mistakes and corrective actions
+A range that cuts a peak's tail biases its width and area: include the tails. A
+Chebyshev background over a wide range can follow broad peaks: narrow the range.
+
+Worked example
+One reflection near 2.2 Å⁻¹: drag from 2.0 to 2.4 Å⁻¹, then Fit.
+
+References
+xdart/gui/analysis/peak_fit_dialog.py — the range row and the dragged range.
+xrd_tools/analysis/display_fit_operations.py — the fitted points.
+"""),
+    HelpTopic("peak-fit.weighting", "Peak Fitter: weighting", """Purpose
+Choose whether points are weighted by their measured uncertainties.
+
+Required inputs
+A trace that carries measured uncertainties (σ); otherwise the option is off.
+
+Steps
+1. In Advanced, Use uncertainties weights each point by 1/σ.
+2. Leave it off for an unweighted least-squares fit.
+
+Units and conventions
+σ is in intensity units and the weights are 1/σ. No uncertainties are inferred from
+the counts.
+
+Assumptions
+The measured σ are correct and independent between points.
+
+Expected observations
+A weighted fit follows the low-noise points more closely, and its parameter errors
+scale with σ.
+
+Diagnostics
+FIT_UNCERTAINTIES_REQUIRED: the trace has no measured σ. INVALID_FIT_UNCERTAINTIES:
+a σ in the range is not finite and positive.
+
+Common mistakes and corrective actions
+Turn it on only when σ was measured or propagated; an assumed σ makes the weights
+and the errors meaningless.
+
+Worked example
+A trace processed with error propagation: Use uncertainties on, Fit, then compare
+the errors with an unweighted fit.
+
+References
+xrd_tools/analysis/display_fit_operations.py — measured σ admission.
 """),
 )
 
