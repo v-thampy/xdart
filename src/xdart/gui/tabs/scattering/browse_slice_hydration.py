@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import os
 from threading import Event, Lock, Thread
 
 import numpy as np
@@ -11,7 +10,7 @@ import numpy as np
 from xdart.modules.display_context import BrowseContext, ContextKind, DisplaySelection
 from xrd_tools.io import FrameScalarCatalog, FrameViewReader
 from xrd_tools.io.output_transaction import (
-    TargetSnapshot, revalidate_stream_terminal,
+    TargetSnapshot, revalidate_stream_terminal, revalidate_target_snapshot,
     stream_terminal_object_revision,
 )
 
@@ -90,12 +89,6 @@ class BrowseSliceLane:
         self._retiring = False
         if not self._context_live():
             raise RuntimeError("Browse slice context is not exactly admitted")
-        self._revision = self._stat_revision()
-        if self._revision[:4] != (
-            self._snapshot.device, self._snapshot.inode,
-            self._snapshot.size, self._snapshot.mtime_ns,
-        ):
-            raise RuntimeError("Browse slice saved artifact changed after loading")
 
     def _context_live(self) -> bool:
         browse, catalog = self._browse, self._catalog
@@ -201,20 +194,15 @@ class BrowseSliceLane:
 
     def _validate_snapshot(self) -> None:
         terminal = self._terminal
-        unchanged = (
-            revalidate_stream_terminal(self._catalog.artifact_path, terminal) == self._snapshot
+        # Both domains stay bound to the loader's observation, never a new
+        # pathname revision sampled when this lazy lane happens to be created.
+        observed = (
+            revalidate_stream_terminal(self._catalog.artifact_path, terminal)
             if stream_terminal_object_revision(terminal) is not None
-            else self._stat_revision() == self._revision
+            else revalidate_target_snapshot(self._catalog.artifact_path, self._snapshot)
         )
-        if not unchanged:
+        if observed != self._snapshot:
             raise RuntimeError("Browse slice saved artifact changed after loading")
-
-    def _stat_revision(self) -> tuple[int, ...]:
-        # The loader already admitted this file's revision. Display reads only
-        # requalify its object/stat identity, including the observed ctime.
-        observed = os.stat(self._catalog.artifact_path)
-        return (observed.st_dev, observed.st_ino, observed.st_size,
-                observed.st_mtime_ns, observed.st_ctime_ns)
 
     def _cut(self, payload, axis, sliced, center, width, norm):
         native_axis = native_1d_plot_axis(

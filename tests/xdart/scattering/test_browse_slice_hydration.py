@@ -24,7 +24,7 @@ from xrd_tools.io import Browse1DCache, FrameViewReader
 from xrd_tools.io.nexus import write_integrated_stack, write_scan_metadata
 from xrd_tools.io.nexus_record import ensure_frames_container, write_frame_record
 from xrd_tools.io.output_transaction import (
-    StreamTerminal, capture_target_snapshot, revalidate_stream_terminal,
+    StreamTerminal, capture_target_revision, capture_target_snapshot, revalidate_stream_terminal,
 )
 
 
@@ -68,9 +68,12 @@ def saved(tmp_path, request):
     with FrameViewReader(path, include_thumbnail=False, resolve_source=False) as reader:
         catalog = reader.read_scalar_catalog()
     snapshot = capture_target_snapshot(path)
+    if getattr(request, "param", None) == "revision":
+        snapshot = capture_target_revision(path)
     terminal = None
     if getattr(request, "param", None) == "terminal":
-        stat = path.stat()
+        with path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
         terminal = StreamTerminal(str(path.resolve()), stat.st_size, snapshot.digest,
                                   len(labels), stat.st_dev, stat.st_ino,
                                   stat.st_mtime_ns, stat.st_ctime_ns)
@@ -316,7 +319,40 @@ def test_changed_target_during_read_discards_entire_batch(saved, monkeypatch):
     assert "changed" in result.diagnostic and not result.traces
 
 
-@pytest.mark.parametrize("saved", [True, "terminal"], indirect=True)
+@pytest.mark.parametrize("saved", [True, "revision", "terminal"], indirect=True)
+def test_same_stat_rewrite_before_lazy_lane_creation_refuses_saved_cuts(saved, monkeypatch):
+    path, context, frames, selection, old_lane = saved
+    _wait(old_lane.release)
+    before = path.stat()
+    with h5py.File(path, "r+") as handle:
+        intensity = handle["entry/integrated_2d/intensity"]
+        intensity[...] = intensity[...] + 100
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = capture_target_revision(path)
+    assert (after.size, after.mtime_ns, after.device, after.inode) == (
+        before.st_size, before.st_mtime_ns, before.st_dev, before.st_ino)
+    terminal = context.load_request.terminal_commit_identity
+    loaded_ctime = terminal.ctime_ns if terminal is not None else context.target_snapshot.ctime_ns
+    assert after.ctime_ns != loaded_ctime
+    reads = []
+    real_read = FrameViewReader.read
+
+    def read(reader, *args, **kwargs):
+        reads.append(args)
+        return real_read(reader, *args, **kwargs)
+
+    monkeypatch.setattr(FrameViewReader, "read", read)
+    lane = BrowseSliceLane(context)
+    try:
+        result = _project((path, context, frames, selection, lane),
+                          ScientificPreferences(slice_enabled=True))
+        assert "changed" in result.diagnostic and not result.traces
+        assert not reads, "refuse the changed revision before reading new scientific data"
+    finally:
+        _wait(lane.release)
+
+
+@pytest.mark.parametrize("saved", [True, "revision", "terminal"], indirect=True)
 def test_display_requalification_never_rehashes_loaded_artifact(saved, monkeypatch):
     import xrd_tools.io.output_transaction as transaction
 
