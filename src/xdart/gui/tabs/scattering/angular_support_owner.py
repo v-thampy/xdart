@@ -62,7 +62,7 @@ class AngularSupportOwner(QtCore.QObject):
     def profiles(self, source, labels) -> dict[int, AngularSupportProfile]:
         """The completed profiles of ``source``'s shown ``labels`` (any order); the missing ones are being rebuilt
         in one job. A frame no longer shown is let go; another output or load starts afresh."""
-        identity = (source.path, source.entry, source.snapshot, source.labels)
+        identity = source.request(()).source_key
         shown = frozenset(int(label) for label in labels)
         if identity != self._source:
             self._source, self._completed = identity, {}
@@ -98,7 +98,7 @@ class AngularSupportOwner(QtCore.QObject):
 
     def _done(self, request, terminal) -> bool:
         self._completions += 1
-        if (request.path, request.entry, request.snapshot, request.labels) == self._source:
+        if request.source_key == self._source:
             if terminal.status is OperationTerminalStatus.RETURNED and type(terminal.payload) is dict:
                 rebuilt = terminal.payload
             else:
