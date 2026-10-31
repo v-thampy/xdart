@@ -15,6 +15,7 @@ from xdart.modules.display_context import (
 )
 from xrd_tools.io.output_transaction import StreamTerminal
 from xrd_tools.io.output_transaction import TargetSnapshot
+from xrd_tools.io.output_transaction import stream_terminal_object_revision
 
 from .events import (
     CleanupStatus,
@@ -224,6 +225,13 @@ class BrowseCleanupReceipt:
             )
         ):
             raise TypeError("browse cleanup diagnostics are invalid")
+
+
+def sealed_load_terminal(request) -> StreamTerminal | None:
+    """A Browse load request's stream seal when it is one (an object-revision seal, the kind the loader and the 1-D
+    lane requalify against); None for a plain open or a legacy seal (TERMINAL-SUPPORT-128)."""
+    terminal = getattr(request, "terminal_commit_identity", None)
+    return terminal if stream_terminal_object_revision(terminal) is not None else None
 
 
 def canonical_browse_scan_key(source_path: str) -> str:
