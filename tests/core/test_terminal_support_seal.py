@@ -32,7 +32,8 @@ def _summary(profiles):
 
 def _full_seal(target):
     from xrd_tools.io.output_transaction import StreamTerminal
-    observed = os.stat(target)
+    with open(target, "rb") as handle:
+        observed = os.fstat(handle.fileno())
     return StreamTerminal(str(target), int(observed.st_size), hashlib.sha256(target.read_bytes()).hexdigest(), 1,
                           int(observed.st_dev), int(observed.st_ino), int(observed.st_mtime_ns),
                           int(observed.st_ctime_ns))
