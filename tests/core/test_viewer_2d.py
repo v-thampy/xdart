@@ -21,7 +21,9 @@ _EXPECTED_R = 11_546_624
 try:
     _PHYSICAL_RAM = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
 except (ValueError, OSError, AttributeError):
-    _PHYSICAL_RAM = 0
+    # Windows has no sysconf: the viewer reads GlobalMemoryStatusEx there (VIEWER-2D-BUDGET-128).
+    from xrd_tools.core.staging import windows_physical_ram_bytes
+    _PHYSICAL_RAM = windows_physical_ram_bytes() or 0
 _EXPECTED_B = 884_736_000 if _PHYSICAL_RAM <= 0 else min(1024**3, _PHYSICAL_RAM // 20)
 
 
@@ -2258,7 +2260,37 @@ def test_memory_ledger_uses_raw_only_r7_arithmetic_and_fails_closed(monkeypatch)
     assert ledger.budget == 1024**3
 
     monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: None)
     assert api.viewer_2d_memory_ledger(1, 1).budget == 884_736_000
+
+
+def _as_windows(monkeypatch, ram_bytes):
+    """A Windows PC: no os.sysconf RAM figure, GlobalMemoryStatusEx reports ``ram_bytes``."""
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: None)
+    monkeypatch.setattr("xrd_tools.core.staging.windows_physical_ram_bytes", lambda: ram_bytes)
+
+
+def test_windows_budget_uses_the_pcs_own_ram(monkeypatch):
+    """VIEWER-2D-BUDGET-128, his beamline report: "I just ran into an error on the beamline PC in 2d viewer mode
+    trying to load a tiff file that was about 32mb. The memory budget was exceeded" (a Windows PC, 32 GB or more).
+    Windows has no os.sysconf RAM figure, so the budget fell back to 884,736,000 bytes on every Windows PC."""
+    _as_windows(monkeypatch, 32 * 1024**3)
+    ledger = api.viewer_2d_memory_ledger(4096, 4096, encoded_retained=32 * 1024**2)
+    assert ledger.budget == 1024**3, "a 32 GB Windows PC gets the 1 GiB cap, not the fixed fallback"
+    assert ledger.admission <= ledger.budget, "a 4096x4096 frame fits it"
+    _as_windows(monkeypatch, 16 * 1024**3)
+    assert api.viewer_2d_memory_ledger(1, 1).budget == 16 * 1024**3 // 20, "a twentieth of RAM below the cap"
+
+
+def test_windows_pc_reads_a_4096_square_16_bit_tiff(tmp_path, monkeypatch):
+    tifffile = pytest.importorskip("tifffile")
+    path = tmp_path / "frame_4096.tif"
+    tifffile.imwrite(path, (np.arange(4096 * 4096, dtype=np.uint32) % 65521).astype(np.uint16).reshape(4096, 4096))
+    assert 32 * 1024**2 <= path.stat().st_size < 34 * 1024**2, "about 32 MB on disk, as at the beamline"
+    _as_windows(monkeypatch, 32 * 1024**3)
+    catalog = api.catalog_viewer_2d(path)
+    frame = api.read_viewer_2d_frame(catalog, 0)
+    assert frame.array.shape == (4096, 4096)
 
 
 def test_suffix_set_is_closed_and_viewer_only(tmp_path):
