@@ -397,7 +397,10 @@ def test_w9_int_captures_the_displayed_trace_as_the_substrate_and_export_refuses
         assert values["background_template"] is template and values["fit_background"] == "template"
         buttons = tuple(dialog.export_actions.buttons.values())
         assert buttons and not any(button.isEnabled() for button in buttons)
-        assert all("PHASE_TEMPLATE_NOTEBOOK_UNAVAILABLE" in button.toolTip() for button in buttons)
+        # NEXT-128-PEAK-FIT (2026-10-31): the shared row names the capture by its run file, and export waits for
+        # the first fit to record the content (test_background_template_gui T4)
+        assert dialog.background_template_row.source.kind == "nexus"
+        assert all("BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE" in button.toolTip() for button in buttons)
         trace, _anchor = page._capture_analysis_trace("phase")
         other = replace(template, label=template.label + " B")
         one = DisplayedPhaseFitPlan(trace, wavelength_angstrom=1., **values)

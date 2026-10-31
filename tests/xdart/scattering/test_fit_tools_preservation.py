@@ -209,18 +209,21 @@ def test_peak_model_background_and_advanced_defaults_and_choices(monkeypatch, qa
         }
         models = [dialog.model_combo.itemText(index) for index in range(dialog.model_combo.count())]
         backgrounds = [dialog.bkg_combo.itemText(index) for index in range(dialog.bkg_combo.count())]
-        assert models == ["Pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt"]
-        assert backgrounds == ["Linear", "Constant", "None", "Chebyshev (3)"]
+        # NEXT-128-PEAK-FIT (2026-10-31): Pearson VII and split pseudo-Voigt, and the template backgrounds, appended
+        assert models == ["Pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt", "Pearson VII", "Split pseudo-Voigt"]
+        assert backgrounds == ["Linear", "Constant", "None", "Chebyshev (3)", "Template", "Template + linear",
+                               "Template + Chebyshev (3)"]
         chosen = []
         for index in range(len(models)):
             dialog.model_combo.setCurrentIndex(index)
             chosen.append(dialog.vnext_fit_values()["model"])
-        assert chosen == ["pseudovoigt", "gaussian", "lorentzian", "voigt"]
+        assert chosen == ["pseudovoigt", "gaussian", "lorentzian", "voigt", "pearson7", "split_pseudovoigt"]
         chosen = []
         for index in range(len(backgrounds)):
             dialog.bkg_combo.setCurrentIndex(index)
             chosen.append(dialog.vnext_fit_values()["background"])
-        assert chosen == ["linear", "constant", "none", "chebyshev3"]
+        assert chosen == ["linear", "constant", "none", "chebyshev3", "template", "template+linear",
+                          "template+chebyshev3"]
         dialog.adv_sigma_init.setText("0.05")
         dialog.adv_sigma_min.setText("0.01"); dialog.adv_sigma_max.setText("0.2")
         dialog.adv_center_delta.setText("0.1")

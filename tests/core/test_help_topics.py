@@ -10,6 +10,8 @@ IDS = (
     # PHASE-ANALYSIS-128 (2026-10-29): one topic per section of the Phase Analysis window, appended.
     "phase-analysis.phases", "phase-analysis.peak-shape", "phase-analysis.background",
     "phase-analysis.constraints", "phase-analysis.batch",
+    # NEXT-128-PEAK-FIT (2026-10-31): one topic per group of Peak Fitter options, appended.
+    "peak-fit.model", "peak-fit.background", "peak-fit.peaks", "peak-fit.range", "peak-fit.weighting",
 )
 CODES = (
     "ROI_RAW_UNAVAILABLE", "ROI_RAW_SHAPE_INVALID", "ROI_PREVIEW_LIMIT_EXCEEDED",
@@ -19,7 +21,8 @@ CODES = (
 
 
 def test_six_immutable_topics_cover_the_frozen_scientific_questions():
-    """The six frozen topics, then PHASE-ANALYSIS-128's five, each in the same ten-heading shape."""
+    """The six frozen topics, then PHASE-ANALYSIS-128's five and NEXT-128-PEAK-FIT's five, each in the same
+    ten-heading shape."""
     from xrd_tools.help_topics import TOPICS, get_topic
     from dataclasses import FrozenInstanceError
     assert tuple(t.identifier for t in TOPICS) == IDS
@@ -35,6 +38,11 @@ def test_six_immutable_topics_cover_the_frozen_scientific_questions():
         ("SNIP", "Chebyshev", "substrate", "template", "amorphous", "flat"),
         ("lattice", "q-shift", "cross-phase", "fit range", "iterations", "uncertainties"),
         ("Batch", "Sequential", "seed", "trend", "settings", "notebook"),
+        ("pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt", "Pearson VII", "split pseudo-Voigt", "fraction"),
+        ("linear", "Chebyshev", "template", "NeXus", ".xye", "unit", "changed", "conditional"),
+        ("Auto", "count", "centers", "σ", "bounds", "iterations"),
+        ("range", "drag", "Full", "finite"),
+        ("uncertainties", "σ", "weights", "unweighted"),
     )
     for topic, words in zip(TOPICS, concepts, strict=True):
         assert get_topic(topic.identifier) is topic

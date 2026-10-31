@@ -911,6 +911,9 @@ def test_p37_peak_range_finite_manual_auto_suggestion_policy_is_headless_and_ver
         ("gaussian", "constant"),
         ("lorentzian", "none"),
         ("voigt", "chebyshev3"),
+        # NEXT-128-PEAK-FIT (2026-10-31): the strain models fit.py already has
+        ("pearson7", "linear"),
+        ("split_pseudovoigt", "constant"),
     ):
         calls.clear()
         _install_peak_backend(monkeypatch, calls)
@@ -974,7 +977,7 @@ def test_p37_peak_range_finite_manual_auto_suggestion_policy_is_headless_and_ver
             ),
             "n_peaks": 12,
         },
-        {"model": "pearson7"}, {"background": "polynomial"},
+        {"model": "moffat"}, {"background": "polynomial"}, {"background": "template"},
         {"sigma_init": 0.0}, {"sigma_bounds": (1.0, 1.0)},
         {"amplitude_init": -1.0}, {"amplitude_bounds": (2.0, 1.0)},
         {"center_bounds_delta": 20.0}, {"fraction_init": 1.01},
