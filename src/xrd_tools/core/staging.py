@@ -68,8 +68,8 @@ def total_physical_ram_bytes() -> int | None:
 
 def windows_physical_ram_bytes() -> int | None:
     """Total physical RAM on Windows, where ``os.sysconf`` has none (``GlobalMemoryStatusEx``); ``None`` elsewhere or
-    if it can't be read. Only the warm integrator allowance uses it so far; the staging policies above still fall back
-    on Windows."""
+    if it can't be read. Callers choose their own memory policy and fallback; this does not change the separate
+    POSIX-only ``total_physical_ram_bytes`` detector."""
     if sys.platform != "win32":
         return None
     import ctypes
