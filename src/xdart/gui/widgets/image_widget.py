@@ -118,8 +118,15 @@ def _ceiling_safe_levels(
             (raw_arr == sat_ceil) | (raw_arr >= _UINT32_CEIL))
         if ceiling.any() and (finite & ~ceiling).any():
             pop_mask = finite & ~ceiling
+        del ceiling
+    del finite
     population = _level_population(disp, pop_mask)
-    lo, hi = np.nanpercentile(population, pct)
+    # Boolean indexing made a private population. Reuse it for percentile's
+    # partition instead of copying it: if the stride grid is entirely masked,
+    # this fallback can contain almost the whole frame, not just p/16 pixels.
+    # pop_mask already excludes nonfinite values; nanpercentile would allocate
+    # another population-sized mask needlessly.
+    lo, hi = np.percentile(population, pct, overwrite_input=True)
     # Sparse cakes can contain far fewer non-zero bins than the upper-tail
     # percentile (for example 49 positive bins in a 500x500 image).  In that
     # case both percentile endpoints are zero even though real intensity is

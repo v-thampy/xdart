@@ -160,13 +160,21 @@ def test_log_extremes_paint_at_the_ends_of_the_scale_and_nans_stay_transparent(c
     assert hashlib.sha256(source.tobytes()).hexdigest() == digest
 
 
-@pytest.mark.parametrize("nan_fraction", (0.0, 0.001, 0.999))
+@pytest.mark.parametrize("nan_fraction", (0.0, 0.001, 0.999, "stride grid"))
 def test_render_peaks_stay_within_the_ledgers_renderer_charge(nan_fraction):
     """The worst owned-array peak of drawing one frame (a recolour in Log, while the old display copy, QImage and NaN
     mask are still alive) stays within the renderer charge the ledger admits (REVIEW-2 R2)."""
     view = ScientificView()
     view.resize(1200, 900)
-    source = _frame((2048, 2048), nan_fraction)
+    if nan_fraction == "stride grid":
+        source = np.linspace(1, 60000, 2048 * 2048, dtype=np.float32).reshape(2048, 2048)
+        # The mounted raw pane transposes and reverses detector Y. Every
+        # sampled location is masked, although 15/16 of the frame is finite.
+        source[-1::-4, ::4] = np.nan
+        source = _readonly(source)
+    else:
+        source = _frame((2048, 2048), nan_fraction)
+    digest = hashlib.sha256(source).hexdigest()
     charge = api.viewer_2d_memory_ledger(*source.shape).renderer_peak
     tracemalloc.start()
     try:
@@ -175,6 +183,10 @@ def test_render_peaks_stay_within_the_ledgers_renderer_charge(nan_fraction):
         tracemalloc.stop()
     worst = max(peaks.values())
     assert worst <= charge + FIXED_SLACK, {step: round(peak / source.size, 2) for step, peak in peaks.items()}
+    assert hashlib.sha256(source).hexdigest() == digest
+    if nan_fraction == "stride grid":
+        np.testing.assert_array_equal(
+            view.raw.image.levels, np.nanpercentile(np.log10(source), (0.1, 99.9)))
 
 
 def test_a_wide_frame_render_peaks_stay_within_the_wide_charge():
