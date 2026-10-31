@@ -25,9 +25,9 @@ except (ValueError, OSError, AttributeError):
     from xrd_tools.core.staging import windows_physical_ram_bytes
     _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
 if _PHYSICAL_RAM > 0:
-    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 20)
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 10)
 elif _WINDOWS_RAM > 0:
-    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 20))
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 10))
 else:
     _EXPECTED_B = 884_736_000
 

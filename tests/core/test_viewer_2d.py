@@ -27,9 +27,9 @@ except (ValueError, OSError, AttributeError):
     from xrd_tools.core.staging import windows_physical_ram_bytes
     _PHYSICAL_RAM, _WINDOWS_RAM = 0, windows_physical_ram_bytes() or 0
 if _PHYSICAL_RAM > 0:
-    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 20)
+    _EXPECTED_B = min(1024**3, _PHYSICAL_RAM // 10)
 elif _WINDOWS_RAM > 0:
-    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 20))
+    _EXPECTED_B = min(1024**3, max(884_736_000, _WINDOWS_RAM // 10))
 else:
     _EXPECTED_B = 884_736_000
 
@@ -2286,16 +2286,37 @@ def test_windows_budget_uses_the_pcs_own_ram(monkeypatch):
     assert ledger.budget == 1024**3, "a 32 GB Windows PC gets the 1 GiB cap, not the fixed fallback"
     assert ledger.admission <= ledger.budget, "a 4096x4096 frame fits it"
     _as_windows(monkeypatch, 16 * 1024**3)
-    assert api.viewer_2d_memory_ledger(1, 1).budget == 884_736_000, "16 GB keeps the fallback it had (819 MiB < 844)"
+    assert api.viewer_2d_memory_ledger(1, 1).budget == 1024**3, "16 GB reaches the cap at a tenth of RAM"
 
 
 @pytest.mark.parametrize("ram_gib", [7, 8], ids=["hosted-7-gib", "pc-8-gib"])
 def test_a_small_windows_pc_keeps_the_budget_it_had(monkeypatch, ram_gib):
     """Reading Windows RAM must not take anything away: a 7/8 GiB Windows PC had the 884,736,000-byte fallback, where a
-    9-megapixel Eiger2 frame (3108x3262) is admitted; a twentieth of its RAM (410 MiB) would refuse it."""
+    9-megapixel Eiger2 frame (3108x3262) is admitted; a tenth of its RAM (751/819 MiB) is still below it."""
     _as_windows(monkeypatch, ram_gib * 1024**3)
     ledger = api.viewer_2d_memory_ledger(3108, 3262, encoded_retained=40 * 1024**2)
     assert ledger.budget == 884_736_000 and ledger.admission <= ledger.budget
+
+
+def test_a_16_gb_pc_admits_4096_square_and_eiger2_16m_frames(monkeypatch):
+    """His choice after the measurement, "A tenth of RAM (Recommended)": the ledger's about 7c matches the measured
+    switch peak (4096x4096: 817 MiB; Eiger2 16M: 923 MiB, on macOS), so the budget becomes a tenth of RAM, capped at
+    1 GiB. A 16 GB PC, on any system, now admits both frames; a twentieth (819 MiB) refused them."""
+    for detect in ("posix", "windows"):
+        if detect == "posix":
+            monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 16 * 1024**3)
+        else:
+            _as_windows(monkeypatch, 16 * 1024**3)
+        for shape, encoded in (((4096, 4096), 32 * 1024**2), ((4148, 4362), 69 * 1024**2)):
+            ledger = api.viewer_2d_memory_ledger(*shape, encoded_retained=encoded)
+            assert ledger.budget == 1024**3 and ledger.admission <= ledger.budget, (detect, shape)
+
+
+def test_an_8_gb_posix_pc_admits_eiger2_9m_and_still_refuses_4096_square(monkeypatch):
+    monkeypatch.setattr(api, "_physical_ram_bytes", lambda: 8 * 1024**3)
+    assert api.viewer_2d_memory_ledger(1, 1).budget == 8 * 1024**3 // 10
+    assert api.viewer_2d_memory_ledger(3108, 3262, encoded_retained=40 * 1024**2).admission <= 8 * 1024**3 // 10
+    assert api.viewer_2d_memory_ledger(4096, 4096, encoded_retained=32 * 1024**2).admission > 8 * 1024**3 // 10
 
 
 def test_windows_pc_reads_a_4096_square_16_bit_tiff(tmp_path, monkeypatch):
