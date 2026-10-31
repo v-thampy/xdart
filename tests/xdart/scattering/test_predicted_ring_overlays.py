@@ -357,3 +357,29 @@ def test_same_energy_step_to_an_evicted_frame_reuses_the_prediction(qapp, tmp_pa
         monkeypatch.setattr(provider, 'build_phase_references', count)
         select(qapp, page, keys[0]); settle(qapp, view, lambda: rings(view.raw))
         assert rings(view.raw) and not calls
+
+
+def test_run_page_deletes_its_page_only_after_its_cleanup(qapp, tmp_path, monkeypatch):
+    """A refused first cleanup must not leave the page and its retry timer alive into the next test, where its
+    close would run beside that test's Run worker (CI-VIEWERS-HANG-128)."""
+    import shiboken6
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+
+    real = ScatteringWorkspace.close_workspace
+    refusals = [2]
+
+    def refusing(self):
+        receipt = real(self)
+        if refusals[0]:
+            refusals[0] -= 1
+            return replace(receipt, cleanup_status=CleanupStatus.CLEANUP_PENDING)
+        return receipt
+
+    with run_page(qapp, tmp_path / 'teardown') as (page, _view):
+        monkeypatch.setattr(ScatteringWorkspace, 'close_workspace', refusing)
+    assert refusals == [0], "run_page returned before its page finished cleanup"
+    # Qt deletes the page later (processEvents runs no deferred delete); by then nothing is left to clean.
+    assert not shiboken6.isValid(page) or (
+        page.close_workspace().cleanup_status is CleanupStatus.CLEANED
+        and not page._deferred_delete_retry_timer.isActive()
+    )
