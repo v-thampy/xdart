@@ -30,6 +30,7 @@ from xrd_tools.io.output_transaction import (
     revalidate_target_snapshot,
     revalidate_stream_terminal,
     stream_terminal_object_revision,
+    target_revision_key,
 )
 from xrd_tools.session.frame_record_store import FrameRecordStore
 from xrd_tools.session.scan_norm import (
@@ -880,6 +881,14 @@ class BrowseLoader:
             elif not Path(request.source_path).is_file():
                 status = BrowseLoadStatus.REFUSED
                 detail = "Processed browse artifact is unavailable."
+            elif request.expected_revision is not None:
+                # A recheck of the shown result reads no file content and builds no context (BROWSE-CLICK-128).
+                current = target_revision_key(capture_target_revision(Path(request.source_path)))
+                status = (
+                    BrowseLoadStatus.UNCHANGED
+                    if current == request.expected_revision
+                    else BrowseLoadStatus.CHANGED
+                )
             elif not cancelled.is_set():
                 context = self._read_context(
                     request,
@@ -1008,6 +1017,11 @@ class BrowseLoader:
         stage_finish("initial_seal_s", started)
         if type(before) is not TargetSnapshot or not before.exists:
             raise ValueError("processed browse target is unavailable")
+        # The revision a later re-click compares (BROWSE-CLICK-128). A terminal seal carries no ctime, so that mode
+        # samples the revision itself; taken before any read, a change during the load only causes one more reload.
+        load_revision = target_revision_key(
+            before if sealed_terminal is None else capture_target_revision(path)
+        )
         if cancelled.is_set():
             return None
         started = stage_start()
@@ -1135,6 +1149,7 @@ class BrowseLoader:
                 target_entry=target_entry,
                 loaded_labels=labels,
                 target_snapshot=after,
+                load_revision=load_revision,
                 prepared_reintegrate_offer=prepared_offer,
                 ring_basis=ring_basis,
                 # Per-frame facts are read only for the frames Browse shows (PERF-BROWSE-OPEN-128 stage B).

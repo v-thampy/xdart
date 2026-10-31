@@ -85,6 +85,7 @@ from .browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
     BrowseLoadStatus,
+    BrowseLoadTiming,
     LoadedBrowseCapture,
 )
 from .contracts import (
@@ -262,6 +263,36 @@ from .workspace_operations import (
 
 
 _LOG = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _ClickBrowsePerf:
+    """One click open's timing under XDART_PERF (BROWSE-CLICK-128): the request identity and floats only."""
+
+    request: BrowseLoadRequest
+    started_at: float
+    worker: BrowseLoadTiming | None = None
+    first_trace_s: float | None = None
+    image_s: float | None = None
+
+
+def _click_perf_enabled() -> bool:
+    return bool(os.environ.get("XDART_PERF"))
+
+
+def _log_click_perf(perf: _ClickBrowsePerf, endpoint: str, seconds: float) -> None:
+    """One endpoint of one click, with the loader's own stage times; logging never changes behaviour."""
+    worker = perf.worker
+    try:
+        _LOG.info(
+            "[PERF-BROWSE-CLICK] source=%s token=%s generation=%d records=%d | click→%s=%.3fs | worker=%.3fs "
+            "seal=%.3fs scan-open=%.3fs record-iteration=%.3fs presentation-read=%.3fs context-build=%.3fs",
+            perf.request.source_path, perf.request.token, perf.request.load_generation, worker.record_count,
+            endpoint, seconds, worker.worker_total_s, worker.initial_seal_s, worker.scan_open_s,
+            worker.record_iteration_s, worker.presentation_read_s, worker.context_build_s,
+        )
+    except Exception:
+        pass
 _LIVE_EVENT_DRAIN_INTERVAL_MS = 125
 _DEFAULT_LIVE_PLOT_INTERVAL_MS = 250
 _LIVE_PLOT_INTERVAL_ENV = "XDART_LIVE_PLOT_INTERVAL_MS"
@@ -718,6 +749,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._deferred_browse_reopen: _DeferredBrowseReopen | None = None
         # The latest Browse open a click admitted: All frames applies to its READY adoption alone (ALL-FRAMES-128)
         self._all_frames_open: BrowseLoadRequest | None = None
+        # A changed file's reopen after a re-click and the frame labels it returns to (BROWSE-CLICK-128)
+        self._recheck_reload: tuple[BrowseLoadRequest, int, tuple[int, ...]] | None = None
+        # The latest click's timing under XDART_PERF; a newer click or a failed open drops it unlogged
+        self._click_perf: _ClickBrowsePerf | None = None
         self._pending_viewer_2d_path: str | None = None
         self._admission_state: _AdmissionPageOwner | None = None
         self._closing = False
@@ -3451,6 +3486,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if command.path == ("directory",):
                 self._select_scan(value, is_directory=True)
                 return
+            if command.path == ("artifact", "recheck"):
+                ScatteringWorkspace._recheck_scan(self, value)
+                return
             self._retain_outgoing_display = False
             ScatteringWorkspace._clear_presentation_targets(self)
             if command.path not in {(), ("artifact",)}:
@@ -4809,6 +4847,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ScatteringWorkspace._show_every_browse_frame(self)
             self._refresh_shell()
             return
+        click_started = time.perf_counter()
         try:
             request = self._context_controller.begin_browse(
                 value,
@@ -4834,6 +4873,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._ensure_timer()
             return
         self._all_frames_open = request
+        self._click_perf = _ClickBrowsePerf(request, click_started) if _click_perf_enabled() else None
         if terminal_request is not None and request is not terminal_request:
             self._processed_browser.retire_terminal(
                 terminal_request
@@ -4916,6 +4956,91 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         selection = self._context_controller.selection
         return (self._preferences.plot_mode in ALL_FRAMES_PLOT_MODES
                 and selection is not None and selection.kind is ContextKind.BROWSE)
+
+    def _recheck_scan(self, value: object) -> None:
+        """A click on the shown result: reopen it only if its file changed since it was loaded (BROWSE-CLICK-128)."""
+        if type(value) is not str or not value:
+            return
+        controller = self._context_controller
+        request = None
+        started = time.perf_counter()
+        if not (controller.viewer_1d_owned or controller.viewer_2d_owned):
+            try:
+                request = controller.begin_browse_recheck(value)
+            except RuntimeError:
+                return  # another open or a cleanup is pending; the click changes nothing
+        if request is None:
+            # Not the shown result: an ordinary click on it.
+            self._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, value, path=("artifact",)))
+            return
+        self._click_perf = _ClickBrowsePerf(request, started) if _click_perf_enabled() else None
+        self._ensure_timer()
+
+    def _finish_recheck(self, outcome: BrowseLoadOutcome) -> None:
+        """Keep an unchanged result exactly as it is; reopen a changed one on the frame shown ("Keep my frame")."""
+        perf = self._click_perf
+        if perf is not None and perf.request is outcome.request:
+            self._click_perf = None
+            if outcome.status is BrowseLoadStatus.UNCHANGED:
+                try:
+                    _LOG.info(
+                        "[PERF-BROWSE-CLICK] source=%s token=%s generation=%d recheck=unchanged t=%.3fs",
+                        outcome.request.source_path, outcome.request.token, outcome.request.load_generation,
+                        time.perf_counter() - perf.started_at,
+                    )
+                except Exception:
+                    pass
+        if outcome.status is not BrowseLoadStatus.CHANGED:
+            return
+        navigation = self._context_controller.navigation
+        current = navigation.current
+        labels = tuple(frame.local_frame_label for frame in navigation.selected)
+        before = self._all_frames_open
+        self._select_scan(outcome.request.display_path or outcome.request.source_path, reopen=True)
+        request = self._all_frames_open
+        self._recheck_reload = (
+            None if current is None or request is None or request is before
+            else (request, current.local_frame_label, labels)
+        )
+
+    def _restore_rechecked_frame(self, request: BrowseLoadRequest, ready: bool) -> None:
+        """Return a changed result's reopen to the frame it showed, if that frame is still in the file."""
+        pending = self._recheck_reload
+        if pending is None or pending[0] is not request:
+            return
+        self._recheck_reload = None
+        if not ready:
+            return
+        _request, label, labels = pending
+        navigation = self._context_controller.navigation
+        by_label = {frame.local_frame_label: frame for frame in navigation.frames}
+        current = by_label.get(label)
+        if current is None:
+            return  # that frame left the file: the open's own first frame
+        selected = (
+            navigation.frames if ScatteringWorkspace._all_frames_applies(self)
+            else tuple(by_label[item] for item in labels if item in by_label) or (current,)
+        )
+        self._context_controller.select_navigation(current, selected)
+
+    def _stamp_click_perf(self, traced: bool, preview: object) -> None:
+        """Log a click's first painted trace and its current image once each, for that click's own context."""
+        perf = self._click_perf
+        if perf is None or perf.worker is None:
+            return
+        if self._context_controller.capture_loaded_browse(perf.request) is None:
+            return
+        elapsed = time.perf_counter() - perf.started_at
+        if traced and perf.first_trace_s is None:
+            perf.first_trace_s = elapsed
+            _log_click_perf(perf, "first-trace", elapsed)
+        view = getattr(preview, "view", None)
+        if perf.image_s is None and type(preview) is StandardDisplayPayload and view is not None and (
+                view.raw is not None or view.thumbnail is not None or view.intensity_2d is not None):
+            perf.image_s = elapsed
+            _log_click_perf(perf, "image", elapsed)
+        if perf.first_trace_s is not None and perf.image_s is not None:
+            self._click_perf = None
 
     def _show_every_browse_frame(self) -> bool:
         """Every frame of the shown Browse result where All frames applies; no paint of its own, and earlier results'
@@ -5090,6 +5215,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._processed_browser.finish_poll_timing(
                         terminal_request, poll_started
                     )
+            if type(outcome) is BrowseLoadOutcome and outcome.status in {
+                    BrowseLoadStatus.UNCHANGED, BrowseLoadStatus.CHANGED}:
+                ScatteringWorkspace._finish_recheck(self, outcome)
+                outcome = None
+                changed = True
             if outcome is not None:
                 load_outcome = (
                     outcome if type(outcome) is BrowseLoadOutcome else None
@@ -5141,10 +5271,20 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     if (detail or self._deferred_browse_reopen is None) and (
                             detail or not self._progress.terminal or not self._notice_text):
                         self._notice(detail)
+                perf = self._click_perf
+                if load_outcome is not None and perf is not None and load_outcome.request is perf.request:
+                    if load_outcome.status is BrowseLoadStatus.READY and type(load_outcome.timing) is BrowseLoadTiming:
+                        perf.worker = load_outcome.timing
+                    else:
+                        self._click_perf = None
                 if load_outcome is not None and load_outcome.request is self._all_frames_open:
                     self._all_frames_open = None
                     if load_outcome.status is BrowseLoadStatus.READY and not successor_settled:
                         ScatteringWorkspace._show_every_browse_frame(self)
+                    ScatteringWorkspace._restore_rechecked_frame(
+                        self, load_outcome.request,
+                        load_outcome.status is BrowseLoadStatus.READY and not successor_settled,
+                    )
                 current = self._context_controller.navigation.current
                 if current is not None:
                     self._follow_processed_artifact(current)
@@ -7246,6 +7386,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
             self._shell.apply_state(projection, **apply_options)
+            ScatteringWorkspace._stamp_click_perf(self, cache_trace_snapshot is not None, cache_current_preview)
             comparison_notice = self._shell.scientific.browse_comparison_notice
             if comparison_notice and comparison_notice != self._notice_text:
                 self._notice(comparison_notice)

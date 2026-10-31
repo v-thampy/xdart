@@ -150,6 +150,31 @@ class _AccumulatingFrameClickFilter(QtCore.QObject):
         return True
 
 
+class _ResultRecheckFilter(QtCore.QObject):
+    """Remember whether a mouse press lands on the result row already selected (BROWSE-CLICK-128).
+
+    Qt reports no selection change for that click, so without this it would do nothing.
+    """
+
+    def __init__(self, owner: "BrowserView") -> None:
+        super().__init__(owner.scans)
+        self._owner = owner
+        self.pressed_row = -1
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QtCore.QEvent.Type.MouseButtonPress:
+            try:
+                scans = self._owner.scans
+                item = scans.itemAt(event.position().toPoint())
+                self.pressed_row = (
+                    scans.row(item)
+                    if item is not None and item.isSelected() and not item.data(_DIRECTORY_ROLE) else -1
+                )
+            except (AttributeError, RuntimeError):
+                self.pressed_row = -1
+        return False
+
+
 class _FrameSelectionCadenceFilter(QtCore.QObject):
     """Bracket a held navigation key as one deferred browse gesture."""
 
@@ -712,6 +737,12 @@ class BrowserView(QtWidgets.QFrame):
             self.scans.itemSelectionChanged.connect(self._scan_selected)
             self.scans.itemClicked.connect(self._activate_directory)
             self.scans.itemActivated.connect(self._activate_directory)
+            self._result_recheck_filter = _ResultRecheckFilter(self)
+            self.scans.viewport().installEventFilter(self._result_recheck_filter)
+            self.scans.itemClicked.connect(self._recheck_selected_result)
+            self.scans.setToolTip(
+                "Click a result to open it. Click the open result again to reload it if its file has changed."
+            )
         if self.profile.results:  # after the page has heard of the change
             self.scans.currentItemChanged.connect(self._viewed_result_changed)
             self.scans.itemSelectionChanged.connect(self._viewed_result_changed)
@@ -1608,6 +1639,16 @@ class BrowserView(QtWidgets.QFrame):
             frame=current, frames=frames, intent=FrameSelectionIntent.EXACT,
         ))
         self._frame_selection_coalescer.trigger()
+
+    def _recheck_selected_result(self, item) -> None:
+        """A click on the result already open asks the page to reload it if its file changed (BROWSE-CLICK-128)."""
+        pressed = self._result_recheck_filter.pressed_row
+        self._result_recheck_filter.pressed_row = -1
+        if item is None or pressed < 0 or self.scans.row(item) != pressed:
+            return
+        value = item.data(_USER_ROLE)
+        if type(value) is str and value:
+            self._emit(ShellCommandKind.SELECT_SCAN, value, path=("artifact", "recheck"))
 
     def _activate_directory(self, item) -> None:
         if item.data(_DIRECTORY_ROLE) and len(self.scans.selectedItems()) == 1:

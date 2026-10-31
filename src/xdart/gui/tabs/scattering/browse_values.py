@@ -30,6 +30,10 @@ class BrowseLoadStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     SUPERSEDED = "superseded"
+    #: A recheck's file revision still equals the shown context's (BROWSE-CLICK-128): nothing was read or built.
+    UNCHANGED = "unchanged"
+    #: A recheck found the file rewritten since the shown context loaded it; the page reopens it.
+    CHANGED = "changed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +103,9 @@ class BrowseLoadRequest:
     #: ``effect_of_rocking_…`` for ``Effect_of_Rocking_…`` (maintainer, 2026-10-25). Empty: name it from
     #: ``source_path``.
     display_path: str = ""
+    #: A recheck of the shown result (BROWSE-CLICK-128): the revision key (``target_revision_key``) its context was
+    #: loaded at. The worker compares the file's current revision and builds nothing.
+    expected_revision: tuple | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -124,6 +131,8 @@ class BrowseLoadRequest:
             )
             or type(self.display_path) is not str
             or (self.display_path and os.path.normcase(self.display_path) != self.source_path)
+            or self.expected_revision is not None
+            and (type(self.expected_revision) is not tuple or len(self.expected_revision) != 6)
         ):
             raise TypeError("browse load request is invalid")
 
