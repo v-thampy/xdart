@@ -391,6 +391,7 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
         _settle_browse_1d_before_drain=lambda: True,
         _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
         _dispatch_roi_preview=lambda: None,  # the drain dispatches ROI previews since 495c1380
+        _click_perf=None,  # the drain retires a lost click timing record since 347536e8 (BROWSE-CLICK-128)
         _sync_metadata_question=lambda _executor: None,  # Live Auto's question, since 204651e8
         _failed_cleanup_pending=lambda: False,  # a failed Run's pending cleanup retried, since 703753b1
         _terminal_hold=None,  # a Run's end held for the view's paint, since 404e17b2
