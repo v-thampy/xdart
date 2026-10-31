@@ -139,8 +139,8 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
         len(seeded.labels),
     )
 
-    # The initial digest binds the file; unchanged-file revalidation must not
-    # reread the entire artifact for load completion or first-frame hydration.
+    # Browse binds the file by its revision (identity, size, mtime, ctime), not
+    # a digest: neither load completion nor first-frame hydration hashes it.
     from xdart.gui.tabs.scattering.browse_1d_hydration import Browse1DHydrationLane
     from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
     from xdart.gui.tabs.scattering.events import RunIdentity
@@ -170,7 +170,7 @@ def test_default_browse_adopts_one_scalar_catalog_without_payload_rows(
     # Holding the released context cannot retain the catalog graph; only this
     # explicit test reference now keeps it alive.
     assert catalog.rows and context.scalar_catalog is None
-    assert len(hashed) == 1
+    assert hashed == []
 
 
 @pytest.mark.parametrize("finish", ("retry", "cancel", "close", "replace"))
