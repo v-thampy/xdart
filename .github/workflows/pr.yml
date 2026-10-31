@@ -146,7 +146,10 @@ jobs:
           - group: viewers-analysis
             tests: tests/xdart/scattering/test_p*.py
           - group: scattering-other
-            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
+            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py --ignore=tests/xdart/scattering/test_live_revalidation_cost_run.py
+          # About 19 minutes on hosted CI by itself (2026-10-31); its own job keeps scattering-other inside its budget.
+          - group: live-revalidation
+            tests: tests/xdart/scattering/test_live_revalidation_cost_run.py
           - group: application
             tests: >-
               tests/xdart --ignore=tests/xdart/scattering
@@ -161,7 +164,8 @@ jobs:
               tests/xdart/test_text_selection_contrast.py
               tests/xdart/pages/test_synthetic_page_host.py
     runs-on: ubuntu-latest
-    # scattering-other took 49 minutes on hosted CI; leave room for setup/preflight.
+    # scattering-other took about 70 minutes on hosted CI (2026-10-31) until test_live_revalidation_cost_run.py
+    # (about 19 of them) moved to its own group; leave room for setup/preflight.
     timeout-minutes: ${{ matrix.group == 'scattering-other' && 75 || 45 }}
     steps:
       - uses: actions/checkout@v6
