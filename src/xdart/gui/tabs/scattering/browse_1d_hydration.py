@@ -997,10 +997,17 @@ class Browse1DHydrationLane:
             if facts:
                 # The request's resident facts stay recent, so this commit cannot evict its own frames.
                 fact_set = set(fact_labels)
-                self._facts.commit(facts, retain=tuple(
-                    target.label for target in request.targets
-                    if target.label not in fact_set
-                ))
+                # The context gate does not serialize selection supersession.
+                # Keep the bounded facts insertion atomic with submit/retire,
+                # including a supersession after the final row was stored.
+                with self._lock:
+                    if (self._active is not task or self._wanted_identity is not request.identity
+                            or self._retiring or task.cancelled.is_set()):
+                        raise InterruptedError("Browse frame facts request was superseded")
+                    self._facts.commit(facts, retain=tuple(
+                        target.label for target in request.targets
+                        if target.label not in fact_set
+                    ))
         finally:
             request.gate.leave()
         self._prove_requested_resident(task)

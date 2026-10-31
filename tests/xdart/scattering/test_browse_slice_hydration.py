@@ -65,6 +65,10 @@ def saved(tmp_path, request):
             {"I0": [float(n) for n in labels], "epoch": [float(n + 10) for n in labels]},
             index=labels,
         ), labels)
+        if getattr(request, "param", None) == "bad facts":
+            source = entry["frames/frame_0005"].create_group("source")
+            source.create_dataset("path", data=np.bytes_(b"x" * 5000))
+            source.create_dataset("frame_index", data=np.int64(1))
     with FrameViewReader(path, include_thumbnail=False, resolve_source=False) as reader:
         catalog = reader.read_scalar_catalog()
     snapshot = capture_target_snapshot(path)
@@ -123,6 +127,29 @@ def test_full_chi_without_saved_cake_never_substitutes_native_q(saved):
     result = _project(saved, ScientificPreferences(plot_axis="chi"))
     assert not result.traces
     assert "no saved 2-D data" in result.diagnostic
+
+
+@pytest.mark.parametrize("saved", ["bad facts"], indirect=True)
+@pytest.mark.parametrize("resident", [False, True])
+def test_malformed_frame_facts_refuse_slice_with_frame_reason(saved, resident):
+    from xrd_tools.io import FrameFactsFailure
+
+    path, context, frames, _selection, _lane = saved
+    with FrameViewReader(path, resolve_source=False) as reader:
+        (failure,) = reader.read_frame_facts((5,))
+    assert type(failure) is FrameFactsFailure
+    if resident:
+        context.frame_facts.commit((failure,))
+    before = context.frame_facts.resident_labels
+    result = _project(saved, ScientificPreferences(slice_enabled=True, slice_center=0.0,
+                                                   slice_width=0.1), selected=(frames[1],))
+    assert not result.traces
+    assert failure.reason in result.diagnostic
+    assert "frame_0005" in result.diagnostic
+    assert context.frame_facts.resident_labels == before, "the slice lane never populates facts"
+    valid = _project(saved, ScientificPreferences(slice_enabled=True, slice_center=0.0,
+                                                  slice_width=0.1), selected=(frames[0],))
+    assert valid.diagnostic == "" and len(valid.traces) == 1
 
 
 @pytest.mark.parametrize("mode", ["Single", "Overlay", "Waterfall"])
