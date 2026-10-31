@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
+from xrd_tools.core import staging as _staging
 from xrd_tools.core.staging import total_physical_ram_bytes as _physical_ram_bytes
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
@@ -395,7 +396,9 @@ class Viewer2DMemoryLedger:
 
 
 def _memory_budget(ram_bytes=None):
-    detected = _physical_ram_bytes() if ram_bytes is None else ram_bytes
+    # Windows has no os.sysconf RAM figure: without its own (GlobalMemoryStatusEx), every Windows PC got the fixed
+    # fallback and refused a 4096x4096 frame (VIEWER-2D-BUDGET-128).
+    detected = (_physical_ram_bytes() or _staging.windows_physical_ram_bytes()) if ram_bytes is None else ram_bytes
     return 884_736_000 if type(detected) is not int or detected <= 0 else min(
         1024**3, detected // 20
     )
