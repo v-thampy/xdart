@@ -694,9 +694,11 @@ def test_win32_identity_terminal_revalidation_refuses_a_same_size_same_mtime_rew
         api.revalidate_stream_terminal(target, terminal)
 
 
+@pytest.mark.parametrize("capture", ("capture_target_snapshot", "capture_target_revision"))
 def test_win32_identity_target_snapshot_revalidation_refuses_a_same_size_same_mtime_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture: str,
 ) -> None:
     api = _api()
     target = tmp_path / "scan.nexus"
@@ -706,7 +708,7 @@ def test_win32_identity_target_snapshot_revalidation_refuses_a_same_size_same_mt
     monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", False)
     _pathname_stat_reports_creation_time(api, monkeypatch, target)
     assert api.os.stat(target).st_ctime_ns == handle_ctime_ns - 374_000_000
-    snapshot = api.capture_target_snapshot(target)
+    snapshot = getattr(api, capture)(target)
     # The snapshot records the descriptor's view, not the creation time ...
     assert snapshot.ctime_ns == handle_ctime_ns
     # ... so the untouched object revalidates under the Windows shape ...
@@ -725,6 +727,54 @@ def _stat_shape(api, monkeypatch: pytest.MonkeyPatch, target: Path, shape: str) 
     monkeypatch.setattr(_ctime_seam(), "IDENTITY_CARRIES_CTIME", shape == "posix")
     if shape == "win32":
         _pathname_stat_reports_creation_time(api, monkeypatch, target)
+
+
+@pytest.mark.parametrize("shape", ("posix", "win32"))
+@pytest.mark.parametrize("change", ("append", "same-stat-write", "replace", "delete"))
+def test_revision_capture_refuses_mid_observation_change_and_closes_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shape: str, change: str,
+) -> None:
+    api = _api()
+    target = tmp_path / "scan.nexus"
+    target.write_bytes(b"AAAA")
+    before = target.stat()
+    _stat_shape(api, monkeypatch, target, shape)
+    real_fstat = api.os.fstat
+    real_close = api.os.close
+    descriptors = []
+
+    def mutate_after_first_descriptor_observation(descriptor):
+        observed = real_fstat(descriptor)
+        if not descriptors:
+            descriptors.append(descriptor)
+            if change == "append":
+                with target.open("ab") as handle:
+                    handle.write(b"B")
+            elif change == "same-stat-write":
+                target.write_bytes(b"BBBB")
+                os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                assert real_fstat(descriptor).st_ctime_ns != observed.st_ctime_ns
+        return observed
+
+    def mutate_before_final_pathname_observation(descriptor):
+        real_close(descriptor)
+        # Windows need not permit unlink/replacement of an open CRT descriptor.
+        # The final pathname bracket must catch these changes after close too.
+        if change == "replace":
+            replacement = tmp_path / "replacement.nexus"
+            replacement.write_bytes(b"AAAA")
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            replacement.replace(target)
+        elif change == "delete":
+            target.unlink()
+
+    monkeypatch.setattr(api.os, "fstat", mutate_after_first_descriptor_observation)
+    monkeypatch.setattr(api.os, "close", mutate_before_final_pathname_observation)
+    with pytest.raises(api.TargetChanged):
+        api.capture_target_revision(target)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        real_fstat(descriptors[0])
 
 
 def _rewrite_inside_the_hash(api, monkeypatch: pytest.MonkeyPatch, target: Path, payload: bytes):

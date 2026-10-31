@@ -210,7 +210,7 @@ class BrowseSliceLane:
             raise RuntimeError("Browse slice saved artifact changed after loading")
 
     def _stat_revision(self) -> tuple[int, ...]:
-        # The loader already hashed this admitted file. Display reads only
+        # The loader already admitted this file's revision. Display reads only
         # requalify its object/stat identity, including the observed ctime.
         observed = os.stat(self._catalog.artifact_path)
         return (observed.st_dev, observed.st_ino, observed.st_size,

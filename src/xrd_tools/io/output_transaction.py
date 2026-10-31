@@ -761,8 +761,9 @@ def capture_target_revision(path: Path | str) -> TargetSnapshot:
 
     The same pathname/descriptor brackets as the content capture, without reading the file: identity, size, mtime
     and the descriptor's change time (``ctime_ns``). It certifies the filesystem revision, not content equality
-    (PERF-BROWSE-OPEN-128); ``revalidate_target_snapshot`` holds it through the same revision fence. Writers keep the
-    content capture. A missing target is the absent snapshot; any change while observing raises ``TargetChanged``.
+    (PERF-BROWSE-OPEN-128); ``revalidate_target_snapshot`` holds it through the same revision fence. Writers keep
+    their existing admission policies. A missing target is the absent snapshot; disagreeing observations raise
+    ``TargetChanged``. This does not lock the file: consumers must revalidate across their reads.
     """
     target = os.path.realpath(os.fspath(path))
     try:
