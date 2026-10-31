@@ -60,9 +60,13 @@ def _selected_admission(catalog, label):
     shape = fact.shape if fact is not None else catalog.source_shape[-2:]
     encoded = (catalog.primary_revision.size if catalog.format_name in
                {"edf", "cbf", "img", "mar3450"} else 0)
-    canonical = 8 * shape[0] * shape[1]
-    peak = max(3 * canonical, encoded + 4 * canonical)
-    return canonical + _EXPECTED_R + max(peak, 6 * canonical)
+    # DISPLAY-FLOAT32-128: one float32 frame's working set, its read or its drawing, whichever is larger (bytes per
+    # pixel from the design's per-phase table), with the loading snapshot; the previous frame is cleared first.
+    pixels = shape[0] * shape[1]
+    read = encoded + pixels * (8 + 8 + 4 + 1)  # decoded source, contiguous copy, canonical, finite mask
+    # a Log recolour: canonical, old display, its QImage and NaN mask (coordinates when wider than 32767), new display, Log
+    draw = pixels * (4 + 4 + 4 + (16 if max(shape) > 32767 else 1) + 4 + 4)
+    return _EXPECTED_R + 8_000_000 + max(read, draw)
 
 
 class _Port:
