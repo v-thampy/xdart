@@ -1,4 +1,4 @@
-from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision; from xrd_tools.io.stat_identity import identity_ctime_ns; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
+from __future__ import annotations; import hashlib, json, math, os, tempfile, threading, time; from bisect import bisect_right; from collections.abc import Mapping; from contextlib import contextmanager; from dataclasses import dataclass, fields; from pathlib import Path, PurePosixPath; from types import MappingProxyType, SimpleNamespace; from typing import Any, Literal, NamedTuple; from xrd_tools.io.append import _replacement_hard_group, decode_replacement_lineage, science_fingerprint; from xrd_tools.io.output_transaction import StreamTerminal, TargetSnapshot, capture_target_snapshot, revalidate_stream_terminal, stream_terminal_object_revision, target_revision_key; from xrd_tools.io.stat_identity import identity_ctime_ns; from xrd_tools.session.policy import FlushPolicy, SessionPolicy, SessionResourceAllocation, SessionResourceRequirements, requirements_from, resolve_session_policy
 _REQUESTS = {"workers", "reduction_inflight", "queue_depth", "owner_block_bytes", "staging_items", "record_heavy_items", "publication_heavy_items", "thumbnail_items", "record_items", "publication_items"}
 # Keep headless replacement admission aligned with the GUI's 256 MiB decoded
 # scientific-mask ceiling without importing GUI policy into xrd_tools.  Both
@@ -2648,6 +2648,14 @@ def _resolve_persisted_selected(selected, shared, dimension, mask):
     mode = selected["gi_mode"] if shared["gi"]["enabled"] else None; requested = {**selected, "gi_mode": mode}; plan = _core_plan(requested, shared, mask)
     from xrd_tools.reduction.provenance_config import _integration_1d_args, _integration_2d_args
     args = _integration_1d_args(plan.integration_1d, plan.gi) if dimension == "1d" else _integration_2d_args(plan.integration_2d, plan.gi); args.pop(f"gi_mode_{dimension}", None); resolved = {**requested, "bai_args": args}; _validate_science(resolved, shared, dimension); return resolved
+def _same_admitted_target(fresh: TargetSnapshot, expected: TargetSnapshot) -> bool:
+    """Whether this fresh full capture is the file Browse admitted. A read-only Browse revision (no digest; PERF-BROWSE-OPEN-128)
+    promotes to the fresh capture only while its explicit file revision holds; any other expected snapshot keeps exact equality."""
+    if expected.digest is None and expected.ctime_ns is not None:
+        return target_revision_key(fresh) == target_revision_key(expected)
+    return fresh == expected
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ReintegratePlan:
     api_version: int; target: str; entry: str; source_root: str; expected_target_snapshot: TargetSnapshot; dimension: Literal["1d", "2d"]; labels: tuple[int, ...]; detector_shape: tuple[int, int]; native_dtype: str; selected_plan: Mapping[str, Any]; requested_shared_science: Mapping[str, Any]; gi_bootstrap_incidence: float | None; retained_mask_bytes: int; mask_decode_bytes: int; session_policy: SessionPolicy; rollback_policy: Literal["ROLLBACK_ON_STOP"]; science_identity: str; operation_identity: str
@@ -2673,7 +2681,7 @@ class ReintegratePlan:
             source_root = os.fspath(source_root)
             _normalized_absolute_path(
                 source_root, "REPLACEMENT_SOURCE_RELOCATION_UNSUPPORTED")
-        _reject(not snapshot.exists, "replacement target must exist"); _reject(sealed is None and expected_target_snapshot is not None and snapshot != expected_target_snapshot, "TARGET_SNAPSHOT_CHANGED"); target_revision = _target_object_revision(path, snapshot); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension, snapshot, target_revision, source_root, read_mask=False); _event(cancel_token); labels = tuple(observed.labels)
+        _reject(not snapshot.exists, "replacement target must exist"); _reject(sealed is None and expected_target_snapshot is not None and not _same_admitted_target(snapshot, expected_target_snapshot), "TARGET_SNAPSHOT_CHANGED"); target_revision = _target_object_revision(path, snapshot); _event(cancel_token); observed = _inspect_artifact(path, entry, dimension, snapshot, target_revision, source_root, read_mask=False); _event(cancel_token); labels = tuple(observed.labels)
         _reject(expected_labels is not None and labels != expected_labels, "EXPECTED_LABELS_CHANGED")
         if persisted: shared = _plain(observed.persisted_shared_science); selected = _resolve_persisted_selected(selected, shared, dimension, None)
         else: _reject(_plain(observed.persisted_shared_science) != shared, "shared science differs")

@@ -24,6 +24,7 @@ from xrd_tools.io.browse_1d_cache import Browse1DCachePhase
 from xrd_tools.io.browse_presentation import read_browse_presentation
 from xrd_tools.io.output_transaction import (
     TargetSnapshot,
+    capture_target_revision,
     capture_target_snapshot,
     revalidate_target_snapshot,
     revalidate_stream_terminal,
@@ -994,8 +995,10 @@ class BrowseLoader:
                 "terminal" if sealed_terminal is not None else "snapshot"
             )
         started = stage_start()
+        # A read-only open seals the file revision, not its content: hashing the whole output was most of a large
+        # file's open time, and the final fence below already trusts this revision (PERF-BROWSE-OPEN-128).
         before = (
-            capture_target_snapshot(path)
+            capture_target_revision(path)
             if sealed_terminal is None
             else revalidate_stream_terminal(path, sealed_terminal)
         )
