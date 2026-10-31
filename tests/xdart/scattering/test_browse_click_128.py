@@ -178,7 +178,7 @@ def test_a_click_logs_first_trace_and_image_once_with_the_worker_stages(tmp_path
         _wait(lambda: _shows(page, second, 1))
         _wait(lambda: True if any("image=" in line for line in _perf_lines(caplog)) else None)
         lines = _perf_lines(caplog)
-        assert lines and all(os.path.basename(str(second)) in line for line in lines)
+        assert lines and all(str(second) in line for line in lines)
         assert len([line for line in lines if "first-trace=" in line]) == 1
         assert len([line for line in lines if "image=" in line]) == 1
         assert all("worker=" in line and "record-iteration=" in line for line in lines)
