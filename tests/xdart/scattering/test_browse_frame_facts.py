@@ -380,3 +380,33 @@ def test_a_superseded_lane_job_commits_no_facts(tmp_path, monkeypatch) -> None:
     finally:
         release.set()
         _release(loader, context, lane)
+
+
+def test_supersession_after_last_row_store_cannot_commit_old_facts(tmp_path, monkeypatch) -> None:
+    """The row/facts boundary is still inside the request's ownership window."""
+    seeded = _seed(tmp_path)
+    loader, outcome = _open(seeded.target)
+    context = loader.consume(outcome)
+    lane, selection, _navigation, by_label = _scope(context)
+    first, second = seeded.labels[0], seeded.labels[2]
+    entered, release = Event(), Event()
+    store_target = lane._store_target
+
+    def blocked(task, rows, target):
+        store_target(task, rows, target)
+        if target.label == first:
+            entered.set()
+            assert release.wait(20.0)
+
+    monkeypatch.setattr(lane, "_store_target", blocked)
+    try:
+        assert lane.submit(selection, (by_label[first],)) is not None
+        assert entered.wait(20.0)
+        assert lane.submit(selection, (by_label[second],)) is not None
+        release.set()
+        _drain(lane, timeout=20.0)
+        assert context.frame_facts.get(first) is None
+        assert type(context.frame_facts.get(second)) is _facts_types()[0]
+    finally:
+        release.set()
+        _release(loader, context, lane)
