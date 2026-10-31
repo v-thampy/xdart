@@ -1017,10 +1017,12 @@ class BrowseLoader:
         stage_finish("initial_seal_s", started)
         if type(before) is not TargetSnapshot or not before.exists:
             raise ValueError("processed browse target is unavailable")
-        # The revision a later re-click compares (BROWSE-CLICK-128). A terminal seal carries no ctime, so that mode
-        # samples the revision itself; taken before any read, a change during the load only causes one more reload.
-        load_revision = target_revision_key(
-            before if sealed_terminal is None else capture_target_revision(path)
+        # The revision a later re-click compares (BROWSE-CLICK-128), taken before any read, so a change during the
+        # load only causes one more reload. A modern terminal seal already carries the file's object revision,
+        # which revalidate_stream_terminal has just verified: no extra capture (terminal Browse keeps its two fences).
+        load_revision = (
+            target_revision_key(before) if sealed_terminal is None
+            else (True, *stream_terminal_object_revision(sealed_terminal))
         )
         if cancelled.is_set():
             return None

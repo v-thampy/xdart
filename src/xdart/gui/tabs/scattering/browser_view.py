@@ -166,9 +166,15 @@ class _ResultRecheckFilter(QtCore.QObject):
             try:
                 scans = self._owner.scans
                 item = scans.itemAt(event.position().toPoint())
+                # Only a plain click in single selection: a modifier or multi-selection click is a selection gesture.
+                plain = (
+                    event.button() == QtCore.Qt.MouseButton.LeftButton
+                    and event.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier
+                    and scans.selectionMode() == QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+                )
                 self.pressed_row = (
                     scans.row(item)
-                    if item is not None and item.isSelected() and not item.data(_DIRECTORY_ROLE) else -1
+                    if plain and item is not None and item.isSelected() and not item.data(_DIRECTORY_ROLE) else -1
                 )
             except (AttributeError, RuntimeError):
                 self.pressed_row = -1
@@ -740,9 +746,6 @@ class BrowserView(QtWidgets.QFrame):
             self._result_recheck_filter = _ResultRecheckFilter(self)
             self.scans.viewport().installEventFilter(self._result_recheck_filter)
             self.scans.itemClicked.connect(self._recheck_selected_result)
-            self.scans.setToolTip(
-                "Click a result to open it. Click the open result again to reload it if its file has changed."
-            )
         if self.profile.results:  # after the page has heard of the change
             self.scans.currentItemChanged.connect(self._viewed_result_changed)
             self.scans.itemSelectionChanged.connect(self._viewed_result_changed)
