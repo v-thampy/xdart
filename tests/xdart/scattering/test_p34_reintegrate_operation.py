@@ -2220,7 +2220,8 @@ def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monk
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest, BrowseLoadStatus
 
     target, _raw = _write_processed(tmp_path, labels=(2, 5, 9))
-    real_capture = module.capture_target_snapshot
+    # PERF-BROWSE-OPEN-128 stage A: a read-only Browse open captures a revision seal, not a content digest.
+    real_capture = module.capture_target_revision
     real_revalidate = module.revalidate_target_snapshot
     real_presentation = module.read_browse_presentation
     calls = []
@@ -2248,7 +2249,7 @@ def test_browse_snapshot_brackets_complete_load_and_refuses_drift(tmp_path, monk
         assert snapshot is snapshots[-1]
         return real_revalidate(path, snapshot)
 
-    monkeypatch.setattr(module, "capture_target_snapshot", capture)
+    monkeypatch.setattr(module, "capture_target_revision", capture)
     monkeypatch.setattr(module, "read_browse_presentation", presentation)
     monkeypatch.setattr(module, "revalidate_target_snapshot", revalidate)
     expected = [(stage, "scattering-browse") for stage in (
@@ -2300,10 +2301,12 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     target = seeded.target.resolve()
     seal = seeded.terminal.commit_identity
     real_capture = module.capture_target_snapshot
+    real_revision = transaction.capture_target_revision
     real_revalidate = module.revalidate_stream_terminal
     real_snapshot_revalidate = module.revalidate_target_snapshot
     real_sha = transaction._sha256_handle
     full_captures = []
+    revision_captures = []
     captured_snapshots = []
     snapshot_revalidations = []
     revalidations = []
@@ -2312,6 +2315,12 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     def capture(path):
         full_captures.append(threading.current_thread().name)
         snapshot = real_capture(path)
+        captured_snapshots.append(snapshot)
+        return snapshot
+
+    def revision(path):
+        revision_captures.append(threading.current_thread().name)
+        snapshot = real_revision(path)
         captured_snapshots.append(snapshot)
         return snapshot
 
@@ -2329,6 +2338,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
         return real_sha(handle)
 
     monkeypatch.setattr(module, "capture_target_snapshot", capture)
+    monkeypatch.setattr(module, "capture_target_revision", revision)
     monkeypatch.setattr(module, "revalidate_stream_terminal", revalidate)
     monkeypatch.setattr(module, "revalidate_target_snapshot", revalidate_snapshot)
     monkeypatch.setattr(transaction, "_sha256_handle", sha256_handle)
@@ -2360,7 +2370,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
         terminal_context.prepared_reintegrate_offer.miss_code
         is PreparedCapsuleMissCode.CAPSULE_NOT_SUPPLIED
     )
-    assert full_captures == hashed_bytes == snapshot_revalidations == []
+    assert full_captures == revision_captures == hashed_bytes == snapshot_revalidations == []
     assert revalidations == ["scattering-browse"] * 2
     assert terminal_loader.release_context(
         terminal_context
@@ -2368,7 +2378,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
 
     legacy = type(seal)(seal.target, seal.size, seal.digest, seal.ordinal)
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
-    captured_snapshots.clear(); snapshot_revalidations.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear(); revision_captures.clear()
     legacy_loader = module.BrowseLoader()
     legacy_request = BrowseLoadRequest(
         "legacy-two-fence", 1, str(target), legacy,
@@ -2377,15 +2387,14 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     legacy_outcome = _wait(lambda: legacy_loader.poll(legacy_request))
     legacy_context = legacy_loader.consume(legacy_outcome)
     assert legacy_outcome.status is BrowseLoadStatus.READY
-    assert full_captures == snapshot_revalidations == ["scattering-browse"]
-    assert revalidations == []
-    assert hashed_bytes == [target.stat().st_size]
+    assert revision_captures == snapshot_revalidations == ["scattering-browse"]
+    assert revalidations == full_captures == hashed_bytes == [], "a legacy seal opens with a revision, unhashed"
     assert legacy_loader.release_context(
         legacy_context
     ).cleanup_status.value == "cleaned"
 
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
-    captured_snapshots.clear(); snapshot_revalidations.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear(); revision_captures.clear()
     generic_loader = module.BrowseLoader()
     generic_request = BrowseLoadRequest(
         "generic-two-fence", 1, str(target),
@@ -2394,9 +2403,8 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     generic_outcome = _wait(lambda: generic_loader.poll(generic_request))
     generic_context = generic_loader.consume(generic_outcome)
     assert generic_outcome.status is BrowseLoadStatus.READY
-    assert full_captures == snapshot_revalidations == ["scattering-browse"]
-    assert revalidations == []
-    assert hashed_bytes == [target.stat().st_size]
+    assert revision_captures == snapshot_revalidations == ["scattering-browse"]
+    assert revalidations == full_captures == hashed_bytes == [], "a plain open hashes no file bytes"
     assert generic_loader.release_context(
         generic_context
     ).cleanup_status.value == "cleaned"
@@ -2407,7 +2415,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     os.replace(replacement, target)
     assert target.stat().st_ino != original_inode
     full_captures.clear(); revalidations.clear(); hashed_bytes.clear()
-    captured_snapshots.clear(); snapshot_revalidations.clear()
+    captured_snapshots.clear(); snapshot_revalidations.clear(); revision_captures.clear()
     opened = []
 
     def forbidden_open(_path):
@@ -2424,7 +2432,7 @@ def test_terminal_browse_reuses_writer_seal_without_full_artifact_hash(
     )
     assert replaced_outcome.status is BrowseLoadStatus.FAILED
     assert replaced_loader.context_for_outcome(replaced_outcome) is None
-    assert opened == full_captures == hashed_bytes == snapshot_revalidations == []
+    assert opened == full_captures == revision_captures == hashed_bytes == snapshot_revalidations == []
     assert revalidations == ["scattering-browse"]
 
 
@@ -2524,13 +2532,13 @@ def test_unsealed_browse_physical_validation_runs_only_on_browse_worker(
     page, _store = _page(tmp_path, monkeypatch)
     main_ident = threading.get_ident()
     snapshot_threads = []
-    real_capture = browse_loader.capture_target_snapshot
+    real_capture = browse_loader.capture_target_revision
 
     def tracked_capture(path, *args, **kwargs):
         snapshot_threads.append(threading.get_ident())
         return real_capture(path, *args, **kwargs)
 
-    monkeypatch.setattr(browse_loader, "capture_target_snapshot", tracked_capture)
+    monkeypatch.setattr(browse_loader, "capture_target_revision", tracked_capture)
     try:
         request = page._context_controller.begin_browse(target)
         assert main_ident not in snapshot_threads
