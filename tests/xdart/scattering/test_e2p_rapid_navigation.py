@@ -284,8 +284,10 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
     original_apply_state = shell.apply_state
 
     def record_apply_state(
-        state, *, preserve_display: bool = False, preserve_scientific: bool = False,
+        state, *, preserve_display: bool = False, preserve_scientific: bool = False, **options,
     ) -> None:
+        # ``options``: the shell's other keywords (``replace_scientific_on_failure``, which the page passes whenever
+        # a cached trace snapshot exists), forwarded unchanged
         heavy = state.scientific.heavy
         if heavy is not None:
             rendered_labels.append(heavy.frame.local_frame_label)
@@ -293,7 +295,7 @@ def test_public_run_delivers_651_frames_with_bounded_retention(
                 rendered_raw.append(weakref.ref(heavy.raw))
         original_apply_state(
             state, preserve_display=preserve_display,
-            preserve_scientific=preserve_scientific,
+            preserve_scientific=preserve_scientific, **options,
         )
 
     shell.apply_state = record_apply_state
