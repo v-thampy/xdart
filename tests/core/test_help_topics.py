@@ -12,6 +12,8 @@ IDS = (
     "phase-analysis.constraints", "phase-analysis.batch",
     # NEXT-128-PEAK-FIT (2026-10-31): one topic per group of Peak Fitter options, appended.
     "peak-fit.model", "peak-fit.background", "peak-fit.peaks", "peak-fit.range", "peak-fit.weighting",
+    # NEXT-128-HELP-FOLLOWUPS (2026-10-31): the Strain Analysis topic that opens the Strain guide, appended.
+    "strain.sin2psi",
 )
 CODES = (
     "ROI_RAW_UNAVAILABLE", "ROI_RAW_SHAPE_INVALID", "ROI_PREVIEW_LIMIT_EXCEEDED",
@@ -43,6 +45,7 @@ def test_six_immutable_topics_cover_the_frozen_scientific_questions():
         ("Auto", "count", "centers", "σ", "bounds", "iterations"),
         ("range", "drag", "Full", "finite"),
         ("uncertainties", "σ", "weights", "unweighted"),
+        ("sin²ψ", "d0", "ψ*", "branch", "equibiaxial", "elastic", "apparent", "χ²"),
     )
     for topic, words in zip(TOPICS, concepts, strict=True):
         assert get_topic(topic.identifier) is topic
