@@ -140,3 +140,21 @@ def test_a_browser_refusal_opens_the_topic_and_names_the_reason(qapp, monkeypatc
         assert owner_for(dialog).window is None
     finally:
         dialog.close()
+
+
+def test_f7_the_help_window_offers_the_strain_guide(qapp, opened):
+    """NEXT-128-HELP-FOLLOWUPS F7: until the Strain window exists, its guide opens from the strain topic."""
+    from xdart.gui.widgets.context_help import owner_for
+    root = QtWidgets.QWidget()
+    try:
+        owner = owner_for(root)
+        owner.show_topic("strain.sin2psi")
+        window = owner.window
+        assert window.topic_id == "strain.sin2psi" and not window.guide_button.isHidden()
+        window.guide_button.click()
+        qapp.processEvents()
+        assert opened and Path(opened[-1].toLocalFile()).name == "strain.html"
+        assert Path(opened[-1].toLocalFile()).is_file()
+    finally:
+        owner_for(root).shutdown()
+        root.deleteLater()

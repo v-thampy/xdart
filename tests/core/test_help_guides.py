@@ -17,9 +17,12 @@ ROOT = Path(__file__).resolve().parents[2]
 GUIDES = {"peak-fit.html": ("peak-fit.model", "peak-fit.background", "peak-fit.peaks", "peak-fit.range",
                             "peak-fit.weighting"),
           "phase-analysis.html": ("phase-analysis.phases", "phase-analysis.peak-shape", "phase-analysis.background",
-                                  "phase-analysis.constraints", "phase-analysis.batch")}
+                                  "phase-analysis.constraints", "phase-analysis.batch"),
+          # NEXT-128-HELP-FOLLOWUPS (the maintainer's "Strain guide"): the Strain window (stage 2) mounts it too
+          "strain.html": ("strain.sin2psi",)}
 FIGURES = {"peak-fit.html": ("measures", "williamson-hall", "anatomy", "profiles", "template", "weights"),
-           "phase-analysis.html": ("pattern", "widths", "texture", "mixture")}
+           "phase-analysis.html": ("pattern", "widths", "texture", "mixture"),
+           "strain.html": ("sin2psi", "scatter")}
 
 
 def _figures():
@@ -95,3 +98,16 @@ def test_g6_the_figures_compute_with_the_fitting_owners():
     from xrd_tools.analysis.fitting.phase_fitting import _SCHERRER_K
     wh = figures.williamson_hall()
     assert wh.k == _SCHERRER_K and abs(wh.size_angstrom - 400.0) < 25.0 and abs(wh.strain - 0.002) < 0.0003
+
+
+def test_g6_the_strain_figures_compute_with_the_strain_owner():
+    """NEXT-128-HELP-FOLLOWUPS F6: the Strain guide's numbers come from xdart's strain regression, not from the page.
+    Its synthetic Pt 111 sectors carry 1 GPa of equibiaxial stress with the isotropic E and nu (nu = 0.38)."""
+    import numpy as np
+    figures = _figures()
+    fit = figures.strain_fit()
+    assert abs(fit.stress - 1.0e9) < 0.03e9  # the regression recovers the stress the sectors were made with
+    nu = 0.38
+    assert abs(fit.psi_star_deg - np.degrees(np.arcsin(np.sqrt(2 * nu / (1 + nu))))) < 0.05  # sin2psi* = 2nu/(1+nu)
+    scatter = figures.strain_scatter()
+    assert scatter.reduced_chi_squared > 4 and "excess scatter" in scatter.notice
