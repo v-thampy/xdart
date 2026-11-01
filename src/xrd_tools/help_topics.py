@@ -4,6 +4,7 @@ Topic IDs are presentation identifiers, independent of settings or readiness.
 Diagnostic prose supplements the original strings; it never classifies a result.
 """
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,7 @@ class HelpTopic:
     text: str
     figures: tuple[str, ...] = ()
     run_key: str | None = None
+    guide: str | None = None
 
 
 #: The multi-step calibration's seven steps, declared once as (label, text), each text starting with its label:
@@ -842,13 +844,25 @@ _FIGURES = {
     'calibration.frame-choice': ('arm-motion', 'centred'),
     'calibration.diagnostics': ('residuals',),
 }
+#: Each tool's illustrated physics guide (NEXT-128-HELP-GUIDES), by topic family: an offline page under assets/help
+#: that the tool window's top "?" and the Help window open in the system browser. Its figures are drawn by
+#: xrd_tools.guide_figures from xdart's own models.
+_GUIDES = {"peak-fit": "peak-fit.html", "phase-analysis": "phase-analysis.html"}
+GUIDE_DIR = Path(__file__).resolve().parent / "assets" / "help"
 TOPICS = tuple(replace(t, figures=_FIGURES.get(t.identifier, ()),
-                      run_key='orientation-check' if t.identifier == 'geometry.orientation' else None)
+                      run_key='orientation-check' if t.identifier == 'geometry.orientation' else None,
+                      guide=_GUIDES.get(t.identifier.split(".", 1)[0]))
                for t in TOPICS)
 
 
 def get_topic(identifier: str) -> HelpTopic | None:
     return next((topic for topic in TOPICS if topic.identifier == identifier), None)
+
+
+def guide_path(identifier: str) -> Path | None:
+    """Where the topic's guide ships, or None when the topic has no guide; the caller reports a missing file."""
+    topic = get_topic(identifier)
+    return None if topic is None or topic.guide is None else GUIDE_DIR / topic.guide
 
 
 def search_topics(query: str) -> tuple[HelpTopic, ...]:
