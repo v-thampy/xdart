@@ -10,8 +10,9 @@ dark.
 
 ``render_guide(text)`` regenerates every figure and the stylesheet of a guide's text. tests/core/test_help_guides.py
 fails when a shipped guide no longer matches the code. ``python -m xrd_tools.guide_figures`` rewrites the shipped
-guides in place. Noise comes from seeded legacy generators (stable across numpy versions) and coordinates are rounded
-to 0.1 px, so a figure is the same on every platform.
+guides in place. Noise comes from seeded legacy generators (stable across numpy versions), a fit's free values are
+rounded to four significant figures before drawing, no threshold falls on a sample, and coordinates are rounded to
+0.1 px, so a figure is the same on every platform.
 """
 from __future__ import annotations
 
@@ -93,6 +94,7 @@ th { font: 600 12px var(--mono); letter-spacing: .05em; text-transform: uppercas
 td.yes { color: var(--good); font-weight: 600; white-space: nowrap; } td.no { color: var(--bad); font-weight: 600; white-space: nowrap; }
 ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; max-width: 70ch; }
 footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 14px; }
+a { color: var(--accent); }
 svg text { font: 12px var(--body); fill: var(--muted); }
 svg text.axis { font-size: 12.5px; fill: var(--fg); }
 svg text.note { font-style: italic; }

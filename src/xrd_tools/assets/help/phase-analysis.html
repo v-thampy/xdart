@@ -69,6 +69,7 @@ th { font: 600 12px var(--mono); letter-spacing: .05em; text-transform: uppercas
 td.yes { color: var(--good); font-weight: 600; white-space: nowrap; } td.no { color: var(--bad); font-weight: 600; white-space: nowrap; }
 ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; max-width: 70ch; }
 footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 14px; }
+a { color: var(--accent); }
 svg text { font: 12px var(--body); fill: var(--muted); }
 svg text.axis { font-size: 12.5px; fill: var(--fg); }
 svg text.note { font-style: italic; }
@@ -186,7 +187,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         <span class="k-fit"><i></i>their sum, what is fitted (drawn above)</span></div>
       <figcaption>A sample with several phases scatters as the sum of their patterns, and Phase Analysis fits one
         scale per phase together with its lattice, widths and background. Each phase's computed intensities are
-        normalized to its strongest reflection, so a phase's scale is the area that reflection has in the data. The
+        normalized to its strongest reflection, so a phase's scale is the area that reflection would have in the data
+        without texture. The
         fraction Phase Analysis reports is each scale over the sum of scales: CsCl at scale 1 and NaCl at 0.6 give
         0.625 and 0.375. That compares how strongly each phase diffracts. It is not a weight fraction, which would
         also need each phase's scattering power per unit mass and the sample's absorption; Phase Analysis does not
@@ -319,7 +321,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
     <span class="mono">phase-analysis.peak-shape</span>, <span class="mono">phase-analysis.background</span>,
     <span class="mono">phase-analysis.constraints</span>, <span class="mono">phase-analysis.batch</span>. This guide
     ships with xdart and works offline. Its plots are drawn by Phase Analysis's own code
-    (<span class="mono">xrd_tools.guide_figures</span>), and the test suite checks that they still match it.</footer>
+    (<span class="mono">xrd_tools.guide_figures</span>), and the test suite checks that they still match it. See
+    also the <a href="peak-fit.html">Peak Fitter guide</a>.</footer>
 </main>
 </body>
 </html>
