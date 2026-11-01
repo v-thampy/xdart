@@ -212,6 +212,7 @@ class ActionButton(QtWidgets.QPushButton):
                 owner_for(context).show_topic(topic_id, details=reason)
 
         button.clicked.connect(_open)
+        owner_for(context)  # mount the tool window's F1 shortcut before its first help visit
         return button
 
     def apply_spec(self, spec: ControlActionSpec) -> None:

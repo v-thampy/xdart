@@ -12,7 +12,8 @@ dark.
 fails when a shipped guide no longer matches the code. ``python -m xrd_tools.guide_figures`` rewrites the shipped
 guides in place. Noise comes from seeded legacy generators (stable across numpy versions), a fit's free values are
 rounded to four significant figures before drawing, no threshold falls on a sample, and coordinates are rounded to
-0.1 px, so a figure is the same on every platform.
+0.1 px to suppress small numerical differences. The exact regeneration test detects remaining drift, including
+changes in a scientific dependency's model; rounding is not a guarantee against every future library change.
 """
 from __future__ import annotations
 
@@ -252,7 +253,8 @@ def _pseudo_voigt(x, center, fwhm, height, fraction=0.5):
 def _settled(fit_result):
     """A fit's parameters with each free value rounded to four significant figures, and a value within 10⁻⁴ of its
     bound's span pinned to that bound (where a solver stops near a bound depends on its path). The figures draw from
-    these, so a fit's last digits, which differ between platforms and library builds, never move a drawn coordinate."""
+    these to suppress changes in a fit's last digits across platforms and library builds. G6 checks the resulting
+    SVG against the shipped figure; changes that cross a rounding boundary remain detectable."""
     params = fit_result.params.copy()
     for parameter in params.values():
         if parameter.expr is not None:

@@ -198,16 +198,18 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       <table>
         <thead><tr><th>Fitted value</th><th>What it measures</th><th>Read it as</th></tr></thead>
         <tbody>
-          <tr><td>Center, <code>p0_center</code></td><td>the plane spacing, d = 2π/q</td><td>a shift between frames
-            is strain or thermal expansion</td></tr>
+          <tr><td>Center, <code>p0_center</code></td><td>position in the displayed x unit; for total q,
+            d = 2π/q</td><td>spacing changes can show strain or thermal expansion; a 2θ centre needs the source
+            wavelength in Bragg's law</td></tr>
           <tr><td>FWHM, <code>p0_fwhm</code></td><td>size and microstrain broadening, plus the instrument</td>
-            <td>size from Scherrer, D ≈ 2πK/FWHM, once the instrument's width is removed</td></tr>
+            <td>size from Scherrer, D ≈ 2πK/FWHM<sub>size</sub>, with the size-only width in total-q units after
+              instrument correction and negligible or separately resolved strain broadening</td></tr>
           <tr><td>Amplitude, <code>p0_amplitude</code></td><td>the peak's area, its integrated intensity</td>
             <td>phase amount × |F|² × multiplicity × texture: compare one reflection across frames</td></tr>
           <tr><td><code>p0_fraction</code></td><td>the Lorentzian share of a pseudo-Voigt</td><td>size broadening
             tends to be Lorentzian, strain and instrument broadening Gaussian</td></tr>
-          <tr><td><code>bg_A</code></td><td>the template's scale</td><td>how much substrate scattering the sample
-            shows: a thinner film shows more</td></tr>
+          <tr><td><code>bg_A</code></td><td>the template's scale</td><td>relative substrate scattering;
+            thickness, absorption and intensity normalization can all change it</td></tr>
           <tr><td>the trend</td><td>any of these against frame or a scan column</td><td>in-situ change: expansion
             on heating, a phase growing</td></tr>
         </tbody>
@@ -261,7 +263,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       <div class="key"><span class="k-tm"><i class="dash"></i>measured substrate (template)</span>
         <span class="k-bg"><i class="dash"></i>template × bg_A</span><span class="k-data"><i class="dot"></i>sample data</span>
         <span class="k-fit"><i></i>fit</span></div>
-      <figcaption>When the background has a shape of its own, such as a glass substrate's broad hump, measure the
+      <figcaption>This synthetic example simulates a substrate pattern, sample peaks and counting noise.
+        When the background has a shape of its own, such as a glass substrate's broad hump, measure the
         bare substrate and use its pattern as the template. The fit scales it by one amplitude, <code>bg_A</code>
         (never below 0), and adds the peaks; here the fitted bg_A comes out close to the 1.6 the sample was made
         with.
@@ -308,9 +311,10 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
           <text x="645" y="293" text-anchor="end">later edits</text>
         </svg>
       </div>
-      <figcaption>A template is always named by its file. <b>Use displayed</b> names the trace's own file, frame and
-        1-D mode, and the first fit checks that the file holds that curve, within one part in a million; if it does
-        not, the capture still fits but stays unnamed. <b>Choose file…</b> takes a NeXus result, with its frame and
+      <figcaption>A template needs a reproducible file source to be saved or exported. <b>Use displayed</b>
+        proposes the trace's own file, frame and 1-D mode when available, and the first fit checks that the file
+        holds that curve, within one part in a million; if it does not, or the trace has no reproducible source,
+        the capture still fits but stays unnamed. <b>Choose file…</b> takes a NeXus result, with its frame and
         mode, or an .xye file, whose unit you choose. The first fit records the file's content. From then on the
         template is saved with <b>Save settings…</b> and exported to notebooks, and a file changed since then is
         refused until you choose it again.</figcaption>
@@ -351,7 +355,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       <li>Drag the shaded range on the plot or type it; <b>Full</b> resets it to the whole trace.</li>
       <li><b>Auto</b> finds up to twelve peaks in the range; turn it off to fit a count, or type centres in
         Advanced.</li>
-      <li>σ initial, σ min / max and Center ± delta bound each peak's start; Max iterations caps the solver.</li>
+      <li>σ initial seeds each peak's width; σ min / max bound the fitted width, and Center ± delta bounds the
+        fitted centre around its start. Max iterations caps the solver.</li>
     </ul>
   </section>
 

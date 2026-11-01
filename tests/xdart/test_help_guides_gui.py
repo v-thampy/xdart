@@ -6,7 +6,7 @@ browser call is answered, as the file choosers are. Frozen before the product ch
 from pathlib import Path
 
 import pytest
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
 
 
 @pytest.fixture
@@ -84,5 +84,59 @@ def test_g3_a_missing_guide_is_named_and_nothing_opens(qapp, opened, monkeypatch
         assert not opened
         window = owner_for(dialog).window
         assert window is not None and "missing" in window.pane.toPlainText().casefold()
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("kind", ("peak", "phase"))
+def test_f1_on_the_top_question_mark_works_before_any_help_was_opened(qapp, opened, kind):
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    dialog = (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
+    try:
+        dialog.show()
+        dialog.activateWindow()
+        dialog.guide_button.setFocus()
+        qapp.processEvents()
+        assert not dialog.guide_button.autoDefault() and not dialog.guide_button.isDefault()
+        QtTest.QTest.keyClick(dialog.guide_button, QtCore.Qt.Key.Key_F1)
+        qapp.processEvents()
+        owner = getattr(dialog, "_context_help_owner", None)
+        assert owner is not None and owner.window is not None
+        expected = "peak-fit.model" if kind == "peak" else "phase-analysis.phases"
+        assert owner.window.topic_id == expected and not opened
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("kind", ("peak", "phase"))
+def test_a_browser_refusal_opens_the_topic_and_names_the_reason(qapp, monkeypatch, kind):
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.widgets.context_help import owner_for
+    calls = []
+    monkeypatch.setattr(QtGui.QDesktopServices, "openUrl", staticmethod(lambda url: calls.append(url) or False))
+    dialog = (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
+    try:
+        dialog.show()
+        qapp.processEvents()
+        dialog.guide_button.click()
+        qapp.processEvents()
+        window = owner_for(dialog).window
+        assert len(calls) == 1 and calls[0].isLocalFile()
+        assert window is not None and window.isVisible()
+        assert "system browser did not open" in window.pane.toPlainText().casefold()
+        assert not window.guide_button.autoDefault()
+        search, button = window.search_row.geometry(), window.guide_button.geometry()
+        assert max(search.top(), button.top()) < min(search.bottom(), button.bottom())
+        assert search.right() < button.left() and button.width() > 0
+        before = len(calls)
+        window.search_row.editor.setFocus()
+        QtTest.QTest.keyClick(window.search_row.editor, QtCore.Qt.Key.Key_Return)
+        qapp.processEvents()
+        assert len(calls) == before
+        dialog.hide()
+        qapp.processEvents()
+        assert owner_for(dialog).window is None
     finally:
         dialog.close()

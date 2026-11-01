@@ -118,8 +118,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       <div class="fact"><b>11 profiles</b>pseudo-Voigt, Gaussian, Lorentzian, Voigt, Pearson VII and six more</div>
       <div class="fact"><b>3 width models</b>Caglioti (the instrument), Scherrer (size and strain), or one fixed
         width</div>
-      <div class="fact"><b>Batches and notebooks</b>Sequential batches seed each fit from the last; a fit exports to
-        Jupyter and marimo</div>
+      <div class="fact"><b>Batches and notebooks</b>Sequential batches seed each fit from the last; supported
+        file-backed fits export to Jupyter and marimo</div>
     </div>
   </header>
 
@@ -189,8 +189,9 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         <span class="k-fit"><i></i>their sum, what is fitted (drawn above)</span></div>
       <figcaption>A sample with several phases scatters as the sum of their patterns, and Phase Analysis fits one
         scale per phase together with its lattice, widths and background. Each phase's computed intensities are
-        normalized to its strongest reflection in the q range being fitted, so a phase's scale is the area that
-        reflection would have in the data without texture. The
+        normalized to its strongest admitted reflection across the full finite trace, even when the solve uses
+        a narrower dragged range. A phase's scale multiplies those relative intensities; the profile and texture
+        determine the resulting peak areas. The
         fraction Phase Analysis reports is each scale over the sum of scales: CsCl at scale 1 and NaCl at 0.6 give
         0.625 and 0.375. That compares how strongly each phase diffracts. It is not a weight fraction, which would
         also need each phase's scattering power per unit mass and the sample's absorption; Phase Analysis does not
@@ -207,8 +208,9 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         <tbody>
           <tr><td>a, b, c</td><td>the unit cell</td><td>strain or thermal expansion against a reference; in a solid
             solution, composition through Vegard's law</td></tr>
-          <tr><td>Fraction</td><td>each phase's scale over the sum of scales</td><td>how strongly each phase
-            diffracts; a share growing through a series is that phase growing</td></tr>
+          <tr><td>Fraction</td><td>each phase's scale over the sum of scales</td><td>compare only with comparable
+            profiles, reflection windows and texture constraints. Free per-peak heights can trade against scale;
+            a growing share alone does not establish phase growth</td></tr>
           <tr><td><code>q_shift</code></td><td>one shift of every reflection</td><td>a sample-height or calibration
             offset; pinned at its bound, the bound is too tight or the calibration is off</td></tr>
           <tr><td>D and ε</td><td>Scherrer's crystallite size and microstrain</td><td>small D: nanocrystals; large ε:
@@ -302,8 +304,9 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         axis letter ordered across phases.</li>
       <li>Drag the fit range on the plot or type it: only those points enter the fit, while the whole trace is
         drawn.</li>
-      <li>In Advanced, <b>Max iterations</b> caps the solver and <b>Use uncertainties</b> weights each point by its
-        measured σ, available only when the trace carries one.</li>
+      <li>In Advanced, <b>Max iterations</b> caps the solver. <b>Use uncertainties</b> divides each residual by
+        its measured σ, so its least-squares contribution is residual²/σ²; available only when the trace carries
+        measured uncertainties.</li>
     </ul>
   </section>
 
@@ -315,7 +318,9 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       <li><b>Sequential</b> starts each fit from the previous one's values; a fit whose reflections differ starts
         fresh. Turn it off across a phase change.</li>
       <li><b>Save settings…</b> and <b>Load settings…</b> keep every option, the phase list and the substrate's
-        file; a fit exports to Jupyter and marimo notebooks that repeat it.</li>
+        file. CIF-based fits export to Jupyter and marimo notebooks that repeat them; manual lattice phases
+        cannot export in the current CIF notebook format. A substrate template must have a reproducible file
+        source whose identity a fit has recorded; an unnamed capture cannot be saved or exported.</li>
     </ul>
   </section>
 
