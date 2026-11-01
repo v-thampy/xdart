@@ -8,11 +8,28 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 import os
+from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xrd_tools.help_topics import TOPICS, get_topic, search_topics
 from .read_only_text import ReadOnlyTextWindow
+
+
+def open_guide(identifier: str) -> str:
+    """Open the illustrated physics guide of ``identifier``'s tool in the system browser (NEXT-128-HELP-GUIDES; the
+    maintainer chose "System browser"). Returns "" when it opened, else why nothing opened: the topic has no guide,
+    its file is missing, or the browser refused it."""
+    from xrd_tools import help_topics
+    path = help_topics.guide_path(identifier)
+    if path is None:
+        return f"{identifier} has no illustrated guide."
+    path = Path(path)
+    if not path.is_file():
+        return f"The illustrated guide is missing: {path}"
+    if not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path))):
+        return f"The system browser did not open the illustrated guide: {path}"
+    return ""
 
 
 def bind_topic(widget, topic_id: str, *, details=None) -> None:
@@ -69,9 +86,10 @@ class HelpWindow(ReadOnlyTextWindow):
     def __init__(self, parent):
         super().__init__("Scientific help", (920, 700), parent)
         # Lazy composition avoids a module-level widgets → tabs/scattering edge.
-        from .controls_panel import FormRow
+        from .controls_panel import ActionButton, FormRow
         from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
+        from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
         self._entry_type = BrowserResult
         self.topic_id = None
         self.figure_view = None
@@ -84,7 +102,13 @@ class HelpWindow(ReadOnlyTextWindow):
         self.browser.scans.setToolTip("Matching topics in catalogue order; selecting one changes only help text.")
         self.browser.setMaximumHeight(100)
         self.pane.setToolTip("Read, select and copy these instructions and literal diagnostics; text cannot be edited.")
-        self.insert_content(self.search_row)
+        # A tool's topics also offer its illustrated physics guide, opened in the system browser.
+        self.guide_button = ActionButton(ControlActionSpec(ControlAction.HELP, "Illustrated guide", SectionId.EXPERIMENT),
+                                         self)
+        self.guide_button.set_purpose_tooltip("Open this tool's illustrated physics guide in your web browser; it "
+                                              "works offline.")
+        self.guide_button.clicked.connect(self._open_guide)
+        self.insert_content_row((self.search_row, self.guide_button), 0)
         self.insert_content(self.browser, 1)
         self.search_row.editor.textChanged.connect(self._search)
         self.browser.commandRequested.connect(lambda command:
@@ -112,8 +136,14 @@ class HelpWindow(ReadOnlyTextWindow):
         self.browser.reconcile_results(tuple(self._entry_type(t.identifier, t.title, t.identifier)
                                              for t in topics), self.topic_id)
 
+    def _open_guide(self) -> None:
+        reason = open_guide(self.topic_id) if self.topic_id else "Select a topic first."
+        if reason:
+            self.pane.appendPlainText("\n" + reason)
+
     def show_index(self, requested: str | None = None, details: str = "") -> None:
         self.topic_id = None
+        self.guide_button.hide()
         if self.figure_view is not None:
             for widget in self._figure_widgets:
                 widget.hide()
@@ -134,6 +164,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.topic_id = identifier
         self._details = details
         self._walkthrough = identifier == 'geometry.orientation'
+        self.guide_button.setVisible(topic.guide is not None)
         self._search(self.search_row.editor.text())
         self.set_text(topic.title + "\n" + topic.identifier + "\n\n" + topic.text +
                       ("\n\nCurrent context\n" + details if details else ""))

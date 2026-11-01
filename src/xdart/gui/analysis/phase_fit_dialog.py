@@ -33,7 +33,7 @@ from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSerie
 from xdart.gui.tabs.scattering.results_table import PHASE_RESULT_HEADERS, ResultsTable, phase_result_rows
 from xdart.gui.tabs.scattering.trend_view import TrendView
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
-from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
 
 #: each section's help topic (``xrd_tools.help_topics``)
 TOPICS = {"phases": "phase-analysis.phases", "shape": "phase-analysis.peak-shape",
@@ -174,6 +174,12 @@ class PhaseFitDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
+        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31).
+        self.guide_button = ActionButton.for_guide(self, TOPICS["phases"])
+        top = QtWidgets.QHBoxLayout()
+        top.addStretch(1)
+        top.addWidget(self.guide_button)
+        lay.addLayout(top)
         # The options' column on the left, the displays on the right; each scrolls when the window is small.
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
         self.splitter.setChildrenCollapsible(False)

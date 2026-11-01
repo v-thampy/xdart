@@ -38,7 +38,7 @@ from xdart.gui.tabs.scattering.results_table import (
     PEAK_OUTCOME_HEADERS, ResultsTable, peak_outcome_rows, peak_parameter_rows,
 )
 from xdart.gui.tabs.scattering.trend_view import TrendView
-from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,12 @@ class PeakFitDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
+        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31).
+        self.guide_button = ActionButton.for_guide(self, TOPICS["model"])
+        top = QtWidgets.QHBoxLayout()
+        top.addStretch(1)
+        top.addWidget(self.guide_button)
+        lay.addLayout(top)
 
         # The fit's rows: model, background and its template, peaks (Auto or a count) and the fit range, on the
         # shared rows, each with its "?".
