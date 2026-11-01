@@ -848,8 +848,9 @@ Steps
 2. Fit the reflection in each sector (pseudo-Voigt, Pearson VII or split
    pseudo-Voigt) for its d. A sector with too little finite data, a peak under
    five times its noise, or a failed fit is left out, with its reason.
-3. Fit d against sin²ψ, with ψ = |χ|: weighted by 1/σ² once three points carry
-   an error, otherwise unweighted.
+3. Fit d against sin²ψ, with ψ = |χ|: with three usable points carrying finite
+   positive errors, use those points with weights 1/σ² and name any others
+   left out. Otherwise fit all usable points unweighted, with a notice.
 4. With d0 and the elastic constants, read the equibiaxial stress from the
    slope m: σ = m/(½s2·d0).
 In a notebook, run_strain(StrainPlan(...), result2d) runs these steps.

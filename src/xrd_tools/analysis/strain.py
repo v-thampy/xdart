@@ -731,7 +731,7 @@ def d0_from_library(entry, hkl, *, wavelength_angstrom: float) -> D0Reference:
 
 
 def d0_from_reference(points) -> D0Reference:
-    """d0 as a stress-free result's weighted mean spacing (the plain mean when its points carry no errors)."""
+    """d0 as a stress-free result's weighted mean spacing; plain mean if any accepted point lacks a valid error."""
     valid = [point for point in points if point.excluded is None and np.isfinite(point.d)]
     if not valid:
         raise ValueError("the stress-free reference has no usable points")

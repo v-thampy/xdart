@@ -674,7 +674,7 @@ def strain_fit() -> StrainFigure:
         svg.line(frame.X(x_star), frame.Y(-5.0), frame.X(x_star), frame.Y(0.0), "marker")
         svg.text(frame.X(x_star) + 6, frame.Y(-4.4), f"ψ* = {star:.1f}°: sin²ψ* = 2ν/(1+ν)", "lab")
         _strain_dots(svg, frame, points, [scale * (point.d - _PT111_D0) for point in points])
-        svg.text(frame.X(0.03), frame.Y(2.3), f"slope m → σ = m/(½s₂·d₀) = {fit.stress / 1e9:.2f} GPa", "lab")
+        svg.text(frame.X(0.03), frame.Y(2.3), f"d-fit slope m_d → σ = m_d/(½s₂·d₀) = {fit.stress / 1e9:.2f} GPa", "lab")
         return svg.render()
     return _strain_figure(41, 1.0, draw)
 
