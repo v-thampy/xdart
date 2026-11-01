@@ -2595,8 +2595,10 @@ class FrameViewReader:
         labels: tuple[int, ...],
         bundle: _ReaderArrayBundle,
         checkpoint: Callable[[], None],
+        *,
+        modes: tuple[str, ...] | None = None,
     ) -> tuple[_Frame1DReadModePlan, ...]:
-        """Freeze an exact bounded row route without reading row payloads."""
+        """Freeze an exact bounded row route without reading row payloads; ``modes`` (None: all) limits the route."""
 
         _validate_1d_result_projection(
             label_count=len(labels),
@@ -2613,6 +2615,8 @@ class FrameViewReader:
 
         for mode, group in self._g1_modes.items():
             checkpoint()
+            if modes is not None and mode not in modes:
+                continue
             axis = self._axis_1d_modes[mode]
             if axis.values is None:
                 raise ValueError(f"1-D mode {mode!r} has no sampled axis")
@@ -2738,6 +2742,7 @@ class FrameViewReader:
         self,
         labels: tuple[int, ...],
         *,
+        modes: tuple[str, ...] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> Frame1DRows:
         """Read requested persisted 1-D rows without broad frame hydration.
@@ -2745,10 +2750,18 @@ class FrameViewReader:
         One atomic reader bundle owns every row read.  The method deliberately
         does not project metadata, geometry, source locators, thumbnails, or
         2-D results; its returned arrays are transferred as immutable caller
-        payload only after the bundle settles.
+        payload only after the bundle settles.  ``modes``, an exact tuple of
+        1-D mode names (``modes_1d()``), limits the read to those modes: the
+        others' rows are neither read nor charged.  None reads every mode.
         """
 
         self._require_reader_open()
+        if modes is not None:
+            if type(modes) is not tuple or not modes or any(type(mode) is not str for mode in modes):
+                raise TypeError("modes must be None or a nonempty exact tuple of 1-D mode names")
+            unknown = [mode for mode in modes if mode not in self._g1_modes]
+            if unknown:
+                raise ValueError(f"no 1-D mode {unknown[0]!r} in this record")
         if type(labels) is not tuple or not labels:
             raise TypeError("labels must be a nonempty exact tuple")
         if len(labels) > _MAX_1D_RESULT_LABELS:
@@ -2781,7 +2794,7 @@ class FrameViewReader:
 
             checkpoint()
             mode_plans = self._preflight_1d_rows(
-                selected_labels, bundle, checkpoint,
+                selected_labels, bundle, checkpoint, modes=modes,
             )
             checkpoint()
             mode_results: list[Frame1DModeRows] = []

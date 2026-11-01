@@ -288,8 +288,9 @@ def _read_nexus(source: BackgroundTemplateSource, path: Path, _facts: tuple) -> 
                                               f"{', '.join(modes) or 'none'}")
             if not reader.has_frame(source.frame):
                 raise _refuse("FRAME_MISSING", f"{path.name} has no frame {source.frame}")
-            # the frame's 1-D rows only (Codex REVIEW-3 F3): never its 2-D result, geometry or thumbnail
-            rows = reader.read_1d_rows((source.frame,))
+            # the frame's 1-D rows only (Codex REVIEW-3 F3), in its own mode only (REVIEW-4's hardening): never its
+            # 2-D result, geometry, thumbnail or other modes
+            rows = reader.read_1d_rows((source.frame,), modes=(source.mode,))
     except BackgroundTemplateRefused:
         raise
     except Exception as error:  # noqa: BLE001 - a template file is user input

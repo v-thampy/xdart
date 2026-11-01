@@ -382,7 +382,11 @@ def _vp_lorentzian_squared(x, centers, amplitudes, sigmas, **_):
 
 
 def _vp_pearson7(x, centers, amplitudes, sigmas, *, expo=1.5, **_):
-    """Pearson VII, area-normalised (matches lmfit's Pearson7Model)."""
+    """Pearson VII with σ its half width at half maximum, area-normalised (the amplitude is the area).
+
+    lmfit's Pearson7Model takes σ without the 2^(1/m) − 1 factor; here the factor is in the core, so σ is the HWHM as
+    for the other profiles, and the normalisation carries √(2^(1/m) − 1) to keep the area (NEXT-128-HELP-FOLLOWUPS:
+    the area was amplitude/√(2^(1/m) − 1), which biased phase fractions when the phases' exponents differed)."""
     from scipy.special import gamma as gamma_fn
     x, dx, sig, amp = _broadcast_peaks(x, centers, amplitudes, sigmas)
     if dx is None:
@@ -390,7 +394,7 @@ def _vp_pearson7(x, centers, amplitudes, sigmas, *, expo=1.5, **_):
     m = float(max(expo, 0.1))
     # lmfit Pearson7 uses the form:
     #   amp * (Γ(m) / (σ · Γ(m − 1/2) · √π)) · (1 + ((x−c)/σ)² · (2^(1/m) − 1))^(−m)
-    norm = gamma_fn(m) / (sig * gamma_fn(m - 0.5) * np.sqrt(np.pi))
+    norm = gamma_fn(m) * np.sqrt(2.0 ** (1.0 / m) - 1.0) / (sig * gamma_fn(m - 0.5) * np.sqrt(np.pi))
     core = (1.0 + (dx / sig) ** 2 * (2.0 ** (1.0 / m) - 1.0)) ** (-m)
     return (amp * norm * core).sum(axis=1)
 
@@ -413,12 +417,16 @@ def _vp_splitlorentzian(x, centers, amplitudes, sigmas, *, sigma_r=None, **_):
 
 
 def _vp_moffat(x, centers, amplitudes, sigmas, *, beta=1.0, **_):
-    """Moffat profile: amp · (β−1)/(π σ²) · (1 + (dx/σ)²)^(−β)."""
+    """Moffat profile, area-normalised in one dimension: amp · Γ(β)/(σ√π Γ(β − ½)) · (1 + (dx/σ)²)^(−β).
+
+    The normalisation was the two-dimensional (β − 1)/(πσ²), so the area depended on σ and biased phase fractions
+    when the phases' widths differed (NEXT-128-HELP-FOLLOWUPS). β keeps its lower bound of 1.01."""
+    from scipy.special import gamma as gamma_fn
     x, dx, sig, amp = _broadcast_peaks(x, centers, amplitudes, sigmas)
     if dx is None:
         return np.zeros_like(x)
     b = float(max(beta, 1.01))
-    norm = (b - 1.0) / (np.pi * sig * sig)
+    norm = gamma_fn(b) / (sig * np.sqrt(np.pi) * gamma_fn(b - 0.5))
     return (amp * norm * (1.0 + (dx / sig) ** 2) ** (-b)).sum(axis=1)
 
 
