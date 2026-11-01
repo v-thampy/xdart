@@ -255,7 +255,7 @@ def _caglioti_sigma(q: float | np.ndarray, U: float, V: float, W: float) -> floa
 
         σ²(Q) = U·Q² + V·|Q| + W
 
-    U has units Å⁻², V has units Å⁻¹, W is dimensionless.  Returns σ.
+    With σ and Q in Å⁻¹, U is dimensionless, V has units Å⁻¹ and W has units Å⁻².  Returns σ.
     """
     sigma2 = U * q**2 + V * np.abs(q) + W
     return np.sqrt(np.clip(sigma2, 1e-10, None))

@@ -107,6 +107,7 @@ class HelpWindow(ReadOnlyTextWindow):
                                          self)
         self.guide_button.set_purpose_tooltip("Open this tool's illustrated physics guide in your web browser; it "
                                               "works offline.")
+        self.guide_button.setAutoDefault(False)  # never the window's Enter default: Return in Search stays local
         self.guide_button.clicked.connect(self._open_guide)
         self.insert_content_row((self.search_row, self.guide_button), 0)
         self.insert_content(self.browser, 1)

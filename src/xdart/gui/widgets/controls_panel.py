@@ -198,8 +198,9 @@ class ActionButton(QtWidgets.QPushButton):
     def for_guide(cls, context, topic_id: str):
         """A tool window's own "?", at its top: opens the illustrated physics guide of ``topic_id``'s tool in the
         system browser (NEXT-128-HELP-GUIDES). When it cannot, the Help window shows the topic and says why."""
-        from .context_help import open_guide, owner_for
+        from .context_help import bind_topic, open_guide, owner_for
         button = cls(ControlActionSpec(ControlAction.HELP, "?", SectionId.EXPERIMENT))
+        bind_topic(button, topic_id)  # F1 on it opens the tool's topic
         button.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         button.setAutoDefault(False)  # never a dialog's Enter default: Return in an editor must not open the browser
         button.set_purpose_tooltip("Open this tool's illustrated physics guide in your web browser (offline): the "
