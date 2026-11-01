@@ -386,6 +386,17 @@ def test_log_moves_the_keyed_levels_into_what_the_panes_draw(qapp):
         qapp.processEvents()
 
 
+def _steady(widget):
+    """Turn the event loop until three grabs of ``widget``, 50 ms apart, are identical (3 s at most): the columns are
+    measured on a settled layout. A fixed 100 ms wait measured a half-done one on CI (2026-11-01)."""
+    previous, same, deadline = widget.grab().toImage(), 0, QtCore.QDeadlineTimer(3000)
+    while same < 2 and not deadline.hasExpired():
+        QtTest.QTest.qWait(50)
+        current = widget.grab().toImage()
+        same = same + 1 if current == previous else 0
+        previous = current
+
+
 def test_single_column_keyed_image_and_trace_share_coordinate_columns(qapp):
     """A calibration preview's Q coordinate lands on the same screen column in its image and profile."""
     state = _state()
@@ -395,7 +406,7 @@ def test_single_column_keyed_image_and_trace_share_coordinate_columns(qapp):
         view.resize(900, 720)
         view.reconcile_keyed(state)
         view.show()
-        QtTest.QTest.qWait(100)
+        _steady(view)
         image = view.keyed_panel(_HK).pane.canvas
         trace = view.keyed_panel(_H).plot
 
@@ -407,12 +418,12 @@ def test_single_column_keyed_image_and_trace_share_coordinate_columns(qapp):
             left, right = columns(q)
             assert abs(left - right) <= 2, (q, left, right)
         image.imageViewBox.setXRange(1.2, 2.5, padding=0)
-        QtTest.QTest.qWait(100)
+        _steady(view)
         for q in (1.3, 2.3):
             left, right = columns(q)
             assert abs(left - right) <= 2, (q, left, right)
         trace.getViewBox().setXRange(1.1, 2.7, padding=0)
-        QtTest.QTest.qWait(100)
+        _steady(view)
         for q in (1.3, 2.3):
             left, right = columns(q)
             assert abs(left - right) <= 2, (q, left, right)

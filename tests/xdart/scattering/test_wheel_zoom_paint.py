@@ -103,7 +103,7 @@ def _view(state, navigation):
 
 def _reconcile(view, state, navigation):
     view.reconcile(state, navigation, completed=1, total=len(navigation.frames), detail="Ready")
-    QtTest.QTest.qWait(100)
+    _steady(view)
 
 
 def _keyed_state(points=1500, color_map="Default"):
@@ -134,6 +134,17 @@ class _Paints(QtCore.QObject):
         if event.type() == QtCore.QEvent.Type.Paint:
             self.count += 1
         return False
+
+
+def _steady(widget, dpr=1.):
+    """Turn the event loop until three renders of ``widget``, 50 ms apart, are identical (3 s at most): a measurement
+    never catches a layout or a deferred range update half done. A fixed 100 ms wait did, on CI (2026-11-01)."""
+    previous, same, deadline = _pixels(_render(widget, dpr)), 0, QtCore.QDeadlineTimer(3000)
+    while same < 2 and not deadline.hasExpired():
+        QtTest.QTest.qWait(50)
+        current = _pixels(_render(widget, dpr))
+        same = same + 1 if np.array_equal(current, previous) else 0
+        previous = current
 
 
 def _settle(paints):
@@ -208,11 +219,12 @@ def _assert_parent_pixels(plot_widget, items, dpr=2.):
     antialiased pen, 'auto', and its default range limit), up to antialiasing seams: where a dense, noisy curve's
     strokes overlap away from the symbols, the segments blend their edges one after another and the path blends
     their union, so a few edge pixels inside the curve's band differ by a fraction of the contrast."""
+    _steady(plot_widget, dpr)
     fixed = _pixels(_render(plot_widget, dpr))
     for item in items:
         item.curve.setSegmentedLineMode("auto")
         item.setDynamicRangeLimit(1e6)
-    QtTest.QTest.qWait(50)
+    _steady(plot_widget, dpr)
     delta = np.abs(fixed.astype(int) - _pixels(_render(plot_widget, dpr)).astype(int)).max(axis=2)
     assert delta.max() <= 96 and np.count_nonzero(delta) <= .001 * delta.size, (int(delta.max()),
                                                                                  np.count_nonzero(delta))
@@ -286,10 +298,10 @@ def test_a_curve_crosses_a_tiny_y_window_where_its_data_do(height):
         box = view.curve.getViewBox()
         box.setRange(xRange=(crossing - .01, crossing + .01), yRange=(level - height / 2., level + height / 2.),
                      padding=0.)
-        QtTest.QTest.qWait(100)
+        _steady(view.curve, 2.)
         shown = _pixels(_render(view.curve, 2.))
         item.setVisible(False)
-        QtTest.QTest.qWait(50)
+        _steady(view.curve, 2.)
         lit = np.any(shown != _pixels(_render(view.curve, 2.)), axis=2)  # the device pixels the curve drew
         expected = view.curve.viewport().mapTo(view.curve,
                                                view.curve.mapFromScene(box.mapViewToScene(QtCore.QPointF(crossing,
@@ -311,7 +323,7 @@ def test_data_curves_draw_as_segments_with_the_parents_pixels(case):
     try:
         if case == "zoomed in":  # symbols about 25 px apart: the line between them shows
             view.curve.getViewBox().setRange(xRange=(2.13, 2.27), yRange=(-50., 1100.), padding=0.)
-            QtTest.QTest.qWait(100)
+            _steady(view.curve, 2.)
         items = _data_items(view.curve)
         _assert_data_drawing(items)
         _assert_parent_pixels(view.curve, items)
@@ -344,7 +356,7 @@ def test_the_keyed_trace_draws_as_segments_with_the_parents_pixels():
     try:
         view.reconcile_keyed(_keyed_state())
         view.reconcile_keyed(_keyed_state(color_map="magma"))  # the keyed panel's repeated draw
-        QtTest.QTest.qWait(100)
+        _steady(view)
         panel = view.keyed_panel(_H)
         _assert_data_drawing([panel.curve])
         _assert_parent_pixels(panel.plot, [panel.curve])
@@ -365,7 +377,8 @@ def _grid_twins():
         widget.resize(900, 420)
         widget.show()
         plots.append(widget)
-    QtTest.QTest.qWait(100)
+    for widget in plots:
+        _steady(widget)
     return plots
 
 
@@ -380,7 +393,8 @@ def test_grid_rows_light_the_pixels_of_pyqtgraphs_axis(dpr):
         for widget in (stock, fixed):  # the layout moves the axis: a title, a left label with units
             widget.setTitle("A title")
             widget.setLabel("left", "Intensity", units="counts")
-        QtTest.QTest.qWait(100)
+        for widget in (stock, fixed):
+            _steady(widget, dpr)
         for offset in ((0, 0), (3, 5)):
             assert _differing(_render(stock, dpr, offset), _render(fixed, dpr, offset)) == 0
     finally:
@@ -442,12 +456,12 @@ def test_reference_lines_draw_as_segments_with_the_parents_pixels(zoomed):
                     for count, color in ((40, (230, 120, 40)), (20, (150, 80, 200)))]
         if zoomed:
             plot.getViewBox().setRange(xRange=(2.13, 2.27), yRange=(-50., 1100.), padding=0.)
-        QtTest.QTest.qWait(100)
+        _steady(view.curve, 2.)
         fixed = _render(view.curve, 2.)
         for family in families:
             assert family.lines.opts["segmentedLineMode"] == "on"
             family.lines.setSegmentedLineMode("auto")
-        QtTest.QTest.qWait(50)
+        _steady(view.curve, 2.)
         assert _differing(fixed, _render(view.curve, 2.)) == 0
         assert pg.getConfigOption("segmentedLineMode") == "auto"  # every other curve keeps pyqtgraph's choice
     finally:
