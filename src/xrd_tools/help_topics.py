@@ -832,6 +832,65 @@ the errors with an unweighted fit.
 References
 xrd_tools/analysis/display_fit_operations.py — measured σ admission.
 """),
+    HelpTopic("strain.sin2psi", "Strain Analysis: the sin²ψ method", """Purpose
+Measure the in-plane residual stress of a film or surface layer from how one
+reflection's plane spacing d changes with the tilt ψ of its planes, in a
+grazing-incidence fiber map. The illustrated guide explains the physics.
+
+Required inputs
+A GI q–χ (fiber) 2-D result from Int; one reflection's q range; its stress-free
+spacing d0 (typed, a phase-library line, a stress-free reference result, or ψ*);
+the reflection's diffraction elastic constants s1 and ½s2, or E and ν for the
+isotropic assumption. Refraction needs the incidence angle, energy and material.
+
+Steps
+1. Cut the map into χ sectors (centres and width) on one or both χ branches.
+2. Fit the reflection in each sector (pseudo-Voigt, Pearson VII or split
+   pseudo-Voigt) for its d; a sector without enough finite data is left out.
+3. Fit d against sin²ψ, with ψ = |χ|: weighted by 1/σ² once three points carry
+   an error, otherwise unweighted.
+4. With d0 and the elastic constants, read the equibiaxial stress from the
+   slope m: σ = m/(½s2·d0).
+In a notebook, run_strain(StrainPlan(...), result2d) runs these steps.
+
+Units and conventions
+ψ and χ in degrees, χ measured from the surface normal (0°) toward the in-plane
+direction (90°); d and d0 in Å; stress in Pa; s1 and ½s2 in 1/Pa. A sector's ψ
+is the mean |χ| of its bins. Positive stress is tensile.
+
+Assumptions
+Equibiaxial in-plane stress with none normal to the free surface; one
+reflection's elastic constants; d linear in sin²ψ. Uniaxial stress and shear
+are refused: they need each point's in-plane direction, and the +χ and −χ
+branches of a fiber map are mirror images, not two in-plane directions.
+
+Expected observations
+A straight line of d against sin²ψ: a positive slope is tensile, a negative
+one compressive. The line crosses d0 at the strain-free direction ψ*, where
+sin²ψ* = −2s1/½s2 (2ν/(1+ν) for isotropic constants). Each branch's own fit
+is descriptive only.
+
+Diagnostics
+A fit needs three usable points at two distinct ψ. A weighted χ²_red above 1 is
+named in the notice: the points scatter more than their errors, and the formal
+error leaves that scatter out. Refraction is estimated, never corrected: near
+the critical angle, or with no material chosen, the stress is apparent.
+
+Common mistakes and corrective actions
+Taking the intercept as d0: it is d at ψ = 0, which the strain already shifts.
+Treating a phase-library d0 as stress-free: it is a chosen reference, so the
+absolute stress inherits its error. Reading the branch difference as shear.
+
+Worked example
+Pt 111 under 1 GPa of equibiaxial tension (E = 168 GPa, ν = 0.38,
+d0 = 2.2650 Å): the slope is d0·½s2·σ ≈ 0.0186 Å and ψ* ≈ 47.9°, as the
+illustrated guide's figure shows.
+
+References
+xrd_tools/analysis/strain.py — sectors, the sin²ψ regression, d0 and elastic
+constants, the refraction estimate.
+xrd_tools/analysis/plans.py — StrainPlan and run_strain.
+"""),
 )
 
 
@@ -847,7 +906,7 @@ _FIGURES = {
 #: Each tool's illustrated physics guide (NEXT-128-HELP-GUIDES), by topic family: an offline page under assets/help
 #: that the tool window's top "?" and the Help window open in the system browser. Its figures are drawn by
 #: xrd_tools.guide_figures from xdart's own models.
-_GUIDES = {"peak-fit": "peak-fit.html", "phase-analysis": "phase-analysis.html"}
+_GUIDES = {"peak-fit": "peak-fit.html", "phase-analysis": "phase-analysis.html", "strain": "strain.html"}
 GUIDE_DIR = Path(__file__).resolve().parent / "assets" / "help"
 TOPICS = tuple(replace(t, figures=_FIGURES.get(t.identifier, ()),
                       run_key='orientation-check' if t.identifier == 'geometry.orientation' else None,

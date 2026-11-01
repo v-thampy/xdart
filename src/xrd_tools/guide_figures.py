@@ -27,7 +27,8 @@ import numpy as np
 
 from xrd_tools.help_topics import GUIDE_DIR
 
-__all__ = ["GUIDE_CSS", "FIGURES", "render_guide", "template_fit", "williamson_hall", "write_guides"]
+__all__ = ["GUIDE_CSS", "FIGURES", "render_guide", "strain_fit", "strain_scatter", "template_fit",
+           "williamson_hall", "write_guides"]
 
 #: the stylesheet every guide carries (one source, so the guides never drift apart): xdart's plot colours, light and
 #: dark, offline system fonts
@@ -108,6 +109,7 @@ svg .grid { stroke: var(--rule); stroke-width: .6; opacity: .7; }
 svg .tick { stroke: var(--muted); }
 svg .range, svg .area { fill: var(--range); stroke: none; }
 svg .pt { fill: var(--data); }
+svg .pt-open { fill: var(--panel); stroke: var(--data); stroke-width: 1.4; }
 svg .fit { fill: none; stroke: var(--fit); stroke-width: 2.2; }
 svg .bgc { fill: none; stroke: var(--bgc); stroke-width: 1.6; stroke-dasharray: 7 5; }
 svg .tmpl { fill: none; stroke: var(--tmpl); stroke-width: 1.4; stroke-dasharray: 2 4; }
@@ -606,11 +608,110 @@ def _mixture() -> str:
     return svg.render()
 
 
+# ---- Strain Analysis's figures ------------------------------------------------------------------------------
+
+_PT111_D0 = 3.9231 / np.sqrt(3.0)  # Å, platinum's 111 spacing (a = 3.9231 Å)
+_PT_E, _PT_NU = 168e9, 0.38  # Pa; platinum's isotropic constants, the assumption ElasticConstants.from_E_nu names
+_STRESS = 1.0e9  # Pa, equibiaxial in-plane tension
+_PSI_PLUS = (8.0, 17.0, 25.0, 32.0, 38.0, 44.0, 50.0, 56.0, 62.0, 68.0)  # degrees, the +χ branch's sectors
+_PSI_MINUS = (12.0, 21.0, 28.0, 35.0, 41.0, 47.0, 53.0, 59.0, 65.0)  # degrees, the −χ branch's
+_D_ERR = 2.0e-5  # Å, each sector's d error
+
+
+@dataclass(frozen=True)
+class StrainFigure:
+    """A Strain guide figure's numbers, from Strain Analysis's own regression (``strain.strain_regression``)."""
+
+    stress: float
+    psi_star_deg: float
+    reduced_chi_squared: float | None
+    notice: str
+    svg: str
+
+
+def _strain_points(seed: int, scatter: float):
+    """Synthetic Pt 111 sectors on both χ branches under 1 GPa of equibiaxial stress at a free surface, where
+    ε(ψ) = ½s2·σ·sin²ψ + 2·s1·σ; each d scatters ``scatter`` times its error."""
+    from xrd_tools.analysis.strain import ElasticConstants, StrainPoint
+    elastic = ElasticConstants.from_E_nu((1, 1, 1), E=_PT_E, nu=_PT_NU)
+    psi = np.array(_PSI_PLUS + _PSI_MINUS)
+    sin2 = np.sin(np.radians(psi)) ** 2
+    strain = elastic.half_s2 * _STRESS * sin2 + 2.0 * elastic.s1 * _STRESS
+    d = _PT111_D0 * (1.0 + strain) + scatter * _D_ERR * _noise(seed, psi.size)
+    branches = (1,) * len(_PSI_PLUS) + (-1,) * len(_PSI_MINUS)
+    return tuple(StrainPoint(psi=float(a), d=float(b), d_err=_D_ERR, branch=c)
+                 for a, b, c in zip(psi, d, branches)), elastic
+
+
+def _strain_figure(seed: int, scatter: float, draw) -> StrainFigure:
+    from xrd_tools.analysis.strain import D0Reference, strain_regression
+    points, elastic = _strain_points(seed, scatter)
+    fit = strain_regression(points, d0=D0Reference.typed(_PT111_D0), elastic=elastic)
+    star = float(np.degrees(np.arcsin(np.sqrt(fit.sin2psi_star))))
+    return StrainFigure(float(fit.stress), star, fit.reduced_chi_squared, fit.notice, draw(points, fit, star))
+
+
+def _strain_dots(svg: _Svg, frame: _Frame, points, values):
+    for point, value in zip(points, values):
+        svg.add("circle", {"cx": _f(frame.X(point.sin2psi)), "cy": _f(frame.Y(value)), "r": "3.6",
+                           "class": "pt" if point.branch > 0 else "pt-open"})
+
+
+def strain_fit() -> StrainFigure:
+    """Strain against sin²ψ: the sectors of both branches, the regression's line, ε = 0 at d0, and ψ*."""
+    def draw(points, fit, star):
+        svg = _Svg(680, 300, "Strain against sin squared psi for platinum 111 sectors on both chi branches, the fitted "
+                             "line, the strain-free spacing d0 and the strain-free direction psi star")
+        frame = _frame(svg, (76, 16, 584, 222), (0.0, 0.9), (-5.0, 3.0), nx=9, ny=4, xlabel="sin²ψ",
+                       ylabel="strain (d − d₀)/d₀ (10⁻³)")
+        scale = 1e3 / _PT111_D0
+        line_x = np.array([0.0, 0.9])
+        svg.path(frame.d(line_x, scale * (fit.intercept + fit.slope * line_x - _PT111_D0)), "fit")
+        svg.line(76, frame.Y(0.0), 660, frame.Y(0.0), "half")
+        svg.text(654, frame.Y(0.0) + 16, "ε = 0: d = d₀", "note", "end")
+        x_star = fit.sin2psi_star
+        svg.line(frame.X(x_star), frame.Y(-5.0), frame.X(x_star), frame.Y(0.0), "marker")
+        svg.text(frame.X(x_star) + 6, frame.Y(-4.4), f"ψ* = {star:.1f}°: sin²ψ* = 2ν/(1+ν)", "lab")
+        _strain_dots(svg, frame, points, [scale * (point.d - _PT111_D0) for point in points])
+        svg.text(frame.X(0.03), frame.Y(2.3), f"slope m → σ = m/(½s₂·d₀) = {fit.stress / 1e9:.2f} GPa", "lab")
+        return svg.render()
+    return _strain_figure(41, 1.0, draw)
+
+
+def strain_scatter() -> StrainFigure:
+    """The fit's residuals when the sectors scatter four times their error bars, with the formal ±1σ band of the
+    fitted line and the reduced χ² that names the excess scatter."""
+    def draw(points, fit, star):
+        svg = _Svg(680, 280, "Residuals of a sin squared psi fit scattering four times their error bars, with the "
+                             "narrow formal one-sigma band of the fitted line")
+        frame = _frame(svg, (76, 16, 584, 202), (0.0, 0.9), (-30.0, 30.0), nx=9, ny=4, xlabel="sin²ψ",
+                       ylabel="d − fit (10⁻⁵ Å)")
+        scale = 1e5
+        cov = np.array(fit.cov)
+        xs = np.linspace(0.0, 0.9, 91)
+        band = scale * np.sqrt(np.maximum(cov[0, 0] * xs ** 2 + 2.0 * cov[0, 1] * xs + cov[1, 1], 0.0))
+        upper = frame.d(xs, band)
+        lower = " ".join(f"L{_f(frame.X(x))} {_f(frame.Y(-b))}" for x, b in zip(xs[::-1], band[::-1]))
+        svg.path(f"{upper} {lower} Z", "area")
+        svg.line(76, frame.Y(0.0), 660, frame.Y(0.0), "fit")
+        residuals = [scale * (point.d - (fit.intercept + fit.slope * point.sin2psi)) for point in points]
+        for point, value in zip(points, residuals):
+            svg.line(frame.X(point.sin2psi), frame.Y(value - scale * _D_ERR), frame.X(point.sin2psi),
+                     frame.Y(value + scale * _D_ERR), "err")
+        _strain_dots(svg, frame, points, residuals)
+        svg.text(frame.X(0.03), frame.Y(25.0), f"χ²_red = {fit.reduced_chi_squared:.0f}: the points scatter beyond "
+                                              "their error bars", "lab")
+        svg.text(frame.X(0.03), frame.Y(-25.0), "the formal ±1σ band of the line leaves that scatter out", "note")
+        return svg.render()
+    return _strain_figure(43, 4.0, draw)
+
+
 #: each figure's builder, by the name its marker carries
 FIGURES = {
     "measures": _measures, "williamson-hall": lambda: williamson_hall().svg, "anatomy": _anatomy,
     "profiles": _profiles, "template": lambda: template_fit().svg, "weights": _weights,
     "pattern": _pattern, "widths": _widths, "texture": _texture, "mixture": _mixture,
+    "sin2psi": lambda: strain_fit().svg, "scatter": lambda: strain_scatter().svg,
 }
 
 _FIGURE = re.compile(r"(<!-- figure:([a-z0-9-]+) -->)(.*?)(<!-- /figure -->)", re.S)
