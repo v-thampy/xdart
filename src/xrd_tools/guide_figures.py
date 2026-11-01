@@ -250,12 +250,19 @@ def _pseudo_voigt(x, center, fwhm, height, fraction=0.5):
 
 
 def _settled(fit_result):
-    """A fit's parameters with each free value rounded to four significant figures. The figures draw from these, so
-    a fit's last digits, which differ between platforms and library builds, never move a drawn coordinate."""
+    """A fit's parameters with each free value rounded to four significant figures, and a value within 10⁻⁴ of its
+    bound's span pinned to that bound (where a solver stops near a bound depends on its path). The figures draw from
+    these, so a fit's last digits, which differ between platforms and library builds, never move a drawn coordinate."""
     params = fit_result.params.copy()
     for parameter in params.values():
-        if parameter.expr is None:
-            parameter.set(value=float(f"{parameter.value:.4g}"))
+        if parameter.expr is not None:
+            continue
+        value, low, high = float(parameter.value), float(parameter.min), float(parameter.max)
+        span = high - low if np.isfinite(low) and np.isfinite(high) else max(abs(value), 1.0)
+        for bound in (low, high):
+            if np.isfinite(bound) and abs(value - bound) <= 1e-4 * span:
+                value = bound
+        parameter.set(value=float(f"{value:.4g}"))
     return params
 
 
@@ -489,7 +496,9 @@ loop_
   Cl  Cl2  0.0  0.5  0.0  1
   Cl  Cl3  0.0  0.0  0.5  1
 """
-_WAVELENGTH = 1.0  # Å; a pattern in q does not depend on it
+#: Å: peak positions in q do not depend on it; the intensities carry the Lorentz-polarization factor, evaluated at
+#: each reflection's angle for this wavelength
+_WAVELENGTH = 1.0
 
 
 def _phase(cif: str, name: str, q_range):
