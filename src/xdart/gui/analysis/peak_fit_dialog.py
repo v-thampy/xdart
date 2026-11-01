@@ -148,18 +148,20 @@ class PeakFitDialog(QtWidgets.QDialog):
                                                settings=self.export_fit_values)
         self._build_settings()
         self._sync_export()
+        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31). It is
+        # made last, so it is last in the tab order: the first option keeps the initial focus and a section's "?"
+        # stays the first help button (Phase Analysis W11).
+        self.guide_button = ActionButton.for_guide(self, TOPICS["model"])
+        top = QtWidgets.QHBoxLayout()
+        top.addStretch(1)
+        top.addWidget(self.guide_button)
+        self.layout().insertLayout(0, top)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
-        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31).
-        self.guide_button = ActionButton.for_guide(self, TOPICS["model"])
-        top = QtWidgets.QHBoxLayout()
-        top.addStretch(1)
-        top.addWidget(self.guide_button)
-        lay.addLayout(top)
 
         # The fit's rows: model, background and its template, peaks (Auto or a count) and the fit range, on the
         # shared rows, each with its "?".

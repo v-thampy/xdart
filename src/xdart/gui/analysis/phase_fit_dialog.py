@@ -148,6 +148,14 @@ class PhaseFitDialog(QtWidgets.QDialog):
         controls = min(440, width // 2)
         self.splitter.setSizes([controls, max(1, width - controls)])
         self.displays.setSizes([600, 260, 140])  # the fit first; each splitter keeps its proportions as it grows
+        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31). It is
+        # made last, so it is last in the tab order: the first option keeps the initial focus and a section's "?"
+        # stays the first help button (Phase Analysis W11).
+        self.guide_button = ActionButton.for_guide(self, TOPICS["phases"])
+        top = QtWidgets.QHBoxLayout()
+        top.addStretch(1)
+        top.addWidget(self.guide_button)
+        self.layout().insertLayout(0, top)
 
     # ---- UI construction ------------------------------------------------
     def _card(self, title, section, tip):
@@ -174,12 +182,6 @@ class PhaseFitDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
-        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31).
-        self.guide_button = ActionButton.for_guide(self, TOPICS["phases"])
-        top = QtWidgets.QHBoxLayout()
-        top.addStretch(1)
-        top.addWidget(self.guide_button)
-        lay.addLayout(top)
         # The options' column on the left, the displays on the right; each scrolls when the window is small.
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
         self.splitter.setChildrenCollapsible(False)
