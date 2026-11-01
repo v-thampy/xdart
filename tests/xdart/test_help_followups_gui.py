@@ -55,8 +55,9 @@ def test_f1_return_in_a_peak_fitter_field_commits_it_and_presses_no_button(qapp)
 
 @pytest.mark.parametrize("tool", ("peak", "phase"))
 def test_f2_the_window_question_mark_never_takes_the_first_focus(qapp, tool):
-    """Fable's B2 on HELP-GUIDES: the guide "?" is made last, so the window's first control keeps the initial focus and
-    a stray Space on opening never launches the browser."""
+    """Fable's B2 on HELP-GUIDES: the guide "?" is made last, so it never takes the first focus (the Peak Fitter's goes
+    to its first section's "?", Phase Analysis's to its options pane) and a stray Space on opening never launches the
+    browser."""
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     dialog = (PeakFitDialog if tool == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)

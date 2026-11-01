@@ -392,8 +392,8 @@ def _vp_pearson7(x, centers, amplitudes, sigmas, *, expo=1.5, **_):
     if dx is None:
         return np.zeros_like(x)
     m = float(max(expo, 0.1))
-    # lmfit Pearson7 uses the form:
-    #   amp * (Γ(m) / (σ · Γ(m − 1/2) · √π)) · (1 + ((x−c)/σ)² · (2^(1/m) − 1))^(−m)
+    # amp · Γ(m)·√(2^(1/m) − 1) / (σ·√π·Γ(m − ½)) · (1 + ((x−c)/σ)²·(2^(1/m) − 1))^(−m): σ is the HWHM, and the
+    # √ factor keeps the area (lmfit's pearson7 has no 2^(1/m) − 1 factor, so its σ is not the HWHM)
     norm = gamma_fn(m) * np.sqrt(2.0 ** (1.0 / m) - 1.0) / (sig * gamma_fn(m - 0.5) * np.sqrt(np.pi))
     core = (1.0 + (dx / sig) ** 2 * (2.0 ** (1.0 / m) - 1.0)) ** (-m)
     return (amp * norm * core).sum(axis=1)
@@ -417,7 +417,8 @@ def _vp_splitlorentzian(x, centers, amplitudes, sigmas, *, sigma_r=None, **_):
 
 
 def _vp_moffat(x, centers, amplitudes, sigmas, *, beta=1.0, **_):
-    """Moffat profile, area-normalised in one dimension: amp · Γ(β)/(σ√π Γ(β − ½)) · (1 + (dx/σ)²)^(−β).
+    """Moffat profile, area-normalised in one dimension: amp · Γ(β)/(σ√π Γ(β − ½)) · (1 + (dx/σ)²)^(−β). σ is the
+    width parameter: the half width at half maximum is σ·√(2^(1/β) − 1), σ itself as β → 1.
 
     The normalisation was the two-dimensional (β − 1)/(πσ²), so the area depended on σ and biased phase fractions
     when the phases' widths differed (NEXT-128-HELP-FOLLOWUPS). β keeps its lower bound of 1.01."""

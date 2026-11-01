@@ -846,7 +846,8 @@ isotropic assumption. Refraction needs the incidence angle, energy and material.
 Steps
 1. Cut the map into χ sectors (centres and width) on one or both χ branches.
 2. Fit the reflection in each sector (pseudo-Voigt, Pearson VII or split
-   pseudo-Voigt) for its d; a sector without enough finite data is left out.
+   pseudo-Voigt) for its d. A sector with too little finite data, a peak under
+   five times its noise, or a failed fit is left out, with its reason.
 3. Fit d against sin²ψ, with ψ = |χ|: weighted by 1/σ² once three points carry
    an error, otherwise unweighted.
 4. With d0 and the elastic constants, read the equibiaxial stress from the

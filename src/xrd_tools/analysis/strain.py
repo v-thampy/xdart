@@ -17,8 +17,10 @@ Definitions
   χ = 0° → out-of-plane (surface normal); χ = 90° → in-plane.
 - ψ (psi) : angle of the scattering vector from the surface normal = |χ|.
   ψ = 0° → planes parallel to surface; ψ = 90° → planes perpendicular.
-- Missing-wedge: near χ = ±90° (ψ ≈ 90°) the GI geometry has an inaccessible
-  region.  Expect usable ψ coverage out to ~70–80°.
+- Missing wedge: around the surface normal (χ ≈ 0) the GI geometry cannot reach
+  q along the normal, so |χ| below about the Bragg angle is empty, widening with
+  q.  Toward χ = ±90° the data end at the sample horizon; the detector's extent
+  sets the practical upper limit at high q.
 """
 
 from __future__ import annotations

@@ -85,7 +85,7 @@ code, .mono { font-family: var(--mono); font-size: .9em; }
 .key i.dot { width: 7px; height: 7px; border: 0; border-radius: 50%; background: currentColor; }
 .k-data { color: var(--data); } .k-fit { color: var(--fit); } .k-bg { color: var(--bgc); } .k-res { color: var(--resid); }
 .k-c1 { color: var(--c1); } .k-c2 { color: var(--c2); } .k-c3 { color: var(--c3); } .k-c4 { color: var(--c4); }
-.k-tm { color: var(--tmpl); }
+.k-tm { color: var(--tmpl); } .k-half { color: var(--muted); }
 .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
 .fact { background: var(--soft); border-radius: 5px; padding: 9px 11px; font-size: 13px; color: var(--muted); min-width: 0; }
 .fact b { display: block; color: var(--fg); font: 600 14px var(--body); }
@@ -613,8 +613,9 @@ def _mixture() -> str:
 _PT111_D0 = 3.9231 / np.sqrt(3.0)  # Å, platinum's 111 spacing (a = 3.9231 Å)
 _PT_E, _PT_NU = 168e9, 0.38  # Pa; platinum's isotropic constants, the assumption ElasticConstants.from_E_nu names
 _STRESS = 1.0e9  # Pa, equibiaxial in-plane tension
-_PSI_PLUS = (8.0, 17.0, 25.0, 32.0, 38.0, 44.0, 50.0, 56.0, 62.0, 68.0)  # degrees, the +χ branch's sectors
-_PSI_MINUS = (12.0, 21.0, 28.0, 35.0, 41.0, 47.0, 53.0, 59.0, 65.0)  # degrees, the −χ branch's
+#: degrees, each branch's sectors, above the missing wedge (|χ| below about the Bragg angle, 12.7° for Pt 111 at 1 Å)
+_PSI_PLUS = (16.0, 22.0, 28.0, 34.0, 40.0, 46.0, 52.0, 58.0, 64.0, 70.0)
+_PSI_MINUS = (19.0, 25.0, 31.0, 37.0, 43.0, 49.0, 55.0, 61.0, 67.0)
 _D_ERR = 2.0e-5  # Å, each sector's d error
 
 
@@ -701,7 +702,8 @@ def strain_scatter() -> StrainFigure:
         _strain_dots(svg, frame, points, residuals)
         svg.text(frame.X(0.03), frame.Y(25.0), f"χ²_red = {fit.reduced_chi_squared:.0f}: the points scatter beyond "
                                               "their error bars", "lab")
-        svg.text(frame.X(0.03), frame.Y(-25.0), "the formal ±1σ band of the line leaves that scatter out", "note")
+        svg.text(frame.X(0.03), frame.Y(-25.0), "the formal ±1σ band of the line, thinner than the line here, leaves "
+                                               "that scatter out", "note")
         return svg.render()
     return _strain_figure(43, 4.0, draw)
 
