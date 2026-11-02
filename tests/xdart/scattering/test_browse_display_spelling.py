@@ -1,7 +1,8 @@
-"""Browse names a scan in its own spelling while it compares paths case-folded, as Windows folds them (maintainer,
-2026-10-25: after a Run on his share the legend and Browse read ``effect_of_rocking_…`` for the file
-``Effect_of_Rocking_…``). Real Runs and the real page; ``os.path.normcase`` folds case here as it does on Windows,
-which needs a case-insensitive file system (macOS, Windows)."""
+"""Browse keeps file spelling; its legend keeps family spelling without the operation suffix.
+
+Real Runs exercise both native paths (all platforms) and Windows-like case folding (on a case-insensitive
+filesystem). The maintainer separately asked on 2026-10-26 that ``int1d`` never appear in a 1-D legend.
+"""
 from __future__ import annotations
 
 import os
@@ -23,8 +24,10 @@ def qapp(_xdart_qt_harness):
 
 
 @pytest.fixture
-def folded(monkeypatch, tmp_path):
+def folded(monkeypatch, tmp_path, request):
     """``os.path.normcase`` as on Windows: it folds case (each module that imported it by name too)."""
+    if not request.param:
+        return os.path.normcase
     probe = tmp_path / "CaseProbe"
     probe.write_text("")
     insensitive = (tmp_path / "caseprobe").exists()
@@ -41,6 +44,7 @@ def folded(monkeypatch, tmp_path):
     return fold
 
 
+@pytest.mark.parametrize("folded", (False, True), indirect=True, ids=("native-path", "folded-path"))
 def test_after_a_run_browse_names_the_scan_as_its_file_is_spelled(qapp, tmp_path, folded) -> None:
     intent = _series(tmp_path / "Baniecki_Oct2026", (16.0, 16.0), mode="Int 1D")
     intent.save_path = str(tmp_path / "Baniecki_Oct2026" / "Effect_of_Rocking.nexus")
@@ -49,11 +53,12 @@ def test_after_a_run_browse_names_the_scan_as_its_file_is_spelled(qapp, tmp_path
         written = Path(terminal.artifact)
         assert written.name == "Effect_of_Rocking_int1d.nexus" and written.is_file()
         browse = _browsing(qapp, page)
-        assert browse.requested_path == folded(str(written))  # compared folded, as before
+        assert browse.requested_path == folded(str(written))  # normalized for comparison only
         assert browse.scan_key == "Effect_of_Rocking_int1d"  # named as the file is spelled
         projection = page._last_scientific_projection
         titles = [trace.title for trace in projection.traces]
-        assert titles and all(title.startswith("Effect_of_Rocking_int1d") for title in titles), titles
+        # A Browse scan is named by its file stem, while a curve uses the persisted family, as during Run.
+        assert titles == ["Effect_of_Rocking_2"], titles
 
 
 def test_a_browse_request_spelling_must_fold_to_its_path() -> None:
