@@ -33,3 +33,16 @@ def test_peak_fit_dialog_swallows_escape(qapp):
 def test_phase_fit_dialog_swallows_escape(qapp):
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
     assert _survives_escape(PhaseFitDialog(vnext_submit=lambda *_args: None), qapp)  # PHASE-ANALYSIS-128
+
+
+def test_tool_windows_inherit_one_key_policy():
+    """The retained windows mount the shared policy rather than copying its handler."""
+    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+    from xdart.gui.tabs.calibration.dialog import CalibrationDialog
+    from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
+
+    for dialog_type in (PeakFitDialog, PhaseFitDialog, CalibrationDialog):
+        assert issubclass(dialog_type, RetainedDialogKeyPolicy)
+        assert 'keyPressEvent' not in dialog_type.__dict__
+        assert dialog_type.keyPressEvent is RetainedDialogKeyPolicy.keyPressEvent
