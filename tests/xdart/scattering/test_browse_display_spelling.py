@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 
-from tests.xdart.scattering.test_browse_reference_rings_run import _browsing, _page, _run, _series
+from tests.xdart.scattering.test_browse_reference_rings_run import _browsing, _page, _pump, _run, _series
 from xdart.gui.tabs.scattering import shell_projection, shell_values
 from xdart.gui.tabs.scattering.browse_values import BrowseLoadRequest
 
@@ -55,8 +55,11 @@ def test_after_a_run_browse_names_the_scan_as_its_file_is_spelled(qapp, tmp_path
         browse = _browsing(qapp, page)
         assert browse.requested_path == folded(str(written))  # normalized for comparison only
         assert browse.scan_key == "Effect_of_Rocking_int1d"  # named as the file is spelled
-        projection = page._last_scientific_projection
-        titles = [trace.title for trace in projection.traces]
+        def drawn():  # the trace hydrates after Browse adopts the file; reading it at once raced on Linux CI
+            page._refresh_shell()
+            return page._last_scientific_projection.traces
+        assert _pump(qapp, drawn, seconds=30.), "Browse never drew the trace"
+        titles = [trace.title for trace in page._last_scientific_projection.traces]
         # A Browse scan is named by its file stem, while a curve uses the persisted family, as during Run.
         assert titles == ["Effect_of_Rocking_2"], titles
 
