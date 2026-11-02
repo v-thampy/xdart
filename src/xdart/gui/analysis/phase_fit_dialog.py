@@ -34,6 +34,7 @@ from xdart.gui.tabs.scattering.results_table import PHASE_RESULT_HEADERS, Result
 from xdart.gui.tabs.scattering.trend_view import TrendView
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
 from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
 
 #: each section's help topic (``xrd_tools.help_topics``)
 TOPICS = {"phases": "phase-analysis.phases", "shape": "phase-analysis.peak-shape",
@@ -103,7 +104,7 @@ def _range_text(value):
     return '' if value is None else f'{round(float(value), 3):.4g}'
 
 
-class PhaseFitDialog(QtWidgets.QDialog):
+class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """The Phase Analysis window; ``vnext_submit(action, values)`` is its host's ("reload", "fit", "close",
     "capture_template"), and ``allow_batch`` whether the host can fit a batch (Stitch can; Int's is held)."""
 
@@ -665,18 +666,6 @@ class PhaseFitDialog(QtWidgets.QDialog):
         """The host's reason no fit can run now (Stitch: no result is open), shown on Fit and Batch."""
         self._fit_reason = str(reason or '')
         self._sync_actions()
-
-    def keyPressEvent(self, event):
-        # Esc must not discard the fit setup (phases/range/results); the default
-        # QDialog Esc -> reject closes the popup.  Match the metadata plotter.
-        # Return/Enter arrive here after the field they were typed in has taken
-        # them; QDialog would then press its default button, the first section's
-        # "?", so Help opened on every committed value (PR #6 run 41005408144).
-        # A focused button still takes its own Return.  Other keys pass through.
-        if event.key() in (QtCore.Qt.Key.Key_Escape, QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
     def refresh_pattern(self):
         """Re-grab the host's displayed pattern (Reload)."""

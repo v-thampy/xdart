@@ -39,6 +39,7 @@ from xdart.gui.tabs.scattering.results_table import (
 )
 from xdart.gui.tabs.scattering.trend_view import TrendView
 from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ def _combo(label, name, choices):
                    choice_labels={value: text for text, value in choices})
 
 
-class PeakFitDialog(QtWidgets.QDialog):
+class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """Peak-fit the active 1-D pattern.
 
     Parameters
@@ -395,19 +396,6 @@ class PeakFitDialog(QtWidgets.QDialog):
         return lo, hi
 
     # ---- data + fit -----------------------------------------------------
-    def keyPressEvent(self, event):
-        # Esc must not discard the fit setup (model/peaks/range/results); the
-        # default QDialog Esc -> reject closes the popup.  Match the metadata
-        # plotter.  Return/Enter arrive here after the field they were typed in
-        # has taken them; QDialog would then press its default button, the first
-        # section's "?", so Help opened on every committed value (as Phase
-        # Analysis's W11).  A focused button still takes its own Return.  Other
-        # keys pass through.
-        if event.key() in (QtCore.Qt.Key.Key_Escape, QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
     def refresh_pattern(self):
         """Re-grab the active frame's pattern, draw the raw data, reset the fit."""
         if self._vnext:

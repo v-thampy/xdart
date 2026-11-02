@@ -21,6 +21,7 @@ from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xdart.gui.widgets.file_dialogs import NEXUS_FILTER
 from xdart.gui.widgets.read_only_text import ReadOnlyTextPane
+from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
 from xdart.gui.tabs.scattering.results_table import ResultsTable
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.point_images import PointImagesRequired, PointImageDetection, inspect_point_images
@@ -496,7 +497,7 @@ class CalibrationContext:
                 raise TypeError("a calibration window's starting camera is a DetectorCamera")
 
 
-class CalibrationDialog(QtWidgets.QDialog):
+class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """Retained window. ``calibrationSaved(path, backend)`` adopts a saved pyFAI calibration
     (``backend`` 'multigeometry'); its xrayutilities partner, when one was made, is beside it
     (``xu_partner_path``).
@@ -3785,15 +3786,6 @@ class CalibrationDialog(QtWidgets.QDialog):
             if window is not None:
                 window.close()
         super().hideEvent(event)
-
-    def keyPressEvent(self, event):
-        """Return or Enter commits the box being typed in and presses no button: with many boxes and
-        buttons, the dialog's default button (Fit direct-beam distance) would start a job.
-        Escape returning from a file chooser must not reject this retained window."""
-        if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter, QtCore.Qt.Key.Key_Escape):
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
     def _apply_distance(self):
         if self._distance_result is None:
