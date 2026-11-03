@@ -62,8 +62,8 @@ def _template_file(folder, name="iq_substrate.xye", scale=1.0):
 def _choose(qapp, row, path, unit="q_nm^-1"):
     """Choose a template file as the user does (NEXT-128-WINDOW-POLISH): a template background first, since the row
     waits for one (PF9), then Choose file…, the unit answered in the popup that asks for it (PF10)."""
-    host = row.window()
-    combo = host.bkg_combo if hasattr(host, "bkg_combo") else host.fit_background_row.editor
+    host = row.window()  # Phase Analysis's template background is its fitted one (its bkg_combo is the pre-fit one)
+    combo = host.fit_background_row.editor if hasattr(host, "fit_background_row") else host.bkg_combo
     if not row.choose_btn.isEnabled():
         combo.setCurrentIndex(combo.findData("template"))
     row._file_chooser = lambda: str(path)
@@ -292,10 +292,10 @@ def test_t9_the_peak_fitter_saves_and_loads_its_source_and_fit_values(qapp, monk
         assert (document["kind"], document["version"]) == ("xdart-peak-fit-settings", 1)
         assert document["background_template"] == {"source": dict(row.source.to_pairs()), "identity": identity}
         assert all(not isinstance(value, str) or not value.startswith("(") for value in document["fields"].values())
+        _press(qapp, row.clear_btn)  # PF9: Clear waits for a template background, so before Linear
         dialog.model_combo.setCurrentIndex(0)
         dialog.bkg_combo.setCurrentIndex(0)
         dialog.auto_check.setChecked(True)
-        _press(qapp, row.clear_btn)
         assert row.source is None
         assert dialog.settings_io.load().__class__.__name__ == "ActionCompleted"
         qapp.processEvents()
@@ -355,9 +355,9 @@ def test_t9_phase_analysis_saves_its_source_and_an_old_document_clears_it(qapp, 
 def test_t4_a_capture_its_file_cannot_reproduce_stays_usable_and_unnamed(qapp, monkeypatch, tmp_path):
     with _peak_page(qapp, monkeypatch) as (page, dialog):
         row = dialog.background_template_row
+        dialog.bkg_combo.setCurrentText("Template")  # PF9: the row waits for a template background
         _press(qapp, row.capture_btn)  # the trace's receipt names /tmp/a.nxs, frame 3, which does not exist
         assert row.template is not None and row.source is not None and row.source.kind == "nexus"
-        dialog.bkg_combo.setCurrentText("Template")
         _fit(qapp, page, dialog)
         result = page._peak_result
         assert result.code == "OK" and result.background_template_identity == ""
@@ -380,13 +380,13 @@ def test_t4_phase_names_the_run_trace_by_its_file_after_the_first_fit(qapp, tmp_
         dialog.phase_source.add_library_entry(one.id)
         qapp.processEvents()
         row = dialog.background_template_row
+        dialog.fit_background_row.editor.setCurrentText("Substrate")  # PF9: the row waits for a template background
+        qapp.processEvents()
         _press(qapp, row.capture_btn)
         captured = row.template
         assert captured is not None and row.identity is None
         assert row.source == _owner().BackgroundTemplateSource(
             "nexus", str(captured.receipt.artifact), frame=int(captured.receipt.frame_label), mode="default")
-        dialog.fit_background_row.editor.setCurrentText("Substrate")
-        qapp.processEvents()
         assert "BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE" in row.export_reason()
         # declared repair (as W3/W4): the run's own trace has eight points, under the phase fit's ten-point floor
         trace, _anchor = _trace(*_peaks())
@@ -410,9 +410,9 @@ def test_t4_the_peak_fitter_names_the_run_trace_by_its_file_after_the_first_fit(
         _press(qapp, button)
         dialog = page._peak_dialog
         row = dialog.background_template_row
+        dialog.bkg_combo.setCurrentText("Template")  # PF9: the row waits for a template background
         _press(qapp, row.capture_btn)
         assert row.template is not None and row.source.kind == "nexus" and row.source.mode == "default"
-        dialog.bkg_combo.setCurrentText("Template")
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(1)
         qapp.processEvents()
