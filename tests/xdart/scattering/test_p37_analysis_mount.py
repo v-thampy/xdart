@@ -1926,6 +1926,7 @@ def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
         dialog.set_vnext_trace(trace)
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(2)
+        dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
         dialog.range_lo.setText("1.5"); dialog.range_hi.setText("3")
         dialog._fields_to_region()
         dialog.adv_centers.setText("")

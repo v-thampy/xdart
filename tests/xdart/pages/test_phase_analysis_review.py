@@ -20,6 +20,7 @@ def test_stitch_range_survives_axis_change_and_settings_reload(qapp, tmp_path):
         _finish(host, qapp)
         dialog = host.dialog
         old = tuple(host.snapshot.axes[0].values[[2, -3]])
+        dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
         for editor, value in zip(dialog.fit_range_row.editors, old):
             editor.setText(f"{value:.12g}")
         expected = convert_radial_axis(np.asarray(old), "2th_deg", "q_A^-1", host.snapshot.wavelength_angstrom)

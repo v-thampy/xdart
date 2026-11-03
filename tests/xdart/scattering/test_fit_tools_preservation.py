@@ -166,6 +166,7 @@ def test_peak_manual_count_and_range_fit_only_the_chosen_window(monkeypatch, qap
         dialog = _show(page, monkeypatch, "peak", trace, anchor)
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(2)
+        dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
         dialog.range_lo.setText("1.2"); dialog.range_hi.setText("2.8")
         dialog._fields_to_region()
         values = dialog.vnext_fit_values()
@@ -242,6 +243,7 @@ def test_peak_reload_keeps_the_range_full_resets_it_and_a_narrower_pattern_clamp
     page = _page()
     try:
         dialog = _show(page, monkeypatch, "peak", trace, anchor)
+        dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
         dialog.range_lo.setText("1.5"); dialog.range_hi.setText("3.0")
         dialog._fields_to_region()
         dialog.refresh_btn.click()  # Reload: the page captures the displayed trace again

@@ -1,12 +1,21 @@
-"""NEXT-128-HELP-GUIDES G3: each tool window's top-level "?" opens its illustrated physics guide in the browser, and
-the Help window offers the same guide for the tool's topics (the maintainer, 2026-10-31: "These would be the top level
-help that open the question mark at the top of the page"; "System browser (Recommended)"). Only the operating system's
-browser call is answered, as the file choosers are. Frozen before the product change (red on d923716b).
+"""NEXT-128-HELP-GUIDES G3: the Help window offers each tool's illustrated physics guide for the tool's topics, and opens
+it in the system browser ("System browser (Recommended)"). Only the operating system's browser call is answered, as the
+file choosers are. Frozen before the product change (red on d923716b).
+
+NEXT-128-WINDOW-POLISH (TQ) retired the tool windows' top "?" (the maintainer, 2026-11-02: "the question mark at the very
+top of the windows that brings up the illustrated guide is not really required. the same can be gotten to by clicking the
+illustrated guide button in any of the help windows, right?", then "Remove it (Recommended)"). Its rows are replaced:
+neither window has it, every section "?" reaches the guide through the Help window's Illustrated guide, F1 in an option
+still opens help before any help was opened, and the missing-guide and browser-refusal rows go through the Help window.
+Frozen before that change (red on 034723d4).
 """
 from pathlib import Path
 
 import pytest
 from pyqtgraph.Qt import QtCore, QtGui, QtTest, QtWidgets
+
+KINDS = ("peak", "phase")
+GUIDES = {"peak": "peak-fit.html", "phase": "phase-analysis.html"}
 
 
 @pytest.fixture
@@ -26,31 +35,53 @@ def isolated_library(tmp_path, monkeypatch):
     monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
 
 
-def _dialogs():
+def _dialog(kind):
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    return ((PeakFitDialog(vnext_submit=lambda *_args: None), "peak-fit.html"),
-            (PhaseFitDialog(vnext_submit=lambda *_args: None), "phase-analysis.html"))
+    return (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
 
 
-def test_g3_each_tool_windows_top_question_mark_opens_its_guide(qapp, opened):
+@pytest.mark.parametrize("kind", KINDS)
+def test_tq_neither_tool_window_has_a_top_question_mark(qapp, kind):
     from xdart.gui.widgets.controls_panel import ActionButton
-    for dialog, name in _dialogs():
-        try:
-            dialog.show()
-            qapp.processEvents()
-            button = dialog.guide_button
-            assert isinstance(button, ActionButton) and button.text() == "?" and button.toolTip(), name
-            top = button.mapTo(dialog, QtCore.QPoint(0, 0)).y()
-            assert top < dialog.fit_view.mapTo(dialog, QtCore.QPoint(0, 0)).y(), name  # at the top of the window
-            before = len(opened)
+    dialog = _dialog(kind)
+    try:
+        dialog.show()
+        qapp.processEvents()
+        assert not hasattr(dialog, "guide_button") and not hasattr(ActionButton, "for_guide")
+        assert dialog.layout().itemAt(0).widget() is dialog.split, "no row above the options and plots"
+        tips = [button.toolTip().casefold() for button in dialog.findChildren(ActionButton)]
+        assert not any("illustrated physics guide" in tip for tip in tips)
+    finally:
+        dialog.close()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_tq_every_section_question_mark_offers_its_tools_guide_in_the_help_window(qapp, opened, kind):
+    from xrd_tools.help_topics import get_topic
+    from xdart.gui.widgets.context_help import owner_for
+    from xdart.gui.widgets.controls_panel import ActionButton
+    dialog = _dialog(kind)
+    try:
+        dialog.show()
+        qapp.processEvents()
+        buttons = [button for button in dialog.findChildren(ActionButton) if button.text() == "?"]
+        assert buttons
+        for button in buttons:
             button.click()
             qapp.processEvents()
+            window = owner_for(dialog).window
+            assert window is not None and window.isVisible()
+            assert get_topic(window.topic_id).guide == GUIDES[kind], window.topic_id
+            assert not window.guide_button.isHidden() and window.guide_button.toolTip()
+            before = len(opened)
+            window.guide_button.click()
+            qapp.processEvents()
             assert len(opened) == before + 1
-            url = opened[-1]
-            assert url.isLocalFile() and Path(url.toLocalFile()).name == name and Path(url.toLocalFile()).is_file()
-        finally:
-            dialog.close()
+            path = Path(opened[-1].toLocalFile())
+            assert opened[-1].isLocalFile() and path.name == GUIDES[kind] and path.is_file()
+    finally:
+        dialog.close()
 
 
 def test_g3_the_help_window_offers_the_guide_only_for_topics_that_have_one(qapp, opened):
@@ -75,56 +106,57 @@ def test_g3_a_missing_guide_is_named_and_nothing_opens(qapp, opened, monkeypatch
     from xrd_tools import help_topics
     from xdart.gui.widgets.context_help import owner_for
     monkeypatch.setattr(help_topics, "guide_path", lambda identifier: tmp_path / "gone.html")
-    dialog, _name = _dialogs()[0]
+    dialog = _dialog("peak")
     try:
         dialog.show()
         qapp.processEvents()
-        dialog.guide_button.click()
+        dialog.range_row.help_button.click()
+        qapp.processEvents()
+        window = owner_for(dialog).window
+        window.guide_button.click()
         qapp.processEvents()
         assert not opened
-        window = owner_for(dialog).window
-        assert window is not None and "missing" in window.pane.toPlainText().casefold()
+        assert "missing" in window.pane.toPlainText().casefold()
     finally:
         dialog.close()
 
 
-@pytest.mark.parametrize("kind", ("peak", "phase"))
-def test_f1_on_the_top_question_mark_works_before_any_help_was_opened(qapp, opened, kind):
-    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
+@pytest.mark.parametrize("kind", KINDS)
+def test_tq_f1_in_an_option_opens_its_topic_before_any_help_was_opened(qapp, opened, kind):
+    dialog = _dialog(kind)
     try:
         dialog.show()
         dialog.activateWindow()
-        dialog.guide_button.setFocus()
+        editor, expected = ((dialog.model_combo, "peak-fit.model") if kind == "peak" else
+                            (dialog.profile_combo, "phase-analysis.peak-shape"))
+        editor.setFocus()
         qapp.processEvents()
-        assert not dialog.guide_button.autoDefault() and not dialog.guide_button.isDefault()
-        QtTest.QTest.keyClick(dialog.guide_button, QtCore.Qt.Key.Key_F1)
+        QtTest.QTest.keyClick(editor, QtCore.Qt.Key.Key_F1)
         qapp.processEvents()
         owner = getattr(dialog, "_context_help_owner", None)
-        assert owner is not None and owner.window is not None
-        expected = "peak-fit.model" if kind == "peak" else "phase-analysis.phases"
+        assert owner is not None and owner.window is not None, "F1 is bound when the window opens"
         assert owner.window.topic_id == expected and not opened
     finally:
         dialog.close()
 
 
-@pytest.mark.parametrize("kind", ("peak", "phase"))
-def test_a_browser_refusal_opens_the_topic_and_names_the_reason(qapp, monkeypatch, kind):
-    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_browser_refusal_names_the_reason_in_the_help_window(qapp, monkeypatch, kind):
     from xdart.gui.widgets.context_help import owner_for
+    from xdart.gui.widgets.controls_panel import ActionButton
     calls = []
     monkeypatch.setattr(QtGui.QDesktopServices, "openUrl", staticmethod(lambda url: calls.append(url) or False))
-    dialog = (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
+    dialog = _dialog(kind)
     try:
         dialog.show()
         qapp.processEvents()
-        dialog.guide_button.click()
+        next(button for button in dialog.findChildren(ActionButton) if button.text() == "?").click()
         qapp.processEvents()
         window = owner_for(dialog).window
-        assert len(calls) == 1 and calls[0].isLocalFile()
         assert window is not None and window.isVisible()
+        window.guide_button.click()
+        qapp.processEvents()
+        assert len(calls) == 1 and calls[0].isLocalFile()
         assert "system browser did not open" in window.pane.toPlainText().casefold()
         assert not window.guide_button.autoDefault()
         search, button = window.search_row.geometry(), window.guide_button.geometry()

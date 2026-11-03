@@ -1,7 +1,10 @@
-"""NEXT-128-HELP-FOLLOWUPS (GUI rows F1, F2): Return in a Peak Fitter field commits it and presses no button, and the
-window "?" never takes the first keyboard focus. The maintainer picked "Return and focus fixes (Recommended)".
-Frozen before the product change (DESIGN-HELP-FOLLOWUPS-128.md): F1 is red on 72050876 (Return opened Help, Fable's B6
-on HELP-GUIDES); F2 pins 72050876's creation order.
+"""NEXT-128-HELP-FOLLOWUPS (GUI row F1): Return in a Peak Fitter field commits it and presses no button. The maintainer
+picked "Return and focus fixes (Recommended)". Frozen before the product change (DESIGN-HELP-FOLLOWUPS-128.md): F1 is red
+on 72050876 (Return opened Help, Fable's B6 on HELP-GUIDES).
+
+NEXT-128-WINDOW-POLISH: F2 (the window "?" never takes the first focus) is retired with that "?" (TQ, "Remove it
+(Recommended)"; test_help_guides_gui pins its absence), and F1 turns Full off before typing a range, since Full is on by
+default and locks the range while it is (PF5).
 """
 import pytest
 from pyqtgraph.Qt import QtCore, QtTest, QtWidgets
@@ -33,6 +36,7 @@ def test_f1_return_in_a_peak_fitter_field_commits_it_and_presses_no_button(qapp)
         dialog.activateWindow()
         qapp.processEvents()
         assert not _help_shown()
+        dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
         line = dialog.range_lo
         QtTest.QTest.mouseClick(line, QtCore.Qt.MouseButton.LeftButton)
         qapp.processEvents()
@@ -44,27 +48,9 @@ def test_f1_return_in_a_peak_fitter_field_commits_it_and_presses_no_button(qapp)
         assert not _help_shown() and dialog.isVisible(), "and presses no button"
         # A focused button still answers its own Return.
         button = next(button for button in dialog.findChildren(QtWidgets.QPushButton) if button.text() == "?")
-        assert button is not dialog.guide_button  # a section's "?", whose Return opens Help
-        button.setFocus()
+        button.setFocus()  # a section's "?", whose Return opens Help
         QtTest.QTest.keyClick(button, QtCore.Qt.Key.Key_Return)
         qapp.processEvents()
         assert _help_shown(), "a focused ? opens Help on Return"
-    finally:
-        dialog.close()
-
-
-@pytest.mark.parametrize("tool", ("peak", "phase"))
-def test_f2_the_window_question_mark_never_takes_the_first_focus(qapp, tool):
-    """Fable's B2 on HELP-GUIDES: the guide "?" is made last, so it never takes the first focus (the Peak Fitter's goes
-    to its first section's "?", Phase Analysis's to its options pane) and a stray Space on opening never launches the
-    browser."""
-    from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
-    from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    dialog = (PeakFitDialog if tool == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
-    try:
-        dialog.show()
-        dialog.activateWindow()
-        qapp.processEvents()
-        assert dialog.focusWidget() is not dialog.guide_button
     finally:
         dialog.close()
