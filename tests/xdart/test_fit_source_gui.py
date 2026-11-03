@@ -9,6 +9,7 @@ and the real reader (no fake on those seams). The displayed frame is supplied as
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import os
 import time
 from types import SimpleNamespace
@@ -327,5 +328,60 @@ def test_s6_an_xye_source_exports_its_one_curve_as_a_captured_input(qapp, tmp_pa
         _drain(qapp, host)
         assert destination.is_file(), dialog.status.text()
         assert len(tuple(tmp_path.glob("fit.ipynb*.input.npz"))) == 1
+    finally:
+        _close_page(page, qapp)
+
+
+_EIGER = (Path(os.environ.get("XDART_TEST_DATA", "/nonexistent")) / "xdart_processed_data"
+          / "eiger_S069Ta_redo_eta2p0_1_scan001_int1d.nexus")
+
+
+@pytest.mark.skipif(not _EIGER.is_file(), reason="needs XDART_TEST_DATA (xdart_processed_data/eiger_..._int1d.nexus)")
+@pytest.mark.parametrize("axis", ("Q", "2theta"))
+def test_s4_a_real_browse_display_batches_on_its_displayed_unit(qapp, tmp_path, monkeypatch, _xdart_qt_harness, axis):
+    """The advisor's pre-push check of the display-source Batch on Int's real Browse route (no fake): a real result
+    shown as Q or as 2θ gives Batch a canonical displayed unit, the displayed frame's batch input is the displayed
+    trace itself (no norm channel, Set BG or χ slice), and the Batch state's re-evaluation after a render is cheap
+    (its median time is printed)."""
+    import statistics
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page as _real_page
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    from xrd_tools.analysis.fit_sources import int_frame_snapshot
+    page, _store = _real_page(tmp_path, monkeypatch)
+    try:
+        browse = page._context_controller.begin_browse(str(_EIGER), source_root=str(_EIGER.parent))
+        outcome = _wait(page._context_controller.poll_browse, timeout=60)
+        assert outcome.request is browse and outcome.status is BrowseLoadStatus.READY, outcome
+        page.resize(1200, 800)
+        page.show()
+        page._refresh_shell()
+        if axis == "2theta":
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_AXIS, "2theta"))
+            page._refresh_shell()
+        wanted = "q_A^-1" if axis == "Q" else "2th_deg"
+
+        def painted():
+            page._drain_executor()
+            value = page._last_scientific_projection
+            return value if value is not None and value.traces and value.traces[0].axis.unit == wanted else None
+        _wait(painted, timeout=60)
+        dialog, _host = _window(page, "peak")
+        trace, _anchor = page._capture_analysis_trace("peak")
+        assert trace is not None and trace.axis_unit == wanted
+        assert dialog.batch_btn.isEnabled(), dialog.batch_btn.toolTip()
+        assert _EIGER.name in dialog.batch_btn.toolTip()
+        frame = int(trace.receipt.frame_label)
+        snapshot = int_frame_snapshot(_EIGER, frame, mode="default", unit=trace.axis_unit)
+        np.testing.assert_allclose(snapshot.axes[0].values, trace.axis, rtol=1e-12, atol=0.0)
+        np.testing.assert_array_equal(snapshot.values, trace.intensity)
+        times = []
+        for _ in range(15):
+            start = time.perf_counter()
+            page._sync_fit_batch("peak")
+            times.append(time.perf_counter() - start)
+        print(f"S4 real {axis}: unit {trace.axis_unit}, frame {frame}, Batch re-evaluation median "
+              f"{statistics.median(times) * 1e3:.2f} ms (max {max(times) * 1e3:.2f} ms)")
     finally:
         _close_page(page, qapp)
