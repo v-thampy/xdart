@@ -165,6 +165,7 @@ class TrendView(QtWidgets.QWidget):
                                 "shows every one.")
         self.members.setMenu(QtWidgets.QMenu(self.members))
         self._word = members.capitalize()
+        self._phase_members = members == "phases"
         self._members: tuple = ()
         self._hidden: set = set()
         self.save = QtWidgets.QPushButton("Save CSV…")
@@ -333,7 +334,7 @@ class TrendView(QtWidgets.QWidget):
             self.right_view_box.setVisible(False)
             return
         x = np.asarray([xs[index] for index in drawn], dtype=float)
-        grouped = group_families(columns)
+        grouped = group_families(columns, phase=self._phase_members)
         colour = 0
         family = self.family.currentData()
         if family is not None:
@@ -372,7 +373,7 @@ class TrendView(QtWidgets.QWidget):
         keys: list[str] = []
         for row in self._rows.values():
             keys += [key for key in row.params if key not in keys]
-        families = tuple(group_families(keys))
+        families = tuple(group_families(keys, phase=self._phase_members))
         if frozenset(families) == frozenset(self._families):
             return
         for combo, none in ((self.family, False), (self.right_family, True)):
@@ -399,7 +400,7 @@ class TrendView(QtWidgets.QWidget):
         for row in self._rows.values():
             keys += [key for key in row.params if key not in keys]
         members: list = []
-        for entries in group_families(keys).values():
+        for entries in group_families(keys, phase=self._phase_members).values():
             members += [member for _key, member in entries if member not in members]
         numbers = sorted(member for member in members if isinstance(member, int))
         members = tuple(numbers + [member for member in members if not isinstance(member, int)])

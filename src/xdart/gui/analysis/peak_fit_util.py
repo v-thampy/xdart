@@ -50,12 +50,17 @@ def _phase_family(key, phases):
     return None
 
 
-def group_families(keys):
+def group_families(keys, *, phase=False):
     """An iterable of param keys -> ordered ``{family: [(key, member), ...]}`` so a family's curves plot together:
     a peak fit's members are its peak indices (sorted); a phase fit's keys (``frac_<phase>``, ``<phase>_<cell>``)
-    group by kind, their members the phases' names in the order of their fractions (NEXT-128-WINDOW-POLISH)."""
+    group by kind, their members the phases' names in the order of their fractions (NEXT-128-WINDOW-POLISH).
+    With ``phase=True``, cell suffixes also identify phases when lattice-only fits withhold every fraction.
+    Other trend consumers retain their peak and bare-key grouping."""
     keys = list(keys)
     phases = [key[5:] for key in keys if key.startswith("frac_") and len(key) > 5]
+    if phase and not phases:
+        phases = list(dict.fromkeys(head for key in keys for head, _, tail in (key.rpartition("_"),)
+                                    if head and tail in _CELL_KEYS))
     fam = {}
     for key in keys:
         f, member = _phase_family(key, phases) or split_family(key)
