@@ -503,6 +503,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return None if self.source_row is None else self.source_row.source
 
     def set_batch_progress(self, done, total):
+        """A running Batch's count (NEXT-128-WINDOW-POLISH item 14: "there is no update progress and i have no idea
+        where things stand"); the host draws its fitted frames into the trend as they come."""
         self.status.setText(f"Batch fitting… {done}/{total}")
 
     def _pattern_panel(self, *series, markers=()):

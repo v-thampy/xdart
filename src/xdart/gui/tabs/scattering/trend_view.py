@@ -286,10 +286,20 @@ class TrendView(QtWidgets.QWidget):
     def set_row(self, identity: str, x: float | None, params: Mapping[str, float], *, phase_names=()) -> None:
         """One result's parameters: its row is replaced (a re-fit), or added; a result with no parameters adds
         nothing. A phase host passes the fitted names from that result's request, independent of key spelling."""
-        if not params:
+        self.set_rows(((identity, x, params),), phase_names=phase_names)
+
+    def set_rows(self, rows, *, phase_names=()) -> None:
+        """Many results' parameters, ``(identity, x, params)`` each, as ``set_row`` takes one, in one redraw: a batch's
+        rows (NEXT-128-WINDOW-POLISH item 14: 3621 rows took 26.91 s one ``set_row`` at a time, each redrawing every
+        row, against one 11.2 ms redraw). Rows with no parameters add nothing; nothing added, nothing is redrawn."""
+        added = False
+        for identity, x, params in rows:
+            if params:
+                self._rows[str(identity)] = TrendRow(str(identity), None if x is None else float(x), dict(params),
+                                                    tuple(phase_names))
+                added = True
+        if not added:
             return
-        self._rows[str(identity)] = TrendRow(str(identity), None if x is None else float(x), dict(params),
-                                            tuple(phase_names))
         self._sync_families()
         self._sync_members()
         self.redraw()

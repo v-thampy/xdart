@@ -1,5 +1,7 @@
 """One fit-window controller for native hosts, on the existing worker and fit components."""
-from dataclasses import dataclass, replace
+import threading
+import time
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -49,6 +51,32 @@ class _Request:
     data_root: object = None
     #: a phase Batch seeds each fit from the previous one (the analyzer's option, never a plan field)
     sequential: bool = False
+    #: a Batch's fitted rows as the worker fits each frame (``_RowStream``), taken at each progress poll
+    stream: object = field(default=None, compare=False)
+
+
+class _RowStream:
+    """A Batch's fitted rows, ``(identity, x, params)`` each, put by the worker as it fits each frame and taken by the
+    window at each progress poll (NEXT-128-WINDOW-POLISH item 14, the maintainer's "Count + live trend"): a lock and a
+    list, so the worker never touches a Qt object."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rows = []
+
+    def put(self, row):
+        with self._lock:
+            self._rows.append(row)
+
+    def take(self):
+        with self._lock:
+            rows, self._rows = self._rows, []
+        return rows
+
+
+#: a streaming trend redraws at most this often (s): one redraw of 3621 rows costs 11.2 ms, so a redraw per 50 ms
+#: progress poll would hold the GUI (and the worker's interpreter lock) a fifth of the time
+_TREND_FLUSH_S = 0.5
 
 
 def _snapshot(target, settings):
@@ -83,6 +111,7 @@ def _job(request, cancel, progress):
     analyzer = (DisplayedPeakFitAnalyzer(settings=settings, cancel_token=cancel) if request.kind == 'peak' else
                 DisplayedPhaseFitAnalyzer(settings=settings, cancel_token=cancel, sequential=request.sequential))
     last, keys, xs = [None], {}, {}
+    stream, position = request.stream, [0]
 
     def load(target):
         snapshot = _snapshot(target, request.settings)
@@ -99,9 +128,18 @@ def _job(request, cancel, progress):
                 pass  # the fit remains independent of an unavailable trend coordinate
         return phase_fit_snapshot(snapshot) if request.kind == 'phase' else snapshot
 
+    def frame_fitted(outcome):
+        # its trend row as the host draws it when the batch ends: a trend column's value, else its frame, else its place
+        x = xs.get(outcome.label)
+        if outcome.params:
+            stream.put((outcome.label, x if request.column or x is not None else float(position[0]),
+                        dict(outcome.params)))
+        position[0] += 1
+
     outcomes = run_batch(analyzer, tuple(lambda target=target: load(target) for target in request.inputs),
                          should_cancel=cancel.is_set,
-                         on_progress=lambda done, total: progress('Fitting', done, total), compact=True)
+                         on_progress=lambda done, total: progress('Fitting', done, total),
+                         on_frame=None if stream is None else frame_fitted, compact=True)
     return tuple(outcomes), last[0], keys, xs
 
 
@@ -122,8 +160,16 @@ class SnapshotFitHost(QtCore.QObject):
         self._batching = False
         #: whether shutdown also stops the Fitter's Add CIF… worker (Int's page owns it for the windows it mounts)
         self._owns_phase_source = bool(owns_phase_source)
-        self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, parent=self)
+        self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, progress=self._progress,
+                                        parent=self)
         self._shown_outcome = None
+        #: the adopted fits' trend rows (a cancelled or refused Batch's streamed rows give way to them again); a running
+        #: Batch's rows taken but not yet drawn, its request, and when the trend last drew them
+        self._trend_rows, self._trend_phases = [], ()
+        self._held_rows, self._held_request, self._last_flush = [], None, 0.0
+        self._flush_timer = QtCore.QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self._flush_trend)
         if dialog is not None:
             # NEXT-128-WINDOW-POLISH item 11: Int's page mounts its own window and routes its actions; this host runs
             # the window's file-source fits, its batches and its exports, with none of the result pages' rows.
@@ -183,15 +229,55 @@ class SnapshotFitHost(QtCore.QObject):
         self.dialog.status.setText({'reload': 'Loading…', 'export': 'Exporting…',
                                     'capture': 'Capturing the substrate…'}.get(action, 'Fitting…'))
         self._batching = action == 'batch'
+        self._end_stream()
         if action == 'batch':
             self.dialog.set_batch_running(True)
+            self.dialog.trend.clear()  # the batch's own rows join as its frames are fitted
         elif action == 'reload':
             self.dialog.fit_btn.setEnabled(False)
         sequential = action == 'batch' and self.kind == 'phase' and self.dialog.sequential_batch()
         self.owner.ask(_Request(action, self.kind, self.scope(), settings, tuple(inputs),
                                 self.trend_column, destination,
                                 self.source_root() if callable(self.source_root) else self.source_root,
-                                sequential=sequential))
+                                sequential=sequential, stream=_RowStream() if action == 'batch' else None))
+
+    def _progress(self, request, progress):
+        """A running Batch's count in the status and its fitted frames into the trend (NEXT-128-WINDOW-POLISH item 14:
+        "i started a batch fit over a long sequence. there is no update progress"; his "Count + live trend")."""
+        if self.dialog is None or request.action != 'batch' or request.stream is None:
+            return
+        self.dialog.set_batch_progress(progress.completed, progress.total)
+        self._held_rows += request.stream.take()
+        self._held_request = request
+        self._flush_trend()
+
+    def _flush_trend(self):
+        """Draw the held rows: at once, or when ``_TREND_FLUSH_S`` has passed since the last draw (a timer)."""
+        request = self._held_request
+        if request is None or self.dialog is None or self.owner.wanted is not request:
+            self._end_stream()
+            return
+        if not self._held_rows:
+            return
+        wait = self._last_flush + _TREND_FLUSH_S - time.monotonic()
+        if wait > 0:
+            if not self._flush_timer.isActive():
+                self._flush_timer.start(int(wait * 1000) + 1)
+            return
+        rows, self._held_rows = self._held_rows, []
+        self._last_flush = time.monotonic()
+        self.dialog.trend.set_rows(rows, phase_names=dict(request.settings).get('phase_names', ()))
+
+    def _end_stream(self):
+        """No Batch streams now: its held rows go undrawn."""
+        self._flush_timer.stop()
+        self._held_rows, self._held_request, self._last_flush = [], None, 0.0
+
+    def _restore_trend(self):
+        """A Batch ended unadopted (cancelled, refused or failed): the trend shows the adopted fits' rows again."""
+        if self.dialog is not None:
+            self.dialog.trend.clear()
+            self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
 
     def _request_settings(self, action):
         # Frozen phase entries feed the analyzer unchanged; only FitInputKey
@@ -223,8 +309,12 @@ class SnapshotFitHost(QtCore.QObject):
 
     def _batch(self):
         if self.computing and (self._batching or self.column_row is not None):
+            batching = self._batching
             self.owner.release()
             self._batching = False
+            self._end_stream()
+            if batching:
+                self._restore_trend()
             self.dialog.set_batch_running(False)
             self.dialog.status.setText('Cancelled; the running solve is draining')
             return
@@ -243,6 +333,7 @@ class SnapshotFitHost(QtCore.QObject):
 
     def _done(self, request, terminal):
         self._batching = False
+        self._end_stream()
         if self.dialog is None:  # a retired host: its window is gone
             return False
         self.dialog.set_batch_running(False)
@@ -254,9 +345,13 @@ class SnapshotFitHost(QtCore.QObject):
         except (ValueError, KeyError, OSError):
             unchanged = False
         if not unchanged:
+            if request.action == 'batch':
+                self._restore_trend()
             self.dialog.status.setText('FIT_INPUT_CHANGED: reload the current selection')
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED:
+            if request.action == 'batch':
+                self._restore_trend()
             message = terminal.failure_message or terminal.status.value
             self.dialog.status.setText(message)
             source = getattr(self.dialog, 'source_row', None)
@@ -279,11 +374,11 @@ class SnapshotFitHost(QtCore.QObject):
         self._last_settings = plain_settings(dict(request.settings))
         self._adopt_template(self.outcomes)
         self.dialog.trend.clear()
-        phase_names = dict(request.settings).get('phase_names', ())
-        for position, outcome in enumerate(self.outcomes):
-            x = xs.get(outcome.label)
-            self.dialog.trend.set_row(outcome.label, x if request.column or x is not None else float(position),
-                                      outcome.params, phase_names=phase_names)
+        # every row in one redraw (item 14): one ``set_row`` per outcome redrew every row each time
+        self._trend_rows = [(outcome.label, x if request.column or x is not None else float(position), outcome.params)
+                            for position, outcome in enumerate(self.outcomes) for x in (xs.get(outcome.label),)]
+        self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
+        self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
         if not self.outcomes:
             return False
         outcome = self.outcomes[-1]
@@ -296,7 +391,10 @@ class SnapshotFitHost(QtCore.QObject):
                 self.dialog.show_phase_result_details(outcome.result)
             else:
                 self.dialog.table.show_rows(*peak_parameter_rows(outcome.result))
-        if self.kind != 'phase' or outcome.overlay is None:
+        if request.action == 'batch':  # where the batch stands at its end (item 14)
+            fitted = sum(1 for each in self.outcomes if each.ok)
+            self.dialog.status.setText(f'Batch done: {fitted} of {len(self.outcomes)} frames fitted')
+        elif self.kind != 'phase' or outcome.overlay is None:
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         source = getattr(self.dialog, 'source_row', None)
         if source is not None and 'FIT_SOURCE_' in (outcome.message or ''):
@@ -343,8 +441,9 @@ class SnapshotFitHost(QtCore.QObject):
     def invalidate(self):
         self.owner.release()
         self._batching = False
+        self._end_stream()
         self.snapshot = self._shown_outcome = None
-        self.outcomes, self._keys = (), {}
+        self.outcomes, self._keys, self._trend_rows, self._trend_phases = (), {}, [], ()
         if self.dialog is not None:
             self.dialog.clear_input()
             self.dialog.trend.clear()

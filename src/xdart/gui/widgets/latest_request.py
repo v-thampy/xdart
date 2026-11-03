@@ -12,7 +12,11 @@ job and its callbacks:
   payload or FAILED; the tool draws the result or names the refusal, and returns whether the request is now shown;
 - ``same(a, b)``: two requests are the same computation (a running one is kept, a finished one still asked for);
 - ``unchanged(request, shown)``, ``same`` by default: the request would show what is shown, so asking it computes
-  nothing (``VolumeView`` decides that from the index it keeps, not from the request shown).
+  nothing (``VolumeView`` decides that from the index it keeps, not from the request shown);
+- ``progress(request, progress)``, optional: on the GUI thread, the latest progress the job published (an
+  ``OperationProgress``: its stage, completed and total) while its request is still the one asked for; a released or
+  superseded request's progress reaches nobody, as its result does (NEXT-128-WINDOW-POLISH item 14: a fit window's
+  Batch counts its frames).
 
 ``ask(request)`` makes ``request`` (None: none) the one asked for and returns whether a computation is asked for. A
 different request on the worker is cancelled (its job sees its cancel event) and dropped when it returns, its
@@ -42,10 +46,10 @@ from xdart.gui.pages.values import PageCleanup
 class LatestRequestOwner(QtCore.QObject):
     """A tool's computations on one ``SingleWorkerOwner``, the latest request winning (the module docstring)."""
 
-    def __init__(self, job, done, *, same, unchanged=None, parent=None, interval_ms: int = 50):
+    def __init__(self, job, done, *, same, unchanged=None, progress=None, parent=None, interval_ms: int = 50):
         super().__init__(parent)
         self._owner = SingleWorkerOwner(job)
-        self._done, self._same = done, same
+        self._done, self._same, self._progress = done, same, progress
         self._unchanged = same if unchanged is None else unchanged
         self._wanted = self._running = self._shown = None
         #: counts forget, release and shutdown: one inside ``done`` voids the "shown" that ``done`` returns
@@ -131,7 +135,12 @@ class LatestRequestOwner(QtCore.QObject):
             return
         identity, request = self._running
         update = self._owner.poll(identity)
-        if update is None or update.terminal is None:
+        if update is None:
+            return
+        if update.terminal is None:  # a progress revision: its tool's, while the request is still asked for
+            if (self._progress is not None and update.progress is not None and self._wanted is not None
+                    and self._same(request, self._wanted)):
+                self._progress(request, update.progress)
             return
         self._running = None
         terminal = update.terminal

@@ -896,7 +896,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._sync_actions()
 
     def set_batch_progress(self, done, total):
-        self.status.setText(f"Phase-fitting… {done}/{total}")
+        """A running Batch's count (NEXT-128-WINDOW-POLISH item 14), as the Peak Fitter words it."""
+        self.status.setText(f"Batch fitting… {done}/{total}")
 
     def reset_param_trend(self):
         """A fresh trend (Reload, a new batch run)."""
