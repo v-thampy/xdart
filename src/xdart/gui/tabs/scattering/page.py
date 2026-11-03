@@ -1667,8 +1667,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     "frame number.")
 
     def _sync_fit_batches(self):
-        """After a render: each open window following Int's display re-evaluates its Batch (never failing a render)."""
-        for kind in tuple(self._fit_hosts):
+        """After a render: each open window following Int's display re-evaluates its Batch (never failing a render;
+        a page double without fit windows has none, as ``analysis_start_allowed`` reads it)."""
+        for kind in tuple(getattr(self, "_fit_hosts", None) or ()):
             dialog = self._fit_dialog(kind)
             if dialog is None or not dialog.isVisible() or dialog.fit_source() is not None:
                 continue
@@ -3354,7 +3355,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         from xdart.gui.pages.values import PageCleanup
         phase_close = self._shell.scientific.shutdown_phase_overlays()
         # each fit window's host, open or retired, drains its worker first (NEXT-128-WINDOW-POLISH item 11)
-        fit_closes = tuple(host.shutdown() for host in (*self._fit_hosts.values(), *self._retired_fit_hosts))
+        fit_closes = tuple(host.shutdown() for host in (*(getattr(self, "_fit_hosts", None) or {}).values(),
+                                                        *(getattr(self, "_retired_fit_hosts", None) or ())))
         if (phase_close.status is not PageCleanup.CLEAN
                 or any(receipt.status is not PageCleanup.CLEAN for receipt in fit_closes)
                 or not self._release_browse_1d_debt()
