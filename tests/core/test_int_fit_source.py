@@ -89,7 +89,7 @@ def test_a_frame_is_its_stored_row_on_its_stored_axis_at_the_files_wavelength(tm
     assert snapshot.wavelength_angstrom == pytest.approx(WAVELENGTH, rel=1e-12, abs=0.0)
     key = snapshot.key
     assert key.path == str(path) and key.generation == 0 and key.background == "none"
-    assert dict(key.selection) == {"meaning": "radial", "frame": 3, "mode": mode}
+    assert dict(key.selection) == {"meaning": "radial", "frame": 3, "mode": mode, "entry": "entry"}
     assert "sample_int1d" in key.result_identity and "3" in key.result_identity
     assert len(key.fingerprint) == 64
     again = _sources().int_frame_snapshot(path, 3, mode=mode)
