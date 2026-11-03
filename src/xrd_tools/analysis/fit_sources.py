@@ -109,3 +109,180 @@ def rsm_reciprocal_transform(payload):
         return None
     # RSM's persisted UB is in the Q convention consumed by rsm_coordinate_matrix.
     return rsm_coordinate_matrix(volume.coordinate_frame, matrices[0])
+
+
+# ---- the fit windows' file Source (NEXT-128-WINDOW-POLISH item 11) -------------------------------------------------
+# The maintainer, 2026-11-03: "I think it will be good to have an option to choose a separate source than the nexus
+# file selected in the main window in the fit windows ... This also fits well with the export jupyter idea"; his
+# "Stored rows; fit the substrate (Recommended)". A source frame is its stored 1-D row, as written: Int's χ slice,
+# monitor normalization and Set BG are display-only and never applied here (a substrate is the fit's template
+# background). One reader serves the GUI's Reload, Fit and Batch and an exported notebook (``SourceReference``
+# "int_1d"), so they read the same values.
+
+#: frames read per ``read_1d_rows`` call in a batch; one chunk is held at a time
+_INT_ROW_CHUNK = 64
+#: the radial units Int's plot converts between (``scientific_axes._present_radial_axis``)
+_DISPLAY_UNITS = frozenset({'q_A^-1', '2th_deg'})
+_MAX_XYE_BYTES = 64 * 1024 * 1024
+_UNREAD = object()
+
+
+def _source_refused(code: str, detail: str) -> ValueError:
+    return ValueError(f'FIT_SOURCE_{code}: {detail}')
+
+
+def _row_digest(mode, unit, axis, values, sigma) -> str:
+    """The content identity of one fit input: its mode, unit, axis, values and σ (a rewritten row is another input)."""
+    import hashlib
+    digest = hashlib.sha256()
+    parts = (json.dumps({'mode': mode, 'unit': unit}, sort_keys=True).encode('utf-8'),
+             np.ascontiguousarray(axis, dtype='<f8').tobytes(), np.ascontiguousarray(values, dtype='<f8').tobytes(),
+             b'' if sigma is None else np.ascontiguousarray(sigma, dtype='<f8').tobytes())
+    for part in parts:
+        digest.update(len(part).to_bytes(8, 'big'))
+        digest.update(part)
+    return digest.hexdigest()
+
+
+class IntResultRows:
+    """An Int NeXus result's stored 1-D rows in one ``mode`` as fit inputs (``FitInputSnapshot``), read in chunks of
+    ``chunk`` frames with one chunk held, so a batch holds a bounded number of rows whatever the file's length.
+
+    Each input is the frame's row on its stored axis, with its σ when stored, at the file's recorded wavelength (the
+    monochromator's, as Int's Browse reads it; None when not recorded). ``unit`` places the rows on a displayed unit:
+    q (Å⁻¹) and 2θ (°) convert with ``convert_radial_axis`` at that wavelength, as Int's plot converts them; any other
+    difference is refused. A missing file, mode or frame is refused by name (``FIT_SOURCE_...``). Blocking: hosts call
+    it on their fit worker."""
+
+    def __init__(self, path, *, mode, entry='entry', unit=None, chunk=_INT_ROW_CHUNK):
+        from pathlib import Path
+        self.path = Path(path)
+        self.mode, self.entry, self.unit = str(mode), str(entry), None if unit is None else str(unit)
+        self._chunk = max(1, int(chunk))
+        self._labels = None
+        self._rows = None
+        self._wavelength = _UNREAD
+
+    def _open(self):
+        from xrd_tools.io.frame_view import FrameViewReader
+        if not self.path.is_file():
+            raise _source_refused('UNREADABLE', f'the source file is missing: {self.path}')
+        return FrameViewReader(self.path, entry=self.entry, include_thumbnail=False, resolve_source=False)
+
+    def _unreadable(self, error) -> ValueError:
+        return _source_refused('UNREADABLE', f'{self.path.name} is not a readable xdart NeXus result: {error}')
+
+    def _inventory(self, reader) -> tuple[int, ...]:
+        if self._labels is None:
+            modes = tuple(reader.modes_1d())
+            if self.mode not in modes:
+                raise _source_refused('MODE_MISSING', f'{self.path.name} has no 1-D mode {self.mode!r}; its modes are '
+                                                      f'{", ".join(modes) or "none"}')
+            self._labels = reader.labels_1d(self.mode)
+        return self._labels
+
+    def labels(self) -> tuple[int, ...]:
+        """The frames with a stored row in the mode, ascending."""
+        if self._labels is None:
+            try:
+                with self._open() as reader:
+                    self._inventory(reader)
+            except ValueError as error:
+                if str(error).startswith('FIT_SOURCE_'):
+                    raise
+                raise self._unreadable(error) from None
+            except (OSError, RuntimeError, KeyError, TypeError) as error:
+                raise self._unreadable(error) from None
+        return self._labels
+
+    def wavelength_angstrom(self) -> float | None:
+        """The file's recorded wavelength in Å (None: not recorded), read once."""
+        if self._wavelength is _UNREAD:
+            from xrd_tools.core.energy import wavelength_m_to_angstrom
+            from xrd_tools.io.browse_presentation import read_browse_presentation
+            try:
+                presentation, _mask = read_browse_presentation(self.path, entry=self.entry)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                raise self._unreadable(error) from None
+            value = presentation.get('wavelength_m')
+            self._wavelength = None if value is None else wavelength_m_to_angstrom(value, allow_default_sentinel=True)
+        return self._wavelength
+
+    def _rows_with(self, frame: int):
+        held = self._rows
+        if held is not None and frame in held.labels:
+            return held
+        from bisect import bisect_left
+        self._rows = None  # the held chunk goes before the next is read
+        try:
+            with self._open() as reader:
+                labels = self._inventory(reader)
+                index = bisect_left(labels, frame)
+                if index == len(labels) or labels[index] != frame:
+                    raise _source_refused('FRAME_MISSING', f'{self.path.name} has no frame {frame} in 1-D mode '
+                                                           f'{self.mode!r}')
+                rows = reader.read_1d_rows(tuple(labels[index:index + self._chunk]), modes=(self.mode,))
+        except ValueError as error:
+            if str(error).startswith('FIT_SOURCE_'):
+                raise
+            raise self._unreadable(error) from None
+        except (OSError, RuntimeError, KeyError, TypeError) as error:
+            raise self._unreadable(error) from None
+        self._rows = next(mode for mode in rows.modes if mode.mode == self.mode)
+        return self._rows
+
+    def snapshot(self, frame) -> FitInputSnapshot:
+        """Frame ``frame``'s stored row as a fit input (the class docstring)."""
+        from xrd_tools.core import axis_from_unit
+        if type(frame) is not int or frame < 0:
+            raise _source_refused('INVALID', f'a source frame is a whole number, not {frame!r}')
+        rows = self._rows_with(frame)
+        values, sigma = rows.row(frame)
+        axis = rows.axis
+        x, label, unit = axis.values, axis.label, axis.unit
+        wavelength = self.wavelength_angstrom()
+        if self.unit is not None and self.unit != unit:
+            if not {unit, self.unit} <= _DISPLAY_UNITS:
+                raise _source_refused('AXIS_MISMATCH', f'{self.path.name} stores mode {self.mode!r} in {unit}, which '
+                                                       f'does not convert to the displayed {self.unit}')
+            if wavelength is None:
+                raise _source_refused('WAVELENGTH_REQUIRED', f'{self.path.name} records no wavelength, which '
+                                                             f'converting {unit} to {self.unit} needs')
+            x = convert_radial_axis(np.asarray(x, dtype=float), unit, self.unit, wavelength)
+            label, unit = axis_from_unit(self.unit, x).label, self.unit
+        selection = (('meaning', 'radial'), ('frame', frame), ('mode', self.mode))
+        if self.unit is not None:
+            selection += (('unit', self.unit),)
+        key = FitInputKey(f'{self.path.stem} frame {frame}', str(self.path), _row_digest(self.mode, unit, x, values,
+                                                                                        sigma), 0, selection)
+        return FitInputSnapshot(key, (FitAxis(label, unit, x),), values, wavelength_angstrom=wavelength, sigma=sigma)
+
+
+def int_frame_snapshot(path, frame, *, mode, entry='entry', unit=None) -> FitInputSnapshot:
+    """One Int result frame's stored 1-D row as a fit input (``IntResultRows``, one frame read)."""
+    return IntResultRows(path, mode=mode, entry=entry, unit=unit, chunk=1).snapshot(frame)
+
+
+def xye_fit_snapshot(path, *, unit) -> FitInputSnapshot:
+    """An .xye file's columns as a fit input on its chosen x ``unit`` (a file records none; its name only hints at it),
+    with its σ column when present and no wavelength (``phase_fit_snapshot`` refuses it by name)."""
+    import os
+    from pathlib import Path
+    from xrd_tools.core import axis_from_unit
+    from xrd_tools.io.export import read_xye
+    path = Path(path)
+    try:
+        size = os.stat(path).st_size
+    except OSError as error:
+        raise _source_refused('UNREADABLE', f'the source file cannot be read: {path} ({error.strerror or error})') \
+            from None
+    if size > _MAX_XYE_BYTES:
+        raise _source_refused('UNREADABLE', f'{path.name} is over 64 MiB')
+    try:
+        x, y, sigma = read_xye(path, strict=True)
+    except Exception as error:  # noqa: BLE001 - a source file is user input
+        raise _source_refused('UNREADABLE', f'{path.name} is not a two- or three-column .xye table: {error}') from None
+    x = np.asarray(x, dtype=float)
+    key = FitInputKey(path.stem, str(path), _row_digest('xye', str(unit), x, y, sigma), 0,
+                      (('meaning', 'radial'), ('unit', str(unit))))
+    return FitInputSnapshot(key, (FitAxis(axis_from_unit(str(unit), x).label, str(unit), x),), y, sigma=sigma)

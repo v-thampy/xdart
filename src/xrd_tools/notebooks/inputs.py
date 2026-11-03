@@ -60,8 +60,8 @@ class SourceReference:
     background: str = "none"
 
     def __post_init__(self):
-        if self.reader not in {"stitch", "rsm_lineout", "rsm_region"}:
-            raise ValueError("source reader is stitch, rsm_lineout or rsm_region")
+        if self.reader not in {"stitch", "rsm_lineout", "rsm_region", "int_1d"}:
+            raise ValueError("source reader is stitch, rsm_lineout, rsm_region or int_1d")
         if any(type(item) is not str for item in (self.path, self.label, self.result_fingerprint,
                                                   self.request_fingerprint, self.original_path)):
             raise TypeError("source reference identity fields are text")
@@ -155,6 +155,45 @@ def load_snapshot(reference: SnapshotReference | SourceReference, *, bundle_root
         raise NotebookInputError(f"INPUT_INVALID: {path}: {error}") from error
 
 
+def int_frame_reference(snapshot: FitInputSnapshot, *, data_root: str | Path | None = None) -> SourceReference:
+    """An Int result frame's fit input (``fit_sources.IntResultRows``) as a notebook source (NEXT-128-WINDOW-POLISH
+    item 11: "notebook export names the source"): its file (relative to ``data_root`` when under it), entry, frame,
+    mode and displayed unit, its row's content identity, and the file's recorded size and mtime. Replayed by the same
+    reader; a row that changed is INPUT_CHANGED."""
+    if type(snapshot) is not FitInputSnapshot:
+        raise TypeError("an Int frame reference is made from its FitInputSnapshot")
+    key = snapshot.key
+    selection = dict(key.selection)
+    if "frame" not in selection or "mode" not in selection:
+        raise ValueError("an Int frame reference needs a frame and 1-D mode input")
+    path = Path(key.path)
+    stored = path
+    if data_root is not None:
+        try:
+            stored = path.relative_to(Path(data_root))
+        except ValueError:
+            pass  # an explicitly external result keeps its absolute path
+    facts = path.stat()
+    return SourceReference(str(stored), "int_1d", key.result_identity, key.fingerprint, "",
+                           (("entry", str(selection.get("entry", "entry"))), ("frame", int(selection["frame"])),
+                            ("mode", str(selection["mode"])), ("unit", str(selection.get("unit", "")))),
+                           file_facts=(facts.st_size, facts.st_mtime_ns), original_path=str(path))
+
+
+def _load_int_frame(reference: SourceReference, path: Path) -> FitInputSnapshot:
+    from dataclasses import replace
+    from xrd_tools.analysis.fit_sources import int_frame_snapshot
+    selection = dict(reference.selection)
+    try:
+        snapshot = int_frame_snapshot(path, selection["frame"], mode=selection["mode"],
+                                      entry=selection.get("entry", "entry"), unit=selection.get("unit") or None)
+    except (ValueError, KeyError) as error:
+        raise NotebookInputError(f"INPUT_SOURCE_INVALID: {path}: {error}") from error
+    if snapshot.key.fingerprint != reference.result_fingerprint:
+        raise NotebookInputError(f"INPUT_CHANGED: {path}; frame {selection['frame']}'s stored row differs")
+    return replace(snapshot, key=replace(snapshot.key, result_identity=reference.label))
+
+
 def _load_source(reference: SourceReference, *, data_root):
     from xrd_tools.io.analysis_artifact import read_analysis_artifact, AnalysisArtifactError
     from xrd_tools.analysis import fit_sources
@@ -169,6 +208,8 @@ def _load_source(reference: SourceReference, *, data_root):
     if reference.original_path and path.absolute() == Path(reference.original_path).absolute():
         if reference.file_facts is not None and facts != reference.file_facts:
             raise NotebookInputError(f"INPUT_CHANGED: {path}; source is a new admitted input")
+    if reference.reader == "int_1d":
+        return _load_int_frame(reference, path)
     try:
         payload = read_analysis_artifact(path)
     except (AnalysisArtifactError, ValueError, OSError) as error:

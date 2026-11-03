@@ -3351,6 +3351,16 @@ class FrameViewReader:
         self._revalidate_reader_open(state)
         return result
 
+    def labels_1d(self, mode: str) -> tuple[int, ...]:
+        """The frame labels with a persisted 1-D row in ``mode``, ascending, read from the open inventory (no row is
+        read). A mode the record does not hold is refused by name, as ``read_1d_rows`` refuses it."""
+        state = self._require_reader_open()
+        if type(mode) is not str or mode not in self._g1_modes:
+            raise ValueError(f"no 1-D mode {mode!r} in this record")
+        result = tuple(sorted(int(label) for label in self._map_1d_modes.get(mode, {})))
+        self._revalidate_reader_open(state)
+        return result
+
     def modes_2d(self) -> tuple:
         """GI 2D mode_keys present (primary first)."""
         state = self._require_reader_open()
