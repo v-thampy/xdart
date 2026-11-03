@@ -237,8 +237,10 @@ class SnapshotFitHost(QtCore.QObject):
         self._last_settings = plain_settings(dict(request.settings))
         self._adopt_template(self.outcomes)
         self.dialog.trend.clear()
+        phase_names = dict(request.settings).get('phase_names', ())
         for position, outcome in enumerate(self.outcomes):
-            self.dialog.trend.set_row(outcome.label, xs.get(outcome.label) if request.column else float(position), outcome.params)
+            self.dialog.trend.set_row(outcome.label, xs.get(outcome.label) if request.column else float(position),
+                                      outcome.params, phase_names=phase_names)
         if not self.outcomes:
             return False
         outcome = self.outcomes[-1]

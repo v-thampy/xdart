@@ -94,6 +94,7 @@ class TrendRow:
     identity: str
     x: float | None
     params: Mapping[str, float]
+    phase_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,12 +283,13 @@ class TrendView(QtWidgets.QWidget):
             self._value_unit = unit
             self.redraw()
 
-    def set_row(self, identity: str, x: float | None, params: Mapping[str, float]) -> None:
+    def set_row(self, identity: str, x: float | None, params: Mapping[str, float], *, phase_names=()) -> None:
         """One result's parameters: its row is replaced (a re-fit), or added; a result with no parameters adds
-        nothing."""
+        nothing. A phase host passes the fitted names from that result's request, independent of key spelling."""
         if not params:
             return
-        self._rows[str(identity)] = TrendRow(str(identity), None if x is None else float(x), dict(params))
+        self._rows[str(identity)] = TrendRow(str(identity), None if x is None else float(x), dict(params),
+                                            tuple(phase_names))
         self._sync_families()
         self._sync_members()
         self.redraw()
@@ -334,7 +336,7 @@ class TrendView(QtWidgets.QWidget):
             self.right_view_box.setVisible(False)
             return
         x = np.asarray([xs[index] for index in drawn], dtype=float)
-        grouped = group_families(columns, phase=self._phase_members)
+        grouped = self._grouped(columns)
         colour = 0
         family = self.family.currentData()
         if family is not None:
@@ -373,7 +375,7 @@ class TrendView(QtWidgets.QWidget):
         keys: list[str] = []
         for row in self._rows.values():
             keys += [key for key in row.params if key not in keys]
-        families = tuple(group_families(keys, phase=self._phase_members))
+        families = tuple(self._grouped(keys))
         if frozenset(families) == frozenset(self._families):
             return
         for combo, none in ((self.family, False), (self.right_family, True)):
@@ -393,6 +395,10 @@ class TrendView(QtWidgets.QWidget):
         """A family's (key, member) entries whose member the chooser shows."""
         return [(key, member) for key, member in entries if member not in self._hidden]
 
+    def _grouped(self, keys):
+        names = tuple(dict.fromkeys(name for row in self._rows.values() for name in row.phase_names))
+        return group_families(keys, phase=self._phase_members, phase_names=names)
+
     def _sync_members(self) -> None:
         """The chooser lists every family's members (peak indices in order, or a phase fit's phases), keeping what was
         hidden; rebuilt only when the members change."""
@@ -400,7 +406,7 @@ class TrendView(QtWidgets.QWidget):
         for row in self._rows.values():
             keys += [key for key in row.params if key not in keys]
         members: list = []
-        for entries in group_families(keys, phase=self._phase_members).values():
+        for entries in self._grouped(keys).values():
             members += [member for _key, member in entries if member not in members]
         numbers = sorted(member for member in members if isinstance(member, int))
         members = tuple(numbers + [member for member in members if not isinstance(member, int)])

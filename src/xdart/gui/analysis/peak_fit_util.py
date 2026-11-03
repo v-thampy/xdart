@@ -42,22 +42,24 @@ def split_family(key):
 def _phase_family(key, phases):
     """A phase fit's key as ``(kind, phase)``: ``frac_<phase>`` -> ``("frac", phase)``, ``<phase>_<cell>`` ->
     ``(cell, phase)`` for a listed phase (longest name first); None for any other key."""
-    if key.startswith("frac_") and key[5:] in phases:
-        return "frac", key[5:]
+    # The analyzer publishes cells after fractions: when flat keys collide, the value is a cell.
     for phase in sorted(phases, key=len, reverse=True):
         if key.startswith(f"{phase}_") and key[len(phase) + 1:] in _CELL_KEYS:
             return key[len(phase) + 1:], phase
+    if key.startswith("frac_") and key[5:] in phases:
+        return "frac", key[5:]
     return None
 
 
-def group_families(keys, *, phase=False):
+def group_families(keys, *, phase=False, phase_names=()):
     """An iterable of param keys -> ordered ``{family: [(key, member), ...]}`` so a family's curves plot together:
     a peak fit's members are its peak indices (sorted); a phase fit's keys (``frac_<phase>``, ``<phase>_<cell>``)
     group by kind, their members the phases' names in the order of their fractions (NEXT-128-WINDOW-POLISH).
     With ``phase=True``, cell suffixes also identify phases when lattice-only fits withhold every fraction.
-    Other trend consumers retain their peak and bare-key grouping."""
+    A phase host supplies its request's ``phase_names`` so names starting with ``frac_`` are not mistaken for
+    fractions. Other trend consumers retain their peak and bare-key grouping."""
     keys = list(keys)
-    phases = [key[5:] for key in keys if key.startswith("frac_") and len(key) > 5]
+    phases = list(phase_names) or [key[5:] for key in keys if key.startswith("frac_") and len(key) > 5]
     if phase and not phases:
         phases = list(dict.fromkeys(head for key in keys for head, _, tail in (key.rpartition("_"),)
                                     if head and tail in _CELL_KEYS))
