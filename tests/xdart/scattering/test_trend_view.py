@@ -29,7 +29,7 @@ def test_rows_are_keyed_by_result_drawn_by_x_repeats_kept_and_an_unavailable_x_l
     after them, never compared with a number."""
     view = TrendView()
     try:
-        assert not view.family.isEnabled() and not view.save.isEnabled() and not view.overlay.isEnabled()
+        assert not view.family.isEnabled() and not view.save.isEnabled() and not view.members.isEnabled()
         view.set_row("b", 2.0, {"center_0": 2.1})
         view.set_row("a", 1.0, {"center_0": 2.0})
         view.set_row("c", 2.0, {"center_0": 2.2})  # another result at the same x: its own row
@@ -83,16 +83,20 @@ def test_a_second_family_goes_on_the_right_axis_once_and_none_turns_it_off(qapp)
         view.deleteLater()
 
 
-def test_overlay_draws_every_peak_of_the_family_and_a_choice_survives_new_rows(qapp):
+def test_members_draw_every_peak_by_default_and_choices_survive_new_rows(qapp):
     view = TrendView()
     try:
         view.set_row("0", 0, {"center_0": 1.0, "center_1": 2.0, "fwhm_0": 0.1, "fwhm_1": 0.2})
         _choose(view.family, "fwhm")
-        assert [name for name, *_xy in _curves(view)] == ["fwhm_0"]
-        view.overlay.setChecked(True)
         assert [name for name, *_xy in _curves(view)] == ["fwhm_0", "fwhm_1"]
+        actions = {action.text(): action for action in view.members.menu().actions() if action.text()}
+        actions["Peak 1"].trigger()
+        assert [name for name, *_xy in _curves(view)] == ["fwhm_0"]
         view.set_row("1", 1, {"center_0": 1.1, "center_1": 2.1, "fwhm_0": 0.11, "fwhm_1": 0.21})
-        assert view.family.currentData() == "fwhm" and len(_curves(view)) == 2
+        assert view.family.currentData() == "fwhm" and len(_curves(view)) == 1
+        actions = {action.text(): action for action in view.members.menu().actions() if action.text()}
+        actions["All"].trigger()
+        assert len(_curves(view)) == 2
     finally:
         view.deleteLater()
 
