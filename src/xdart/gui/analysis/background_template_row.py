@@ -487,7 +487,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         its popup)."""
         template, source = self._template, self._source
         if template is not None:  # a captured trace is usable whether or not a file names it
-            name = template.title or template.label
+            name = f"{template.title} ({template.label})" if template.title else template.label  # with its axis
             if "UNREPRODUCIBLE" in self._reason:
                 return f"Displayed: {name}: its file does not hold this trace; not saved or exported"
             return f"Displayed: {name}" + ("; its file is checked at the first fit" if source is not None else
