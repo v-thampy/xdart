@@ -3,8 +3,8 @@
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
-from tests.core.test_int_fit_source import _result
-from tests.xdart.test_fit_source_gui import _choose_nexus, _drain, _window
+from tests.core.test_int_fit_source import _result, _peak, _stored
+from tests.xdart.test_fit_source_gui import _choose_nexus, _displayed, _drain, _window
 from tests.xdart.scattering.test_fit_tools_preservation import _close_page, _page
 
 
@@ -45,5 +45,24 @@ def test_a_source_read_problem_opens_once_in_a_popup(qapp, tmp_path):
         dialog.refresh_btn.click()
         _drain(qapp, host)
         assert row.message_box is box, "the same source problem does not repeat"
+    finally:
+        _close_page(page, qapp)
+
+
+def test_raising_a_file_source_window_does_not_replace_it_with_ints_trace(qapp, tmp_path, monkeypatch):
+    import numpy as np
+    main = _result(tmp_path / "main.nexus")
+    chosen = _result(tmp_path / "chosen.nexus", shift=.3)
+    page = _page()
+    try:
+        trace, anchor = _displayed(main, 2)
+        monkeypatch.setattr(page, "_capture_analysis_trace", lambda _kind: (trace, anchor))
+        dialog, host = _window(page, "peak")
+        _choose_nexus(dialog, chosen, 1)
+        _drain(qapp, host)
+        np.testing.assert_array_equal(dialog._y, _stored(_peak(2.4)))
+        page._open_analysis_mount("peak")  # the same launcher raises its retained window
+        assert page._peak_dialog is dialog and dialog.fit_source().path == str(chosen)
+        np.testing.assert_array_equal(dialog._y, _stored(_peak(2.4)))
     finally:
         _close_page(page, qapp)
