@@ -387,12 +387,12 @@ def test_w9_int_captures_the_displayed_trace_as_the_substrate_and_export_refuses
     with run_page(qapp, tmp_path / "int", energies=(16, 16), mode="Int 1D") as (page, view):
         dialog = _open(qapp, page)
         assert dialog.substrate_template is None
+        dialog.fit_background_row.editor.setCurrentText("Substrate")  # PF9: the substrate row waits for this
+        qapp.processEvents()
         _press(qapp, dialog.substrate_capture_btn)
         template = dialog.substrate_template
         assert isinstance(template, DisplayedTraceInput) and template.axis_unit in {"q_A^-1", "1/angstrom", "A^-1"}
         assert template.label in dialog.background_card.status.text() and dialog.background_card.status.toolTip()
-        dialog.fit_background_row.editor.setCurrentText("Substrate")
-        qapp.processEvents()
         values = dialog.vnext_fit_values()
         assert values["background_template"] is template and values["fit_background"] == "template"
         buttons = tuple(dialog.export_actions.buttons.values())
