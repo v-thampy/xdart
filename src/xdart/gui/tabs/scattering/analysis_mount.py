@@ -29,13 +29,18 @@ RETENTION_LIMIT = 128 << 20
 def mount_target(kind: object, value: object) -> str | None:
     key = (kind, "" if kind is ShellCommandKind.SHOW_METADATA else str(value))
     return MOUNT_TARGETS.get(key)
-def analysis_start_allowed(page: object) -> bool:
+def analysis_start_allowed(page: object, *, except_host: object = None) -> bool:
+    """Whether the page may start an analysis now: no Run, no other analysis on its slot, and (NEXT-128-WINDOW-POLISH
+    item 11) no fit window's file fit or batch on its shared fit host, ``except_host`` excepted (a host's own next
+    request replaces its last)."""
     lifecycle = getattr(page, "_lifecycle", None)
     controller = getattr(page, "_context_controller", None)
     slot = getattr(page, "_analysis_slot", None)
     experiment_busy = getattr(page, "_experiment_operation_busy", None)
     phase = getattr(getattr(lifecycle, "phase", None), "value", None)
+    hosts = (*(getattr(page, "_fit_hosts", None) or {}).values(), *(getattr(page, "_retired_fit_hosts", None) or ()))
     return bool(
+        not any(host.computing for host in hosts if host is not except_host) and
         not getattr(page, "_closing", True)
         and not getattr(page, "_closed", True)
         and getattr(page, "_admission_state", None) is None

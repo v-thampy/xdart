@@ -112,13 +112,16 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """The Phase Analysis window; ``vnext_submit(action, values)`` is its host's ("reload", "fit", "close",
     "capture_template"), and ``allow_batch`` whether the host can fit a batch (Stitch can; Int's is held)."""
 
-    def __init__(self, parent=None, *, vnext_submit=None, allow_batch=False):
+    def __init__(self, parent=None, *, vnext_submit=None, allow_batch=False, source=False):
         super().__init__(parent)
+        #: Int's windows choose their input in a Source card (NEXT-128-WINDOW-POLISH item 11); other hosts have none
+        self._source_enabled = bool(source)
         if not callable(vnext_submit):
             raise TypeError("Phase Analysis fits through its host: Int's analysis mount or a SnapshotFitHost")
         self._vnext_submit = vnext_submit
         self._allow_batch = bool(allow_batch)
         self._batch_reason = '' if allow_batch else diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+        self._batch_tip = _BATCH_TIP
         self._fit_reason = ''
         self._running = False
         #: a host's probe of a fit it runs (Load settings waits for it); None: the host runs none in the background
@@ -173,6 +176,36 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return FormRow(label=label, path=_path(name), value=value, kind="int", minimum=minimum, maximum=maximum,
                        allow_blank=blank)
 
+    def _build_source(self):
+        """The input first (NEXT-128-WINDOW-POLISH item 11), on the shared Source row: Int's display or a processed
+        NeXus result's frame (an .xye records no wavelength, so it is refused when chosen)."""
+        from .background_template_row import FitSourceRow
+        from .peak_fit_dialog import SOURCE_TIP, SOURCE_TOPIC
+        self.source_card = self.source_row = None
+        if not self._source_enabled:
+            return
+        self.source_card = SectionCard("Source", self, collapsible=False)
+        self.source_card.set_purpose_tooltip(SOURCE_TIP.replace(" or an .xye file", ""))
+        self.source_card.set_help_topic(SOURCE_TOPIC)
+        self.source_row = FitSourceRow(self, xye=False)
+        self.source_row.set_help_topic(SOURCE_TOPIC)
+        self.source_card.add_row(self.source_row)
+        self.split.add_card(self.source_card)
+
+    def fit_source(self):
+        """The Source card's file (a ``BackgroundTemplateSource``), or None: Int's display, or a host with no card."""
+        return None if self.source_row is None else self.source_row.source
+
+    def set_batch_reason(self, reason="", tooltip=""):
+        """The host's Batch (NEXT-128-WINDOW-POLISH item 11): enabled when ``reason`` is "", its tooltip then saying
+        what it fits (``tooltip``); otherwise disabled, saying why. Sequential follows it."""
+        self._batch_reason = str(reason or "")
+        self._batch_tip = str(tooltip or _BATCH_TIP)
+        self._allow_batch = not self._batch_reason
+        self.sequential_row.editor.setEnabled(self._allow_batch)
+        self.sequential_row.set_reason(self._batch_reason)
+        self._sync_actions()
+
     def _build_ui(self):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
@@ -182,6 +215,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         from xdart.gui.tabs.scattering.tool_window import ToolWindowSplit
         self.split = ToolWindowSplit(self, name="phaseAnalysis")
         self.splitter, self.displays = self.split, self.split.displays
+        self._build_source()
         self._build_phases()
         self._build_shape()
         self._build_background()
@@ -632,7 +666,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.batch_btn.setToolTip("Cancel the batch; the running solve finishes first.")
         else:
             self.batch_btn.setEnabled(not batch_reason)
-            self.batch_btn.setToolTip(batch_reason or _BATCH_TIP)
+            self.batch_btn.setToolTip(batch_reason or self._batch_tip)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
         self.background_template_row.set_busy('A batch is fitting; capture the substrate when it is done.'
                                               if self._running else '')
@@ -651,7 +685,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if refusal:
             self.status.setText(refusal)
             return
-        if self._x is None:  # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn
+        # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn (a file source's fit reads
+        # and shows its own frame)
+        if self._x is None and self.fit_source() is None:
             self._vnext_submit("reload", None)
             if self._x is None:
                 return

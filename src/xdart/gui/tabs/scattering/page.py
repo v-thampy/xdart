@@ -815,6 +815,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._metadata_dialog = self._scan_roi_dialog = None
         self._metadata_plot_dialog = None
         self._peak_dialog = self._phase_dialog = None
+        #: each open fit window's shared fit host (its file-source fits, batches and exports), and the hosts of closed
+        #: windows whose worker still drains (NEXT-128-WINDOW-POLISH item 11)
+        self._fit_hosts, self._retired_fit_hosts = {}, []
         # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
         self._metadata_question_dialog = None
         self._metadata_question_shown_for = None
@@ -1331,6 +1334,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         field = f"_{target}_dialog"
         if getattr(self, field, None) is not dialog: return
         setattr(self, field, None)
+        host = self._fit_hosts.pop(target, None) if target in {"peak", "phase"} else None
+        if host is not None:  # its fit is dropped; its worker drains before the page closes
+            host.retire()
+            self._retired_fit_hosts.append(host)
         if target in {"metadata", "scan_roi"}:
             from .analysis_mount import cancel_owned
             token = self._metadata_operations.dialog_identity(target)
@@ -1369,12 +1376,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 dialog = ScanPlotDialog(parent=self, vnext_submit=self._scan_analysis_action)
             elif target == "peak":
                 from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
-                dialog = PeakFitDialog(parent=self, vnext_submit=self._peak_analysis_action)
-                dialog.busy_probe = lambda: self._analysis_target == "peak" and self._analysis_identity is not None
+                dialog = PeakFitDialog(parent=self, vnext_submit=lambda action, values: self._fit_window_action(
+                    "peak", action, values), source=True)
+                dialog.busy_probe = lambda: self._fit_busy("peak")
             else:
                 from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-                dialog = PhaseFitDialog(parent=self, vnext_submit=self._phase_analysis_action)
-                dialog.busy_probe = lambda: self._analysis_target == "phase" and self._analysis_identity is not None
+                dialog = PhaseFitDialog(parent=self, vnext_submit=lambda action, values: self._fit_window_action(
+                    "phase", action, values), source=True)
+                dialog.busy_probe = lambda: self._fit_busy("phase")
                 # its list is this view's reference phases, attached before it opens (PHASE-ANALYSIS-128)
                 self._shell.scientific.attach_phase_list(dialog.phase_binding)
             dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -1382,6 +1391,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if target in {"peak", "phase"}:
                 dialog._export_snapshot_provider = lambda t=target: self._fit_export_snapshot(t)
                 dialog.background_template_row.describe_displayed = lambda t=target: self._displayed_template(t)
+                self._mount_fit_host(target, dialog)
             if target in {"metadata", "scan_roi"}:
                 if self._metadata_operations.open_dialog(target) is None:
                     dialog.close()
@@ -1513,9 +1523,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog.set_vnext_trace(trace, **options); return trace
 
     def _fit_export_snapshot(self, kind):
-        """Detach the current displayed trace and controls, never an earlier fit's input."""
-        trace, anchor = self._capture_analysis_trace(kind)
+        """Detach the current displayed trace and controls, never an earlier fit's input (a file source: the frame
+        its window shows)."""
         dialog = self._peak_dialog if kind == "peak" else self._phase_dialog
+        host = self._fit_hosts.get(kind)
+        if dialog is not None and host is not None and dialog.fit_source() is not None:
+            return host.snapshot
+        trace, anchor = self._capture_analysis_trace(kind)
         if trace is None or anchor is None or dialog is None:
             return None
         from .analysis_mount import phase_wavelength_angstrom
@@ -1549,6 +1563,197 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         candidate, reason = displayed_template_candidate(self._context_controller, trace,
                                                          None if anchor is None else anchor.frame)
         dialog.capture_background_template(trace, candidate, reason)
+
+    # ---- the fit windows' Source and Batch (NEXT-128-WINDOW-POLISH item 11) ------------------------------------
+    # The maintainer, 2026-11-03: "an option to choose a separate source than the nexus file selected in the main
+    # window in the fit windows"; his "Yes, in 1.2.8 with Batch" and "Stored rows; fit the substrate". With Int's
+    # display as the source, Fit and Reload stay on this page's analysis slot; a file source's Reload, Fit and export,
+    # and every Batch (each frame's stored 1-D curve), run on the window's shared fit host.
+    _FIT_WAITS = "A fit, batch or Run is running; try again when it is done."
+
+    def _fit_dialog(self, kind):
+        return self._peak_dialog if kind == "peak" else self._phase_dialog
+
+    def _fit_busy(self, kind):
+        host = self._fit_hosts.get(kind)
+        return ((self._analysis_target == kind and self._analysis_identity is not None)
+                or (host is not None and host.computing))
+
+    def _mount_fit_host(self, kind, dialog):
+        from xdart.gui.analysis.snapshot_fit_host import SnapshotFitHost
+        host = SnapshotFitHost(kind, parent=self, current=lambda: self._fit_file_target(kind),
+                               scope=lambda: self._fit_scope(kind), batch=lambda: self._fit_batch_targets(kind),
+                               dialog=dialog, owns_phase_source=False)
+        self._fit_hosts[kind] = host
+        dialog.batch_btn.clicked.connect(lambda _checked=False: self._fit_batch(kind))
+        dialog.source_row.changed.connect(lambda: self._fit_source_changed(kind))
+        dialog.source_row.describe_displayed = lambda: self._displayed_template(kind)
+        dialog.export_actions.export = lambda path: self._fit_export(kind, path)
+        self._sync_fit_batch(kind)
+
+    def _fit_window_action(self, kind, action, values):
+        """Int's fit windows' actions: Int's display source to this page's slot, a file source to the window's host."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        handler = self._peak_analysis_action if kind == "peak" else self._phase_analysis_action
+        if action == "close" or dialog is None or host is None:
+            return handler(action, values)
+        if dialog.fit_source() is None:
+            if action in {"fit", "reload", "capture_template"} and host.computing:
+                dialog.status.setText(self._FIT_WAITS)
+                return None
+            return handler(action, values)
+        if action == "capture_template":
+            return self._capture_source_template(kind)
+        from .analysis_mount import analysis_start_allowed
+        if action in {"fit", "reload"} and not analysis_start_allowed(self, except_host=host):
+            dialog.status.setText(self._FIT_WAITS)
+            return None
+        return host._action(action, values)
+
+    def _fit_batch(self, kind):
+        """Batch (or Cancel): every frame of the source's NeXus result, on the window's host."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        if dialog is None or host is None:
+            return
+        from .analysis_mount import analysis_start_allowed
+        if not host._batching and not analysis_start_allowed(self, except_host=host):
+            dialog.status.setText(self._FIT_WAITS)
+            return
+        host._batch()
+
+    def _fit_batch_source(self, kind):
+        """The batch's NeXus result as ``(path, mode, entry, unit)`` and "", or None and why there is none: a file
+        source's own, or the file and 1-D mode behind Int's displayed trace on its displayed unit."""
+        dialog = self._fit_dialog(kind)
+        source = None if dialog is None else dialog.fit_source()
+        if source is not None:
+            if source.kind != "nexus":
+                return None, ("An .xye file holds one curve, so it has no frames to batch: choose a processed NeXus "
+                              "result in the Source card.")
+            return (source.path, source.mode, source.entry, None), ""
+        trace, anchor = self._capture_analysis_trace(kind)
+        if trace is None:
+            return None, ("Batch fits the frames of a processed NeXus result: show one in Int (open it in Browse), or "
+                          "choose its file in the Source card.")
+        from .analysis_mount import displayed_template_candidate
+        candidate, why = displayed_template_candidate(self._context_controller, trace,
+                                                      None if anchor is None else anchor.frame)
+        if candidate is None:
+            return None, f"Batch fits the frames of a processed NeXus result: {why}."
+        return (candidate.path, candidate.mode, candidate.entry, trace.axis_unit or None), ""
+
+    def _sync_fit_batch(self, kind):
+        """Batch's state for the window's source (re-evaluated as Int's display changes): enabled with a NeXus result
+        to batch, its tooltip naming what it fits; otherwise disabled, saying why."""
+        dialog = self._fit_dialog(kind)
+        if dialog is None or kind not in self._fit_hosts:
+            return
+        facts, reason = self._fit_batch_source(kind)
+        if facts is None:
+            dialog.set_batch_reason(reason)
+            return
+        path, mode, _entry, _unit = facts
+        substrate = "template" if kind == "peak" else "substrate"
+        shown = ("" if dialog.fit_source() is not None else
+                 ": Int's χ slice, normalization and Set BG are display-only and are not applied")
+        dialog.set_batch_reason("", f"Fit every frame of {Path(path).name} ({mode}) with these settings, from each "
+                                    f"frame's stored 1-D curve as saved{shown}; remove a {substrate} with the "
+                                    f"{substrate.capitalize()} background. The trend plots the results against the "
+                                    "frame number.")
+
+    def _sync_fit_batches(self):
+        for kind in tuple(self._fit_hosts):
+            dialog = self._fit_dialog(kind)
+            if dialog is not None and dialog.isVisible() and dialog.fit_source() is None:
+                self._sync_fit_batch(kind)
+
+    def _fit_batch_targets(self, kind):
+        from xdart.gui.analysis.snapshot_fit_host import FitTarget
+        from xrd_tools.analysis.fit_sources import IntResultRows
+        from xrd_tools.notebooks.inputs import int_frame_reference
+        facts, reason = self._fit_batch_source(kind)
+        if facts is None:
+            raise ValueError(reason)
+        path, mode, entry, unit = facts
+        rows = IntResultRows(path, mode=mode, entry=entry, unit=unit)  # one chunk held as the worker reads them
+        stem = Path(path).stem
+        return tuple(FitTarget(f"{stem} frame {label}", lambda label=label: rows.snapshot(label), x=float(label),
+                               reference=lambda label=label: int_frame_reference(rows.snapshot(label)))
+                     for label in rows.labels())  # the inventory only: a few ms
+
+    def _fit_file_target(self, kind):
+        """The window's file source as the host's current input (read on its worker)."""
+        from xdart.gui.analysis.snapshot_fit_host import FitTarget
+        from xrd_tools.analysis.fit_sources import IntResultRows, xye_fit_snapshot
+        from xrd_tools.notebooks.inputs import int_frame_reference
+        dialog = self._fit_dialog(kind)
+        source = None if dialog is None else dialog.fit_source()
+        if source is None:
+            raise ValueError("FIT_SOURCE_REQUIRED: choose a file in the Source card, or fit Int's display")
+        if source.kind == "xye":
+            return FitTarget(Path(source.path).stem, lambda: xye_fit_snapshot(source.path, unit=source.unit))
+        rows, frame = IntResultRows(source.path, mode=source.mode, entry=source.entry, chunk=1), source.frame
+        return FitTarget(f"{Path(source.path).stem} frame {frame}", lambda: rows.snapshot(frame), x=float(frame),
+                         reference=lambda: int_frame_reference(rows.snapshot(frame)))
+
+    def _fit_scope(self, kind):
+        """What a host's fit belongs to: the window's generation and its source (a file's pairs, or the displayed
+        result's file, mode and unit); a fit of another is not adopted."""
+        dialog = self._fit_dialog(kind)
+        source = None if dialog is None else dialog.fit_source()
+        facts = self._fit_batch_source(kind)[0] if source is None else None
+        return (self._analysis_generation_for(kind), None if source is None else source.to_pairs(), facts)
+
+    def _fit_source_changed(self, kind):
+        """Another source: the window's shown input, fit and trend belong to the old one and go; the new one is shown
+        at once (a file's frame read on the host, or Int's displayed trace)."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        if dialog is None or host is None:
+            return
+        from .analysis_mount import cancel_owned
+        setattr(self, f"_{kind}_generation", getattr(self, f"_{kind}_generation") + 1)
+        if self._analysis_target == kind:
+            cancel_owned(self._analysis_slot, self._analysis_identity)
+        if kind == "peak":
+            self._peak_result = None
+        else:
+            self._phase_result = None
+        host.invalidate()
+        dialog.set_batch_running(False)
+        self._sync_fit_batch(kind)
+        if dialog.fit_source() is None:
+            self._refresh_fit_trace(kind)
+        elif not dialog.source_row.reason:
+            self._fit_window_action(kind, "reload", None)
+
+    def _capture_source_template(self, kind):
+        """Use displayed with a file source: the frame the window shows, named by its file, is the template."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        snapshot = None if host is None else host.snapshot
+        if snapshot is None:
+            dialog.status.setText("Reload the source first: the frame it shows becomes the template.")
+            return
+        from xrd_tools.analysis.background_template import BackgroundTemplateSource
+        selection = dict(snapshot.key.selection)
+        source = (BackgroundTemplateSource("nexus", snapshot.key.path, frame=selection["frame"],
+                                           mode=selection["mode"]) if "frame" in selection else
+                  BackgroundTemplateSource("xye", snapshot.key.path, unit=selection["unit"]))
+        dialog.background_template_row.restore((source, None))
+
+    def _fit_export(self, kind, path):
+        """Export: a file source's notebook names its file and frames (the host); Int's display's, as before."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        if dialog is None:
+            return
+        if host is not None and dialog.fit_source() is not None:
+            host._export(path)
+            return
+        from xdart.gui.analysis.fit_export import write_fit_notebook
+        snapshot = dialog.export_snapshot()
+        if snapshot is None:
+            raise ValueError("FIT_INPUT_REQUIRED: load a scientific input first")
+        write_fit_notebook(path, snapshot, kind, dialog.export_actions.settings())
+        dialog.status.setText(f"Exported {path}")
 
     def _peak_analysis_action(self, action, values):
         if action == "close":
@@ -3134,7 +3339,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
         from xdart.gui.pages.values import PageCleanup
         phase_close = self._shell.scientific.shutdown_phase_overlays()
+        # each fit window's host, open or retired, drains its worker first (NEXT-128-WINDOW-POLISH item 11)
+        fit_closes = tuple(host.shutdown() for host in (*self._fit_hosts.values(), *self._retired_fit_hosts))
         if (phase_close.status is not PageCleanup.CLEAN
+                or any(receipt.status is not PageCleanup.CLEAN for receipt in fit_closes)
                 or not self._release_browse_1d_debt()
                 or not self._clear_viewer_1d_renderer(close=True)
                 or not self._clear_viewer_2d_renderer(close=True)
@@ -7505,6 +7713,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._last_scientific_projection = (None
                 if scientific.processing_mode == "Int 1D" and heavy is not None
                 and heavy.detector_source == "full" else scientific)
+            self._sync_fit_batches()  # a fit window's Batch follows what Int shows
             self._context_controller.commit_navigation_projection(
                 tuple(frame for frame in self._shell.scientific.trace_history_keys
                       if self._context_controller.owns_frame(frame)),

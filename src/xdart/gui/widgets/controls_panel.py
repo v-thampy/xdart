@@ -982,6 +982,12 @@ class FormRow(QtWidgets.QWidget):
         self._collapse_path_editor()
         return True
 
+    def set_reason(self, reason: str = "") -> None:
+        """Why the row is disabled now, shown as its tooltip ("" shows its purpose again): a host's live state
+        (NEXT-128-WINDOW-POLISH item 11, Phase Analysis's Sequential following its Batch)."""
+        self._reason = str(reason or "")
+        self._refresh_tooltip()
+
     def _refresh_tooltip(self, refusal: str = "") -> None:
         tip = (f"{self.label.text()}: {refusal}" if refusal else
                self._reason or (self._model_value if self._browse and self._model_value else

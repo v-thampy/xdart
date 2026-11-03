@@ -78,6 +78,11 @@ _BACKGROUNDS = [
 #: each group of options' help topic (``xrd_tools.help_topics``)
 TOPICS = {"model": "peak-fit.model", "background": "peak-fit.background", "peaks": "peak-fit.peaks",
           "range": "peak-fit.range", "weighting": "peak-fit.weighting"}
+#: the Source card's help, shared with Phase Analysis (NEXT-128-WINDOW-POLISH item 11)
+SOURCE_TOPIC = "fit.source"
+SOURCE_TIP = ("What Fit, Reload and Batch read: the trace Int shows (the default) or a file you choose, a processed "
+              "NeXus result's frame or an .xye file.")
+_BATCH_TIP = "Fit every frame in the scan with these settings, then plot the parameters vs frame number."
 #: the Peak Fitter's saved settings (Save settings…, Load settings…); no last-session restore
 PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_settings", "Peak Fitter",
                                  sections=("background_template",))
@@ -117,11 +122,14 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """
 
     def __init__(self, pattern_provider=None, parent=None, *, analysis_context=None,
-                 vnext_submit=None, allow_batch=False):
+                 vnext_submit=None, allow_batch=False, source=False):
         super().__init__(parent)
         self._vnext = callable(vnext_submit)
         self._vnext_submit = vnext_submit
         self._allow_batch = bool(allow_batch)
+        #: Int's windows choose their input in a Source card (NEXT-128-WINDOW-POLISH item 11); other hosts have none
+        self._source_enabled = bool(source)
+        self._batch_reason, self._batch_tip = "", _BATCH_TIP
         self._export_trace = None
         self._export_snapshot_provider = None
         self._provider = (
@@ -149,7 +157,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.live_check.setToolTip(diagnostic_text("P3_7_LIVE_FITTING_UNAVAILABLE"))
             self.batch_btn.setEnabled(bool(allow_batch))
             if not allow_batch:
-                self.batch_btn.setToolTip(diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE"))
+                self._batch_reason = diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+                self.batch_btn.setToolTip(self._batch_reason)
         from .fit_export import FitExportActions
         self.export_actions = FitExportActions(self, tool='peak', snapshot=self.export_snapshot,
                                                settings=self.export_fit_values)
@@ -177,7 +186,18 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         # The fit's rows: model, background and its template, the peaks (a count and Auto, in one row) and the fit
         # range with Full, on the shared rows, each ending in its "?" (one column: "the question mark right most in
         # the same row" and "aligned with the question marks above").
-        from .background_template_row import BackgroundTemplateRow
+        from .background_template_row import BackgroundTemplateRow, FitSourceRow
+        # The input first (NEXT-128-WINDOW-POLISH item 11: "These should probably be the first thing in the left
+        # panel"): Int's display or a file, on the shared Source row.
+        self.source_card = self.source_row = None
+        if self._source_enabled:
+            self.source_card = SectionCard("Source", collapsible=False)
+            self.source_card.set_purpose_tooltip(SOURCE_TIP)
+            self.source_card.set_help_topic(SOURCE_TOPIC)
+            self.source_row = FitSourceRow(self)
+            self.source_row.set_help_topic(SOURCE_TOPIC)
+            self.source_card.add_row(self.source_row)
+            self.split.add_card(self.source_card)
         card = SectionCard("Peak fit", collapsible=False)
         card.set_purpose_tooltip("The peak model, the background and its template, the peaks and the fit range.")
         card.set_help_topic(TOPICS["model"])
@@ -247,9 +267,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.fit_btn = QtWidgets.QPushButton("Fit")
         self.fit_btn.setObjectName("peakFitGo")
         self.batch_btn = QtWidgets.QPushButton("Batch")
-        self.batch_btn.setToolTip(
-            "Fit every frame in the scan with these settings, then plot the "
-            "parameters vs frame number.")
+        self.batch_btn.setToolTip(_BATCH_TIP)
         self.load_settings_btn = QtWidgets.QPushButton("Load settings…")
         self.load_settings_btn.setToolTip("Restore every option and the template's file from a saved Peak Fitter "
                                           "settings file; a captured trace not named by its file is not saved.")
@@ -465,9 +483,24 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.fit_btn.setEnabled(not running)
         self.live_check.setEnabled(not running and not self._vnext)
         self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
+        self.batch_btn.setToolTip("Cancel the batch; the running solve finishes first." if running else
+                                  self._batch_reason or self._batch_tip)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
         self.background_template_row.set_busy('A batch is fitting; capture the template when it is done.'
                                               if running else '')
+
+    def set_batch_reason(self, reason="", tooltip=""):
+        """The host's Batch (NEXT-128-WINDOW-POLISH item 11): enabled when ``reason`` is "", its tooltip then saying
+        what it fits (``tooltip``); otherwise disabled, its tooltip saying why. A running batch keeps its Cancel."""
+        self._batch_reason, self._batch_tip = str(reason or ""), str(tooltip or _BATCH_TIP)
+        self._allow_batch = not self._batch_reason
+        if self.batch_btn.text() != "Cancel":
+            self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
+            self.batch_btn.setToolTip(self._batch_reason or self._batch_tip)
+
+    def fit_source(self):
+        """The Source card's file (a ``BackgroundTemplateSource``), or None: Int's display, or a host with no card."""
+        return None if self.source_row is None else self.source_row.source
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Batch fitting… {done}/{total}")
@@ -740,7 +773,9 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.status.setText(refusal)
             return
         if self._vnext:
-            if self._x is None:  # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn
+            # nothing shown yet: the displayed trace first, as Reload, so its fit can be drawn (a file source's fit
+            # reads and shows its own frame)
+            if self._x is None and self.fit_source() is None:
                 self._vnext_submit("reload", None)
                 if self._x is None:
                     return

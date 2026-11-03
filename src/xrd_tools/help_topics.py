@@ -900,6 +900,66 @@ xrd_tools/analysis/strain.py — sectors, the sin²ψ regression, d0 and elastic
 constants, the refraction estimate.
 xrd_tools/analysis/plans.py — StrainPlan and run_strain.
 """),
+    # NEXT-128-WINDOW-POLISH item 11 (2026-11-03): the fit windows' Source card, shared by both windows, appended.
+    HelpTopic("fit.source", "Fit windows: the source", """Purpose
+Choose what the Peak Fitter and Phase Analysis read: the trace Int shows, or a
+file of its own, so a window can fit another result than Int's, and Batch can
+fit every frame of a processed NeXus result.
+
+Required inputs
+Int's display (the default) or a file: a processed NeXus result, with the frame
+and 1-D mode to read, or (Peak Fitter only) an .xye file and its x unit.
+
+Steps
+1. Int's display: Reload and Fit take the trace Int shows, as it shows it (its
+   frame, 1-D mode, axis, χ slice, normalization and Set BG).
+2. Choose file…: pick the file; a popup asks a NeXus result's frame and 1-D mode,
+   or an .xye file's x unit (a file name's prefix only suggests it). The chosen
+   frame is read and shown at once; change the Frame or 1-D mode row to read
+   another.
+3. Batch fits every frame of the source's NeXus result (Int's display: the file
+   and 1-D mode it shows) from each frame's stored 1-D curve, then shows the last
+   frame; the trend plots the results against the frame number.
+4. Export Jupyter… or Export marimo… with a NeXus source names the file and its
+   frames in the notebook, which reads them again; nothing is copied.
+
+Units and conventions
+A file's frame is fitted on its stored axis. With Int's display, Batch places
+each stored curve on the axis Int shows: q (Å⁻¹) and 2θ (°) convert at the
+file's recorded wavelength, as Int's plot converts them.
+
+Assumptions
+Batch fits stored curves as saved: Int's χ slice, normalization and Set BG are
+display-only and are not applied, so remove a substrate with the template
+(substrate) background, which a notebook also replays. The source is the input,
+not a fit setting: it is not saved with the settings.
+
+Expected observations
+The Source card names the source; its tooltip gives the file's full path. A
+batch draws the last frame and fills the trend, one row per frame.
+
+Diagnostics
+FIT_SOURCE_FRAME_MISSING or FIT_SOURCE_MODE_MISSING: the file holds no such
+frame or 1-D mode (the message lists its modes). FIT_SOURCE_AXIS_MISMATCH: the
+stored curves do not convert to the axis Int shows. FIT_SOURCE_UNREADABLE: the
+file is missing or not an xdart NeXus result. Phase Analysis refuses an .xye
+file when it is chosen: it records no wavelength.
+
+Common mistakes and corrective actions
+Expecting Batch to fit Int's χ slice or Set BG-subtracted traces: it fits the
+stored curves; use the template background for a substrate. A changed file is
+reported in an exported notebook as INPUT_CHANGED: export it again.
+
+Worked example
+A 651-frame temperature series: choose its _int1d.nexus file, frame 0, mode
+default; set the range around one reflection; press Batch, then follow the
+center and FWHM against the frame number in the trend.
+
+References
+xrd_tools/analysis/fit_sources.py — IntResultRows, int_frame_snapshot and
+xye_fit_snapshot.
+xrd_tools/notebooks/inputs.py — the int_1d notebook source.
+"""),
 )
 
 

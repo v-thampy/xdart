@@ -20,12 +20,21 @@ from xrd_tools.analysis.runner import DisplayedPeakFitAnalyzer, DisplayedPhaseFi
 
 @dataclass(frozen=True)
 class FitTarget:
-    """A cheap queued input; load and optional metadata resolution run on the fit worker."""
+    """A cheap queued input; load and optional metadata resolution run on the fit worker. ``x`` is its trend
+    coordinate when no trend column is chosen (an Int frame's number; None: its place in the batch). ``reference`` is
+    its notebook source, or a zero-argument callable that makes it on the worker (an Int frame's row digest)."""
     label: str
     load: Callable
     trend: Callable | None = None
     column_names: tuple[str, ...] = ()
     reference: object = None
+    x: float | None = None
+
+
+def _reference(target):
+    """A target's notebook source: its own, made on the worker when it is a callable (None: capture a sidecar)."""
+    reference = target.reference if isinstance(target, FitTarget) else None
+    return reference() if callable(reference) else reference
 
 
 @dataclass(frozen=True)
@@ -65,11 +74,11 @@ def _job(request, cancel, progress):
                 for item in request.inputs[1:]:
                     if cancel.is_set():
                         raise ValueError('CANCELLED: notebook export cancelled')
-                    yield (item.reference if isinstance(item, FitTarget) and item.reference is not None
-                           else _snapshot(item, request.settings))
+                    reference = _reference(item)
+                    yield reference if reference is not None else _snapshot(item, request.settings)
             return write_fit_notebook(request.destination, snapshot, request.kind, settings,
                                       batch_inputs=batch_inputs(), data_root=request.data_root, trend_column=request.column,
-                                      reference=getattr(request.inputs[0], 'reference', None))
+                                      reference=_reference(request.inputs[0]))
         return snapshot
     analyzer = (DisplayedPeakFitAnalyzer(settings=settings, cancel_token=cancel) if request.kind == 'peak' else
                 DisplayedPhaseFitAnalyzer(settings=settings, cancel_token=cancel, sequential=request.sequential))
@@ -81,7 +90,7 @@ def _job(request, cancel, progress):
         last[0] = snapshot
         label = snapshot.key.result_identity
         keys[label] = snapshot.key
-        xs[label] = None
+        xs[label] = getattr(target, 'x', None)
         if request.column and isinstance(target, FitTarget) and target.trend is not None:
             try:
                 value = target.trend(request.column)
@@ -102,13 +111,25 @@ _UNNAMED_CAPTURE = ("a result page's trace is not named by a NeXus file and fram
 
 class SnapshotFitHost(QtCore.QObject):
     """Mount Int's fit dialogs with explicit Batch capability, never unholding Int's own profile."""
-    def __init__(self, kind, parent=None, *, current, scope, batch=None, source_root=None):
+    def __init__(self, kind, parent=None, *, current, scope, batch=None, source_root=None, dialog=None,
+                 owns_phase_source=True):
         super().__init__(parent)
         from .peak_fit_dialog import PeakFitDialog
         from .phase_fit_dialog import PhaseFitDialog
         self.kind, self.current, self.scope, self.batch, self.source_root = kind, current, scope, batch, source_root
         self.outcomes, self.snapshot, self._keys = (), None, {}
         self._last_settings = ()
+        self._batching = False
+        #: whether shutdown also stops the Fitter's Add CIF… worker (Int's page owns it for the windows it mounts)
+        self._owns_phase_source = bool(owns_phase_source)
+        self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, parent=self)
+        self._shown_outcome = None
+        if dialog is not None:
+            # NEXT-128-WINDOW-POLISH item 11: Int's page mounts its own window and routes its actions; this host runs
+            # the window's file-source fits, its batches and its exports, with none of the result pages' rows.
+            self.dialog, self.column_row = dialog, None
+            dialog.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_outcome(self._shown_outcome))
+            return
         self.dialog = (PeakFitDialog if kind == 'peak' else PhaseFitDialog)(parent=parent,
             vnext_submit=self._action, allow_batch=batch is not None)
         self.dialog.batch_btn.clicked.connect(self._batch)
@@ -127,8 +148,6 @@ class SnapshotFitHost(QtCore.QObject):
         else:
             self.dialog.layout().insertWidget(0, self.column_row)
         self.column_row.setVisible(batch is not None)
-        self.owner = LatestRequestOwner(_job, self._done, same=lambda a, b: a is b, parent=self)
-        self._shown_outcome = None
         # a peak fit's own peaks are evaluated only while Components is on
         self.dialog.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_outcome(self._shown_outcome))
 
@@ -138,10 +157,14 @@ class SnapshotFitHost(QtCore.QObject):
 
     @property
     def trend_column(self):
+        if self.column_row is None:
+            return ''
         value = self.column_row.editor.currentText().strip()
         return '' if value == 'Result order' else value
 
     def set_trend_columns(self, names):
+        if self.column_row is None:
+            return
         combo = self.column_row.editor
         current = combo.currentText()
         combo.clear()
@@ -153,6 +176,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.owner.forget()
         self.dialog.status.setText({'reload': 'Loading…', 'export': 'Exporting…',
                                     'capture': 'Capturing the substrate…'}.get(action, 'Fitting…'))
+        self._batching = action == 'batch'
         if action == 'batch':
             self.dialog.set_batch_running(True)
         elif action == 'reload':
@@ -192,8 +216,9 @@ class SnapshotFitHost(QtCore.QObject):
                 self.dialog.status.setText(str(error))
 
     def _batch(self):
-        if self.computing:
+        if self.computing and (self._batching or self.column_row is not None):
             self.owner.release()
+            self._batching = False
             self.dialog.set_batch_running(False)
             self.dialog.status.setText('Cancelled; the running solve is draining')
             return
@@ -202,11 +227,18 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.status.setText(refusal)
             return
         if self.batch is not None:
-            targets = tuple(self.batch())
+            try:
+                targets = tuple(self.batch())
+            except (ValueError, OSError) as error:  # the host names why it has nothing to batch
+                self.dialog.status.setText(str(error))
+                return
             self.set_trend_columns(n for target in targets for n in target.column_names)
             self._request('batch', targets)
 
     def _done(self, request, terminal):
+        self._batching = False
+        if self.dialog is None:  # a retired host: its window is gone
+            return False
         self.dialog.set_batch_running(False)
         try:
             # plain projections on both sides: a substrate compares by its trace identity, never its arrays
@@ -239,7 +271,8 @@ class SnapshotFitHost(QtCore.QObject):
         self.dialog.trend.clear()
         phase_names = dict(request.settings).get('phase_names', ())
         for position, outcome in enumerate(self.outcomes):
-            self.dialog.trend.set_row(outcome.label, xs.get(outcome.label) if request.column else float(position),
+            x = xs.get(outcome.label)
+            self.dialog.trend.set_row(outcome.label, x if request.column or x is not None else float(position),
                                       outcome.params, phase_names=phase_names)
         if not self.outcomes:
             return False
@@ -296,10 +329,17 @@ class SnapshotFitHost(QtCore.QObject):
 
     def invalidate(self):
         self.owner.release()
+        self._batching = False
         self.snapshot = self._shown_outcome = None
         self.outcomes, self._keys = (), {}
-        self.dialog.clear_input()
-        self.dialog.trend.clear()
+        if self.dialog is not None:
+            self.dialog.clear_input()
+            self.dialog.trend.clear()
+
+    def retire(self):
+        """The window closed (Int's page): drop its fit and the window, keeping the worker for ``shutdown``."""
+        self.invalidate()
+        self.dialog = None
 
     def _export(self, path):
         try:
@@ -314,13 +354,12 @@ class SnapshotFitHost(QtCore.QObject):
         settings = self.dialog.export_actions.settings()
         frozen = plain_settings(settings)
         inputs = () if self.batch is None else tuple(self.batch())
-        batch = (item.reference if isinstance(item, FitTarget) and item.reference is not None
-                 else _snapshot(item, frozen) for item in inputs)
+        batch = (_reference(item) or _snapshot(item, frozen) for item in inputs)
         current = self.current()
         return write_fit_notebook(path, _snapshot(current, frozen), self.kind, settings,
                                   batch_inputs=batch, trend_column=self.trend_column,
                                   data_root=self.source_root() if callable(self.source_root) else self.source_root,
-                                  reference=getattr(current, 'reference', None))
+                                  reference=_reference(current))
 
     def export_csv(self, path):
         from xrd_tools.analysis.fit_table import outcomes_table, table_csv
@@ -345,7 +384,7 @@ class SnapshotFitHost(QtCore.QObject):
         """Close the fit worker and the Fitter's Add CIF… worker: CLEAN, or PENDING while either runs."""
         self.invalidate()
         receipts = [self.owner.shutdown()]
-        source = getattr(self.dialog, 'phase_source', None)
+        source = getattr(self.dialog, 'phase_source', None) if self._owns_phase_source else None
         if source is not None:
             receipts.append(source.shutdown())
         return next((receipt for receipt in receipts if receipt.status is not PageCleanup.CLEAN), receipts[0])

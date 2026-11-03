@@ -48,7 +48,144 @@ def _path(name):
     return ("background_template", name)
 
 
-class BackgroundTemplateRow(QtWidgets.QWidget):
+class CurveFileRow(QtWidgets.QWidget):
+    """The file half shared by the template row and the fit windows' Source row (NEXT-128-WINDOW-POLISH item 11): a
+    status line, a row of buttons ending in the "?", a NeXus file's Frame and 1-D mode rows and an .xye file's x unit
+    row (the shared ``FormRow``), the file chooser (the shared ``file_dialogs``) and the popups that ask an .xye file's
+    unit and a NeXus file's frame (the shared ``AdvancedDialog``) or show a message about a file. ``what`` names the
+    curve in every text ("template", "substrate", "source"); ``filter_name`` is the chooser's ``file_dialogs`` filter."""
+
+    def __init__(self, parent=None, *, what, filter_name="BACKGROUND_TEMPLATE_FILTER"):
+        super().__init__(parent)
+        self._what = what
+        self._filter_name = filter_name
+        self._announced = ""    # the last message shown in a popup
+        self.message_box = None
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.status = QtWidgets.QLabel("", self)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self._buttons = QtWidgets.QHBoxLayout()
+        self._buttons.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self._buttons)
+
+    def _curve_rows(self, root, *, unit_tip, frame_tip, mode_tip):
+        """The x unit, Frame and 1-D mode rows under ``root`` (a settings path's first part), added to the layout."""
+        unit_row = FormRow(label="x unit", path=(root, "unit"), value="", kind="combo",
+                           choices=("", *(unit for unit, _label in XYE_UNITS)),
+                           choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
+        unit_row.set_purpose_tooltip(unit_tip)
+        frame_row = FormRow(label="Frame", path=(root, "frame"), value="", kind="int", minimum=0,
+                            maximum=1_000_000_000, allow_blank=True)
+        frame_row.set_purpose_tooltip(frame_tip)
+        mode_row = FormRow(label="1-D mode", path=(root, "mode"), value=NEXUS_MODES[0], kind="combo",
+                           choices=NEXUS_MODES)
+        mode_row.set_purpose_tooltip(mode_tip)
+        for row in (unit_row, frame_row, mode_row):
+            self.layout().addWidget(row)
+        return unit_row, frame_row, mode_row
+
+    # ---- the file half's popups and chooser (shared) -----------------------------
+    def _notify(self, headline: str, detail: str) -> None:
+        """The popup: Qt's message box, as Int's page shows its notices, not modal; a newer message replaces it."""
+        if self.message_box is not None:
+            self.message_box.close()
+            self.message_box.deleteLater()
+        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.NoIcon, f"The {self._what}", headline,
+                                    QtWidgets.QMessageBox.StandardButton.Ok, self)
+        box.setInformativeText(detail)
+        box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        box.show()
+        self.message_box = box
+
+    # ---- the popups that ask -----------------------------------------------------
+    def _ask_unit(self, path: str, hint) -> str:
+        """An .xye file's x unit, asked in a popup ("" when cancelled; tests replace it)."""
+        dialog, unit_row = self._unit_dialog(path, hint)
+        try:
+            accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+            return unit_row.current_value() if accepted else ""
+        finally:
+            dialog.deleteLater()
+
+    def _unit_dialog(self, path: str, hint):
+        """The unit popup: the shared Advanced dialog with OK and Cancel, a line naming the file and what its name
+        suggests, and the unit row, chosen by the user (OK waits for it)."""
+        name = Path(path).name
+        suggestion = (f"Its name suggests {dict(XYE_UNITS).get(hint, hint)}, but xdart writes the same prefix for Å⁻¹ "
+                      "and nm⁻¹ (and for degrees and radians), so the name cannot decide." if hint else
+                      "Its name does not say.")
+        note = QtWidgets.QLabel(f"Which unit is the x column of {name} in?\n{suggestion}")
+        note.setWordWrap(True)
+        note.setToolTip("An .xye file records no unit: it must be the fit's, or convert to it without a wavelength.")
+        unit_row = FormRow(label="x unit", path=_path("unit"), value="", kind="combo",
+                           choices=("", *(unit for unit, _label in XYE_UNITS)),
+                           choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
+        unit_row.set_purpose_tooltip("The unit of the file's x column.")
+        return self._asking_dialog(f"The {self._what}'s x unit", (note, unit_row),
+                                   lambda: bool(unit_row.current_value())), unit_row
+
+    def _ask_frame(self, path: str, frame, mode):
+        """A NeXus file's frame and 1-D mode, asked in a popup: ``(frame, mode)``, or None when cancelled."""
+        dialog, frame_row, mode_row = self._frame_dialog(path, frame, mode)
+        try:
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return None
+            return frame_row.editor.value(), mode_row.current_value()
+        finally:
+            dialog.deleteLater()
+
+    def _frame_dialog(self, path: str, frame, mode):
+        note = QtWidgets.QLabel(f"Which frame and 1-D curve of {Path(path).name} is the {self._what}?")
+        note.setWordWrap(True)
+        note.setToolTip("A processed NeXus result holds many frames; the display names one only when it shows this "
+                        "file.")
+        frame_row = FormRow(label="Frame", path=_path("frame"), value="" if frame is None else str(frame), kind="int",
+                            minimum=0, maximum=1_000_000_000)
+        frame_row.set_purpose_tooltip("The frame label to read.")
+        mode_row = FormRow(label="1-D mode", path=_path("mode"), value=mode, kind="combo", choices=NEXUS_MODES)
+        mode_row.set_purpose_tooltip("The 1-D curve to read: default for a single result, or a grazing-incidence "
+                                     "mode.")
+        dialog = self._asking_dialog(f"The {self._what}'s frame", (note, frame_row, mode_row),
+                                     lambda: not frame_row.refusal())
+        frame_row.editor.textChanged.connect(lambda _text: self._ok_follows(dialog, lambda: not frame_row.refusal()))
+        return dialog, frame_row, mode_row
+
+    def _asking_dialog(self, title, rows, ready):
+        from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+        dialog = AdvancedDialog(self, title=title, object_name="backgroundTemplateAskDialog", accept_buttons=True)
+        dialog.add_group("", rows)
+        for row in rows:
+            if isinstance(row, FormRow) and row._kind == "combo":
+                row.editor.currentIndexChanged.connect(lambda _index: self._ok_follows(dialog, ready))
+        self._ok_follows(dialog, ready)
+        return dialog
+
+    @staticmethod
+    def _ok_follows(dialog, ready) -> None:
+        dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(bool(ready()))
+
+    def _file_chooser(self):
+        """The chosen file ("" when cancelled), through the shared ``file_dialogs`` (tests replace it)."""
+        from xdart.gui.widgets import file_dialogs
+        source = getattr(self, "_source", None)
+        picks = file_dialogs.browse(self, f"Choose the {self._what} file",
+                                    file_filter=getattr(file_dialogs, self._filter_name),
+                                    current="" if source is None else source.path)
+        return picks[0] if picks else ""
+
+    def set_help_topic(self, topic_id: str) -> None:
+        """Bind F1 and a "?" to ``topic_id``, as the shared rows do."""
+        from xdart.gui.widgets.context_help import bind_topic
+        bind_topic(self, topic_id)
+        if not hasattr(self, "help_button"):
+            self.help_button = ActionButton.for_help(self, topic_id)
+            self._buttons.addWidget(self.help_button)
+
+
+class BackgroundTemplateRow(CurveFileRow):
     """The template row; ``what`` names the template in its texts ("template", Phase Analysis's "substrate").
 
     ``changed`` is emitted after every change of the template, its source, identity or reason. The host's "Use
@@ -59,27 +196,16 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
     changed = QtCore.Signal()
 
     def __init__(self, parent=None, *, what="template", capture_label="Use displayed", clear_label="Clear"):
-        super().__init__(parent)
+        super().__init__(parent, what=what)
         self.setObjectName("backgroundTemplateRow")
-        self._what = what
         self._template = None   # a captured DisplayedTraceInput
         self._source = None     # a BackgroundTemplateSource: chosen, restored, bound, or a capture's candidate
         self._identity = None   # the content identity a completed fit recorded
         self._reason = ""       # why the template cannot be named, read or exported now
         self._file = None       # (kind, path) of a chosen or bound file, whose rows rebuild its source
         self._available, self._waits, self._busy = True, "", ""  # the host's background and batch state
-        self._announced = ""    # the last message shown in a popup
-        self.message_box = None
         self.describe_displayed = None
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        self.status = QtWidgets.QLabel("", self)
         self.status.setObjectName("backgroundTemplateStatus")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
-        self._buttons = QtWidgets.QHBoxLayout()
-        self._buttons.setContentsMargins(0, 0, 0, 0)
         self.capture_btn = ActionButton(ControlActionSpec(ControlAction.PREVIEW, capture_label, SectionId.PROCESSING),
                                         self)
         self.capture_btn.set_purpose_tooltip(
@@ -99,25 +225,15 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
             button.setAutoDefault(False)
             self._buttons.addWidget(button)
         self._buttons.addStretch(1)
-        layout.addLayout(self._buttons)
-        self.unit_row = FormRow(label="x unit", path=_path("unit"), value="", kind="combo",
-                                choices=("", *(unit for unit, _label in XYE_UNITS)),
-                                choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
-        self.unit_row.set_purpose_tooltip(
-            "The .xye file's x unit. A file name's xdart prefix (iq_, itth_, iqip_, iqoop_, iexit_) only suggests "
-            "it: confirm it. It must be the fit's unit, or convert to it without a wavelength (Å⁻¹ and nm⁻¹; "
-            "degrees and radians).")
-        self.frame_row = FormRow(label="Frame", path=_path("frame"), value="", kind="int", minimum=0,
-                                 maximum=1_000_000_000, allow_blank=True)
-        self.frame_row.set_purpose_tooltip(
-            "The NeXus result's frame label to read; a frame the file does not hold is refused at the fit.")
-        self.mode_row = FormRow(label="1-D mode", path=_path("mode"), value=NEXUS_MODES[0], kind="combo",
-                                choices=NEXUS_MODES)
-        self.mode_row.set_purpose_tooltip(
-            "The NeXus result's 1-D curve: default for a single result; q_total, q_ip, q_oop, exit_angle or chi_gi "
-            "for grazing incidence. A mode the file does not hold is refused at the fit, naming the file's modes.")
-        for row in (self.unit_row, self.frame_row, self.mode_row):
-            layout.addWidget(row)
+        self.unit_row, self.frame_row, self.mode_row = self._curve_rows(
+            "background_template",
+            unit_tip="The .xye file's x unit. A file name's xdart prefix (iq_, itth_, iqip_, iqoop_, iexit_) only "
+                     "suggests it: confirm it. It must be the fit's unit, or convert to it without a wavelength (Å⁻¹ "
+                     "and nm⁻¹; degrees and radians).",
+            frame_tip="The NeXus result's frame label to read; a frame the file does not hold is refused at the fit.",
+            mode_tip="The NeXus result's 1-D curve: default for a single result; q_total, q_ip, q_oop, exit_angle or "
+                     "chi_gi for grazing incidence. A mode the file does not hold is refused at the fit, naming the "
+                     "file's modes.")
         self.capture_btn.setObjectName("backgroundTemplateCapture")
         self.choose_btn.clicked.connect(self._choose)
         self.clear_btn.clicked.connect(self.clear)
@@ -330,94 +446,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
                 Path(self._source.path).name if self._source is not None else f"The displayed {self._what}")
         self._notify(f"{name}: {self._short()}", reason)
 
-    def _notify(self, headline: str, detail: str) -> None:
-        """The popup: Qt's message box, as Int's page shows its notices, not modal; a newer message replaces it."""
-        if self.message_box is not None:
-            self.message_box.close()
-            self.message_box.deleteLater()
-        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.NoIcon, f"The {self._what}", headline,
-                                    QtWidgets.QMessageBox.StandardButton.Ok, self)
-        box.setInformativeText(detail)
-        box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
-        box.show()
-        self.message_box = box
-
-    # ---- the popups that ask -----------------------------------------------------
-    def _ask_unit(self, path: str, hint) -> str:
-        """An .xye file's x unit, asked in a popup ("" when cancelled; tests replace it)."""
-        dialog, unit_row = self._unit_dialog(path, hint)
-        try:
-            accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
-            return unit_row.current_value() if accepted else ""
-        finally:
-            dialog.deleteLater()
-
-    def _unit_dialog(self, path: str, hint):
-        """The unit popup: the shared Advanced dialog with OK and Cancel, a line naming the file and what its name
-        suggests, and the unit row, chosen by the user (OK waits for it)."""
-        name = Path(path).name
-        suggestion = (f"Its name suggests {dict(XYE_UNITS).get(hint, hint)}, but xdart writes the same prefix for Å⁻¹ "
-                      "and nm⁻¹ (and for degrees and radians), so the name cannot decide." if hint else
-                      "Its name does not say.")
-        note = QtWidgets.QLabel(f"Which unit is the x column of {name} in?\n{suggestion}")
-        note.setWordWrap(True)
-        note.setToolTip("An .xye file records no unit: it must be the fit's, or convert to it without a wavelength.")
-        unit_row = FormRow(label="x unit", path=_path("unit"), value="", kind="combo",
-                           choices=("", *(unit for unit, _label in XYE_UNITS)),
-                           choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
-        unit_row.set_purpose_tooltip("The unit of the file's x column.")
-        return self._asking_dialog(f"The {self._what}'s x unit", (note, unit_row),
-                                   lambda: bool(unit_row.current_value())), unit_row
-
-    def _ask_frame(self, path: str, frame, mode):
-        """A NeXus file's frame and 1-D mode, asked in a popup: ``(frame, mode)``, or None when cancelled."""
-        dialog, frame_row, mode_row = self._frame_dialog(path, frame, mode)
-        try:
-            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-                return None
-            return frame_row.editor.value(), mode_row.current_value()
-        finally:
-            dialog.deleteLater()
-
-    def _frame_dialog(self, path: str, frame, mode):
-        note = QtWidgets.QLabel(f"Which frame and 1-D curve of {Path(path).name} is the {self._what}?")
-        note.setWordWrap(True)
-        note.setToolTip("A processed NeXus result holds many frames; the display names one only when it shows this "
-                        "file.")
-        frame_row = FormRow(label="Frame", path=_path("frame"), value="" if frame is None else str(frame), kind="int",
-                            minimum=0, maximum=1_000_000_000)
-        frame_row.set_purpose_tooltip("The frame label to read.")
-        mode_row = FormRow(label="1-D mode", path=_path("mode"), value=mode, kind="combo", choices=NEXUS_MODES)
-        mode_row.set_purpose_tooltip("The 1-D curve to read: default for a single result, or a grazing-incidence "
-                                     "mode.")
-        dialog = self._asking_dialog(f"The {self._what}'s frame", (note, frame_row, mode_row),
-                                     lambda: not frame_row.refusal())
-        frame_row.editor.textChanged.connect(lambda _text: self._ok_follows(dialog, lambda: not frame_row.refusal()))
-        return dialog, frame_row, mode_row
-
-    def _asking_dialog(self, title, rows, ready):
-        from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
-        dialog = AdvancedDialog(self, title=title, object_name="backgroundTemplateAskDialog", accept_buttons=True)
-        dialog.add_group("", rows)
-        for row in rows:
-            if isinstance(row, FormRow) and row._kind == "combo":
-                row.editor.currentIndexChanged.connect(lambda _index: self._ok_follows(dialog, ready))
-        self._ok_follows(dialog, ready)
-        return dialog
-
-    @staticmethod
-    def _ok_follows(dialog, ready) -> None:
-        dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(bool(ready()))
-
     # ---- choosing a file ---------------------------------------------------
-    def _file_chooser(self):
-        """The chosen template file ("" when cancelled), through the shared ``file_dialogs`` (tests replace it)."""
-        from xdart.gui.widgets import file_dialogs
-        picks = file_dialogs.browse(self, f"Choose the {self._what} file",
-                                    file_filter=file_dialogs.BACKGROUND_TEMPLATE_FILTER,
-                                    current="" if self._source is None else self._source.path)
-        return picks[0] if picks else ""
-
     def _choose(self) -> None:
         path = self._file_chooser()
         if not path:
@@ -521,17 +550,179 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         self._apply_controls()
         self.changed.emit()
 
-    def set_help_topic(self, topic_id: str) -> None:
-        """Bind F1 and a "?" to ``topic_id``, as the shared rows do."""
-        from xdart.gui.widgets.context_help import bind_topic
-        bind_topic(self, topic_id)
-        if not hasattr(self, "help_button"):
-            self.help_button = ActionButton.for_help(self, topic_id)
-            self._buttons.addWidget(self.help_button)
-
 
 def _same_file(first, second) -> bool:
     try:
         return Path(first).expanduser().resolve() == Path(second).expanduser().resolve()
     except (OSError, RuntimeError, ValueError):
         return str(first) == str(second)
+
+
+#: the Source row's texts (NEXT-128-WINDOW-POLISH item 11)
+_DISPLAY_TEXT = "Int's display (the trace Int shows)"
+_XYE_REFUSED = ("An .xye file records no wavelength, which phase fitting needs to place each reflection: choose a "
+                "processed NeXus result.")
+
+
+def _as_source(text: str) -> str:
+    """A template message reworded for the fit's source (its codes and nouns)."""
+    return str(text).replace("BACKGROUND_TEMPLATE_", "FIT_SOURCE_").replace("template", "source")
+
+
+class FitSourceRow(CurveFileRow):
+    """The fit windows' Source (NEXT-128-WINDOW-POLISH item 11; the maintainer, 2026-11-03: "an option to choose a
+    separate source than the nexus file selected in the main window in the fit windows", "Yes, in 1.2.8 with Batch"):
+    Int's display (the default) or a file curve, as a ``BackgroundTemplateSource`` (a NeXus result's frame and 1-D
+    mode, or an .xye file and its x unit), the value type the template row already names a file curve with.
+
+    "Int's display" follows Int: the host fits the trace Int shows. "Choose file…" asks the file, then its frame and
+    1-D mode or its x unit in the template row's popups; ``xye=False`` (Phase Analysis) refuses an .xye file in a popup,
+    since it records no wavelength. Editing the Frame, 1-D mode or x unit row changes the source. ``changed`` is
+    emitted after every change. The row reads no file (a chosen one is checked with a stat) and the source is not
+    saved with the settings: it is the input, not the recipe."""
+
+    changed = QtCore.Signal()
+
+    def __init__(self, parent=None, *, xye=True):
+        super().__init__(parent, what="source", filter_name="BACKGROUND_TEMPLATE_FILTER" if xye else "NEXUS_FILTER")
+        self.setObjectName("fitSourceRow")
+        self.status.setObjectName("fitSourceStatus")
+        self._xye = bool(xye)
+        self._source = None   # the chosen BackgroundTemplateSource, or None: Int's display
+        self._reason = ""     # why the chosen file cannot be read now ("" when it can)
+        self.describe_displayed = None
+        self.follow_btn = ActionButton(ControlActionSpec(ControlAction.PREVIEW, "Int's display", SectionId.PROCESSING),
+                                       self)
+        self.follow_btn.set_purpose_tooltip(
+            "Fit what Int shows: Reload and Fit take Int's displayed trace (its frame, 1-D mode, axis, χ slice, "
+            "normalization and Set BG); Batch fits every frame of the shown NeXus result from its stored 1-D curves.")
+        self.choose_btn = ActionButton(ControlActionSpec(ControlAction.PREVIEW, "Choose file…", SectionId.PROCESSING),
+                                       self)
+        self.choose_btn.set_purpose_tooltip(
+            "Fit a file instead of Int's display: a processed NeXus result's frame and 1-D mode"
+            + (" or an .xye file and its x unit" if xye else "")
+            + ". Reload and Fit read that frame's stored 1-D curve; Batch fits every frame of the NeXus result. The "
+              "source is not saved with the settings.")
+        for button in (self.follow_btn, self.choose_btn):
+            button.setAutoDefault(False)
+            self._buttons.addWidget(button)
+        self._buttons.addStretch(1)
+        self.unit_row, self.frame_row, self.mode_row = self._curve_rows(
+            "fit_source",
+            unit_tip="The .xye file's x unit, chosen when the file was: a file name's xdart prefix only suggests it.",
+            frame_tip="The NeXus result's frame that Reload and Fit read; Batch fits every frame. A frame the file "
+                      "does not hold is refused by name.",
+            mode_tip="The NeXus result's 1-D curve: default for a single result; q_total, q_ip, q_oop, exit_angle or "
+                     "chi_gi for grazing incidence. A mode the file does not hold is refused, naming its modes.")
+        self.follow_btn.clicked.connect(self.use_display)
+        self.choose_btn.clicked.connect(self._choose)
+        self.unit_row.editor.currentIndexChanged.connect(lambda _index: self._edited())
+        self.mode_row.editor.currentIndexChanged.connect(lambda _index: self._edited())
+        self.frame_row.valueChanged.connect(lambda _path, _value: self._edited())
+        self._sync()
+
+    @property
+    def source(self):
+        """The chosen ``BackgroundTemplateSource``, or None: Int's display."""
+        return self._source
+
+    @property
+    def reason(self):
+        """Why the chosen file cannot be read now ("" when it can, or with Int's display)."""
+        return self._reason
+
+    def use_display(self) -> None:
+        """Follow Int's display again."""
+        if self._source is None:
+            return
+        self._source, self._reason, self._announced = None, "", ""
+        self._sync()
+
+    def _choose(self) -> None:
+        path = self._file_chooser()
+        if not path:
+            return
+        name = Path(path).name
+        if Path(path).suffix.casefold() not in _NEXUS_SUFFIXES:
+            if not self._xye:
+                self._notify(f"{name}: not a NeXus result", _XYE_REFUSED)
+                return
+            # a name never fixes the scale (Codex REVIEW-3 F1): the popup asks and preselects nothing
+            unit = self._ask_unit(str(path), xye_unit_hint(path))
+            if not unit:
+                return  # cancelled: the source stays as it was
+            source = BackgroundTemplateSource("xye", str(path), unit=unit)
+        else:
+            current = self._source if self._source is not None and self._source.kind == "nexus" else None
+            frame, mode = (None, NEXUS_MODES[0]) if current is None else (current.frame, current.mode)
+            displayed = self.describe_displayed() if callable(self.describe_displayed) else None
+            if displayed is not None and _same_file(displayed[0], path):
+                frame, mode = displayed[1], displayed[2]  # the frame Int shows, offered first
+            asked = self._ask_frame(str(path), frame, mode)
+            if asked is None:
+                return
+            source = BackgroundTemplateSource("nexus", str(path), frame=int(asked[0]), mode=asked[1])
+        self._announced = ""  # a deliberate new choice can report the same problem again
+        self._set(source)
+
+    def _set(self, source) -> None:
+        if source == self._source:
+            return
+        self._source = source
+        self._reason = _as_source(template_file_problem(source))
+        self._sync()
+        if self._reason:
+            notice = (source.to_pairs(), self._reason)
+            if notice != self._announced:
+                self._announced = notice
+                self._notify(f"{Path(source.path).name}: cannot be read", self._reason)
+
+    def _edited(self) -> None:
+        """A user's edit of the Frame, 1-D mode or x unit row: the source becomes that frame, mode or unit."""
+        source = self._source
+        if source is None:
+            return
+        try:
+            if source.kind == "xye":
+                unit = self.unit_row.current_value()
+                edited = BackgroundTemplateSource("xye", source.path, unit=unit) if unit else source
+            else:
+                frame = None if self.frame_row.refusal() else self.frame_row.editor.value()
+                edited = source if frame is None else BackgroundTemplateSource(
+                    "nexus", source.path, frame=int(frame), mode=self.mode_row.current_value(), entry=source.entry)
+        except BackgroundTemplateRefused:
+            edited = source
+        if edited != source:
+            self._set(edited)
+
+    def describe(self) -> str:
+        """The source in one short line: Int's display, or the file and what is read from it."""
+        if self._source is None:
+            return _DISPLAY_TEXT
+        text = self._source.describe()
+        return f"{text}: cannot be read" if self._reason else text
+
+    def _sync(self) -> None:
+        source = self._source
+        text = self.describe()
+        self.status.setText(text)
+        detail = self._reason or ("" if source is None else source.path)
+        self.status.setToolTip("What Fit, Reload and Batch read: Int's display or a chosen file. "
+                               + (f"{text}. {detail}" if detail else f"{text}."))
+        kind = None if source is None else source.kind
+        self.unit_row.setVisible(kind == "xye")
+        self.frame_row.setVisible(kind == "nexus")
+        self.mode_row.setVisible(kind == "nexus")
+        with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor), \
+                QtCore.QSignalBlocker(self.frame_row.editor):
+            if kind == "xye":
+                self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(source.unit)))
+            elif kind == "nexus":
+                self.frame_row.editor.setValue(source.frame)
+                index = self.mode_row.editor.findText(source.mode)
+                self.mode_row.editor.setCurrentIndex(index if index >= 0 else 0)
+        spec = self.follow_btn.spec
+        self.follow_btn.apply_spec(ControlActionSpec(spec.action, spec.label, spec.section, enabled=source is not None,
+                                                     reason="" if source is not None else
+                                                     "Int's display is the source."))
+        self.changed.emit()
