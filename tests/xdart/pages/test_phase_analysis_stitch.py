@@ -63,6 +63,8 @@ def test_s2_a_two_theta_results_substrate_is_captured_in_inverse_angstrom(qapp, 
         _finish(host, qapp)
         dialog = host.dialog
         assert dialog.fit_btn.isEnabled()
+        dialog.fit_background_row.editor.setCurrentText("Substrate")  # PF9: the substrate row waits for this
+        qapp.processEvents()
         dialog.substrate_capture_btn.click()
         _finish(host, qapp)
         template = dialog.substrate_template

@@ -363,6 +363,7 @@ def test_t4_a_capture_its_file_cannot_reproduce_stays_usable_and_unnamed(qapp, m
         assert result.code == "OK" and result.background_template_identity == ""
         assert any("BACKGROUND_TEMPLATE_UNREPRODUCIBLE" in line for line in result.diagnostics)
         assert row.source is None and row.template is not None and "UNREPRODUCIBLE" in row.reason
+        assert "does not hold this trace" in row.status.text()  # NEXT-128-WINDOW-POLISH PF10: the short status
         assert dialog.vnext_fit_values()["background_template"] is row.template
         assert "BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE" in row.export_reason()
         assert not any(button.isEnabled() for button in _export_buttons(dialog))

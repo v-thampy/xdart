@@ -527,3 +527,35 @@ def test_pf10_a_message_about_the_file_opens_once_in_a_popup_and_the_status_stay
         box.close()
     finally:
         row.close()
+
+
+def test_pf10_a_nexus_files_frame_is_asked_and_a_usable_capture_says_so(qapp, tmp_path):
+    """Added at the advisor's pre-push review (test completion, disclosed): the frame popup, a capture no file names
+    (usable, only not saved), and the capture button's reason when the row both waits and is busy."""
+    from xdart.gui.analysis.background_template_row import BackgroundTemplateRow
+    row = BackgroundTemplateRow()
+    try:
+        row.set_available(True, "")
+        path = tmp_path / "other.nxs"
+        path.write_bytes(b"")
+        row._file_chooser = lambda: str(path)
+        row._ask_frame = lambda target, frame, mode: (5, "q_ip")
+        row.choose_btn.click()
+        assert row.source is not None and (row.source.frame, row.source.mode) == (5, "q_ip")
+        dialog, frame_row, mode_row = row._frame_dialog(str(path), None, "default")
+        try:
+            ok = dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+            assert not ok.isEnabled() and mode_row.current_value() == "default", "OK waits for a frame"
+            frame_row.editor.setText("7")
+            assert ok.isEnabled()
+        finally:
+            dialog.close()
+        trace, _anchor = _trace(*_peaks())
+        row.set_capture(trace, None, "the displayed template has no NeXus file and frame behind it")
+        status = row.status.text()
+        assert "not saved or exported" in status and "cannot be used" not in status, status
+        row.set_busy("A batch is fitting.")
+        row.set_available(False, "Choose a Template background first.")
+        assert row.capture_btn.toolTip() == "Choose a Template background first.", "the waiting reason comes first"
+    finally:
+        row.close()

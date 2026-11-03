@@ -291,7 +291,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         waits = "" if self._available else self._waits
         present = self._template is not None or self._source is not None or self._file is not None
         for button, enabled, reason in (
-                (self.capture_btn, self._available and not self._busy, self._busy or waits),
+                (self.capture_btn, self._available and not self._busy, waits or self._busy),
                 (self.choose_btn, self._available, waits),
                 (self.clear_btn, self._available and present,
                  waits or ("" if present else f"No {self._what} is set."))):
@@ -479,12 +479,12 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         """The template as the row's status names it, in one short line (a message's whole text is in the tooltip and
         its popup)."""
         template, source = self._template, self._source
-        if template is not None:
+        if template is not None:  # a captured trace is usable whether or not a file names it
             name = template.title or template.label
-            if self._reason:
-                return f"Displayed: {name}: {self._short()}"
+            if "UNREPRODUCIBLE" in self._reason:
+                return f"Displayed: {name}: its file does not hold this trace; not saved or exported"
             return f"Displayed: {name}" + ("; its file is checked at the first fit" if source is not None else
-                                           "; not saved or exported")
+                                           "; not named by a file: not saved or exported")
         if source is not None:
             state = self._short() if self._reason else (
                 "recorded" if self._identity is not None else "read at the first fit")
