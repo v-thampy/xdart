@@ -332,3 +332,198 @@ def test_pa3_the_phase_list_is_half_its_earlier_height(dark):
         assert browser.height() >= browser.minimumSizeHint().height()
     finally:
         dialog.close()
+
+
+# ---- PF7, PF8 the Peak parameters card and the peak count's name (his answers, 2026-11-03) ---------------------------
+
+def test_pf7_the_peak_parameters_card_orders_its_rows_and_groups_the_solver(dark):
+    """His words: "The center +- delta is how much the center is allowed to vary, right? this should be right after the
+    peak centers" and "this section can have a more descriptive name"; his "Peak parameters (Recommended)"."""
+    dialog = _dialog("peak")
+    try:
+        dialog.show()
+        _settle(dark)
+        card = dialog.advanced_card
+        assert card.title.text() == "PEAK PARAMETERS"
+        editors = (dialog.adv_centers, dialog.adv_center_delta, dialog.adv_sigma_init, dialog.adv_sigma_min,
+                   dialog.adv_fraction, dialog.adv_maxfev, dialog.use_uncertainties)
+        tops = [editor.mapTo(card, QtCore.QPoint(0, 0)).y() for editor in editors]
+        assert tops == sorted(tops) and len(set(tops)) == len(tops), tops
+        headers = {label.text(): label.mapTo(card, QtCore.QPoint(0, 0)).y()
+                   for label in card.findChildren(QtWidgets.QLabel) if label.objectName() == "controlsGroupHeader"}
+        assert set(headers) == {"Solver"} and tops[4] < headers["Solver"] < tops[5], headers
+    finally:
+        dialog.close()
+
+
+def test_pf8_the_peak_count_is_named_no_of_peaks(dark):
+    """His "No. of peaks (Recommended)"."""
+    dialog = _dialog("peak")
+    try:
+        assert dialog.count_row.label.text() == "No. of peaks"
+    finally:
+        dialog.close()
+
+
+# ---- TR the trend row: Track, Track 2, then one chooser of the peaks or phases drawn ----------------------------------
+
+def _curves(trend):
+    return sorted(item.name() for item in trend.plot.listDataItems())
+
+
+def test_tr_the_trend_row_reads_track_track_2_and_its_chooser_picks_the_peaks_drawn(dark):
+    """His words: "the overlay button should be to the right of the Right option", "the space between the Track label
+    and the dropdown box, and the same for right (rename to Track #2 or something) and the dropdown box is too much",
+    and "i can select which particular peaks i want to look at"; his "Track 2 (Recommended)" and "One chooser, all by
+    default (Recommended)"."""
+    dialog = _dialog("peak")
+    try:
+        dialog.show()
+        _settle(dark)
+        trend = dialog.trend
+        assert (trend.family_row.label.text(), trend.right_row.label.text()) == ("Track", "Track 2")
+        assert not hasattr(trend, "overlay_row") and trend.members.toolTip()
+        xs = [_left(widget, trend) for widget in (trend.family_row, trend.right_row, trend.members,
+                                                  dialog.fit_view.components_toggle, trend.save)]
+        assert xs == sorted(xs), xs
+        for row in (trend.family_row, trend.right_row):
+            assert row.label.width() <= row.label.sizeHint().width() + 2, "the label hugs its text"
+        for frame in (1, 2, 3):
+            trend.set_row(str(frame), frame, {f"center_{peak}": 1.0 + peak + frame / 10 for peak in range(3)}
+                          | {f"fwhm_{peak}": 0.1 for peak in range(3)})
+        trend.family.setCurrentIndex(trend.family.findData("center"))
+        assert trend.members.text() == "Peaks: all" and _curves(trend) == ["center_0", "center_1", "center_2"]
+        actions = {action.text(): action for action in trend.members.menu().actions() if action.text()}
+        assert set(actions) == {"All", "Peak 0", "Peak 1", "Peak 2"}
+        assert all(action.isCheckable() and action.isChecked() for action in actions.values())
+        actions["Peak 1"].trigger()
+        assert _curves(trend) == ["center_0", "center_2"] and trend.members.text() == "Peaks: 0, 2"
+        trend.right_family.setCurrentIndex(trend.right_family.findData("fwhm"))
+        assert _curves(trend) == ["center_0", "center_2"] and len(trend.right_view_box.addedItems) == 2
+        actions = {action.text(): action for action in trend.members.menu().actions() if action.text()}
+        actions["All"].trigger()
+        assert trend.members.text() == "Peaks: all" and len(_curves(trend)) == 3
+        actions = {action.text(): action for action in trend.members.menu().actions() if action.text()}
+        actions["Peak 0"].trigger()
+        trend.clear()  # a new batch shows every peak again
+        assert trend.members.text() == "Peaks: all"
+    finally:
+        dialog.close()
+
+
+def test_tr_a_phase_fits_parameters_group_by_kind_one_series_per_phase(dark):
+    """A phase fit's trend keys are frac_<phase> and <phase>_<cell>: Track lists the kinds (Phase fraction, Lattice a…)
+    and the chooser the phases, so the chooser works in both windows."""
+    dialog = _dialog("phase")
+    try:
+        trend = dialog.trend
+        for position, fraction in enumerate((0.3, 0.4)):
+            trend.set_row(str(position), float(position), {"frac_TiN": fraction, "frac_HfO2": 1 - fraction,
+                                                           "TiN_a": 4.24, "HfO2_a": 5.1, "HfO2_c": 5.2})
+        items = {trend.family.itemData(index): trend.family.itemText(index) for index in range(trend.family.count())}
+        assert items == {"frac": "Phase fraction", "a": "Lattice a", "c": "Lattice c"}, items
+        trend.family.setCurrentIndex(trend.family.findData("frac"))
+        assert trend.members.text() == "Phases: all" and _curves(trend) == ["frac_HfO2", "frac_TiN"]
+        assert trend.plot.getPlotItem().getAxis("left").labelText == "Phase fraction"
+        actions = {action.text(): action for action in trend.members.menu().actions() if action.text()}
+        assert set(actions) == {"All", "TiN", "HfO2"}
+        actions["TiN"].trigger()
+        assert _curves(trend) == ["frac_HfO2"] and trend.members.text() == "Phases: HfO2"
+        trend.family.setCurrentIndex(trend.family.findData("a"))
+        assert _curves(trend) == ["HfO2_a"]
+        assert trend.plot.getPlotItem().getAxis("left").labelText == "Lattice a (Å)"
+    finally:
+        dialog.close()
+
+
+# ---- PF9 the template's controls wait for a template background (both windows) ---------------------------------------
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_pf9_the_templates_controls_wait_for_a_template_background(dark, kind):
+    """His words: "the Use displayed/choose file etc options are for the template, right? they should only be enabled
+    if template is selected"; his "Same in both (Recommended)"."""
+    dialog = _dialog(kind)
+    try:
+        row = dialog.background_template_row
+        combo = dialog.bkg_combo if kind == "peak" else dialog.fit_background_row.editor
+        controls = (row.capture_btn, row.choose_btn, row.clear_btn)
+        editors = (row.unit_row.editor, row.frame_row.editor, row.mode_row.editor)
+        word = "Template" if kind == "peak" else "Substrate"
+        assert not any(control.isEnabled() for control in controls + editors)
+        assert all(word in button.toolTip() for button in (row.capture_btn, row.choose_btn)), row.choose_btn.toolTip()
+        combo.setCurrentIndex(combo.findData("template"))
+        assert row.capture_btn.isEnabled() and row.choose_btn.isEnabled()
+        assert not row.clear_btn.isEnabled(), "nothing to clear yet"
+        combo.setCurrentIndex(0)
+        assert not any(control.isEnabled() for control in controls + editors)
+    finally:
+        dialog.close()
+
+
+# ---- PF10 the file's messages in a popup; an .xye file's unit asked there ---------------------------------------------
+
+def _xye(tmp_path, name="iq_substrate.xye"):
+    path = tmp_path / name
+    np.savetxt(path, np.column_stack((np.linspace(10.0, 20.0, 6), np.arange(6.0) + 1)))
+    return path
+
+
+def test_pf10_an_xye_templates_unit_is_asked_in_a_popup_never_preselected(qapp, tmp_path):
+    """His words: "if there is a message about the file selected it should show up in a popup window rather than
+    squeezing it in that space"; his "Ask in the popup (Recommended)". The name only suggests the unit (Codex
+    REVIEW-3 F1): never preselected."""
+    from xdart.gui.analysis.background_template_row import BackgroundTemplateRow
+    from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+    path = _xye(tmp_path)
+    row = BackgroundTemplateRow()
+    try:
+        row.set_available(True, "")
+        asked = []
+        row._file_chooser = lambda: str(path)
+        row._ask_unit = lambda target, hint: asked.append((target, hint)) or "q_nm^-1"
+        row.choose_btn.click()
+        assert asked == [(str(path), "q_A^-1")]
+        assert row.source is not None and row.source.unit == "q_nm^-1" and row.reason == ""
+        row._ask_unit = lambda target, hint: ""  # cancelled: the file waits for its unit in the row
+        row.choose_btn.click()
+        assert row.source is None and "BACKGROUND_TEMPLATE_UNIT_REQUIRED" in row.reason
+        dialog, unit_row = row._unit_dialog(str(path), "q_A^-1")
+        try:
+            assert isinstance(dialog, AdvancedDialog) and unit_row.current_value() == ""
+            ok = dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+            assert not ok.isEnabled(), "OK waits for a unit"
+            text = " ".join(label.text() for label in dialog.findChildren(QtWidgets.QLabel))
+            assert path.name in text and "Å⁻¹" in text and "nm⁻¹" in text
+            unit_row.editor.setCurrentIndex(unit_row.editor.findData("q_A^-1"))
+            assert ok.isEnabled()
+        finally:
+            dialog.close()
+    finally:
+        row.close()
+
+
+def test_pf10_a_message_about_the_file_opens_once_in_a_popup_and_the_status_stays_short(qapp, tmp_path):
+    from xrd_tools.analysis.background_template import BackgroundTemplateSource
+    from xdart.gui.analysis.background_template_row import BackgroundTemplateRow
+    row = BackgroundTemplateRow()
+    try:
+        row.set_available(True, "")
+        notes = []
+        row._notify = lambda headline, detail: notes.append((headline, detail))
+        source = BackgroundTemplateSource("xye", str(tmp_path / "gone.xye"), unit="q_A^-1")
+        parsed = row.parse_section({"source": dict(source.to_pairs()), "identity": None})
+        row.restore(parsed)
+        assert len(notes) == 1 and "gone.xye" in notes[0][0] and notes[0][1], notes
+        status = row.status.text()
+        assert "gone.xye" in status and "BACKGROUND_TEMPLATE" not in status and len(status) <= 80, status
+        assert row.reason and row.reason in row.status.toolTip()
+        row.restore(parsed)
+        assert len(notes) == 1, "the same message opens once"
+        del row._notify  # the owner's own popup: Qt's message box, not modal, naming the file
+        row._announced = ""
+        row.restore(parsed)
+        box = row.message_box
+        assert box.isVisible() and not box.isModal() and "gone.xye" in box.text()
+        box.close()
+    finally:
+        row.close()

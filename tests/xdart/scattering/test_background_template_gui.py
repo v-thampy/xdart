@@ -60,10 +60,15 @@ def _template_file(folder, name="iq_substrate.xye", scale=1.0):
 
 
 def _choose(qapp, row, path, unit="q_nm^-1"):
+    """Choose a template file as the user does (NEXT-128-WINDOW-POLISH): a template background first, since the row
+    waits for one (PF9), then Choose file…, the unit answered in the popup that asks for it (PF10)."""
+    host = row.window()
+    combo = host.bkg_combo if hasattr(host, "bkg_combo") else host.fit_background_row.editor
+    if not row.choose_btn.isEnabled():
+        combo.setCurrentIndex(combo.findData("template"))
     row._file_chooser = lambda: str(path)
+    row._ask_unit = lambda _path, _hint: unit
     _press(qapp, row.choose_btn)
-    editor = row.unit_row.editor
-    editor.setCurrentIndex(editor.findData(unit))
     qapp.processEvents()
 
 

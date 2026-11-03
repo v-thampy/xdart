@@ -19,6 +19,8 @@ def test_f1_an_iq_prefix_waits_for_an_explicit_scale_choice(tmp_path, monkeypatc
     row = BackgroundTemplateRow()
     try:
         monkeypatch.setattr(row, "_file_chooser", lambda: str(path))
+        # NEXT-128-WINDOW-POLISH PF10 asks for the unit in a popup; cancelled, the file waits for the row's choice
+        monkeypatch.setattr(row, "_ask_unit", lambda _path, _hint: "")
         row.choose_btn.click()
         app.processEvents()
         assert row.source is None, f"ambiguous prefix silently resolved to {row.source.unit}"

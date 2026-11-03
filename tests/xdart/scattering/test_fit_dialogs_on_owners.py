@@ -85,7 +85,7 @@ def test_a_refused_peak_count_is_named_and_nothing_is_asked(qapp):
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(13)
         dialog.fit_btn.click()
-        assert dialog.status.text() == "Peaks: must be at most 12" and not asked
+        assert dialog.status.text() == "No. of peaks: must be at most 12" and not asked  # PF8's name
         dialog.npeaks_spin.setValue(2)
         dialog.fit_btn.click()
         assert asked and asked[-1][0] == "fit" and asked[-1][1]["n_peaks"] == 2
