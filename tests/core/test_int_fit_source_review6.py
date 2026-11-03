@@ -76,7 +76,7 @@ def test_default_batch_chunk_adapts_to_individually_admitted_wide_rows(tmp_path,
     axis = axis_from_unit("q_A^-1", np.linspace(1., 4., points))
     records = []
     for i in range(64):
-        extra = {} if not cake or i else dict(axis_2d_x=axis_from_unit("q_A^-1", np.linspace(1., 4., 256)),
+        extra = {} if not cake else dict(axis_2d_x=axis_from_unit("q_A^-1", np.linspace(1., 4., 256)),
                     axis_2d_y=axis_from_unit("chi_deg", np.array([-1., 1.])), intensity_2d=np.ones((2, 256)))
         records.append(FrameRecord.from_view(FrameView(label=i, axis_1d=axis,
             intensity_1d=np.full(axis.values.size, float(i + 1)), sigma_1d=np.ones(axis.values.size), **extra)))

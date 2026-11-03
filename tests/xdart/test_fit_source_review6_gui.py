@@ -13,7 +13,8 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def test_an_invalid_source_frame_never_fits_the_previous_frame(qapp, tmp_path):
+@pytest.mark.parametrize("text", ("not a frame", ""), ids=("invalid", "blank"))
+def test_an_invalid_source_frame_never_fits_the_previous_frame(qapp, tmp_path, text):
     path = _result(tmp_path / "sample.nexus")
     page = _page()
     try:
@@ -21,7 +22,7 @@ def test_an_invalid_source_frame_never_fits_the_previous_frame(qapp, tmp_path):
         _choose_nexus(dialog, path, 1)
         _drain(qapp, host)
         editor = dialog.source_row.frame_row.editor
-        editor.setText("not a frame")
+        editor.setText(text)
         editor.editingFinished.emit()
         dialog.fit_btn.click()
         _drain(qapp, host)
