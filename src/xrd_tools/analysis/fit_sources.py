@@ -217,14 +217,16 @@ class IntResultRows:
         """The file's recorded wavelength in Å (None: not recorded), read once."""
         self._check_file()
         if self._wavelength is _UNREAD:
-            from xrd_tools.core.energy import wavelength_m_to_angstrom
+            from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
             from xrd_tools.io.browse_presentation import read_browse_presentation
             try:
                 presentation, _mask = read_browse_presentation(self.path, entry=self.entry)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                 raise self._unreadable(error) from None
-            value = presentation.get('wavelength_m')
-            self._wavelength = None if value is None else wavelength_m_to_angstrom(value, allow_default_sentinel=True)
+            # the persisted, unit-declared wavelength as Int's Browse takes it (``_browse_wavelength``): canonical
+            # metres, a declared 1.0 Å kept as evidence; Int's plot converts it to Å as here
+            value = canonical_wavelength_m(presentation.get('wavelength_m'), WavelengthUnit.METRE)
+            self._wavelength = None if value is None else value * 1.0e10
             self._check_file()
         return self._wavelength
 
