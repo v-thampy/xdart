@@ -713,8 +713,8 @@ class FitSourceRow(CurveFileRow):
         self.unit_row.setVisible(kind == "xye")
         self.frame_row.setVisible(kind == "nexus")
         self.mode_row.setVisible(kind == "nexus")
-        with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor), \
-                QtCore.QSignalBlocker(self.frame_row.editor):
+        # the frame editor is not blocked: setValue emits no row edit, and its validity display must follow
+        with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor):
             if kind == "xye":
                 self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(source.unit)))
             elif kind == "nexus":
