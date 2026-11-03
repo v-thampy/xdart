@@ -29,11 +29,13 @@ from xrd_tools.session.readiness import (
 
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
-from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView, fit_result_series
+from xdart.gui.tabs.scattering.fit_view import (
+    FitPanel, FitProjection, FitSeries, FitView, fit_result_series, full_range_row,
+)
 from xdart.gui.tabs.scattering.results_table import PHASE_RESULT_HEADERS, ResultsTable, phase_result_rows
 from xdart.gui.tabs.scattering.trend_view import TrendView
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
-from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
 from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
 
 #: each section's help topic (``xrd_tools.help_topics``)
@@ -140,30 +142,20 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._build_settings()
         self._sync_options()
         self._sync_actions()
-        # 1400 x 1200 (the maintainer, after the mockup: "the window can be wider. 1400x1200 is also fine"), within
-        # the screen; the controls and the displays scroll in their own panes when the screen is smaller.
-        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
-        available = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1400, 1200)
-        width, height = min(1400, int(.95 * available.width())), min(1200, int(.95 * available.height()))
-        self.resize(width, height)
-        controls = min(440, width // 2)
-        self.splitter.setSizes([controls, max(1, width - controls)])
-        self.displays.setSizes([600, 260, 140])  # the fit first; each splitter keeps its proportions as it grows
-        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31). It is
-        # made last, so it is last in the tab order: the first option keeps the initial focus and a section's "?"
-        # stays the first help button (Phase Analysis W11).
-        self.guide_button = ActionButton.for_guide(self, TOPICS["phases"])
-        top = QtWidgets.QHBoxLayout()
-        top.addStretch(1)
-        top.addWidget(self.guide_button)
-        self.layout().insertLayout(0, top)
+        # The shared split's opening size, within the screen; the fit first, each splitter keeps its proportions.
+        self.split.open(self, heights=(600, 260, 140))
+        # F1 opens help for the focused option from the first keystroke. The illustrated guide opens from the Help
+        # window's Illustrated guide, for any of this window's topics (NEXT-128-WINDOW-POLISH retired the window's top
+        # "?": the maintainer, 2026-11-02, "Remove it (Recommended)").
+        from xdart.gui.widgets.context_help import owner_for
+        owner_for(self)
 
     # ---- UI construction ------------------------------------------------
     def _card(self, title, section, tip):
         card = SectionCard(title, self, collapsible=False)
         card.set_purpose_tooltip(tip)
         card.set_help_topic(TOPICS[section])
-        self._cards.addWidget(card)
+        self.split.add_card(card)
         return card
 
     def _option(self, card, section, row, tip):
@@ -183,29 +175,16 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
-        # The options' column on the left, the displays on the right; each scrolls when the window is small.
-        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
-        self.splitter.setChildrenCollapsible(False)
-        controls = QtWidgets.QScrollArea(self.splitter)
-        controls.setObjectName("phaseAnalysisControls")
-        controls.setWidgetResizable(True)
-        column = QtWidgets.QWidget(controls)
-        # the cards keep their natural height and the pane scrolls: a short window never squeezes the phase list
-        column.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Minimum)
-        self._cards = QtWidgets.QVBoxLayout(column)
-        self._cards.setContentsMargins(0, 0, 6, 0)
+        # The options' column on the left, the displays on the right: the shared tool-window split (the Peak Fitter
+        # mounts the same, NEXT-128-WINDOW-POLISH), whose options column is never narrower than its widest row.
+        from xdart.gui.tabs.scattering.tool_window import ToolWindowSplit
+        self.split = ToolWindowSplit(self, name="phaseAnalysis")
+        self.splitter, self.displays = self.split, self.split.displays
         self._build_phases()
         self._build_shape()
         self._build_background()
         self._build_constraints()
         self._build_batch()
-        self._cards.addStretch(1)
-        controls.setWidget(column)
-        displays = QtWidgets.QScrollArea(self.splitter)
-        displays.setObjectName("phaseAnalysisDisplays")
-        displays.setWidgetResizable(True)
-        self.displays = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, displays)
-        self.displays.setChildrenCollapsible(False)
         # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
         self.fit_view = FitView(self.displays, name="phaseFitView", summary=False, stretch=(3, 1),
                                 upper_min_height=220, lower_max_height=110, link_x=True, top_bar=True,
@@ -218,19 +197,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         # Each phase's fraction and lattice, on the shared table.
         self.table = ResultsTable(PHASE_RESULT_HEADERS, self.displays, name="phaseFitTable", max_height=150)
         self.table.setToolTip("Each fitted phase's fraction and lattice; a '—' cell's tooltip says why it is empty.")
-        for index, (widget, stretch) in enumerate(((self.fit_view, 5), (self.trend, 2), (self.table, 1))):
-            self.displays.addWidget(widget)
-            self.displays.setStretchFactor(index, stretch)
-        displays.setWidget(self.displays)
-        self.splitter.addWidget(controls)
-        self.splitter.addWidget(displays)
-        self.splitter.setStretchFactor(0, 2)
-        self.splitter.setStretchFactor(1, 5)
-        for splitter, tip in ((self.splitter, 'Drag to share the width between the options and the plots.'),
-                              (self.displays, 'Drag to share the height between the fit, the trend and the table.')):
-            for index in range(1, splitter.count()):
-                splitter.handle(index).setToolTip(tip)
-        lay.addWidget(self.splitter, 1)
+        for widget, stretch in ((self.fit_view, 5), (self.trend, 2), (self.table, 1)):
+            self.split.add_display(widget, stretch)
+        lay.addWidget(self.split, 1)
 
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(7)
@@ -275,8 +244,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.substrate_capture_btn.clicked.connect(lambda: self._vnext_submit("capture_template", None))
         self.background_template_row.changed.connect(self._sync_options)
         self.fit_view.rangeChanged.connect(self._region_to_fields)
-        self.fit_range_row.valueChanged.connect(lambda _path, _value: self._fields_to_region())
-        self.full_btn.clicked.connect(self._on_full)
+        self.fit_range_row.valueChanged.connect(self._range_value_changed)
         for row in (self.texture_row, self.bkg_row, self.fit_background_row, self.amorphous_row):
             row.editor.currentIndexChanged.connect(lambda _index: self._sync_options())
 
@@ -289,7 +257,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         # minimum intensity, keyed by library id; this window's status line shows its messages.
         self.phase_source = PhaseSourceWidget(self.phases_card, checkable=True, show_library=False, calibrants=True,
                                               cutoffs=True, status_visible=False)
-        self.phase_source.browser.setMaximumHeight(230)  # room for all eight phases
+        # half its earlier 220 px (the maintainer, 2026-11-02: "the height of the phases window can be reduced by
+        # 50%"); a longer list scrolls
+        self.phase_source.browser.setMaximumHeight(110)
         self.phase_source.set_help_topic(TOPICS["phases"])
         self.phases_card.add_row(self.phase_source)
         #: the list is the host view's reference-phase plot options; the host attaches this binding to its view
@@ -370,14 +340,15 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.cross_phase_row = self._option(card, "constraints", FormRow(
             label="Cross-phase lock", path=_path("lock_cross_phase"), value=False, kind="bool"),
             'Keep the same axis letter ordered across phases (lock the a, b, c order), as the notebook\'s lock.')
-        self.fit_range_row = _range("Fit range", "fit_range", "", "", ("full", "full"))
-        self.full_btn = QtWidgets.QPushButton("Full", self)
-        self.full_btn.setToolTip("Fit the whole trace: clear the fit range.")
-        self.full_btn.setAutoDefault(False)
-        self.fit_range_row.add_trailing_widget(self.full_btn)
+        # Full, on by default, fits the whole trace and shows its ends greyed, as Int shows an automatic value; off,
+        # the bounds are typed over (a blank one is the trace's end), and a range dragged on the plot turns it off
+        # (NEXT-128-WINDOW-POLISH: the maintainer's "Same toggle in both (Recommended)")
+        self.fit_range_row = full_range_row("Fit range", _path("fit_range_low"), _path("fit_range_high"),
+                                            _path("fit_range_full"))
+        self.full_btn = self.fit_range_row.toggle_button
         self._option(card, "constraints", self.fit_range_row, (
             'The interval, in the displayed axis, whose points enter the solve; the whole trace is still drawn. '
-            'Drag it on the plot or type it; blank fits the whole trace.'))
+            'Full (on by default) fits the whole trace; turn it off to type a range, or drag it on the plot.'))
         for edit in self.fit_range_row.editors:
             edit.setValidator(QtGui.QDoubleValidator(self))
             edit.textEdited.connect(lambda _text: self._range_edited())
@@ -717,6 +688,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if trace.sigma is None:
             self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.label or "q", clear_fit=True)
+        self._sync_range_hints()
         from .peak_fit_dialog import _trace_title
         self.fit_view.set_title(_trace_title(trace))
         self._fields_to_region()
@@ -726,6 +698,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def clear_input(self):
         """Release a detached displayed input when its host changes scope or closes."""
         self._x = self._y = self._export_trace = None
+        self._sync_range_hints()
         self.fit_view.set_fit_range(None)
         self.fit_view.reconcile(FitProjection(FitPanel(), FitPanel(zero_line=True)))
         self.table.clear_rows()
@@ -804,8 +777,22 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return (float(np.nanmin(self._x)), float(np.nanmax(self._x)))
 
     def _region_to_fields(self, lo, hi):
-        """The fit range dragged on the plot, written into the Fit range row."""
+        """The fit range dragged on the plot, written into the Fit range row: a dragged range is no longer Full."""
+        self.fit_range_row.set_toggle(False)
         self._set_range_fields((lo, hi))
+
+    def _range_value_changed(self, path, _value):
+        """The Fit range row: its Full toggle, or a typed bound committed."""
+        if tuple(path) == _path("fit_range_full"):
+            self._on_full()
+        else:
+            self._fields_to_region()
+
+    def _sync_range_hints(self):
+        """The bounds' grey hints: the shown trace's ends (as the fit uses them), or "full" before a trace."""
+        hints = (tuple(_range_text(value) for value in self._data_extent()) if self._x is not None
+                 else ("full", "full"))
+        self.fit_range_row.set_placeholders(*hints)
 
     def _converted_bounds(self, bounds, unit):
         """Preserve the scientific interval when the displayed axis changes, using the recorded wavelength."""
@@ -844,6 +831,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.fit_view.set_fit_range(extent if bounds is None else bounds, limits=extent)
 
     def _on_full(self):
+        """Full on or off: either way the bounds are blank now (the row cleared them on), so the fit takes the whole
+        trace until a bound is typed or the range dragged; a stale saved range's reason goes."""
         self._set_range_fields((None, None))
         self._fields_to_region()
         self._sync_actions()
@@ -1089,6 +1078,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.background_template_row.restore(template)
         if 'fit_range_low' in fields or 'fit_range_high' in fields:
             self._fit_bounds_unit, self._range_reason = self._range_unit(), ''
+            # Full is a saved range with no bound: on again for that, off (and the bounds unlocked) for a typed one
+            self.fit_range_row.set_toggle(self._range_values(self.fit_range_row) == (None, None))
         self._sync_options()
         self._fields_to_region()
         if self.fit_background_row.current_value().startswith("template"):

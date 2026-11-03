@@ -33,12 +33,14 @@ from xdart.gui.pages.values import CloseReceipt, PageCleanup
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
 
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
-from xdart.gui.tabs.scattering.fit_view import FitPanel, FitProjection, FitSeries, FitView, fit_result_series
+from xdart.gui.tabs.scattering.fit_view import (
+    FitPanel, FitProjection, FitSeries, FitView, fit_result_series, full_range_row,
+)
 from xdart.gui.tabs.scattering.results_table import (
     PEAK_OUTCOME_HEADERS, ResultsTable, peak_outcome_rows, peak_parameter_rows,
 )
 from xdart.gui.tabs.scattering.trend_view import TrendView
-from xdart.gui.widgets.controls_panel import ActionButton, FormRow, RangeRow, SectionCard
+from xdart.gui.widgets.controls_panel import FormRow, RangeRow, SectionCard
 from xdart.gui.widgets.retained_dialog import RetainedDialogKeyPolicy
 
 logger = logging.getLogger(__name__)
@@ -136,7 +138,6 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._closing = False
         self.setObjectName("peakFitDialog")
         self.setWindowTitle("Peak Fitting")
-        self.resize(560, 900)
         self._build_ui()
         if self._vnext:
             self.live_check.setChecked(False); self.live_check.setEnabled(False)
@@ -149,23 +150,28 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                                                settings=self.export_fit_values)
         self._build_settings()
         self._sync_export()
-        # The window's own "?" at its top opens the illustrated physics guide (the maintainer, 2026-10-31). It is
-        # made last, so it is last in the tab order: the first option keeps the initial focus and a section's "?"
-        # stays the first help button (Phase Analysis W11).
-        self.guide_button = ActionButton.for_guide(self, TOPICS["model"])
-        top = QtWidgets.QHBoxLayout()
-        top.addStretch(1)
-        top.addWidget(self.guide_button)
-        self.layout().insertLayout(0, top)
+        # Phase Analysis's opening size and shares (the shared split); the fit first.
+        self.split.open(self, heights=(600, 260, 140))
+        # F1 opens help for the focused option from the first keystroke. The illustrated guide opens from the Help
+        # window's Illustrated guide, for any of this window's topics (NEXT-128-WINDOW-POLISH retired the window's top
+        # "?": the maintainer, 2026-11-02, "Remove it (Recommended)").
+        from xdart.gui.widgets.context_help import owner_for
+        owner_for(self)
 
     # ---- UI construction ------------------------------------------------
     def _build_ui(self):
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(11, 11, 11, 11)
         lay.setSpacing(8)
+        # The options on the left, the displays on the right: the shared tool-window split, as Phase Analysis has
+        # them (NEXT-128-WINDOW-POLISH: the maintainer, 2026-11-02, "make it like the phase analysis window (ss2) -
+        # controls on the left, plots on the right").
+        from xdart.gui.tabs.scattering.tool_window import ToolWindowSplit
+        self.split = ToolWindowSplit(self, name="peakFit")
 
-        # The fit's rows: model, background and its template, peaks (Auto or a count) and the fit range, on the
-        # shared rows, each with its "?".
+        # The fit's rows: model, background and its template, the peaks (a count and Auto, in one row) and the fit
+        # range with Full, on the shared rows, each ending in its "?" (one column: "the question mark right most in
+        # the same row" and "aligned with the question marks above").
         from .background_template_row import BackgroundTemplateRow
         card = SectionCard("Peak fit", collapsible=False)
         card.set_purpose_tooltip("The peak model, the background and its template, the peaks and the fit range.")
@@ -174,11 +180,17 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
         self.background_template_row = BackgroundTemplateRow(self)
         self.background_template_row.set_help_topic(TOPICS["background"])
-        self.auto_row = FormRow(label="Auto", path=_path("auto"), value=True, kind="bool")
         self.count_row = FormRow(label="Peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
                                  maximum=_MAX_PEAKS)
-        self.range_row = RangeRow(label="Range", low={"path": _path("range_low"), "value": "", "placeholder": "—"},
-                                  high={"path": _path("range_high"), "value": "", "placeholder": "—"})
+        # Auto in the Peaks row (his "put the Peaks and "Auto" (for detecting peaks in the same row"), as Int parks its
+        # Pts cluster on the Axis row: a shared bool row, its own label the toggle's text
+        self.auto_row = FormRow(label="Auto", path=_path("auto"), value=True, kind="bool")
+        self.auto_row.set_purpose_tooltip("Detect peaks automatically (scipy find_peaks) over the fit range; off, "
+                                          "fit the count beside it.")
+        self.auto_row.set_help_topic(TOPICS["peaks"])  # F1; the row's "?" is the Peaks row's
+        self.count_row.add_trailing_widget(self.auto_row)
+        self.range_row = full_range_row("Range", _path("range_low"), _path("range_high"), _path("range_full"))
+        self.full_btn = self.range_row.toggle_button
         self.model_combo, self.bkg_combo = self.model_row.editor, self.bkg_row.editor
         self.auto_check, self.npeaks_spin = self.auto_row.editor, self.count_row.editor
         self.range_lo, self.range_hi = self.range_row.editors
@@ -188,25 +200,35 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 (self.bkg_row, "background", "The background under the peaks: linear, constant, none or Chebyshev; "
                                              "or the template below scaled by one amplitude, alone or plus a "
                                              "linear or Chebyshev correction."),
-                (self.auto_row, "peaks", "Detect peaks automatically (scipy find_peaks) over the fit range"),
-                (self.count_row, "peaks", "The number of peaks to fit when Auto is off, spread across the range "
-                                          "unless Advanced gives their centers."),
-                (self.range_row, "range", "The interval fitted, in the displayed axis: drag it on the plot or type "
-                                          "it; Full fits the whole trace.")):
+                (self.count_row, "peaks", "The number of peaks to fit when Auto (beside it) is off, spread across "
+                                          "the range unless Advanced gives their centers."),
+                (self.range_row, "range", "The interval fitted, in the displayed axis. Full (on by default) fits the "
+                                          "whole trace; turn it off to type a range, or drag it on the plot.")):
             row.set_purpose_tooltip(tip)
             row.set_help_topic(TOPICS[topic], button=True)
         self.npeaks_spin.setEnabled(False)        # auto on by default
         for edit in (self.range_lo, self.range_hi):
             edit.setValidator(QtGui.QDoubleValidator(self))
-        self.full_btn = QtWidgets.QPushButton("Full")
-        self.full_btn.setToolTip("Reset the fit range to the whole pattern")
-        self.range_row.add_trailing_widget(self.full_btn)
-        for row in (self.model_row, self.bkg_row, self.background_template_row, self.auto_row, self.count_row,
-                    self.range_row):
+        for row in (self.model_row, self.bkg_row, self.background_template_row, self.count_row, self.range_row):
             card.add_row(row)
-        lay.addWidget(card)
+        self.split.add_card(card)
 
-        # Actions: Advanced, Reload, Live, Fit and Batch.
+        # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
+        self.fit_view = FitView(self.split.displays, name="peakFitView", summary=False, stretch=(3, 1),
+                                upper_min_height=240, lower_max_height=120, link_x=True, top_bar=True,
+                                components=False)
+        self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
+        self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
+        # Parameters vs frame (live or batch), on the shared trend; its x is the frame, not q.
+        self.trend = TrendView(self.split.displays, name="peakFitTrend")
+        self.trend.add_header_widget(self.fit_view.components_toggle)  # each peak's own line, off by default
+        self.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_fitted())
+        self.table = ResultsTable(PEAK_OUTCOME_HEADERS, self.split.displays, name="peakFitTable", max_height=130)
+        for widget, stretch in ((self.fit_view, 5), (self.trend, 2), (self.table, 1)):
+            self.split.add_display(widget, stretch)
+        lay.addWidget(self.split, 1)
+
+        # Actions below the split, as Phase Analysis's: Advanced, the settings, Reload, Live, Fit and Batch.
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(7)
         self.advanced_btn = QtWidgets.QPushButton("Advanced…")
@@ -249,28 +271,12 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
         self.status.setWordWrap(True)
+        self.status.setToolTip("Peak Fitter status: the loaded trace, refusals and the fit's result.")
         lay.addWidget(self.status)
-
-        # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
-        self.fit_view = FitView(self, name="peakFitView", summary=False, stretch=(3, 1), upper_min_height=240,
-                                lower_max_height=120, link_x=True, top_bar=True, components=False)
-        self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
-        self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
-        lay.addWidget(self.fit_view, 4)
-
-        # Parameters vs frame (live or batch), on the shared trend; its x is the frame, not q.
-        self.trend = TrendView(self, name="peakFitTrend")
-        self.trend.add_header_widget(self.fit_view.components_toggle)  # each peak's own line, off by default
-        self.fit_view.components_toggle.toggled.connect(lambda _on: self._draw_fitted())
         self.trend.messageChanged.connect(self.status.setText)
-        lay.addWidget(self.trend, 2)
-
-        self.table = ResultsTable(PEAK_OUTCOME_HEADERS, self, name="peakFitTable", max_height=130)
-        lay.addWidget(self.table)
 
         self.fit_btn.clicked.connect(self._do_fit)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
-        self.full_btn.clicked.connect(self._on_full)
         self.advanced_btn.clicked.connect(self._show_advanced)
         self.load_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.load))
         self.save_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.save))
@@ -279,7 +285,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.bkg_combo.currentIndexChanged.connect(lambda _index: self._sync_export())
         self.auto_check.toggled.connect(lambda on: self.npeaks_spin.setEnabled(not on))
         self.fit_view.rangeChanged.connect(self._region_to_fields)
-        self.range_row.valueChanged.connect(lambda _path, _value: self._fields_to_region())
+        self.range_row.valueChanged.connect(self._range_value_changed)
 
     def _build_advanced(self):
         """The rarely changed fit values, on the shared Advanced dialog's rows: they apply identically to Fit, Live
@@ -355,30 +361,48 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return (float(np.nanmin(self._x)), float(np.nanmax(self._x)))
 
     def _region_to_fields(self, lo, hi):
-        """The fit range dragged on the plot: kept, and written into the Range row."""
+        """The fit range dragged on the plot: no longer Full, kept, and written into the Range row."""
+        self.range_row.set_toggle(False)
+        self._write_range(lo, hi)
+
+    def _write_range(self, lo, hi):
+        """The fit range (low, high), kept and shown in the Range row as a dragged one is."""
         self._fit_lo, self._fit_hi = lo, hi
         self.range_lo.setText(f"{lo:.4g}")
         self.range_hi.setText(f"{hi:.4g}")
 
+    def _range_value_changed(self, path, value):
+        """The Range row: its Full toggle, or a typed bound committed."""
+        if tuple(path) == _path("range_full"):
+            self._on_full(bool(value))
+        else:
+            self._fields_to_region()
+
     def _fields_to_region(self):
-        """The Range row's values: kept, and shown as the plot's fit range."""
-        ext = self._data_extent()
+        """The Range row's typed values, kept, and shown as the plot's fit range. A blank bound stays blank: the trace's
+        end, whichever trace is shown."""
         try:
-            lo = float(self.range_lo.text()) if self.range_lo.text() else ext[0]
-            hi = float(self.range_hi.text()) if self.range_hi.text() else ext[1]
+            typed = [float(edit.text()) if edit.text() else None for edit in (self.range_lo, self.range_hi)]
         except ValueError:
             return
-        lo, hi = sorted((lo, hi))
-        self._fit_lo, self._fit_hi = lo, hi
+        if None not in typed:
+            typed.sort()
+        self._fit_lo, self._fit_hi = typed
         if self._x is not None:
-            self.fit_view.set_fit_range((lo, hi), limits=ext)
+            self.fit_view.set_fit_range(self._fit_range(), limits=self._data_extent())
 
-    def _on_full(self):
+    def _on_full(self, _full):
+        """Full on: the whole trace, its ends shown greyed in the locked bounds (the row has cleared them); off: the
+        bounds unlock still blank, so the whole trace is fitted until a bound is typed or the range dragged."""
         self._fit_lo = self._fit_hi = None
         if self._x is not None:
             self.fit_view.set_fit_range(self._data_extent(), limits=self._data_extent())
-        self.range_lo.setText("")
-        self.range_hi.setText("")
+
+    def _sync_range_hints(self):
+        """The bounds' grey hints: the shown trace's ends, or "full" before a trace."""
+        hints = (tuple(f"{value:.4g}" for value in self._data_extent()) if self._x is not None
+                 else ("full", "full"))
+        self.range_row.set_placeholders(*hints)
 
     def batch_x_range(self):
         """The (lo, hi) x-window to clip each frame to in a batch run — for the
@@ -413,6 +437,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             logger.exception("peak-fit: failed to read the current pattern")
         if not data:
             self._x = self._y = None
+            self._sync_range_hints()
             self.status.setText("No frame selected — pick a frame, then Reload.")
             self.fit_view.reconcile(replace(self.fit_view.projection, upper=FitPanel()))
             self.fit_view.set_fit_range(None)
@@ -471,7 +496,16 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if clear_fit:
             self.table.clear_rows()
         self.fit_view.set_fit_range(self._fit_range(), limits=self._data_extent())
-        self._region_to_fields(*self.fit_view.fit_range)
+        self._sync_range_hints()
+        if not self.full_btn.isChecked():
+            # a typed or dragged bound is kept, clamped to this trace and shown so; a blank one stays blank
+            lo, hi = self.fit_view.fit_range
+            if self._fit_lo is not None:
+                self._fit_lo = lo
+                self.range_lo.setText(f"{lo:.4g}")
+            if self._fit_hi is not None:
+                self._fit_hi = hi
+                self.range_hi.setText(f"{hi:.4g}")
 
     def _clear_fit(self):
         self._fitted = None
@@ -745,6 +779,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def clear_input(self):
         """Release a detached displayed input when its host changes scope or closes."""
         self._x = self._y = self._export_trace = self._fitted = None
+        self._sync_range_hints()
         self.fit_view.reconcile(FitProjection(FitPanel(), FitPanel(zero_line=True)))
         self.table.clear_rows()
         self.fit_btn.setEnabled(False)
@@ -961,6 +996,9 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 setter(None if value is None else float(value))
             else:
                 setter(value)
+        if any(key in fields for key in _RANGE_KEYS):
+            # Full is a saved range with no bound: on again for that, off (the bounds unlocked) for a typed one
+            self.range_row.set_toggle(self._fit_lo is None and self._fit_hi is None)
         self.background_template_row.restore(template)
         self._sync_export()
         reason = self.background_template_row.reason

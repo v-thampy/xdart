@@ -1053,6 +1053,12 @@ QComboBox#controlsComboBox:disabled {
     background-color: $panel;
     color: $text_muted;
 }
+/* A locked field's grey hint reads as the other locked values do: a fit range's Full shows the
+   trace's ends as hints in its locked bounds (NEXT-128-WINDOW-POLISH); Qt's own disabled hint is
+   half as visible. */
+QLineEdit#controlsLineEdit:disabled {
+    placeholder-text-color: $text_muted;
+}
 /* An integer row's refused text (FormRow kind "int"): kept as typed, outlined, and its tooltip
    says why; unscoped so a page's Advanced rows outside the panel show it too. */
 QLineEdit#controlsLineEdit[invalid="true"] {

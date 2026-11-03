@@ -259,6 +259,22 @@ def test_pf5_saved_settings_keep_full_and_a_typed_range(qapp, monkeypatch, tmp_p
         _close_page(page, qapp)
 
 
+@pytest.mark.parametrize("theme", ("dark", "light"))
+def test_pf5_locked_hints_read_as_the_other_locked_values(theme):
+    """Added after the freeze (test completion, disclosed): a disabled QLineEdit draws its placeholder at about half
+    the contrast of its disabled text (offscreen dark theme: lightness 49 against 98 for the Peaks count beside it),
+    so Full's greyed range hardly showed. The owner's theme gives a locked field's hint the locked text's colour."""
+    import re
+    from xdart.gui.themes import render_qss
+    qss = re.sub(r"/\*.*?\*/", "", render_qss(theme), flags=re.S)
+    found = {}
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", qss):
+        if "QLineEdit#controlsLineEdit:disabled" in (part.strip() for part in selectors.split(",")):
+            found.update((key.strip(), value.strip()) for key, _sep, value in
+                         (line.partition(":") for line in body.split(";") if ":" in line))
+    assert found.get("placeholder-text-color") == found["color"], found
+
+
 # ---- PA1 every "?" is visible when the window opens (Int's controls column never starves) -------------------------
 
 @pytest.mark.parametrize("kind", KINDS)

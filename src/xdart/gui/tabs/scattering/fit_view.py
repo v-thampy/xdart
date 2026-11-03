@@ -34,7 +34,10 @@ from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style
 from xdart.gui.widgets.scientific_plot import PlotCursorReadout, scaled_intensity, scaled_intensity_label, trace_colors
 
-_DATA = (210, 210, 220)
+#: the measured points and lines (NEXT-128-WINDOW-POLISH: the maintainer, 2026-11-02, "the raw data can barely be
+#: discerned. need darker more prominent colors to make it more visible", and his "Dark slate (Recommended)"): 10.3:1
+#: against the plots' background (the themes' SEABORN_BG in both themes), and no fit, background or component colour
+_DATA = (52, 52, 64)
 _FIT = (189, 147, 249)
 _BACKGROUND = (130, 200, 160)
 #: PHASE-ANALYSIS-128: a phase fit's own components, a background refined with the phases and an amorphous peak
@@ -101,6 +104,25 @@ class FitProjection:
     upper: FitPanel = FitPanel()
     lower: FitPanel = FitPanel()
     summary: str = ""
+
+
+#: a fit range's Full toggle (NEXT-128-WINDOW-POLISH), as both fit windows' range rows show it
+FULL_TIP = ("Full, on by default, fits the whole trace: the range shows its ends greyed. Turn it off to type a range; "
+            "dragging the range on the plot turns it off too.")
+FULL_REASON = "Full is on: the whole trace is fitted. Turn Full off to type a range, or drag it on the plot."
+
+
+def full_range_row(label: str, low_path, high_path, full_path):
+    """A fit window's range row: the shared ``RangeRow`` and its Full toggle (the maintainer, 2026-11-02: "Full should
+    be the default and the ranges displayed should be like they are for other default "auto " values - lighter that
+    can be overwritten when full is unselected. then when full is selected the full range should show again"). While
+    Full is on, the bounds are blank and locked, and their grey hints show the trace's ends (``set_placeholders``);
+    off, they are typed over, a blank bound being the trace's end."""
+    from xdart.gui.widgets.controls_panel import RangeRow
+    return RangeRow(label=label, low={"path": low_path, "value": "", "placeholder": "full"},
+                    high={"path": high_path, "value": "", "placeholder": "full"},
+                    toggle={"path": full_path, "value": True, "text": "Full", "tooltip": FULL_TIP,
+                            "automatic_reason": FULL_REASON})
 
 
 def draw_series(plot, series: FitSeries, *, group_count: int = 1, color=None):

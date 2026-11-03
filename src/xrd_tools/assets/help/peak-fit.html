@@ -353,9 +353,10 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         is not propagated.</figcaption>
     </figure>
     <ul>
-      <li>Drag the shaded range on the plot or type it; <b>Full</b> resets it to the whole trace.</li>
-      <li><b>Auto</b> finds up to twelve peaks in the range; turn it off to fit a count, or type centres in
-        Advanced.</li>
+      <li><b>Full</b>, on by default, fits the whole trace and shows its ends greyed; turn it off to type a range,
+        or drag the shaded range on the plot.</li>
+      <li><b>Auto</b>, beside the peak count, finds up to twelve peaks in the range; turn it off to fit the count,
+        or type centres in Advanced.</li>
       <li>σ initial seeds each peak's width; σ min / max bound the fitted width, and Center ± delta bounds the
         fitted centre around its start. Max iterations caps the solver.</li>
     </ul>

@@ -550,7 +550,8 @@ Steps
 1. Lattice ±%: each cell length may move within this percent of its start.
 2. q-shift bound: one global shift of every reflection, within ± this value.
 3. Cross-phase lock keeps the same axis letter ordered across phases.
-4. Fit range: drag the range on the plot or type it; only these points enter the
+4. Fit range: Full, on by default, fits the whole trace and shows its ends greyed;
+   turn it off to type a range, or drag it on the plot. Only these points enter the
    solve, while the whole trace is drawn.
 5. In Advanced, Max iterations caps solver evaluations (blank is automatic) and Use
    uncertainties weights points by their measured σ.
@@ -727,8 +728,8 @@ Required inputs
 A displayed 1-D trace and a fit range that holds the peaks.
 
 Steps
-1. Auto finds up to twelve peaks in the fit range; turn it off to fit a count of 1
-   to 12 peaks spread across the range.
+1. Auto, beside the peak count, finds up to twelve peaks in the fit range; turn it
+   off to fit the count, 1 to 12 peaks spread across the range.
 2. Peak centers (Advanced), comma-separated, seed the fit and override Auto and the
    count.
 3. σ initial starts every width; σ min / max bound it.
@@ -767,9 +768,13 @@ Required inputs
 A displayed 1-D trace.
 
 Steps
-1. Drag the shaded range on the plot, or type its low and high values.
-2. Full resets the range to the whole trace.
-3. The range is kept across Reload and clamped to each new trace.
+1. Full is on by default: the whole trace is fitted, and the range shows its ends
+   greyed.
+2. Turn Full off to type a low or high value over them (a blank one is the trace's
+   end), or drag the shaded range on the plot, which turns Full off.
+3. Turn Full on again to fit the whole trace again.
+4. A typed or dragged range is kept across Reload and clamped to each new trace;
+   with Full on, each new trace is fitted whole.
 
 Units and conventions
 The range is in the displayed axis unit; only finite points inside it are fitted.
@@ -906,7 +911,8 @@ _FIGURES = {
     'calibration.diagnostics': ('residuals',),
 }
 #: Each tool's illustrated physics guide (NEXT-128-HELP-GUIDES), by topic family: an offline page under assets/help
-#: that the tool window's top "?" and the Help window open in the system browser. Its figures are drawn by
+#: that the Help window's Illustrated guide opens in the system browser, from any of the tool's topics (a section's
+#: "?" or F1; NEXT-128-WINDOW-POLISH retired the tool windows' top "?"). Its figures are drawn by
 #: xrd_tools.guide_figures from xdart's own models.
 _GUIDES = {"peak-fit": "peak-fit.html", "phase-analysis": "phase-analysis.html", "strain": "strain.html"}
 GUIDE_DIR = Path(__file__).resolve().parent / "assets" / "help"

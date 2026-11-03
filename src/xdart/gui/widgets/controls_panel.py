@@ -194,27 +194,6 @@ class ActionButton(QtWidgets.QPushButton):
         button.clicked.connect(lambda: owner_for(context).show_context(context))
         return button
 
-    @classmethod
-    def for_guide(cls, context, topic_id: str):
-        """A tool window's own "?", at its top: opens the illustrated physics guide of ``topic_id``'s tool in the
-        system browser (NEXT-128-HELP-GUIDES). When it cannot, the Help window shows the topic and says why."""
-        from .context_help import bind_topic, open_guide, owner_for
-        button = cls(ControlActionSpec(ControlAction.HELP, "?", SectionId.EXPERIMENT))
-        bind_topic(button, topic_id)  # F1 on it opens the tool's topic
-        button.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        button.setAutoDefault(False)  # never a dialog's Enter default: Return in an editor must not open the browser
-        button.set_purpose_tooltip("Open this tool's illustrated physics guide in your web browser (offline): the "
-                                   "physics first, then how each number the tool reports follows from it.")
-
-        def _open():
-            reason = open_guide(topic_id)
-            if reason:
-                owner_for(context).show_topic(topic_id, details=reason)
-
-        button.clicked.connect(_open)
-        owner_for(context)  # mount the tool window's F1 shortcut before its first help visit
-        return button
-
     def apply_spec(self, spec: ControlActionSpec) -> None:
         label = (
             spec.label
@@ -789,6 +768,18 @@ class IntegerLineEdit(QtWidgets.QLineEdit):
         self.setText("" if value is None else str(int(value)))
 
 
+def _add_before_help(row: QtWidgets.QWidget, widget: QtWidgets.QWidget, stretch: int) -> None:
+    """A trailing widget for ``row`` (a ``FormRow`` or ``RangeRow``), placed before the row's "?" when it has one, so
+    the "?" stays rightmost whichever is added first (the maintainer, 2026-11-02: "the question mark right most in the
+    same row" and "aligned with the question marks above")."""
+    layout = row.layout()
+    index = layout.indexOf(getattr(row, "help_button", None)) if hasattr(row, "help_button") else -1
+    if index < 0:
+        layout.addWidget(widget, stretch)
+    else:
+        layout.insertWidget(index, widget, stretch)
+
+
 class FormRow(QtWidgets.QWidget):
     """One editable row in the Controls form."""
 
@@ -1033,8 +1024,9 @@ class FormRow(QtWidgets.QWidget):
         """Append a widget to the right of the row (after the editor).  Used to
         park the compact 'Pts' cluster on the Axis row — the editor stretches, so
         trailing widgets pin to the right; a ``stretch`` shares the width instead
-        (a second field on a file row, e.g. the calibration window's image stem)."""
-        self.layout().addWidget(widget, stretch)
+        (a second field on a file row, e.g. the calibration window's image stem).
+        The row's "?" stays last, so a card's "?"s form one column (NEXT-128-WINDOW-POLISH)."""
+        _add_before_help(self, widget, stretch)
 
     def set_number(self, value) -> None:
         """A float row's projection: silent; a changed value is authoritative, an equal one keeps a draft being
@@ -1310,6 +1302,12 @@ class RangeRow(QtWidgets.QWidget):
     keystone still emits as separate fields, so the panel matches the mockup
     without changing the field model or the write-through: each editor emits
     ``valueChanged(path, value)`` for the SAME path the individual rows used.
+
+    NEXT-128-WINDOW-POLISH: the toggle may carry its own ``text`` (a fit range's
+    Full) and an ``automatic_reason``. With one, the toggle checked means the range
+    is automatic, as Int shows an automatic value: the bounds are blank, their grey
+    placeholders show the automatic range (``set_placeholders``), and they are
+    locked, with the reason as their tip, until the toggle is turned off.
     """
 
     valueChanged = QtCore.Signal(object, object)
@@ -1354,10 +1352,11 @@ class RangeRow(QtWidgets.QWidget):
 
         self._toggle = None
         self._toggle_inverts_model = False
+        self._automatic_reason = ""
         if toggle is not None:
             btn = QtWidgets.QToolButton()
             btn.setObjectName("controlsAutoButton")
-            btn.setText("✦")
+            btn.setText(str(toggle.get("text", "✦")))
             btn.setCheckable(True)
             tpath = tuple(toggle["path"])
             # Integration stores whether a range is automatic.  The operator
@@ -1379,6 +1378,9 @@ class RangeRow(QtWidgets.QWidget):
                 if self._toggle_inverts_model else "Enable",
             ))
             btn.setMinimumWidth(31)
+            self._automatic_reason = str(toggle.get("automatic_reason", "") or "")
+            # the lock first, so a host's own slot reads the bounds as the toggle leaves them
+            btn.toggled.connect(self._show_automatic)
             btn.toggled.connect(
                 lambda checked, p=tpath: self.valueChanged.emit(
                     p,
@@ -1388,6 +1390,7 @@ class RangeRow(QtWidgets.QWidget):
             )
             lay.addWidget(btn)
             self._toggle = (tpath, btn)
+            self._show_automatic(checked)
 
     def _edit(self, spec, lay):
         value = spec.get("value")
@@ -1420,8 +1423,44 @@ class RangeRow(QtWidgets.QWidget):
         return self._low, self._high
 
     def add_trailing_widget(self, widget: QtWidgets.QWidget, stretch: int = 0) -> None:
-        """Append a widget to the right of the row (a fit range's Full button), as ``FormRow`` does."""
-        self.layout().addWidget(widget, stretch)
+        """Append a widget to the right of the row, before its "?", as ``FormRow`` does."""
+        _add_before_help(self, widget, stretch)
+
+    @property
+    def toggle_button(self) -> QtWidgets.QToolButton | None:
+        """The row's toggle (``toggle=``), for a window that drives the row itself (a fit range's Full), or None."""
+        return None if self._toggle is None else self._toggle[1]
+
+    def set_placeholders(self, low: str, high: str) -> None:
+        """The bounds' grey hints (a fit range's whole trace while Full is on), shown while a bound is blank."""
+        for edit, text in ((self._low, low), (self._high, high)):
+            if edit.placeholderText() != text:
+                edit.setPlaceholderText(text)
+
+    def set_toggle(self, checked: bool) -> None:
+        """Set the toggle as its window's projection: no ``valueChanged``; an automatic toggle locks or unlocks the
+        bounds as a click does."""
+        if self._toggle is None:
+            raise TypeError("set_toggle needs a row with a toggle")
+        btn = self._toggle[1]
+        with QtCore.QSignalBlocker(btn):
+            btn.setChecked(bool(checked))
+        self._show_automatic(bool(checked))
+
+    def _show_automatic(self, checked: bool) -> None:
+        """An automatic toggle (``automatic_reason``): checked, the bounds are blank so their placeholders show the
+        automatic range, and locked with the reason; unchecked, they unlock with whatever they hold."""
+        if not self._automatic_reason:
+            return
+        for edit, path in ((self._low, self._low_path), (self._high, self._high_path)):
+            if checked:
+                with QtCore.QSignalBlocker(edit):
+                    edit.setText("")
+                edit.setModified(False)
+                self._model_text_by_path[path] = ""
+            edit.setEnabled(not checked)
+            self._reasons[path] = self._automatic_reason if checked else ""
+            edit.setToolTip(self._bound_tooltip(path))
 
     def _bound_tooltip(self, path: tuple[str, ...]) -> str:
         """A bound's tip: its disabled reason, else the row's purpose, else the field's help text."""
@@ -1527,6 +1566,7 @@ class RangeRow(QtWidgets.QWidget):
                     btn.setChecked(checked)
             finally:
                 btn.blockSignals(was_blocked)
+            self._show_automatic(checked)  # an automatic toggle's lock follows a projected value too
             btn.setEnabled(bool(field.enabled))
             fallback = (
                 "Use the entered range values. When off, use Auto."
