@@ -28,7 +28,7 @@ _NO_INTENSITY_TIP = {'lattice': 'Lattice phases have no structural intensities; 
                      'calibrant': 'Calibrants carry positions only, with no intensities; every line is shown.'}
 #: Add CIF…'s busy reason while the chosen files are read (R1, D1)
 _ADD_BUSY_TIP = 'Reading the chosen CIF files on a worker; Add CIF is available again once they are added.'
-_REMOVE_NONE_TIP = 'Select a phase in the list first: Remove acts only on the selected phase.'
+_REMOVE_NONE_TIP = 'Select a phase or a reference line first: Remove acts only on the selected row.'
 #: a calibrant row's own tooltip (PHASE-ANALYSIS-128: reference lines only, never fitted)
 _CALIBRANT_DETAIL = ('{name}: a built-in calibrant, drawn as reference lines and detector rings only. It has '
                      'positions but no intensities, so it is never fitted.')
