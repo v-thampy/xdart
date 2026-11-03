@@ -203,17 +203,19 @@ def test_peak_model_background_and_advanced_defaults_and_choices(monkeypatch, qa
     page = _page()
     try:
         dialog = _show(page, monkeypatch, "peak", trace, anchor)
+        # NEXT-128 background degrees (2026-11-03): Polynomial 1, the same fit as the earlier default Linear
         assert dialog.vnext_fit_values() == {
-            "selection_mode": "auto", "n_peaks": 1, "model": "pseudovoigt", "background": "linear",
+            "selection_mode": "auto", "n_peaks": 1, "model": "pseudovoigt", "background": "polynomial1",
             "fit_bounds": (1.0, 4.0), "manual_centers": (), "sigma_init": None, "sigma_bounds": None,
             "center_bounds_delta": None, "fraction_init": 0.5, "max_nfev": None,
         }
         models = [dialog.model_combo.itemText(index) for index in range(dialog.model_combo.count())]
         backgrounds = [dialog.bkg_combo.itemText(index) for index in range(dialog.bkg_combo.count())]
-        # NEXT-128-PEAK-FIT (2026-10-31): Pearson VII and split pseudo-Voigt, and the template backgrounds, appended
+        # NEXT-128-PEAK-FIT (2026-10-31): Pearson VII and split pseudo-Voigt, and the template backgrounds, appended;
+        # NEXT-128 (2026-11-03): Polynomial replaces Linear and Constant, and each takes the degree beside it
         assert models == ["Pseudo-Voigt", "Gaussian", "Lorentzian", "Voigt", "Pearson VII", "Split pseudo-Voigt"]
-        assert backgrounds == ["Linear", "Constant", "None", "Chebyshev (3)", "Template", "Template + linear",
-                               "Template + Chebyshev (3)"]
+        assert backgrounds == ["None", "Polynomial", "Chebyshev", "Template", "Template + polynomial",
+                               "Template + Chebyshev"]
         chosen = []
         for index in range(len(models)):
             dialog.model_combo.setCurrentIndex(index)
@@ -223,7 +225,7 @@ def test_peak_model_background_and_advanced_defaults_and_choices(monkeypatch, qa
         for index in range(len(backgrounds)):
             dialog.bkg_combo.setCurrentIndex(index)
             chosen.append(dialog.vnext_fit_values()["background"])
-        assert chosen == ["linear", "constant", "none", "chebyshev3", "template", "template+linear",
+        assert chosen == ["none", "polynomial1", "chebyshev3", "template", "template+polynomial1",
                           "template+chebyshev3"]
         dialog.adv_sigma_init.setText("0.05")
         dialog.adv_sigma_min.setText("0.01"); dialog.adv_sigma_max.setText("0.2")

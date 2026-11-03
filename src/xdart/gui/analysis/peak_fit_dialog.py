@@ -18,6 +18,9 @@ NEXT-128-PEAK-FIT: Pearson VII and split pseudo-Voigt; the template backgrounds 
 NEXT-128-WINDOW-POLISH (the maintainer, 2026-11-02 and 11-03): laid out as Phase Analysis on the shared
 ``ToolWindowSplit``, options left and plots right, the advanced options in that column; Auto in the Peaks row; every
 "?" in one column; Full on by default, the range's ends shown greyed until Full is off.
+
+NEXT-128 background degrees (the maintainer, 2026-11-03): Polynomial (replacing Linear and Constant) and Chebyshev,
+alone or after Template, each of the degree in the shared box in the Background row (``background_degree``).
 """
 
 import logging
@@ -65,15 +68,16 @@ _MODELS = [
     ("Pearson VII", "pearson7"),
     ("Split pseudo-Voigt", "split_pseudovoigt"),
 ]
-# (display label, fit_peaks background string)
+# (display label, background choice): a choice that takes a degree names it in the fit_peaks background string with
+# the degree in the box beside it, "polynomial2" (NEXT-128, the maintainer's "Polynomial (this can replace Linear,
+# constant)"); Polynomial 1 is the earlier default Linear
 _BACKGROUNDS = [
-    ("Linear", "linear"),
-    ("Constant", "constant"),
     ("None", "none"),
-    ("Chebyshev (3)", "chebyshev3"),
+    ("Polynomial", "polynomial"),
+    ("Chebyshev", "chebyshev"),
     ("Template", "template"),
-    ("Template + linear", "template+linear"),
-    ("Template + Chebyshev (3)", "template+chebyshev3"),
+    ("Template + polynomial", "template+polynomial"),
+    ("Template + Chebyshev", "template+chebyshev"),
 ]
 #: each group of options' help topic (``xrd_tools.help_topics``)
 TOPICS = {"model": "peak-fit.model", "background": "peak-fit.background", "peaks": "peak-fit.peaks",
@@ -88,7 +92,7 @@ PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_setting
                                  sections=("background_template",))
 _RANGE_KEYS = ("range_low", "range_high")
 #: why the template row waits (NEXT-128-WINDOW-POLISH PF9)
-_TEMPLATE_WAITS = ("Choose a Template background first (Template, Template + linear or Template + Chebyshev (3)): "
+_TEMPLATE_WAITS = ("Choose a Template background first (Template, Template + polynomial or Template + Chebyshev): "
                    "these controls set its template.")
 _TEXT_KEYS = ("centers", "sigma_init", "sigma_min", "sigma_max", "center_delta", "fraction")
 
@@ -103,10 +107,10 @@ def _trace_title(trace):
     return f"{trace.title} · frame {frame}" if frame else trace.title
 
 
-def _combo(label, name, choices):
+def _combo(label, name, choices, default=None):
     values = tuple(value for _text, value in choices)
-    return FormRow(label=label, path=_path(name), value=values[0], kind="combo", choices=values,
-                   choice_labels={value: text for text, value in choices})
+    return FormRow(label=label, path=_path(name), value=values[0] if default is None else default, kind="combo",
+                   choices=values, choice_labels={value: text for text, value in choices})
 
 
 class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
@@ -202,7 +206,14 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         card.set_purpose_tooltip("The peak model, the background and its template, the peaks and the fit range.")
         card.set_help_topic(TOPICS["model"])
         self.model_row = _combo("Model", "model", _MODELS)
-        self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
+        self.bkg_row = _combo("Background", "background", _BACKGROUNDS, default="polynomial")
+        # the degree in the Background row (NEXT-128: "another box to choose the polynomial degree should show in the
+        # same row"), on the shared int row, bounded by the headless owner's ranges
+        from xrd_tools.analysis.display_fit_operations import PEAK_BACKGROUND_DEGREES
+        from .background_degree import BackgroundDegree
+        self.background_degree = BackgroundDegree(self.bkg_row, _path("background_degree"), PEAK_BACKGROUND_DEGREES,
+                                                  topic=TOPICS["background"])
+        self.bkg_degree_row = self.background_degree.row
         self.background_template_row = BackgroundTemplateRow(self)
         self.background_template_row.set_help_topic(TOPICS["background"])
         self.count_row = FormRow(label="No. of peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
@@ -222,9 +233,10 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         for row, topic, tip in (
                 (self.model_row, "model", "The profile fitted to every peak: pseudo-Voigt, Gaussian, Lorentzian, "
                                           "Voigt, Pearson VII or split pseudo-Voigt."),
-                (self.bkg_row, "background", "The background under the peaks: linear, constant, none or Chebyshev; "
-                                             "or the template below scaled by one amplitude, alone or plus a "
-                                             "linear or Chebyshev correction."),
+                (self.bkg_row, "background", "The background under the peaks: none, or a polynomial or Chebyshev of "
+                                             "the degree beside it (polynomial 1, a straight line, by default; 0 a "
+                                             "constant); or the template below scaled by one amplitude, alone or "
+                                             "plus a polynomial or Chebyshev correction of that degree."),
                 (self.count_row, "peaks", "The number of peaks to fit when Auto (beside it) is off, spread across "
                                           "the range unless Peak parameters gives their centers."),
                 (self.range_row, "range", "The interval fitted, in the displayed axis. Full (on by default) fits the "
@@ -365,17 +377,28 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.adv_maxfev.setPlaceholderText("auto")
 
     def _refusal(self):
-        """The first whole-number row whose text is refused, named as the rows name it, or a template background
-        without its template ("" when none)."""
+        """The first whole-number row whose text is refused, named as the rows name it (the background's degree only
+        while its choice takes one), or a template background without its template ("" when none)."""
         for row in (self.count_row, self._maxfev_row):
             if row.refusal():
                 return f"{row.label.text()}: {row.refusal()}"
+        if self.background_degree.refusal():
+            return self.background_degree.refusal()
         if self._background().startswith("template"):
             return self.background_template_row.fit_refusal()
         return ""
 
     def _background(self):
-        return _BACKGROUNDS[self.bkg_combo.currentIndex()][1]
+        """The background the fit takes: the choice with its degree when it takes one, "polynomial1" (the core's own
+        string, so plans, notebooks and settings need no other key)."""
+        from xrd_tools.analysis.display_fit_operations import peak_background
+        return peak_background(self.bkg_row.current_value(), self.background_degree.degree())
+
+    def _set_background(self, background):
+        """A saved background, as its choice and degree: an earlier file's Linear is Polynomial 1, its Constant
+        Polynomial 0, its Template + linear Template + polynomial 1."""
+        from xrd_tools.analysis.display_fit_operations import peak_background_choice
+        self.background_degree.choose(*peak_background_choice(background))
 
     # ---- range sync -----------------------------------------------------
     def _data_extent(self):
@@ -614,7 +637,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         from xrd_tools.analysis.runner import AnalysisInput, PeakFitAnalyzer
 
         model = _MODELS[self.model_combo.currentIndex()][1]
-        background = _BACKGROUNDS[self.bkg_combo.currentIndex()][1]
+        background = self._background()
         if background.startswith("template"):
             self.status.setText("The template backgrounds fit through the page's fit route: open the Peak Fitter "
                                 "from Int's or a result page's Tools.")
@@ -718,7 +741,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             "selection_mode": "auto" if self.auto_check.isChecked() else "count",
             "n_peaks": len(centers) or int(self.npeaks_spin.value()),
             "model": _MODELS[self.model_combo.currentIndex()][1],
-            "background": _BACKGROUNDS[self.bkg_combo.currentIndex()][1],
+            "background": self._background(),
             "fit_bounds": bounds, "manual_centers": centers,
             "sigma_init": self._line_float(self.adv_sigma_init),
             "sigma_bounds": ((smin, smax) if smin is not None and smax is not None else None),
@@ -734,8 +757,11 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def export_fit_values(self):
         """The settings a notebook carries: a template background's file and its recorded identity, never a captured
-        trace; refused (ValueError) with the row's reason when the template cannot be exported."""
+        trace; refused (ValueError) with the row's reason when the template cannot be exported, or the background's
+        degree as its box refuses it (a notebook must fit what the window would)."""
         values = dict(self.vnext_fit_values())
+        if self.background_degree.refusal():
+            raise ValueError(self.background_degree.refusal())
         if values["background"].startswith("template"):
             reason = self.background_template_row.export_reason()
             if reason:
@@ -892,8 +918,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._settings_rows = {
             "model": (self.model_row, self.model_row.current_value,
                       lambda value: self.model_combo.setCurrentIndex(self.model_combo.findData(value))),
-            "background": (self.bkg_row, self.bkg_row.current_value,
-                           lambda value: self.bkg_combo.setCurrentIndex(self.bkg_combo.findData(value))),
+            # the core's string with its degree ("chebyshev6"): the choice and the box beside it, in that order
+            "background": (self.bkg_row, self._background, self._set_background),
             "auto": (self.auto_row, self.auto_check.isChecked, self.auto_check.setChecked),
             "n_peaks": (self.count_row, self.npeaks_spin.value, self.count_row.set_number),
             "range_low": (self.range_row, lambda: self._saved_range_bound(0),
@@ -921,10 +947,11 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _descriptor(self, key, row):
         """The shared field descriptor ``check_fields`` reads: a choice among the stored values, a toggle, a whole
-        number with its bounds, or a number or text."""
+        number with its bounds, or a number or text (the background's string is checked by its owner's reading,
+        ``_checked_fields``, as it names its degree)."""
         label = row.label.text() + {"range_low": " (low)", "range_high": " (high)", "sigma_min": " (min)",
                                     "sigma_max": " (max)"}.get(key, "")
-        if key in ("model", "background"):
+        if key == "model":
             combo = row.editor
             return ControlFormField(SectionId.PROCESSING, label, row.path, kind=ControlFieldKind.COMBO,
                                     choices=tuple(combo.itemData(index) for index in range(combo.count())))
@@ -941,6 +968,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         row, get, _set = self._settings_rows[key]
         if key in ("n_peaks", "max_nfev") and row.refusal():
             raise ValueError(f"{row.label.text()}: {row.refusal()}")
+        if key == "background" and self.background_degree.refusal():
+            raise ValueError(self.background_degree.refusal())
         return get()
 
     def _saved_range_bound(self, index):
@@ -1011,6 +1040,13 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             elif key in _RANGE_KEYS:
                 refusal = '' if value is None or (type(value) in (int, float) and math.isfinite(value)) else (
                     'is not a number')
+            elif key == "background":  # a choice and its degree; an earlier file's choices read as their successors
+                from xrd_tools.analysis.display_fit_operations import peak_background_choice
+                try:
+                    peak_background_choice(value)
+                    refusal = ''
+                except ValueError as error:
+                    refusal = str(error)
             else:
                 refusal = ''
             if refusal:

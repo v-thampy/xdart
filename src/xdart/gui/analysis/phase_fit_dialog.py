@@ -15,6 +15,10 @@ plots ``FitView``, its trend ``TrendView``, its table ``ResultsTable``; Save and
 ``PageSettings``; Browse the shared ``file_dialogs``; its substrate the shared ``BackgroundTemplateRow``
 (NEXT-128-PEAK-FIT: the Peak Fitter mounts the same row), saved by its file and exported to notebooks.
 
+NEXT-128 background degrees (the maintainer's "Same in both (Recommended)", 2026-11-03): Polynomial replaces Linear
+(degree 1), and the degree (a spline's knots) is the shared box in the Fitted background row (``background_degree``),
+shown only for a choice that takes one.
+
 Needs the ``xrd-tools[fitting]`` extra: ``lmfit`` (the fit) and ``pymatgen`` (CIF parsing), both imported lazily.
 """
 import math
@@ -54,30 +58,30 @@ _PROFILES = (("Pseudo-Voigt", "pseudovoigt"), ("Gaussian", "gaussian"), ("Lorent
 _WIDTH_MODELS = (("Caglioti U,V,W", "caglioti"), ("Scherrer size and strain", "scherrer"), ("Fixed width", "fixed"))
 _TEXTURES = (("None", "none"), ("March-Dollase", "march_dollase"), ("Free (per-peak)", "free"))
 _BACKGROUNDS = (("None", "none"), ("SNIP", "snip"), ("Chebyshev", "chebyshev"))
-_FIT_BACKGROUNDS = (("None", "none"), ("Linear", "linear"), ("Polynomial", "polynomial"), ("Chebyshev", "chebyshev"),
-                    ("Spline", "spline"), ("Substrate", "template"), ("Substrate + linear", "template+linear"),
-                    ("Substrate + polynomial", "template+polynomial"),
+# NEXT-128 (the maintainer's "Same in both (Recommended)"): Polynomial 1 is the earlier Linear, Substrate + polynomial
+# 1 the earlier Substrate + linear; the degree (a spline's knots) is in the box beside the choice
+_FIT_BACKGROUNDS = (("None", "none"), ("Polynomial", "polynomial"), ("Chebyshev", "chebyshev"), ("Spline", "spline"),
+                    ("Substrate", "template"), ("Substrate + polynomial", "template+polynomial"),
                     ("Substrate + Chebyshev", "template+chebyshev"))
 _AMORPHOUS = (("None", "none"), ("Gaussian", "gaussian"), ("Pseudo-Voigt", "pseudovoigt"),
               ("Lorentzian", "lorentzian"), ("Voigt", "voigt"), ("Lorentzian²", "lorentzian_squared"))
-#: the fitted backgrounds that take a degree (a spline's knots)
-_DEGREE_BACKGROUNDS = frozenset({"polynomial", "chebyshev", "spline", "template+polynomial", "template+chebyshev"})
 
 _WINDOW_TIP = ('Phase Analysis: one phase list drawn on the plots and fitted, with every option of the phase-fitting '
                'notebook. Each "?" opens its section\'s help.')
 _TEXTURE_TIP = ('How relative intensities within each CIF phase may depart from the structure: none, March-Dollase '
                 'along the axis in Advanced, or free per-peak heights within the range in Advanced.')
 _TEXTURE_LATTICE_TIP = ' Lattice phases always fit free per-peak heights: they have no structural intensities.'
-_FIT_BACKGROUND_TIP = ('A background refined with the phases: linear, polynomial, Chebyshev or spline of the degree '
-                       'below, or the substrate (captured or read from its file) scaled by one amplitude, alone or '
-                       'plus a polynomial.')
+_FIT_BACKGROUND_TIP = ('A background refined with the phases: a polynomial or Chebyshev of the degree beside it '
+                       '(polynomial 1 is a straight line), or a spline of the knots beside it; or the substrate '
+                       '(captured or read from its file) scaled by one amplitude, alone or plus a polynomial or '
+                       'Chebyshev of that degree.')
 _FIT_TIP = 'Fit the checked CIF and lattice phases to the displayed pattern; calibrants are reference lines only.'
 _BATCH_TIP = ('Fit every selected result with these settings, then plot fractions and lattice against the result '
               'order or a scan column.')
 _CALIBRANT_ONLY = 'Calibrants are reference lines only and are not fitted: check a CIF or lattice phase to fit.'
 _SUBSTRATE_NEEDED = ('The Substrate backgrounds need a substrate: show the bare substrate\'s pattern and click Use '
                      'displayed as substrate, or choose its NeXus or .xye file.')
-_SUBSTRATE_WAITS = ('Choose a Substrate fitted background first (Substrate, or Substrate + linear, polynomial or '
+_SUBSTRATE_WAITS = ('Choose a Substrate fitted background first (Substrate, Substrate + polynomial or Substrate + '
                     'Chebyshev): these controls set its substrate.')
 _RECAPTURE_NOTICE = ('These settings name no substrate file: choose the substrate\'s file or capture it again before '
                      'fitting with it.')
@@ -342,10 +346,21 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.bkg_combo = self.bkg_row.editor
         self.fit_background_row = self._option(card, "background", _combo(
             "Fitted background", "fit_background", _FIT_BACKGROUNDS), _FIT_BACKGROUND_TIP)
-        self.fit_background_degree_row = self._option(card, "background", self._int_row(
-            "Degree", "fit_background_degree", "3", 2, 15), (
-            'The fitted background\'s polynomial or Chebyshev degree, or a spline\'s knots (at least four), from 2 '
-            'to 15.'))
+        # the degree in the Fitted background row, shown for a choice that takes one (NEXT-128, as the Peak Fitter's:
+        # the maintainer's "Same in both (Recommended)"), on the shared int row, bounded by the headless owner's ranges
+        from dataclasses import fields
+        from xrd_tools.analysis.display_fit_operations import DisplayedPhaseFitPlan, PHASE_BACKGROUND_DEGREES
+        from .background_degree import BackgroundDegree
+        self.background_degree = BackgroundDegree(self.fit_background_row, _path("fit_background_degree"),
+                                                  PHASE_BACKGROUND_DEGREES, topic=TOPICS["background"])
+        self.fit_background_degree_row = self.background_degree.row
+        #: a choice without a degree sends the plan's own default, so its plan identity is the one it had
+        self._no_degree = next(field.default for field in fields(DisplayedPhaseFitPlan)
+                               if field.name == "fit_background_degree")
+        # a settings file's degree is a whole number within the widest family's bounds, then its family's
+        self._int_bounds["fit_background_degree"] = (min(low for low, _high in PHASE_BACKGROUND_DEGREES.values()),
+                                                     max(high for _low, high in PHASE_BACKGROUND_DEGREES.values()),
+                                                     False)
         # The substrate: the shared template row (captured through the host's own fit input, or read from its file);
         # the card's status names it.
         from .background_template_row import BackgroundTemplateRow
@@ -467,8 +482,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 and self.fit_background_row.current_value().startswith("template"))
 
     def _sync_options(self):
-        """Each row that a choice makes irrelevant is off and says why; Texture's tip names lattice phases; the
-        export buttons say why a fit cannot be exported."""
+        """Each row that a choice makes irrelevant is off and says why (the fitted background's degree is shown only
+        for a choice that takes one, by its own box); Texture's tip names lattice phases; the export buttons say why a
+        fit cannot be exported."""
         fit_background = self.fit_background_row.current_value()
         # the substrate row waits for a Substrate background (NEXT-128-WINDOW-POLISH: "Same in both (Recommended)")
         self.background_template_row.set_available(fit_background.startswith("template"), _SUBSTRATE_WAITS)
@@ -480,8 +496,6 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             ' ' + _SUBSTRATE_NEEDED if fit_background.startswith("template")
             and not self.background_template_row.has_template() else ''))
         for rows, on, reason in (
-                ((self.fit_background_degree_row,), fit_background in _DEGREE_BACKGROUNDS,
-                 'Choose a polynomial, Chebyshev or spline background to set its degree.'),
                 ((self.amorphous_center_row, self.amorphous_sigma_row), amorphous,
                  'Choose an amorphous peak to set its starting centre and σ.'),
                 (self.march_rows, texture == "march_dollase", 'Choose March-Dollase texture to set its axis.'),
@@ -585,8 +599,11 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if self._range_reason:
             return self._range_reason
         for row in (self._maxfev_row, self.fit_background_degree_row, self.snip_width_row, *self.march_rows):
-            if row.refusal():
-                return f"{row.label.text()}: {row.refusal()}"
+            # the degree's hidden box (a choice without one) never refuses a fit
+            refusal = (self.background_degree.refusal() if row is self.fit_background_degree_row else
+                       row.refusal() and f"{row.label.text()}: {row.refusal()}")
+            if refusal:
+                return refusal
         for row in (self.fit_range_row, self.free_height_row, self.width_limits_row):
             try:
                 self._range_values(row)
@@ -619,7 +636,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             "q_shift_bound": float(self.q_shift_row.current_value()),
             "lock_cross_phase": bool(self.cross_phase_row.current_value()),
             "snip_width": self.snip_width_row.editor.value(),
-            "fit_background": fit_background, "fit_background_degree": self.fit_background_degree_row.editor.value(),
+            "fit_background": fit_background, "fit_background_degree": self._plan_degree(),
             "background_template": (self.background_template_row.template if fit_background.startswith("template")
                                     else None),
             "amorphous_peak": self.amorphous_row.current_value(),
@@ -638,14 +655,22 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             values.update(self.background_template_row.values())
         return values
 
+    def _plan_degree(self):
+        """The plan's fitted-background degree: the box's for a choice that takes one (None while the box refuses its
+        text, which Fit names first), else the plan's own default."""
+        return self._no_degree if self.background_degree.family() is None else self.background_degree.degree()
+
     @staticmethod
     def _lattice_export_reason():
         return ('PHASE_LATTICE_NOTEBOOK_UNAVAILABLE: manual lattice phases cannot be exported '
                 'in the existing CIF notebook format.')
 
     def export_fit_values(self):
-        """Keep structural-library exports on the existing portable CIF recipe; Sequential travels with them."""
+        """Keep structural-library exports on the existing portable CIF recipe; Sequential travels with them. Refused
+        (ValueError) with the fitted background's degree as its box refuses it, as Fit is."""
         values = dict(self.vnext_fit_values())
+        if self.background_degree.refusal():
+            raise ValueError(self.background_degree.refusal())
         if values["fit_background"].startswith("template"):
             reason = self.background_template_row.export_reason()
             if reason:
@@ -952,6 +977,10 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 return self._range_values(row)[bound]
             except ValueError as error:
                 raise ValueError(f"{row.label.text()}: {error}") from None
+        if row is self.fit_background_degree_row:  # its box's text counts only for a choice that takes a degree
+            if self.background_degree.refusal():
+                raise ValueError(self.background_degree.refusal())
+            return self._plan_degree()
         if row in self._int_rows:
             if row.refusal():
                 raise ValueError(f"{row.label.text()}: {row.refusal()}")
@@ -1008,8 +1037,15 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _checked_fields(self, document):
         """The document's fields this window has, each within its row's choices and bounds, and the ranges in
-        order: ValueError names the first that is not (nothing applies)."""
+        order: ValueError names the first that is not (nothing applies). An earlier file's Linear is Polynomial 1, its
+        Substrate + linear Substrate + polynomial 1, and its spline of two or three knots the four it fitted with
+        (NEXT-128); the degree it names is checked as written, then against its family's bounds."""
         fields = saved_fields(self, document)
+        degree = None
+        if "fit_background" in fields:
+            from xrd_tools.analysis.display_fit_operations import phase_background_choice
+            fields["fit_background"], degree = phase_background_choice(fields["fit_background"],
+                                                                       fields.get("fit_background_degree"))
         check_fields(self, fields)
         for key, value in fields.items():
             row, bound = self._settings_rows[key]
@@ -1030,6 +1066,13 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                            f'is outside {editor.minimum():g} to {editor.maximum():g}')
             if refusal:
                 raise ValueError(f"{field.label}: {value!r} {refusal}")
+        if degree is not None:
+            fields["fit_background_degree"] = degree
+        if "fit_background_degree" in fields:
+            refusal = self.background_degree.degree_refusal(
+                fields.get("fit_background", self.fit_background_row.current_value()), fields["fit_background_degree"])
+            if refusal:
+                raise ValueError(refusal)
         current = {key: self._setting(key) for key in self._settings_rows}
         merged = {**current, **fields}
         if merged['texture'] == 'march_dollase' and not any(merged[f'march_{axis}'] for axis in 'hkl'):
@@ -1103,6 +1146,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         fields = self._checked_fields(document)
         phases = self._checked_phases(document)
         template = self.background_template_row.parse_section(document.get("background_template"))
+        background = {key: fields.pop(key) for key in ("fit_background", "fit_background_degree") if key in fields}
         for key, value in fields.items():
             row, bound = self._settings_rows[key]
             if bound is not None:
@@ -1115,6 +1159,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 row.editor.setChecked(bool(value))
             else:
                 row.set_number(value)
+        if background:  # the choice, then its degree, whichever order the file names them
+            self.background_degree.choose(background.get("fit_background", self.fit_background_row.current_value()),
+                                          background.get("fit_background_degree"))
         notices = []
         if phases is not None:
             selection, cutoffs, missing = phases

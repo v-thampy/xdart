@@ -114,7 +114,7 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       guide starts with that physics, then shows how each number the Peak Fitter reports follows from it.</p>
     <div class="facts">
       <div class="fact"><b>6 profiles</b>pseudo-Voigt, Gaussian, Lorentzian, Voigt, Pearson VII, split pseudo-Voigt</div>
-      <div class="fact"><b>7 backgrounds</b>linear, constant, none, Chebyshev, and three template backgrounds</div>
+      <div class="fact"><b>6 backgrounds</b>none, a polynomial or Chebyshev of a chosen degree, and three template backgrounds</div>
       <div class="fact"><b>1 to 12 peaks</b>found automatically, counted, or placed at typed centres</div>
       <div class="fact"><b>Notebook export</b>a fit exports to Jupyter and marimo, with its template once a fit has
         recorded the template's file</div>
@@ -269,7 +269,7 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
         bare substrate and use its pattern as the template. The fit scales it by one amplitude, <code>bg_A</code>
         (never below 0), and adds the peaks; here the fitted bg_A comes out close to the 1.6 the sample was made
         with.
-        <b>Template + linear</b> or <b>Template + Chebyshev (3)</b> add a small correction under <code>bgx_</code>
+        <b>Template + polynomial</b> or <b>Template + Chebyshev</b> add a small correction, of the degree in the box beside the choice, under <code>bgx_</code>
         names. Beyond the template's own range, its value is held flat.</figcaption>
     </figure>
   </section>
