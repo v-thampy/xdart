@@ -13,6 +13,14 @@ is read from a file ... This could be a Nexus file with 1d data or perhaps a xye
   export waits for it, and a file changed since then is refused by name until it is chosen again.
 - "Clear" forgets the template.
 
+NEXT-128-WINDOW-POLISH (the maintainer, 2026-11-03: "the Use displayed/choose file etc options are for the template,
+right? they should only be enabled if template is selected. if there is a message about the file selected it should
+show up in a popup window rather than squeezing it in that space"; his "Same in both" and "Ask in the popup"): the host
+says when its background uses the template (``set_available``) and when a batch holds its fit worker (``set_busy``);
+an .xye file's unit, and a NeXus file's frame when the display does not name it, are asked in a popup (the shared
+``AdvancedDialog``; the name's unit is only mentioned, never preselected); a message about the file opens once in a
+popup and the status stays one short line, the whole message in its tooltip.
+
 The headless owner reads the files (``xrd_tools.analysis.background_template``), on the host's fit worker; this row
 never reads one (a restored setting is checked with a stat). It builds no editor of its own (hard rule 14): its rows
 are the shared ``FormRow`` and ``ActionButton``, its status a label.
@@ -59,6 +67,9 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         self._identity = None   # the content identity a completed fit recorded
         self._reason = ""       # why the template cannot be named, read or exported now
         self._file = None       # (kind, path) of a chosen or bound file, whose rows rebuild its source
+        self._available, self._waits, self._busy = True, "", ""  # the host's background and batch state
+        self._announced = ""    # the last message shown in a popup
+        self.message_box = None
         self.describe_displayed = None
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -198,6 +209,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         self._file = (source.kind, source.path)
         self._reason = template_file_problem(source)
         self._sync()
+        self._announce()
 
     def state(self):
         """Everything the row holds, for a settings load that must roll back."""
@@ -242,6 +254,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         else:
             return False
         self._sync()
+        self._announce()
         return True
 
     def refuse(self, result) -> bool:
@@ -255,7 +268,140 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         detail = next(iter(getattr(result, "diagnostics", ()) or ()), "")
         self._reason = detail if detail.startswith(code) else f"{code}: {detail}" if detail else code
         self._sync()
+        self._announce()
         return True
+
+    # ---- the host's state ----------------------------------------------------
+    def set_available(self, available: bool, reason: str = "") -> None:
+        """Whether the host's background uses the template: off, every control waits, saying ``reason``; the template
+        held is kept for when it is chosen again."""
+        if (bool(available), str(reason)) != (self._available, self._waits):
+            self._available, self._waits = bool(available), str(reason)
+            self._apply_controls()
+
+    def set_busy(self, reason: str = "") -> None:
+        """A host's batch holds its fit worker (``reason``; "" when idle): Use displayed waits, saying why."""
+        if str(reason) != self._busy:
+            self._busy = str(reason)
+            self._apply_controls()
+
+    def _apply_controls(self) -> None:
+        """Each control as the host's state and the row's own allow: the captured trace's file rows lock until its fit
+        names it; Clear needs a template."""
+        waits = "" if self._available else self._waits
+        present = self._template is not None or self._source is not None or self._file is not None
+        for button, enabled, reason in (
+                (self.capture_btn, self._available and not self._busy, self._busy or waits),
+                (self.choose_btn, self._available, waits),
+                (self.clear_btn, self._available and present,
+                 waits or ("" if present else f"No {self._what} is set."))):
+            spec = button.spec
+            button.apply_spec(ControlActionSpec(spec.action, spec.label, spec.section, enabled=enabled,
+                                                reason=reason if not enabled else ""))
+        for row in (self.unit_row, self.frame_row, self.mode_row):
+            row.editor.setEnabled(self._available and self._template is None)
+
+    # ---- the messages ----------------------------------------------------------
+    def _short(self) -> str:
+        """The row's message in a few plain words (its whole text is in the tooltip and the popup)."""
+        reason = self._reason
+        for code, words in (("UNIT_REQUIRED", "choose its x unit"), ("INVALID_SOURCE", "choose its frame"),
+                            ("CHANGED", "changed since its fit: choose it again"),
+                            ("UNREPRODUCIBLE", "its file does not hold this trace")):
+            if code in reason:
+                return words
+        if "missing" in reason.casefold():
+            return "file missing"
+        return "cannot be used: see its message" if reason else ""
+
+    def _announce(self) -> None:
+        """A message about the template's file, once, in a popup (``_notify``)."""
+        reason = self._reason
+        if not reason or reason == self._announced:
+            return
+        self._announced = reason
+        name = (Path(self._file[1]).name if self._file is not None else
+                Path(self._source.path).name if self._source is not None else f"The displayed {self._what}")
+        self._notify(f"{name}: {self._short()}", reason)
+
+    def _notify(self, headline: str, detail: str) -> None:
+        """The popup: Qt's message box, as Int's page shows its notices, not modal; a newer message replaces it."""
+        if self.message_box is not None:
+            self.message_box.close()
+            self.message_box.deleteLater()
+        box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.NoIcon, f"The {self._what}", headline,
+                                    QtWidgets.QMessageBox.StandardButton.Ok, self)
+        box.setInformativeText(detail)
+        box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
+        box.show()
+        self.message_box = box
+
+    # ---- the popups that ask -----------------------------------------------------
+    def _ask_unit(self, path: str, hint) -> str:
+        """An .xye file's x unit, asked in a popup ("" when cancelled; tests replace it)."""
+        dialog, unit_row = self._unit_dialog(path, hint)
+        try:
+            accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+            return unit_row.current_value() if accepted else ""
+        finally:
+            dialog.deleteLater()
+
+    def _unit_dialog(self, path: str, hint):
+        """The unit popup: the shared Advanced dialog with OK and Cancel, a line naming the file and what its name
+        suggests, and the unit row, chosen by the user (OK waits for it)."""
+        name = Path(path).name
+        suggestion = (f"Its name suggests {dict(XYE_UNITS).get(hint, hint)}, but xdart writes the same prefix for Å⁻¹ "
+                      "and nm⁻¹ (and for degrees and radians), so the name cannot decide." if hint else
+                      "Its name does not say.")
+        note = QtWidgets.QLabel(f"Which unit is the x column of {name} in?\n{suggestion}")
+        note.setWordWrap(True)
+        note.setToolTip("An .xye file records no unit: it must be the fit's, or convert to it without a wavelength.")
+        unit_row = FormRow(label="x unit", path=_path("unit"), value="", kind="combo",
+                           choices=("", *(unit for unit, _label in XYE_UNITS)),
+                           choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
+        unit_row.set_purpose_tooltip("The unit of the file's x column.")
+        return self._asking_dialog(f"The {self._what}'s x unit", (note, unit_row),
+                                   lambda: bool(unit_row.current_value())), unit_row
+
+    def _ask_frame(self, path: str, frame, mode):
+        """A NeXus file's frame and 1-D mode, asked in a popup: ``(frame, mode)``, or None when cancelled."""
+        dialog, frame_row, mode_row = self._frame_dialog(path, frame, mode)
+        try:
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return None
+            return frame_row.editor.value(), mode_row.current_value()
+        finally:
+            dialog.deleteLater()
+
+    def _frame_dialog(self, path: str, frame, mode):
+        note = QtWidgets.QLabel(f"Which frame and 1-D curve of {Path(path).name} is the {self._what}?")
+        note.setWordWrap(True)
+        note.setToolTip("A processed NeXus result holds many frames; the display names one only when it shows this "
+                        "file.")
+        frame_row = FormRow(label="Frame", path=_path("frame"), value="" if frame is None else str(frame), kind="int",
+                            minimum=0, maximum=1_000_000_000)
+        frame_row.set_purpose_tooltip("The frame label to read.")
+        mode_row = FormRow(label="1-D mode", path=_path("mode"), value=mode, kind="combo", choices=NEXUS_MODES)
+        mode_row.set_purpose_tooltip("The 1-D curve to read: default for a single result, or a grazing-incidence "
+                                     "mode.")
+        dialog = self._asking_dialog(f"The {self._what}'s frame", (note, frame_row, mode_row),
+                                     lambda: not frame_row.refusal())
+        frame_row.editor.textChanged.connect(lambda _text: self._ok_follows(dialog, lambda: not frame_row.refusal()))
+        return dialog, frame_row, mode_row
+
+    def _asking_dialog(self, title, rows, ready):
+        from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+        dialog = AdvancedDialog(self, title=title, object_name="backgroundTemplateAskDialog", accept_buttons=True)
+        dialog.add_group("", rows)
+        for row in rows:
+            if isinstance(row, FormRow) and row._kind == "combo":
+                row.editor.currentIndexChanged.connect(lambda _index: self._ok_follows(dialog, ready))
+        self._ok_follows(dialog, ready)
+        return dialog
+
+    @staticmethod
+    def _ok_follows(dialog, ready) -> None:
+        dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setEnabled(bool(ready()))
 
     # ---- choosing a file ---------------------------------------------------
     def _file_chooser(self):
@@ -271,21 +417,30 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         if not path:
             return
         kind = "nexus" if Path(path).suffix.casefold() in _NEXUS_SUFFIXES else "xye"
+        if kind == "xye":
+            # a name never fixes the scale (Codex REVIEW-3 F1): xdart writes iq_ for Å⁻¹ and nm⁻¹ alike, so the popup
+            # asks and preselects nothing; cancelled, the unit waits for the row's choice
+            unit = self._ask_unit(str(path), xye_unit_hint(path))
+        else:
+            frame, mode = None, NEXUS_MODES[0]
+            displayed = self.describe_displayed() if callable(self.describe_displayed) else None
+            if displayed is not None and _same_file(displayed[0], path):
+                frame, mode = displayed[1], displayed[2]
+            else:
+                asked = self._ask_frame(str(path), frame, mode)
+                if asked is not None:
+                    frame, mode = asked
         self._template, self._identity, self._file = None, None, (kind, str(path))
         with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor):
             if kind == "xye":
-                # a name never fixes the scale (Codex REVIEW-3 F1): xdart writes iq_ for Å⁻¹ and nm⁻¹ alike, so the
-                # unit waits for the user's choice; the name's suggestion is in the reason
-                self.unit_row.editor.setCurrentIndex(0)
+                self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(unit)) if unit else 0)
             else:
-                frame, mode = None, NEXUS_MODES[0]
-                displayed = self.describe_displayed() if callable(self.describe_displayed) else None
-                if displayed is not None and _same_file(displayed[0], path):
-                    frame, mode = displayed[1], displayed[2]
                 self.frame_row.editor.setValue(frame)
                 index = self.mode_row.editor.findText(mode)
                 self.mode_row.editor.setCurrentIndex(index if index >= 0 else 0)
         self._rebuild()
+        if not any(code in self._reason for code in ("UNIT_REQUIRED", "INVALID_SOURCE")):
+            self._announce()  # a waiting choice was just asked; anything else about the file opens a popup
 
     def _edited(self) -> None:
         """A user's edit of the unit, frame or mode: a chosen file's source is rebuilt and must be fitted again."""
@@ -321,19 +476,22 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
 
     # ---- the projection ----------------------------------------------------
     def describe(self) -> str:
-        """The template as the row's status names it."""
+        """The template as the row's status names it, in one short line (a message's whole text is in the tooltip and
+        its popup)."""
         template, source = self._template, self._source
         if template is not None:
-            name = f"{template.title} ({template.label})" if template.title else template.label
-            if source is not None:
-                return f"Displayed: {name}; its file is checked at the first fit: {source.describe()}"
-            return f"Displayed: {name}; not named by a file, so it is not saved or exported"
+            name = template.title or template.label
+            if self._reason:
+                return f"Displayed: {name}: {self._short()}"
+            return f"Displayed: {name}" + ("; its file is checked at the first fit" if source is not None else
+                                           "; not saved or exported")
         if source is not None:
-            state = "recorded" if self._identity is not None else "read at the first fit"
-            return f"{source.describe()} ({state})" + (f"; {self._reason}" if self._reason else "")
+            state = self._short() if self._reason else (
+                "recorded" if self._identity is not None else "read at the first fit")
+            return f"{source.describe()}: {state}"
         if self._file is not None:
-            return f"{Path(self._file[1]).name}: {self._reason}"
-        return f"No {self._what}"
+            return f"{Path(self._file[1]).name}: {self._short()}"
+        return f"No {self._what}: use the displayed trace or choose a file"
 
     def _sync(self) -> None:
         text = self.describe()
@@ -342,7 +500,6 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         self.status.setToolTip(
             f"The {self._what} the template backgrounds scale. " + (f"{text}. {detail}" if detail else text))
         kind = self._file[0] if self._file is not None else (None if self._source is None else self._source.kind)
-        pending = self._template is not None
         self.unit_row.setVisible(kind == "xye")
         self.frame_row.setVisible(kind == "nexus")
         self.mode_row.setVisible(kind == "nexus")
@@ -354,12 +511,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
                 self.frame_row.editor.setValue(source.frame)
                 index = self.mode_row.editor.findText(source.mode)
                 self.mode_row.editor.setCurrentIndex(index if index >= 0 else 0)
-        for row in (self.unit_row, self.frame_row, self.mode_row):
-            row.editor.setEnabled(not pending)
-        present = self._template is not None or self._source is not None or self._file is not None
-        spec = self.clear_btn.spec
-        self.clear_btn.apply_spec(ControlActionSpec(spec.action, spec.label, spec.section, enabled=present,
-                                                    reason="" if present else f"No {self._what} is set."))
+        self._apply_controls()
         self.changed.emit()
 
     def set_help_topic(self, topic_id: str) -> None:

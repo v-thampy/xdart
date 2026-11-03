@@ -24,7 +24,7 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xrd_tools.help_topics import diagnostic_text
 from xrd_tools.session.readiness import (
-    ControlActionSpec, ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
+    ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
 )
 
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
@@ -77,6 +77,8 @@ _BATCH_TIP = ('Fit every selected result with these settings, then plot fraction
 _CALIBRANT_ONLY = 'Calibrants are reference lines only and are not fitted: check a CIF or lattice phase to fit.'
 _SUBSTRATE_NEEDED = ('The Substrate backgrounds need a substrate: show the bare substrate\'s pattern and click Use '
                      'displayed as substrate, or choose its NeXus or .xye file.')
+_SUBSTRATE_WAITS = ('Choose a Substrate fitted background first (Substrate, or Substrate + linear, polynomial or '
+                    'Chebyshev): these controls set its substrate.')
 _RECAPTURE_NOTICE = ('These settings name no substrate file: choose the substrate\'s file or capture it again before '
                      'fitting with it.')
 
@@ -192,7 +194,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.plot, self.resid_plot = self.fit_view.plot, self.fit_view.residuals
         self.fit_view.reconcile(FitProjection(lower=FitPanel(zero_line=True)))
         # Parameters (fractions, lattice) against the result order or a scan column, on the shared trend.
-        self.trend = TrendView(self.displays, name="phaseFitTrend")
+        self.trend = TrendView(self.displays, name="phaseFitTrend", members="phases")
         self.trend.add_header_widget(self.fit_view.components_toggle)  # each phase's own line, on by default
         # Each phase's fraction and lattice, on the shared table.
         self.table = ResultsTable(PHASE_RESULT_HEADERS, self.displays, name="phaseFitTable", max_height=150)
@@ -426,6 +428,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         """Each row that a choice makes irrelevant is off and says why; Texture's tip names lattice phases; the
         export buttons say why a fit cannot be exported."""
         fit_background = self.fit_background_row.current_value()
+        # the substrate row waits for a Substrate background (NEXT-128-WINDOW-POLISH: "Same in both (Recommended)")
+        self.background_template_row.set_available(fit_background.startswith("template"), _SUBSTRATE_WAITS)
         texture = self.texture_row.current_value()
         amorphous = self.amorphous_row.current_value() != "none"
         lattice = any(entry.source_kind == 'lattice' for entry in self._fitted_entries())
@@ -630,10 +634,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.batch_btn.setEnabled(not batch_reason)
             self.batch_btn.setToolTip(batch_reason or _BATCH_TIP)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
-        spec = self.substrate_capture_btn.spec
-        self.substrate_capture_btn.apply_spec(ControlActionSpec(
-            spec.action, spec.label, spec.section, enabled=not self._running,
-            reason='A batch is fitting; capture the substrate when it is done.' if self._running else ''))
+        self.background_template_row.set_busy('A batch is fitting; capture the substrate when it is done.'
+                                              if self._running else '')
 
     def set_fit_reason(self, reason=''):
         """The host's reason no fit can run now (Stitch: no result is open), shown on Fit and Batch."""

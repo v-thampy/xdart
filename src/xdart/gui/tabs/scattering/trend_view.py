@@ -9,8 +9,10 @@ A row is one result's flat parameters (``center_0``, ``fwhm_1``, ``frac_TiN`` �
 re-fit updates its row and two results at the same x stay two rows. Its x is the host's: a frame index (Int), a
 scan column's value, or None when that result has none (it is listed in the CSV, counted in the note, not drawn);
 or, with ``order``, its place among the results. Parameters group into families (one curve per peak: the
-``peak_fit_util`` helpers); the Track family is drawn on the left axis, a Right family on its own right-hand axis
-(dashed, "(R)" in the legend), one series each unless Overlay draws them all. Families in the fitted pattern's
+``peak_fit_util`` helpers); the Track family is drawn on the left axis, a Track 2 family on its own right-hand axis
+(dashed, "(R)" in the legend). One chooser picks the members both draw, the peaks or a phase fit's phases, all by
+default (NEXT-128-WINDOW-POLISH: the maintainer's "One chooser, all by default (Recommended)"). Families in the fitted
+pattern's
 coordinate are labelled with its unit (``set_value_unit``), the others "Intensity". Save CSV… writes the rows
 through the shared Browse rule (``file_dialogs``).
 """
@@ -25,7 +27,9 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from xdart.gui.analysis.peak_fit_util import CURVE_PENS, FAMILY_LABELS, X_UNIT_FAMILIES, group_families
+from xdart.gui.analysis.peak_fit_util import (
+    CURVE_PENS, FAMILY_LABELS, FAMILY_UNITS, X_UNIT_FAMILIES, group_families, member_label,
+)
 from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style, plot_font
 from xdart.gui.widgets.controls_panel import FormRow
@@ -126,7 +130,7 @@ class TrendView(QtWidgets.QWidget):
     def __init__(self, parent=None, *, name: str = "trendView", x_label: str = "Frame", x_name: str = "frame",
                  order: bool = False, save_title: str = "Save parameters vs frame",
                  save_name: str = "fit_params_vs_frame.csv", min_height: int = 150,
-                 series_only: bool = False, identity_column: str | None = None) -> None:
+                 series_only: bool = False, identity_column: str | None = None, members: str = "peaks") -> None:
         super().__init__(parent)
         self.setObjectName(name)
         self._x_name, self._order = x_name, bool(order)
@@ -142,23 +146,31 @@ class TrendView(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         bar = QtWidgets.QHBoxLayout()
         self.family_row = FormRow(label="Track", path=("trend", "family"), value="", kind="combo")
-        self.overlay_row = FormRow(label="Overlay", path=("trend", "overlay"), value=False, kind="bool")
-        self.right_row = FormRow(label="Right", path=("trend", "right_family"), value="", kind="combo")
-        #: the family on the left axis, the one on the right axis (None: off) and the Overlay toggle
+        self.right_row = FormRow(label="Track 2", path=("trend", "right_family"), value="", kind="combo")
+        for row in (self.family_row, self.right_row):
+            row.label.setMinimumWidth(0)  # the label hugs its text beside its box (NEXT-128-WINDOW-POLISH)
+        #: the family on the left axis and the one on the right axis (None: off)
         self.family, self.right_family = self.family_row.editor, self.right_row.editor
-        self.overlay = self.overlay_row.editor
         self.family.clear()
         self.right_family.clear()
         self.right_family.addItem("None", None)
         self.family_row.set_purpose_tooltip("Which fitted parameter to plot across the results")
-        self.overlay_row.set_purpose_tooltip(
-            "Plot every series in the selected parameter on one axis, not just the first")
-        self.right_row.set_purpose_tooltip("Overlay a second parameter family against a right-hand axis "
-                                           "(None = off) — for families of very different magnitude")
+        self.right_row.set_purpose_tooltip("A second fitted parameter, dashed against a right-hand axis (None = off) "
+                                           "— for parameters of very different magnitude")
+        #: the members both tracks draw (peak indices, or a phase fit's phases), each checked unless hidden
+        self.members = QtWidgets.QPushButton(f"{members.capitalize()}: all")
+        self.members.setObjectName(f"{name}Members")
+        self.members.setAutoDefault(False)
+        self.members.setToolTip(f"Which {members} both tracked parameters are drawn for: check the ones to show; All "
+                                "shows every one.")
+        self.members.setMenu(QtWidgets.QMenu(self.members))
+        self._word = members.capitalize()
+        self._members: tuple = ()
+        self._hidden: set = set()
         self.save = QtWidgets.QPushButton("Save CSV…")
         self.save.setToolTip("Export the parameters table")
-        for row in (self.family_row, self.overlay_row, self.right_row):
-            bar.addWidget(row)
+        for widget in (self.family_row, self.right_row, self.members):
+            bar.addWidget(widget)
         bar.addStretch(1)
         bar.addWidget(self.save)
         layout.addLayout(bar)
@@ -176,11 +188,10 @@ class TrendView(QtWidgets.QWidget):
         layout.addWidget(self.plot, 1)
         self.family.currentIndexChanged.connect(self.redraw)
         self.right_family.currentIndexChanged.connect(self.redraw)
-        self.overlay.toggled.connect(self.redraw)
         self.save.clicked.connect(self._save_csv)
         self._set_enabled(False)
         if self._series_only:
-            for widget in (self.family_row, self.overlay_row, self.right_row, self.save, self.note):
+            for widget in (self.family_row, self.right_row, self.members, self.save, self.note):
                 widget.hide()
             self.legend.setLabelTextSize(f"{plot_font().pointSize() + 2}pt")
 
@@ -260,8 +271,9 @@ class TrendView(QtWidgets.QWidget):
         return tuple(self._rows.values())
 
     def add_header_widget(self, widget: QtWidgets.QWidget) -> None:
-        """A window's own control in this row, after Right (NEXT-128-PEAK-FIT: the fit view's components toggle)."""
-        self._bar.insertWidget(self._bar.indexOf(self.right_row) + 1, widget)
+        """A window's own control in this row, after the members chooser (NEXT-128-PEAK-FIT: the fit view's components
+        toggle)."""
+        self._bar.insertWidget(self._bar.indexOf(self.members) + 1, widget)
 
     def set_value_unit(self, unit: str) -> None:
         """The fitted pattern's coordinate (its unit or label), which the centre and width families are in."""
@@ -276,13 +288,16 @@ class TrendView(QtWidgets.QWidget):
             return
         self._rows[str(identity)] = TrendRow(str(identity), None if x is None else float(x), dict(params))
         self._sync_families()
+        self._sync_members()
         self.redraw()
         self._set_enabled(True)
 
     def clear(self) -> None:
-        """No rows: the families and the plot go, Right back to None."""
+        """No rows: the families and the plot go, Track 2 back to None, every member shown again."""
         self._rows = {}
         self._families = ()
+        self._members, self._hidden = (), set()
+        self._build_member_menu()
         for combo, none in ((self.family, False), (self.right_family, True)):
             blocker = QtCore.QSignalBlocker(combo)
             combo.clear()
@@ -319,11 +334,10 @@ class TrendView(QtWidgets.QWidget):
             return
         x = np.asarray([xs[index] for index in drawn], dtype=float)
         grouped = group_families(columns)
-        overlay = self.overlay.isChecked()
         colour = 0
         family = self.family.currentData()
         if family is not None:
-            for key, _peak in grouped.get(family, [])[:None if overlay else 1]:
+            for key, _member in self._shown(grouped.get(family, [])):
                 pen = CURVE_PENS[colour % len(CURVE_PENS)]
                 colour += 1
                 y = np.asarray([columns[key][index] for index in drawn], dtype=float)
@@ -332,7 +346,7 @@ class TrendView(QtWidgets.QWidget):
         right = self.right_family.currentData()
         any_right = False
         if right is not None and right != family:
-            for key, _peak in grouped.get(right, [])[:None if overlay else 1]:
+            for key, _member in self._shown(grouped.get(right, [])):
                 pen = CURVE_PENS[colour % len(CURVE_PENS)]
                 colour += 1
                 y = np.asarray([columns[key][index] for index in drawn], dtype=float)
@@ -374,13 +388,66 @@ class TrendView(QtWidgets.QWidget):
             del blocker
         self._families = families
 
+    def _shown(self, entries):
+        """A family's (key, member) entries whose member the chooser shows."""
+        return [(key, member) for key, member in entries if member not in self._hidden]
+
+    def _sync_members(self) -> None:
+        """The chooser lists every family's members (peak indices in order, or a phase fit's phases), keeping what was
+        hidden; rebuilt only when the members change."""
+        keys: list[str] = []
+        for row in self._rows.values():
+            keys += [key for key in row.params if key not in keys]
+        members: list = []
+        for entries in group_families(keys).values():
+            members += [member for _key, member in entries if member not in members]
+        numbers = sorted(member for member in members if isinstance(member, int))
+        members = tuple(numbers + [member for member in members if not isinstance(member, int)])
+        if members != self._members:
+            self._members, self._hidden = members, self._hidden & set(members)
+            self._build_member_menu()
+
+    def _build_member_menu(self) -> None:
+        """The chooser's menu, All then each member checked unless hidden, and its text naming what is shown."""
+        menu = self.members.menu()
+        menu.clear()
+        everyone = menu.addAction("All")
+        everyone.setCheckable(True)
+        everyone.setChecked(not self._hidden)
+        everyone.triggered.connect(lambda _checked: self._show_members(set()))
+        menu.addSeparator()
+        for member in self._members:
+            action = menu.addAction(member_label(member))
+            action.setCheckable(True)
+            action.setChecked(member not in self._hidden)
+            action.triggered.connect(lambda checked, member=member: self._toggle_member(member, checked))
+        word = ("Phases" if any(isinstance(member, str) for member in self._members) else
+                "Peaks" if self._members else self._word)
+        shown = [str(member) for member in self._members if member not in self._hidden]
+        self.members.setText(f"{word}: all" if not self._hidden else f"{word}: {', '.join(shown) or 'none'}")
+
+    def _toggle_member(self, member, shown: bool) -> None:
+        if shown:
+            self._hidden.discard(member)
+        else:
+            self._hidden.add(member)
+        self._show_members(self._hidden)
+
+    def _show_members(self, hidden) -> None:
+        self._hidden = set(hidden)
+        self._build_member_menu()
+        self.redraw()
+
     def _axis_label(self, family: str) -> str:
-        unit = self._value_unit if family in X_UNIT_FAMILIES else "Intensity"
+        if family in FAMILY_UNITS:
+            unit = FAMILY_UNITS[family]
+        else:
+            unit = self._value_unit if family in X_UNIT_FAMILIES else "Intensity"
         label = FAMILY_LABELS.get(family, family)
         return f"{label} ({unit})" if unit else label
 
     def _set_enabled(self, enabled: bool) -> None:
-        for widget in (self.family, self.right_family, self.overlay, self.save):
+        for widget in (self.family, self.right_family, self.members, self.save):
             widget.setEnabled(enabled)
 
     def _save_csv(self) -> None:

@@ -25,7 +25,7 @@ import math
 
 from xrd_tools.help_topics import diagnostic_text
 from xrd_tools.session.readiness import (
-    ControlActionSpec, ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
+    ControlFieldKind, ControlFormField, SectionId, integer_field_refusal,
 )
 
 import numpy as np
@@ -82,6 +82,9 @@ TOPICS = {"model": "peak-fit.model", "background": "peak-fit.background", "peaks
 PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_settings", "Peak Fitter",
                                  sections=("background_template",))
 _RANGE_KEYS = ("range_low", "range_high")
+#: why the template row waits (NEXT-128-WINDOW-POLISH PF9)
+_TEMPLATE_WAITS = ("Choose a Template background first (Template, Template + linear or Template + Chebyshev (3)): "
+                   "these controls set its template.")
 _TEXT_KEYS = ("centers", "sigma_init", "sigma_min", "sigma_max", "center_delta", "fraction")
 
 
@@ -182,7 +185,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.bkg_row = _combo("Background", "background", _BACKGROUNDS)
         self.background_template_row = BackgroundTemplateRow(self)
         self.background_template_row.set_help_topic(TOPICS["background"])
-        self.count_row = FormRow(label="Peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
+        self.count_row = FormRow(label="No. of peaks", path=_path("n_peaks"), value="1", kind="int", minimum=1,
                                  maximum=_MAX_PEAKS)
         # Auto in the Peaks row (his "put the Peaks and "Auto" (for detecting peaks in the same row"), as Int parks its
         # Pts cluster on the Axis row: a shared bool row, its own label the toggle's text
@@ -203,7 +206,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                                              "or the template below scaled by one amplitude, alone or plus a "
                                              "linear or Chebyshev correction."),
                 (self.count_row, "peaks", "The number of peaks to fit when Auto (beside it) is off, spread across "
-                                          "the range unless Advanced gives their centers."),
+                                          "the range unless Peak parameters gives their centers."),
                 (self.range_row, "range", "The interval fitted, in the displayed axis. Full (on by default) fits the "
                                           "whole trace; turn it off to type a range, or drag it on the plot.")):
             row.set_purpose_tooltip(tip)
@@ -283,31 +286,31 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.range_row.valueChanged.connect(self._range_value_changed)
 
     def _build_advanced(self):
-        """The rarely changed fit values, in an Advanced card under the fit's (NEXT-128-WINDOW-POLISH: the maintainer,
-        2026-11-03, "i think there's enogh space in the peak fitting window left panel that the advanced options can
-        be accommodated there"), on the shared rows, grouped as the Advanced dialog grouped them. They apply
+        """The rarely changed fit values, in the Peak parameters card under the fit's (NEXT-128-WINDOW-POLISH: the
+        maintainer, 2026-11-03, "i think there's enogh space in the peak fitting window left panel that the advanced
+        options can be accommodated there", then "Peak parameters (Recommended)"), on the shared rows: each peak's
+        starting values and limits, Center ± delta right after the centers it bounds, then the Solver's. They apply
         identically to Fit, Live and Batch (all backed by fit_peaks / PeakFitPlan)."""
-        card = self.advanced_card = SectionCard("Advanced", collapsible=False)
-        card.set_purpose_tooltip("The rarely changed options: peak centers, σ start and bounds, center bounds, PV "
-                                 "fraction, the solver's budget and weighting.")
+        card = self.advanced_card = SectionCard("Peak parameters", collapsible=False)
+        card.set_purpose_tooltip("Where each peak's fit starts and how far it may move (centers, ± delta, σ start and "
+                                 "bounds, PV fraction), then the solver's budget and weighting.")
         card.set_help_topic(TOPICS["peaks"])
         rows = {
             "centers": FormRow(label="Peak centers", path=_path("centers"), value=""),
+            "center_delta": FormRow(label="Center ± delta", path=_path("center_delta"), value=""),
             "sigma_init": FormRow(label="σ initial", path=_path("sigma_init"), value=""),
             "sigma_bounds": RangeRow(label="σ min / max",
                                      low={"path": _path("sigma_min"), "value": "", "placeholder": "auto"},
                                      high={"path": _path("sigma_max"), "value": "", "placeholder": "auto"}),
-            "center_delta": FormRow(label="Center ± delta", path=_path("center_delta"), value=""),
             "fraction": FormRow(label="PV fraction", path=_path("fraction"), value=""),
             "max_nfev": FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
                                 maximum=1_000_000, allow_blank=True),
         }
-        card.add_group_header("Peaks", tooltip="Where each peak's fit starts, how far its center and width may move, "
-                                                "and the solver's budget.")
-        for row in rows.values():
-            card.add_row(row)
         uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
-        card.add_group_header("Weighting", tooltip="How much each point counts in the fit.")
+        for name in ("centers", "center_delta", "sigma_init", "sigma_bounds", "fraction"):
+            card.add_row(rows[name])
+        card.add_group_header("Solver", tooltip="The solver's budget, and how much each point counts in the fit.")
+        card.add_row(rows["max_nfev"])
         card.add_row(uncertainty)
         self.split.add_card(card)
         self.use_uncertainties = uncertainty.editor
@@ -463,11 +466,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.live_check.setEnabled(not running and not self._vnext)
         self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
-        capture = self.background_template_row.capture_btn
-        spec = capture.spec
-        capture.apply_spec(ControlActionSpec(spec.action, spec.label, spec.section, enabled=not running,
-                                             reason='A batch is fitting; capture the template when it is done.'
-                                             if running else ''))
+        self.background_template_row.set_busy('A batch is fitting; capture the template when it is done.'
+                                              if running else '')
 
     def set_batch_progress(self, done, total):
         self.status.setText(f"Batch fitting… {done}/{total}")
@@ -711,7 +711,9 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return values
 
     def _sync_export(self):
-        """The export buttons say why a template background cannot be exported."""
+        """The template row waits for a template background (NEXT-128-WINDOW-POLISH: "they should only be enabled if
+        template is selected"); the export buttons say why a template background cannot be exported."""
+        self.background_template_row.set_available(self._background().startswith("template"), _TEMPLATE_WAITS)
         if not hasattr(self, "export_actions"):
             return
         reason = self.background_template_row.export_reason() if self._background().startswith("template") else ""

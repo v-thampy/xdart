@@ -14,9 +14,16 @@ FAMILY_LABELS = {
     "center_err": "Center uncertainty",
     "fwhm": "FWHM",
     "amplitude": "Amplitude",
+    # a phase fit's kinds (NEXT-128-WINDOW-POLISH), one member per phase: ``frac_<phase>`` and ``<phase>_<cell>``
+    "frac": "Phase fraction",
+    "a": "Lattice a", "b": "Lattice b", "c": "Lattice c",
+    "alpha": "Lattice α", "beta": "Lattice β", "gamma": "Lattice γ",
 }
 #: families whose VALUES are in the pattern's x-unit (vs. intensity).
 X_UNIT_FAMILIES = {"center", "center_err", "fwhm"}
+#: families with a unit of their own: a fraction has none; cell lengths are in Å, cell angles in degrees
+FAMILY_UNITS = {"frac": "", "a": "Å", "b": "Å", "c": "Å", "alpha": "°", "beta": "°", "gamma": "°"}
+_CELL_KEYS = ("a", "b", "c", "alpha", "beta", "gamma")
 
 #: per-curve colors (one per peak within a family).
 CURVE_PENS = [(189, 147, 249), (80, 250, 123), (255, 184, 108),
@@ -32,16 +39,37 @@ def split_family(key):
     return key, 0
 
 
+def _phase_family(key, phases):
+    """A phase fit's key as ``(kind, phase)``: ``frac_<phase>`` -> ``("frac", phase)``, ``<phase>_<cell>`` ->
+    ``(cell, phase)`` for a listed phase (longest name first); None for any other key."""
+    if key.startswith("frac_") and key[5:] in phases:
+        return "frac", key[5:]
+    for phase in sorted(phases, key=len, reverse=True):
+        if key.startswith(f"{phase}_") and key[len(phase) + 1:] in _CELL_KEYS:
+            return key[len(phase) + 1:], phase
+    return None
+
+
 def group_families(keys):
-    """An iterable of param keys -> ordered ``{family: [(key, peak_index), ...]}``
-    (each family's peaks sorted by index) so a family's curves plot together."""
+    """An iterable of param keys -> ordered ``{family: [(key, member), ...]}`` so a family's curves plot together:
+    a peak fit's members are its peak indices (sorted); a phase fit's keys (``frac_<phase>``, ``<phase>_<cell>``)
+    group by kind, their members the phases' names in the order of their fractions (NEXT-128-WINDOW-POLISH)."""
+    keys = list(keys)
+    phases = [key[5:] for key in keys if key.startswith("frac_") and len(key) > 5]
     fam = {}
     for key in keys:
-        f, i = split_family(key)
-        fam.setdefault(f, []).append((key, i))
+        f, member = _phase_family(key, phases) or split_family(key)
+        fam.setdefault(f, []).append((key, member))
+    order = {phase: position for position, phase in enumerate(phases)}
     for f in fam:
-        fam[f].sort(key=lambda ki: ki[1])
+        fam[f].sort(key=lambda km: (0, km[1], "") if isinstance(km[1], int) else (1, order.get(km[1], len(order)),
+                                                                                   str(km[1])))
     return fam
+
+
+def member_label(member):
+    """A family member as the trend's chooser names it: "Peak 0" for a peak index, a phase by its name."""
+    return f"Peak {member}" if isinstance(member, int) else str(member)
 
 
 def accumulator_to_table(accumulator):

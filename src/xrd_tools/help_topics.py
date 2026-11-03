@@ -636,7 +636,7 @@ A displayed 1-D trace with resolved peaks.
 Steps
 1. Model: Pseudo-Voigt (the default), Gaussian, Lorentzian, Voigt, Pearson VII or
    Split pseudo-Voigt.
-2. PV fraction (Advanced) starts the Lorentzian fraction of a pseudo-Voigt or split
+2. PV fraction (Peak parameters) starts the Lorentzian fraction of a pseudo-Voigt or split
    pseudo-Voigt, from 0 to 1; it is fitted within those bounds.
 3. Fit, then read each peak's centre, width and area in the table.
 
@@ -680,9 +680,11 @@ For a template: the bare background's displayed trace, or its file: a NeXus resu
 Steps
 1. Background: Linear, Constant, None or Chebyshev (3); or Template, Template plus
    linear, or Template plus Chebyshev (3).
-2. Template row: Use displayed captures the displayed trace and names it by its
-   file, frame and mode; Choose file… takes a NeXus file (enter the frame; a single
-   result's mode is default) or an .xye file (confirm its unit). Clear forgets it.
+2. Template row (it waits until a Template background is chosen): Use displayed
+   captures the displayed trace and names it by its file, frame and mode; Choose
+   file… takes a NeXus file (a popup asks its frame and mode unless the display shows
+   that file) or an .xye file (a popup asks its x unit). Clear forgets it. A problem
+   with the file opens in a popup; the row keeps a short status.
 3. Fit. The first fit reads the file and records its content; the row then names
    the template, which is saved with the settings and exported to notebooks.
 
@@ -728,9 +730,9 @@ Required inputs
 A displayed 1-D trace and a fit range that holds the peaks.
 
 Steps
-1. Auto, beside the peak count, finds up to twelve peaks in the fit range; turn it
+1. Auto, beside No. of peaks, finds up to twelve peaks in the fit range; turn it
    off to fit the count, 1 to 12 peaks spread across the range.
-2. Peak centers (Advanced), comma-separated, seed the fit and override Auto and the
+2. Peak centers (Peak parameters), comma-separated, seed the fit and override Auto and the
    count.
 3. σ initial starts every width; σ min / max bound it.
 4. Center ± delta keeps each centre within that distance of its start.
@@ -808,7 +810,7 @@ Required inputs
 A trace that carries measured uncertainties (σ); otherwise the option is off.
 
 Steps
-1. In Advanced, Use uncertainties weights each point by 1/σ.
+1. In Peak parameters ▸ Solver, Use uncertainties weights each point by 1/σ.
 2. Leave it off for an unweighted least-squares fit.
 
 Units and conventions
