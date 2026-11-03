@@ -114,8 +114,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       lattice, how much each phase scatters, how broad its peaks are and how its crystallites are oriented. This guide
       starts with that physics, then shows how each number Phase Analysis reports follows from it.</p>
     <div class="facts">
-      <div class="fact"><b>Up to 8 phases</b>CIF files, lattice parameters, built-in calibrants or the phase
-        library</div>
+      <div class="fact"><b>Up to 8 phases</b>CIF files, lattice parameters or the phase library, with built-in
+        calibrants listed apart as reference lines</div>
       <div class="fact"><b>11 profiles</b>pseudo-Voigt, Gaussian, Lorentzian, Voigt, Pearson VII and six more</div>
       <div class="fact"><b>3 width models</b>Caglioti (the instrument), Scherrer (size and strain), or one fixed
         width</div>
@@ -266,7 +266,8 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
       </div>
       <figcaption>The model is built in this order for every phase, and the phases' patterns are added. A lattice
         phase (cell and space group only) gives positions without intensities, so it always fits free heights; a
-        built-in calibrant is drawn as reference lines and never fitted.</figcaption>
+        built-in calibrant, listed under Reference lines (not fitted), is drawn as reference lines and never
+        fitted.</figcaption>
     </figure>
   </section>
 
@@ -274,9 +275,11 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
     <h2>The phase list</h2>
     <ul>
       <li>One list serves the reference overlays and the fit: a checked phase is drawn and fitted, an unchecked one
-        is neither, and a calibrant is drawn but never fitted.</li>
+        is neither. Built-in calibrants are listed below it, under <b>Reference lines (not fitted)</b>: a checked
+        calibrant is drawn but never fitted.</li>
       <li><b>Add CIF…</b> keeps the file's bytes in the phase library; <b>Add lattice…</b> predicts positions only;
-        <b>Add calibrant…</b> and <b>Add from library…</b> list built-in calibrants and kept entries.</li>
+        <b>Add from library…</b> lists kept entries; <b>Add calibrant…</b> lists the built-in calibrants, which join
+        the reference lines. <b>Remove</b> takes the selected row of either list.</li>
       <li>The minimum intensity drops a CIF phase's reflections weaker than that percent of its strongest one;
         <b>Same minimum for all phases</b> applies one value to every CIF phase.</li>
     </ul>

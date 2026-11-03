@@ -402,7 +402,8 @@ xrd_tools/analysis/scan_operations.py — identity, normalization and admission.
     HelpTopic("phase-analysis.phases", "Phase Analysis: the phase list", """Purpose
 One list of phases serves both the reference overlays on the plots and the fit. A
 checked (include) phase is drawn as a reference and is fitted; an unchecked one is
-neither. Built-in calibrants are reference lines only: they are drawn but never fitted.
+neither. Built-in calibrants are listed apart, under Reference lines (not fitted):
+they are drawn but never fitted.
 
 Required inputs
 CIF files, lattice parameters (cell lengths, angles and space group), a built-in
@@ -411,9 +412,10 @@ displayed radial trace in q (Int) or Q/2θ with a recorded wavelength (Stitch).
 
 Steps
 1. Add CIF… parses the files on a worker and keeps their bytes in the phase library.
-2. Add lattice… predicts positions only; Add calibrant… and Add from library… list
-   built-in calibrants and kept entries. Remove takes only the selected row.
-3. Check a row to include it: it is drawn and, unless it is a calibrant, fitted.
+2. Add lattice… predicts positions only; Add from library… lists kept entries; Add
+   calibrant… lists the built-in calibrants, which join Reference lines (not fitted).
+   Remove takes only the selected row, in either list.
+3. Check a row to include it: a phase is drawn and fitted, a reference line drawn only.
 4. Same minimum for all phases applies one minimum intensity to every CIF phase; turn
    it off to give each CIF row its own minimum.
 
@@ -423,8 +425,9 @@ keeps the colour slot it joined with, and its legend entry; clicking a legend en
 flips the include check. The top-bar Phases toggle hides the overlays only.
 
 Assumptions
-At most eight phases. Lattice and calibrant phases carry no structural intensities, so
-no minimum applies to them and their positions are all listed.
+At most eight phases and reference lines together. Lattice and calibrant phases carry
+no structural intensities, so no minimum applies to them and their positions are all
+listed.
 
 Expected observations
 The list is saved with the session's plot options; closing and reopening the window
@@ -432,16 +435,18 @@ lists the same rows. After a fit, a CIF row's tooltip shows the receipt of the b
 that were fitted.
 
 Diagnostics
-The rings notice under the list says why detector rings are unavailable. A missing
-library entry is named in the status line. A list holding only calibrants refuses Fit.
+The rings notice under the lists says why detector rings are unavailable. A missing
+library entry is named in the status line. With only reference lines (calibrants)
+checked, Fit refuses.
 
 Common mistakes and corrective actions
 An unchecked phase is not fitted: check it. A calibrant is never fitted: to fit an
 internal standard, add its CIF. A legend click also changes what the next Fit uses.
 
 Worked example
-List LaB6 (calibrant), HfO2 (CIF) and a TiN lattice; uncheck TiN. Fit uses HfO2 only,
-LaB6 stays a reference line, and TiN is neither drawn nor fitted.
+List HfO2 (CIF) and a TiN lattice under the phases, and LaB6 (calibrant) under
+Reference lines (not fitted); uncheck TiN. Fit uses HfO2 only, LaB6 stays a reference
+line, and TiN is neither drawn nor fitted.
 
 References
 xdart/gui/analysis/phase_source.py — the shared phase list.

@@ -7,7 +7,7 @@ into one - Phase Analysis". Its host creates it (Int's analysis mount, Stitch's 
 ``vnext_submit``, on the host's own displayed input and worker. The phase list is Int's shared phase source in its
 reference mode (an include check and a minimum intensity per phase), bound by ``ReferencePhaseBinding`` to the
 reference-phase plot options of the ``ScientificView`` the host attaches it to: a checked phase is drawn and fitted,
-and a built-in calibrant is drawn only.
+and a built-in calibrant, listed apart under "Reference lines (not fitted)" (CALIBRANT-GROUP-128), is drawn only.
 
 It builds no display or editor widget of its own (hard rule 14): its options are the shared Controls rows
 (``FormRow``, ``RangeRow``) in ``SectionCard``s, the rarely changed ones the shared ``AdvancedDialog``'s groups; its
@@ -288,9 +288,11 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         from xdart.gui.tabs.scattering.reference_phases import ReferencePhaseBinding
         from .phase_source import PhaseSourceWidget
         self.phases_card = self._card("Phases", "phases", 'The phase list, shared with the plots: each checked phase '
-                                      'is drawn as a reference and fitted; a built-in calibrant is drawn only.')
-        # The Reference Phases list: calibrants, library entries, CIFs and lattices, each with an include check and a
-        # minimum intensity, keyed by library id; this window's status line shows its messages.
+                                      'is drawn as a reference and fitted. The built-in calibrants below it, under '
+                                      'Reference lines (not fitted), are drawn only.')
+        # The Reference Phases lists, keyed by library id: library entries, CIFs and lattices, each with an include
+        # check and a minimum intensity; below them the built-in calibrants, each with an include check only
+        # (CALIBRANT-GROUP-128). This window's status line shows their messages.
         self.phase_source = PhaseSourceWidget(self.phases_card, checkable=True, show_library=False, calibrants=True,
                                               cutoffs=True, status_visible=False)
         # half its earlier 220 px (the maintainer, 2026-11-02: "the height of the phases window can be reduced by
@@ -298,6 +300,12 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         browser = self.phase_source.browser
         browser.ensurePolished()
         browser.setMaximumHeight(max(110, browser.minimumSizeHint().height()))
+        # The reference lines' list is compact: 90 px shows about three rows in the app's theme (measured offscreen at
+        # 1512x982: 3.4 rows of 18 px at 72 dpi, 2.6 of 22 px at 96 dpi), never below its own polished minimum (an
+        # unthemed Fusion list's is 94-118 px, which then sets the height); a longer list scrolls
+        reference = self.phase_source.reference_browser
+        reference.ensurePolished()
+        reference.setMaximumHeight(max(90, reference.minimumSizeHint().height()))
         self.phase_source.set_help_topic(TOPICS["phases"])
         self.phases_card.add_row(self.phase_source)
         #: the list is the host view's reference-phase plot options; the host attaches this binding to its view

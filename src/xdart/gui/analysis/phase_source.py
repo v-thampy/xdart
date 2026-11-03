@@ -1,8 +1,10 @@
 """Shared CIF/library and manual-lattice source for fitting and reference overlays.
 
-This owner mounts Int's keyed BrowserView and Controls rows. The headless phase
-library owns all valid sources; selection is only an immutable tuple of IDs and
-visibility flags. No reflection listing or detector prediction runs here.
+This owner mounts Int's keyed BrowserView and Controls rows. With calibrants, a second
+keyed BrowserView lists the built-in calibrants apart, as reference lines that are never
+fitted (CALIBRANT-GROUP-128). The headless phase library owns all valid sources; the one
+selection, across both lists, is only an immutable tuple of IDs and visibility flags.
+No reflection listing or detector prediction runs here.
 """
 from __future__ import annotations
 
@@ -30,10 +32,26 @@ _REMOVE_NONE_TIP = 'Select a phase in the list first: Remove acts only on the se
 #: a calibrant row's own tooltip (PHASE-ANALYSIS-128: reference lines only, never fitted)
 _CALIBRANT_DETAIL = ('{name}: a built-in calibrant, drawn as reference lines and detector rings only. It has '
                      'positions but no intensities, so it is never fitted.')
+#: the built-in calibrants' own list, below the phases (CALIBRANT-GROUP-128; the maintainer, 2026-11-03: "Separate
+#: group in Phase Analysis, now")
+REFERENCE_CAPTION = 'Reference lines (not fitted)'
+_REFERENCE_TIP = ('Built-in calibrants: drawn as reference lines (and current-Run detector rings) on the plots; '
+                  'never fitted, and no minimum intensity applies.')
 
 
 def _detail(kind, name):
     return _CALIBRANT_DETAIL.format(name=name) if kind == 'calibrant' else f'{kind} phase: {name}'
+
+
+def _hidden_action_tips(browser):
+    """The keyed profile hides Int's file actions, but they remain children of the mounted owner and retain useful
+    help if a profile reveals them."""
+    for control, tip in ((browser.show_all, 'Show every phase in this source list.'),
+                         (browser.metadata, 'Show the selected phase source details.'),
+                         (browser.auto_last, 'Follow the last phase added to the list.'),
+                         (browser.date_sort, 'Sort the source list by time.'),
+                         (browser.refresh, 'Refresh the available phase sources.')):
+        control.setToolTip(tip)
 
 
 @dataclass(frozen=True, eq=False)
@@ -91,7 +109,8 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._resolved = {}
         self._show_library = bool(show_library)
         self._checkable = bool(checkable)
-        self._shown_ids = ()
+        #: the ids the phase list shows, and the ids the reference list shows (calibrants), each in list order
+        self._shown_ids = self._reference_ids = ()
         self._details = {}
         self._reason = ''
         self._availability_reason = ''
@@ -110,18 +129,12 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.browser.setObjectName('phaseSourceBrowser')
         self.browser.setMaximumHeight(150)
         self.browser.setToolTip(_SOURCE_TIP)
-        self.browser.scans.setToolTip('Phases in list order. Check a phase to draw it on the plots and fit it; '
-                                      'built-in calibrants are reference lines only and are never fitted.'
-                                      if checkable else 'The phases selected for this fit, in order.')
+        self.browser.scans.setToolTip(
+            'Phases in list order. Check a phase to draw it on the plots and fit it.'
+            + (f' Built-in calibrants are listed below, under {REFERENCE_CAPTION}.' if calibrants else '')
+            if checkable else 'The phases selected for this fit, in order.')
         self.browser.scans_label.setToolTip('Persistent CIF and lattice entries available to this tool.')
-        # The keyed profile hides Int's file actions, but they remain children of
-        # the mounted owner and retain useful help if a profile reveals them.
-        for control, tip in ((self.browser.show_all, 'Show every phase in this source list.'),
-                             (self.browser.metadata, 'Show the selected phase source details.'),
-                             (self.browser.auto_last, 'Follow the last phase added to the list.'),
-                             (self.browser.date_sort, 'Sort the source list by time.'),
-                             (self.browser.refresh, 'Refresh the available phase sources.')):
-            control.setToolTip(tip)
+        _hidden_action_tips(self.browser)
         layout.addWidget(self.browser)
         buttons = QtWidgets.QHBoxLayout()
         self.add_cif_btn = QtWidgets.QPushButton('Add CIF…', self)
@@ -129,21 +142,14 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.add_lattice_btn = QtWidgets.QPushButton('Add lattice…', self)
         self.add_lattice_btn.setToolTip('Enter unit-cell lengths, angles and space group for reflection positions.')
         self.remove_btn = QtWidgets.QPushButton('Remove', self)
-        self.remove_btn.setToolTip('Remove the selected phase from this tool; keep its library entry.')
+        self.remove_btn.setToolTip('Remove the selected phase or reference line from this tool; a library entry is '
+                                   'kept.' if calibrants else
+                                   'Remove the selected phase from this tool; keep its library entry.')
         for button in (self.add_cif_btn, self.add_lattice_btn, self.remove_btn):
             buttons.addWidget(button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
-        self.calibrant_row = self.library_row = None
-        if calibrants:
-            from xrd_tools.integrate.calibration import CALIBRANT_NAMES
-            self.calibrant_row = FormRow(label='Calibrant', path=('phase_source', 'calibrant'), value=_ADD_CALIBRANT,
-                                         kind='combo', choices=(_ADD_CALIBRANT, *CALIBRANT_NAMES), parent=self)
-            self.calibrant_row.set_purpose_tooltip(
-                'Add a built-in calibrant: its pyFAI d-spacings as reference lines and current-Run detector rings. '
-                'Positions only; needs no pymatgen.')
-            self.calibrant_row.valueChanged.connect(lambda _path, value: self._choose_calibrant(value))
-            layout.addWidget(self.calibrant_row)
+        self.calibrant_row = self.library_row = self.reference_browser = None
         if calibrants and not show_library:
             self.library_row = FormRow(label='Library', path=('phase_source', 'library'), value='', kind='combo',
                                        choices=('',), choice_labels={'': _ADD_FROM_LIBRARY}, parent=self)
@@ -187,6 +193,29 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.lattice_form.add_row(self.add_lattice_commit)
         self.lattice_form.hide()
         layout.addWidget(self.lattice_form)
+        if calibrants:
+            # The built-in calibrants, below the phase controls: reference lines only, never fitted (the maintainer,
+            # 2026-11-03: "Separate group in Phase Analysis, now"). The same keyed list as the phases, without a
+            # minimum-intensity column (calibrants carry no intensities); its checks edit the one selection.
+            self.reference_browser = BrowserView(self, profile=keyed_list_profile(REFERENCE_CAPTION,
+                                                                                  checkable=checkable))
+            self.reference_browser.setObjectName('phaseSourceReferenceBrowser')
+            self.reference_browser.setToolTip(_REFERENCE_TIP)
+            self.reference_browser.scans.setToolTip(
+                'Reference lines in list order. Check a calibrant to draw its lines on the plots; it is never fitted.'
+                if checkable else 'The reference lines shown with this fit, in order.')
+            self.reference_browser.scans_label.setToolTip(
+                'The built-in calibrants listed for reference: drawn on the plots, never fitted.')
+            _hidden_action_tips(self.reference_browser)
+            layout.addWidget(self.reference_browser)
+            from xrd_tools.integrate.calibration import CALIBRANT_NAMES
+            self.calibrant_row = FormRow(label='Calibrant', path=('phase_source', 'calibrant'), value=_ADD_CALIBRANT,
+                                         kind='combo', choices=(_ADD_CALIBRANT, *CALIBRANT_NAMES), parent=self)
+            self.calibrant_row.set_purpose_tooltip(
+                'Add a built-in calibrant: its pyFAI d-spacings as reference lines and current-Run detector rings. '
+                'Positions only; needs no pymatgen.')
+            self.calibrant_row.valueChanged.connect(lambda _path, value: self._choose_calibrant(value))
+            layout.addWidget(self.calibrant_row)
         self.status = QtWidgets.QLabel('', self)
         self.status.setWordWrap(True)
         self.status.setToolTip('Phase-source validation and missing-library-entry notices.')
@@ -200,10 +229,10 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.note.hide()
         layout.addWidget(self.note)
         self._note = ('', '')
-        controls = (self.browser, self.browser.scans, self.browser.scans_label,
-                    self.browser.show_all, self.browser.metadata, self.browser.auto_last,
-                    self.browser.date_sort, self.browser.refresh, self.add_cif_btn,
-                    self.add_lattice_btn, self.remove_btn, self.lattice_form,
+        controls = (*(control for browser, _ids in self._lists() for control in (
+                        browser, browser.scans, browser.scans_label, browser.show_all, browser.metadata,
+                        browser.auto_last, browser.date_sort, browser.refresh)),
+                    self.add_cif_btn, self.add_lattice_btn, self.remove_btn, self.lattice_form,
                     self.add_lattice_commit, self.status, *self.lattice_rows.values(),
                     *(row for row in (self.calibrant_row, self.library_row, self.global_switch) if row is not None))
         self._purpose_tooltips = {control: control.toolTip() for control in controls}
@@ -211,16 +240,24 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.add_lattice_btn.clicked.connect(lambda: self.lattice_form.setVisible(not self.lattice_form.isVisible()))
         self.add_lattice_commit.clicked.connect(self._commit_lattice)
         self.remove_btn.clicked.connect(self.remove_current)
-        # a user's selection change (reconciles run signal-blocked and resync through _sync_tooltips)
-        self.browser.scans.itemSelectionChanged.connect(self._sync_remove)
-        if checkable:
-            self.browser.checksChanged.connect(self._checks_changed)
+        for browser, _ids in self._lists():
+            # a user's selection change (reconciles run signal-blocked and resync through _sync_tooltips)
+            browser.scans.itemSelectionChanged.connect(lambda browser=browser: self._selection_moved(browser))
+            if checkable:
+                browser.checksChanged.connect(self._checks_changed)
         self._refresh_library()
+
+    def _lists(self):
+        """Each mounted list with the ids it shows, in list order: the phases, then the reference lines."""
+        lists = ((self.browser, self._shown_ids),)
+        return lists if self.reference_browser is None else (*lists, (self.reference_browser, self._reference_ids))
 
     def set_help_topic(self, topic_id):
         """F1 and a "?" on this list's own rows and on its lattice form, for a host's help topic (PHASE-ANALYSIS-128)."""
         from xdart.gui.widgets.context_help import bind_topic
         bind_topic(self, topic_id)
+        if self.reference_browser is not None:
+            bind_topic(self.reference_browser, topic_id)
         for row in (self.calibrant_row, self.library_row, self.global_switch, self.global_row):
             if row is not None:
                 row.set_help_topic(topic_id, button=True)
@@ -268,10 +305,18 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._sync_remove()
         self._sync_cutoff_rows()
 
+    def _selection_moved(self, browser):
+        """A user's row selection in one list clears the other list's, so Remove always names one row."""
+        if browser.selected_result_rows():
+            for other, _ids in self._lists():
+                if other is not browser and other.selected_result_rows():
+                    other.clear_result_selection()
+        self._sync_remove()
+
     def _sync_remove(self):
-        """Remove acts only on the selected phase, never on the row Qt leaves current without selecting it
-        (PHASE-ROW-CLICK-SELECT-REMOVE): disabled, saying why, while none is selected."""
-        chosen = bool(self.browser.selected_result_rows())
+        """Remove acts only on the selected phase or reference line, never on the row Qt leaves current without
+        selecting it (PHASE-ROW-CLICK-SELECT-REMOVE): disabled, saying why, while neither list has one selected."""
+        chosen = any(browser.selected_result_rows() for browser, _ids in self._lists())
         self.remove_btn.setEnabled(chosen)
         suffix = ('' if chosen else ' ' + _REMOVE_NONE_TIP) + (
             ' ' + self._availability_reason if self._availability_reason else '')
@@ -405,7 +450,7 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self.libraryRefreshed.emit()
 
     def _refresh_library(self):
-        """Read the library once for the list and the selection (user actions, never reconciles)."""
+        """Read the library once for the lists and the selection (user actions, never reconciles)."""
         selected = dict(self._selection)
         # Only the selected entries are resolved (read and verified); the library is listed from its catalogue.
         lookups = {identifier: self.library.resolve(identifier) for identifier in selected}
@@ -414,16 +459,27 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         else:
             listed = tuple((lookup.entry.id, lookup.entry.name, lookup.entry.source_kind)
                            for lookup in lookups.values() if lookup.entry is not None)
+        references = ()
+        if self.reference_browser is not None:
+            # the selected calibrants are the reference list's, the rest the phase list's, each in selection order
+            listed = tuple(row for row in listed if row[2] != 'calibrant')
+            references = tuple((lookup.entry.id, lookup.entry.name, lookup.entry.source_kind)
+                               for lookup in lookups.values()
+                               if lookup.entry is not None and lookup.entry.source_kind == 'calibrant')
         self._resolved = {identifier: lookup.entry for identifier, lookup in lookups.items()
                           if lookup.entry is not None}
         self._shown_ids = tuple(identifier for identifier, _name, _kind in listed)
-        rows = tuple(BrowserResult(identifier, name, self._details.get(identifier, _detail(kind, name)))
-                     for identifier, name, kind in listed)
-        if self._checkable:
-            checked = tuple(identifier for identifier in self._shown_ids if selected.get(identifier, False))
-            self.browser.reconcile_checked_results(rows, checked)
-        else:
-            self.browser.reconcile_results(rows, self.browser.current_result())
+        self._reference_ids = tuple(identifier for identifier, _name, _kind in references)
+        for browser, entries in ((self.browser, listed), (self.reference_browser, references)):
+            if browser is None:
+                continue
+            rows = tuple(BrowserResult(identifier, name, self._details.get(identifier, _detail(kind, name)))
+                         for identifier, name, kind in entries)
+            if self._checkable:
+                browser.reconcile_checked_results(rows, tuple(identifier for identifier, _name, _kind in entries
+                                                              if selected.get(identifier, False)))
+            else:
+                browser.reconcile_results(rows, browser.current_result())
         missing = [lookup.reason or f'Missing phase library entry: {identifier}'
                    for identifier, lookup in lookups.items() if lookup.entry is None]
         self._message('; '.join(missing))
@@ -460,13 +516,18 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         self._details = dict(details)
         self._refresh_library()
 
-    def _checks_changed(self, checked):
-        checked = set(checked)
-        visible_ids = {identifier for identifier in self._shown_ids if identifier in checked}
+    def _checks_changed(self, _checked=()):
+        """A user's include check in either list: both lists' checks are read together as the one selection's
+        visibility, so a check in one list never hides the other list's entries."""
+        checked, shown = set(), ()
+        for browser, ids in self._lists():
+            checked.update(browser.checked_results())
+            shown += ids
+        visible_ids = {identifier for identifier in shown if identifier in checked}
         known_ids = {identifier for identifier, _visible in self._selection}
         selected = tuple((identifier, identifier in visible_ids)
                          for identifier, _visible in self._selection)
-        selected += tuple((identifier, True) for identifier in self._shown_ids
+        selected += tuple((identifier, True) for identifier in shown
                           if identifier in visible_ids and identifier not in known_ids)
         if len(selected) > 8:
             self._message('Choose at most eight phases.'); self._refresh_library(); return
@@ -553,11 +614,14 @@ class PhaseSourceWidget(QtWidgets.QWidget):
         return entry
 
     def remove_current(self):
-        """Remove the selected phase (its library entry stays); with none selected, nothing."""
-        rows = self.browser.selected_result_rows()
-        if len(rows) == 1 and 0 <= rows[0] < len(self._shown_ids):
-            identifier = self._shown_ids[rows[0]]
-            self.set_selection(tuple(pair for pair in self._selection if pair[0] != identifier))
+        """Remove the selected phase or reference line (a library entry stays); with none selected, nothing. A
+        selection in one list clears the other's, so at most one list has a selected row."""
+        for browser, ids in self._lists():
+            rows = browser.selected_result_rows()
+            if len(rows) == 1 and 0 <= rows[0] < len(ids):
+                identifier = ids[rows[0]]
+                self.set_selection(tuple(pair for pair in self._selection if pair[0] != identifier))
+                return
 
     def _browse_cifs(self):
         paths = browse(self, 'Add CIF phase(s)', many=True, file_filter=CIF_FILTER)
