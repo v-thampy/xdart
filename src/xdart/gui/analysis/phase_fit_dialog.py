@@ -258,8 +258,10 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.phase_source = PhaseSourceWidget(self.phases_card, checkable=True, show_library=False, calibrants=True,
                                               cutoffs=True, status_visible=False)
         # half its earlier 220 px (the maintainer, 2026-11-02: "the height of the phases window can be reduced by
-        # 50%"); a longer list scrolls
-        self.phase_source.browser.setMaximumHeight(110)
+        # 50%"), never below the list's own polished minimum (another style draws a taller list); a longer list scrolls
+        browser = self.phase_source.browser
+        browser.ensurePolished()
+        browser.setMaximumHeight(max(110, browser.minimumSizeHint().height()))
         self.phase_source.set_help_topic(TOPICS["phases"])
         self.phases_card.add_row(self.phase_source)
         #: the list is the host view's reference-phase plot options; the host attaches this binding to its view

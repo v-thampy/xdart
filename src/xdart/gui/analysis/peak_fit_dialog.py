@@ -6,15 +6,18 @@ Opens from the bottom-left Tools card. Fits the currently displayed 1-D integrat
 from the main display. Non-modal so the user can change the selected frame and re-fit.
 
 It builds no display or editor widget of its own (hard rule 14; FIT-TOOLS-2026-10 phase 0): its rows are the shared
-Controls rows (``FormRow``, ``RangeRow``) in a ``SectionCard``, its rarely changed values the shared
-``AdvancedDialog``, its plots ``FitView`` (whose fit range is the dragged range), its trend ``TrendView`` and its table
-``ResultsTable``. Int's page drives it through ``vnext_submit`` (its analysis slot runs the headless displayed-fit
+Controls rows (``FormRow``, ``RangeRow``) in ``SectionCard``s (its rarely changed values in an Advanced card), its
+plots ``FitView`` (whose fit range is the dragged range), its trend ``TrendView`` and its table ``ResultsTable``. Int's page drives it through ``vnext_submit`` (its analysis slot runs the headless displayed-fit
 operation); without it, the dialog's own path fits through the headless analyzer. ``lmfit`` (the ``xrd-tools[fitting]``
 extra) is imported lazily so xdart still launches without it.
 
 NEXT-128-PEAK-FIT: Pearson VII and split pseudo-Voigt; the template backgrounds through the shared
 ``BackgroundTemplateRow`` (Phase Analysis mounts the same row); a "?" on every option (``xrd_tools.help_topics``
 ``peak-fit.*``); and Save settings… / Load settings… through the shared ``PageSettings``, with no last-session restore.
+
+NEXT-128-WINDOW-POLISH (the maintainer, 2026-11-02 and 11-03): laid out as Phase Analysis on the shared
+``ToolWindowSplit``, options left and plots right, the advanced options in that column; Auto in the Peaks row; every
+"?" in one column; Full on by default, the range's ends shown greyed until Full is off.
 """
 
 import logging
@@ -32,7 +35,6 @@ from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 from xdart.gui.pages.values import CloseReceipt, PageCleanup
 from xdart.gui.tools.page_settings import PageSettings, SettingsKind, check_fields, plain, saved_fields
 
-from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.fit_view import (
     FitPanel, FitProjection, FitSeries, FitView, fit_result_series, full_range_row,
 )
@@ -212,6 +214,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         for row in (self.model_row, self.bkg_row, self.background_template_row, self.count_row, self.range_row):
             card.add_row(row)
         self.split.add_card(card)
+        self._build_advanced()
 
         # Data and fit above (the fit range dragged on it), the residual below: the shared fit display.
         self.fit_view = FitView(self.split.displays, name="peakFitView", summary=False, stretch=(3, 1),
@@ -228,11 +231,9 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.split.add_display(widget, stretch)
         lay.addWidget(self.split, 1)
 
-        # Actions below the split, as Phase Analysis's: Advanced, the settings, Reload, Live, Fit and Batch.
+        # Actions below the split, as Phase Analysis's: the settings, Reload, Live, Fit and Batch.
         actions = QtWidgets.QHBoxLayout()
         actions.setSpacing(7)
-        self.advanced_btn = QtWidgets.QPushButton("Advanced…")
-        self.advanced_btn.setObjectName("peakFitAdvancedToggle")
         self.refresh_btn = QtWidgets.QPushButton("Reload")
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
         self.live_row = FormRow(label="Live", path=_path("live"), value=False, kind="bool")
@@ -252,11 +253,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.save_settings_btn = QtWidgets.QPushButton("Save settings…")
         self.save_settings_btn.setToolTip("Save every option and the template's file (once a fit has recorded its "
                                           "content) as a versioned settings file.")
-        self.advanced_btn.setToolTip("The rarely changed options: peak centers, σ start and bounds, center bounds, "
-                                     "PV fraction, the solver's budget and weighting.")
-        for button in (self.advanced_btn, self.load_settings_btn, self.save_settings_btn):
+        for button in (self.load_settings_btn, self.save_settings_btn):
             button.setAutoDefault(False)
-        actions.addWidget(self.advanced_btn)
         actions.addWidget(self.load_settings_btn)
         actions.addWidget(self.save_settings_btn)
         actions.addStretch(1)
@@ -265,8 +263,6 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         actions.addWidget(self.fit_btn)
         actions.addWidget(self.batch_btn)
         lay.addLayout(actions)
-
-        self._build_advanced()
 
         self.status = QtWidgets.QLabel("")
         self.status.setObjectName("peakFitStatus")
@@ -277,7 +273,6 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
         self.fit_btn.clicked.connect(self._do_fit)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
-        self.advanced_btn.clicked.connect(self._show_advanced)
         self.load_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.load))
         self.save_settings_btn.clicked.connect(lambda: self._settings_action(self.settings_io.save))
         self.background_template_row.capture_btn.clicked.connect(self._capture_template)
@@ -288,9 +283,14 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.range_row.valueChanged.connect(self._range_value_changed)
 
     def _build_advanced(self):
-        """The rarely changed fit values, on the shared Advanced dialog's rows: they apply identically to Fit, Live
-        and Batch (all backed by fit_peaks / PeakFitPlan)."""
-        self.advanced = AdvancedDialog(self, title="Advanced — Peak Fitting", object_name="peakFitAdvancedDialog")
+        """The rarely changed fit values, in an Advanced card under the fit's (NEXT-128-WINDOW-POLISH: the maintainer,
+        2026-11-03, "i think there's enogh space in the peak fitting window left panel that the advanced options can
+        be accommodated there"), on the shared rows, grouped as the Advanced dialog grouped them. They apply
+        identically to Fit, Live and Batch (all backed by fit_peaks / PeakFitPlan)."""
+        card = self.advanced_card = SectionCard("Advanced", collapsible=False)
+        card.set_purpose_tooltip("The rarely changed options: peak centers, σ start and bounds, center bounds, PV "
+                                 "fraction, the solver's budget and weighting.")
+        card.set_help_topic(TOPICS["peaks"])
         rows = {
             "centers": FormRow(label="Peak centers", path=_path("centers"), value=""),
             "sigma_init": FormRow(label="σ initial", path=_path("sigma_init"), value=""),
@@ -302,9 +302,14 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             "max_nfev": FormRow(label="Max iterations", path=_path("max_nfev"), value="", kind="int", minimum=0,
                                 maximum=1_000_000, allow_blank=True),
         }
-        self.advanced.add_group("Peaks", tuple(rows.values())).set_help_topic(TOPICS["peaks"])
+        card.add_group_header("Peaks", tooltip="Where each peak's fit starts, how far its center and width may move, "
+                                                "and the solver's budget.")
+        for row in rows.values():
+            card.add_row(row)
         uncertainty = FormRow(label="Use uncertainties", path=_path("use_uncertainties"), value=False, kind="bool")
-        self.advanced.add_group("Weighting", (uncertainty,)).set_help_topic(TOPICS["weighting"])
+        card.add_group_header("Weighting", tooltip="How much each point counts in the fit.")
+        card.add_row(uncertainty)
+        self.split.add_card(card)
         self.use_uncertainties = uncertainty.editor
         self.use_uncertainties.setEnabled(False)
         self._uncertainty_row = uncertainty
@@ -337,9 +342,6 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             edit.setPlaceholderText("auto")
         self.adv_fraction.setPlaceholderText("0.5")
         self.adv_maxfev.setPlaceholderText("auto")
-
-    def _show_advanced(self):
-        self.advanced.show(); self.advanced.raise_(); self.advanced.activateWindow()
 
     def _refusal(self):
         """The first whole-number row whose text is refused, named as the rows name it, or a template background
