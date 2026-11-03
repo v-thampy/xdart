@@ -1,7 +1,7 @@
 """B-H: frozen real help/cache/display oracle, including pre-writer R1–R5."""
 import numpy as np
 import pytest
-from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from pyqtgraph.Qt import QtGui, QtWidgets
 
 
 @pytest.fixture
@@ -34,7 +34,9 @@ def test_help_teaching_input_cache_ties_and_source_free_second_view(qapp, monkey
             overrides.append(QtGui.QCursor(cursor).shape()); return original(cursor)
         monkeypatch.setattr(QtWidgets.QApplication, 'setOverrideCursor', track)
         window.show_orientation_check()
-        assert QtCore.Qt.CursorShape.WaitCursor in overrides
+        # Superseded pin (NEXT-128-HELP-CURSOR, 2026-11-02): a cold draw sets no override cursor. This row used to
+        # require Qt's WaitCursor, which crashed Scientific help on macOS 27.2 (tests/xdart/test_help_cursor_gui.py).
+        assert overrides == []
         assert QtWidgets.QApplication.overrideCursor() is None
         assert len(window.findChildren(ScientificView)) == 1
         for step in range(4):

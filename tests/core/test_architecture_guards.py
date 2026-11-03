@@ -210,3 +210,35 @@ def test_wavelength_sentinel_has_one_headless_owner():
                 encoding="utf-8", errors="replace"):
             xdart_offenders.append(str(path.relative_to(ROOT)))
     assert xdart_offenders == []
+
+
+#: Qt cursor shapes that Qt 6.11.1 draws on macOS from ICC-tagged PNG resources (spincursor, waitcursor and
+#: sizeallcursor in libqcocoa). Every other shape xdart uses maps to a native NSCursor.
+_IMAGE_BACKED_CURSORS = {"WaitCursor", "BusyCursor", "SizeAllCursor"}
+
+
+def test_xdart_never_requests_qt_image_backed_cursors():
+    """NEXT-128-HELP-CURSOR (row C3): xdart never asks Qt for the three cursors it draws from ICC-tagged images.
+
+    Qt 6.11.1's qt_mac_cgImageFormatForImage stores the colour space it creates for a QImage into the format it
+    returns, then releases it before QImage::toCGImage passes it to CGImageCreate. Both of its branches do this, but
+    the named sRGB space is a CoreGraphics singleton that survives the early release, so images without a colour
+    space (rendered pixmaps, numpy images) and the native cursors (Arrow, Cross, PointingHand, IBeam, the resize and
+    hand cursors) are safe. A colour space made from an ICC profile is a fresh object, so it is freed before use:
+    Help's WaitCursor crashed on every cold figure draw on macOS 27.2 (Mac17,8, 2026-11-02). pyqtgraph's
+    BusyCursor and ProgressDialog(busyCursor=True) set the same WaitCursor.
+
+    Lift this guard only when the pinned Qt keeps that colour space alive through CGImageCreate."""
+    offenders = []
+    for path in (SRC / "xdart").rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            name = (node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name)
+                    else node.name.rsplit(".", 1)[-1] if isinstance(node, ast.alias) else None)
+            busy = (isinstance(node, ast.keyword) and node.arg == "busyCursor"
+                    and not (isinstance(node.value, ast.Constant) and node.value.value is False))
+            if name in _IMAGE_BACKED_CURSORS or busy:
+                offenders.append(f"{path.relative_to(ROOT)}:{getattr(node, 'lineno', '?')}")
+    assert offenders == []
