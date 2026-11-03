@@ -1,5 +1,151 @@
 # Release notes
 
+## 1.2.8 (2026-11-04)
+
+### Added
+
+- **Phase Analysis:** one window replaces Phase Fitting and Reference Phases.
+  - Its phase list (CIF files, lattice parameters and the phase library) feeds
+    both the reference overlays and the fit. Built-in calibrants are listed
+    apart, under **Reference lines (not fitted)**: drawn, never fitted.
+  - The fit has the options of the HZO batch-fitting notebook:
+    - eleven peak profiles;
+    - Caglioti, Scherrer or fixed widths;
+    - March-Dollase or free-height texture;
+    - a pre-fit and a fitted background, a measured substrate and an amorphous
+      peak;
+    - lattice and q-shift bounds.
+  - **Fit all** fits every frame of a processed result in Int, or Stitch
+    results, with **Sequential** seeding.
+  - **Save settings…** and **Load settings…** keep every option, and every
+    option has a **?**.
+- **Peak Fitter:**
+  - Pearson VII and split pseudo-Voigt profiles.
+  - A background template from a file (a NeXus result's 1-D frame, or an .xye
+    file whose unit you choose) or from the displayed trace.
+  - **Save settings…** and **Load settings…**, and a **?** for every option.
+  - Both fit windows now use Int's axis labels, top bar and colour maps, and
+    **Components** draws each peak or phase on its own.
+- **The fit windows read a source of their own:** a **Source** card, first in
+  Int's Peak Fitter and Phase Analysis, fits the trace Int shows (the default)
+  or a file you choose: a processed NeXus result's frame and 1-D mode, or an
+  .xye file (Peak Fitter).
+  - **Fit all** now works in Int: it fits every frame of the source's NeXus
+    result from each frame's stored 1-D curve, then plots the results against
+    the frame number. Int's χ slice, normalization and Set BG are display-only
+    and are not applied; remove a substrate with the template background.
+  - A notebook exported with a NeXus source names its file and frames and
+    reads them again, instead of copying them.
+  - The Source card's **Frame** row is the main window's `<` / frame / `>`.
+    Following Int's display, it lists Int's frames: a step moves the main
+    window to that frame, and the fit window then shows it. With a chosen
+    NeXus file, it steps that file's frames and Int stays where it is.
+- **Fit current and Fit all, with Pause and Stop:** the fit windows' Fit and
+  Batch buttons are now **Fit current** and **Fit all**.
+  - A running Fit all counts its frames ("Fitting all frames… 312/651"), shows
+    each fitted frame in the plot and the table, and fills the trend.
+  - **Pause** holds it after the frame being fitted and **Resume** goes on;
+    **Stop** ends it there and keeps every frame fitted so far.
+  - While it runs, its options, the fit range on the plot and Reload are
+    locked. At its end it says how many frames were fitted.
+  - Stepping through the frames afterwards keeps the trend, and Fit current
+    shows its own fit without changing the run's rows.
+  - A run stays on the file it started on: browsing another result in Int
+    keeps its rows until Fit current, Reload or Fit all follows Int.
+  - Save CSV during a run saves the frames fitted so far, in every window.
+- **Frames are numbered as Int numbers them, from 1,** in the fit windows' plot
+  titles, trend, Frame row, Source card and frame popups. The frames' stored
+  labels are unchanged in files, settings and notebooks.
+- **Track lists every fitted parameter:** each peak's FWHM, height, amplitude,
+  σ and shape (Lorentzian fraction, Pearson VII exponent, Voigt γ), and the
+  background's own parameters, which no peak choice hides.
+- **Polynomial and Chebyshev backgrounds of any degree:** in the Peak Fitter,
+  Polynomial replaces Linear and Constant. Polynomial, Chebyshev, Template +
+  polynomial and Template + Chebyshev take a degree in a box in the Background
+  row, shown only for those choices. Phase Analysis's fitted background works
+  the same way, its substrate included, and keeps Spline (its knots in the same
+  box).
+- **Notebooks from the fit windows:** a fit exports to Jupyter and marimo
+  notebooks that repeat it, with its background template once a fit has
+  recorded the template's file. Phase Analysis exports fits of CIF phases.
+- **Illustrated physics guides:**
+  - The Help window's **Illustrated guide** opens a guide to the Peak Fitter,
+    Phase Analysis or Strain Analysis in your browser. It explains the physics
+    first, then what each fitted number measures. Help opens from F1 or any
+    option's **?**.
+  - The guides work offline, and xdart's own code draws their plots.
+- **All frames:** Int Browse's **Show All** is now a persistent **All frames**
+  toggle, and it works in Single too.
+- **Strain analysis in notebooks:** the sin²ψ method for grazing-incidence
+  fiber maps (`run_strain`), with four kinds of stress-free spacing and a
+  refraction check. Its window comes in a later release.
+
+### Changed
+
+- **Phase Analysis's Pearson VII and Moffat profiles:** each peak's amplitude
+  is now its area, as for the other profiles, so their scales and phase
+  fractions change. With Moffat and a Caglioti or Scherrer width, refitted
+  widths and other parameters change too.
+- **Browse opens results faster:** it reads a file's frame facts when they are
+  needed, not when the catalogue loads. Clicking the open result reloads it
+  only if its file changed.
+- **Less memory for 2-D displays:**
+  - Images are held in single precision.
+  - The 2D Viewer's budget is a tenth of the RAM.
+  - On Windows, both viewers read the PC's own RAM, so a 16 GB PC opens
+    4096 × 4096 and Eiger2 16M frames.
+- **Return in the fit windows keeps the value:** in Phase Analysis and the Peak
+  Fitter, Return commits the field without pressing a button or opening Help.
+- **The Peak Fitter's layout:** its options are on the left and its plots on the
+  right, as in Phase Analysis.
+  - The rarely changed options sit in a **Peak parameters** card, not a separate
+    window: Center ± delta follows Peak centers, under a Solver heading.
+  - **No. of peaks** and **Auto** share one row.
+  - Every option's **?** ends its row, so the **?**s form one column.
+- **Fit ranges start at Full:** in both fit windows **Full** is on by default,
+  and the range shows the trace's ends greyed. Turn it off to type a range, or
+  drag one on the plot.
+- **Linear is now Polynomial of degree 1, and Constant degree 0:** the fit is
+  the same, but new fits name the background's parameters `bg_c0` and `bg_c1`
+  (`bgx_c0`, `bgx_c1` after a template), not `bg_slope`, `bg_intercept` or
+  `bg_c`, in the results table, the trend and saved CSV files. Settings files
+  from earlier versions load as the same fit (Linear as Polynomial 1, Chebyshev
+  (3) as Chebyshev 3), and notebooks exported earlier still run as written.
+- **Darker data points and clearer fit lines** in both fit windows: the fit,
+  its background, the residual, the fit range's edges, the peak markers and the
+  trend's curves use colours that read on the plots' light panel, and the fit
+  draws over its components.
+- **Phase Analysis:** its options column fits every **?**, and the Phases list is
+  half as tall.
+- **The fit windows' options line up:** every box in the options column starts
+  at one x, after the column's longest label. The **Track** boxes are as wide
+  as their longest name, and **Components** has room for its bold checked text.
+- **The template line shows only while a template is held:** its "No
+  template" hint, and each change, go to the window's status line.
+- **The trend row** reads **Track** and **Track 2**, with one menu choosing the
+  peaks or phases drawn (all by default).
+- **Template controls wait for a template background:**
+  - Use displayed, Choose file… and Clear are enabled only with a template (Peak
+    Fitter) or Substrate (Phase Analysis) background.
+  - An .xye file's unit and a NeXus file's frame are asked in a popup.
+  - A message about the file opens in a popup.
+
+### Fixes
+
+- **The end of a long Fit all no longer stalls the window:** the trend takes all
+  of a run's rows in one redraw (3621 frames took 27 s, one redraw per row).
+- **Fit current on Int's display draws the frame it fits:** after a run or a
+  step in Int's footer, it used to draw the new fit over the trace shown before.
+- **A file's frame has a readable plot title** (it showed the frame's internal
+  selection).
+- **A standard result after a grazing-incidence one draws its trace** on its
+  own axes in Int Browse.
+- **The angular coverage strip after a Run** is rebuilt for the result just
+  written.
+- **Browse slices follow the loaded file's revision.**
+- **Scientific help no longer crashes on macOS 27.2** when it first draws a
+  topic's figures.
+
 ## 1.2.7 (2026-10-28)
 
 ### Added
