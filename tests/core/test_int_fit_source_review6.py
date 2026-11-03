@@ -67,19 +67,24 @@ def test_rows_and_wavelength_cannot_come_from_two_file_generations(tmp_path, mon
         int_frame_snapshot(path, 0, mode="default")
 
 
-def test_default_batch_chunk_adapts_to_individually_admitted_wide_rows(tmp_path):
+@pytest.mark.parametrize("points, cake", ((65_536, False), (65_027, True)),
+                         ids=("projected-cap", "physical-cap"))
+def test_default_batch_chunk_adapts_to_individually_admitted_wide_rows(tmp_path, points, cake):
     from xrd_tools.core import FrameRecord, FrameView, axis_from_unit
     from xrd_tools.io import write_frame_records
     path = tmp_path / "wide.nexus"
-    axis = axis_from_unit("q_A^-1", np.linspace(1., 4., 65_536))
-    records = [FrameRecord.from_view(FrameView(label=i, axis_1d=axis,
-               intensity_1d=np.full(axis.values.size, float(i + 1)), sigma_1d=np.ones(axis.values.size)))
-               for i in range(64)]
+    axis = axis_from_unit("q_A^-1", np.linspace(1., 4., points))
+    records = []
+    for i in range(64):
+        extra = {} if not cake or i else dict(axis_2d_x=axis_from_unit("q_A^-1", np.linspace(1., 4., 256)),
+                    axis_2d_y=axis_from_unit("chi_deg", np.array([-1., 1.])), intensity_2d=np.ones((2, 256)))
+        records.append(FrameRecord.from_view(FrameView(label=i, axis_1d=axis,
+            intensity_1d=np.full(axis.values.size, float(i + 1)), sigma_1d=np.ones(axis.values.size), **extra)))
     with h5py.File(path, "w") as handle:
         write_frame_records(current_entry(handle), records)
     rows = IntResultRows(path, mode="default")
     assert rows.labels() == tuple(range(64))
     for label in (0, 31, 32, 63):
         snapshot = rows.snapshot(label)
-        assert snapshot.values.shape == (65_536,)
+        assert snapshot.values.shape == (points,)
         np.testing.assert_array_equal(snapshot.values, float(label + 1))

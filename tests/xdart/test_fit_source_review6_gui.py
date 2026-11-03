@@ -66,3 +66,21 @@ def test_raising_a_file_source_window_does_not_replace_it_with_ints_trace(qapp, 
         np.testing.assert_array_equal(dialog._y, _stored(_peak(2.4)))
     finally:
         _close_page(page, qapp)
+
+
+def test_a_fit_time_source_read_problem_also_opens_its_popup(qapp, tmp_path):
+    path = _result(tmp_path / "sample.nexus")
+    page = _page()
+    try:
+        dialog, host = _window(page, "peak")
+        _choose_nexus(dialog, path, 1)
+        _drain(qapp, host)
+        path.rename(tmp_path / "moved.nexus")
+        dialog.fit_btn.click()
+        _drain(qapp, host)
+        assert host.outcomes and not host.outcomes[-1].ok
+        box = dialog.source_row.message_box
+        assert box is not None and box.isVisible(), dialog.status.text()
+        assert "FIT_SOURCE_UNREADABLE" in box.informativeText()
+    finally:
+        _close_page(page, qapp)
