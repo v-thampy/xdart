@@ -172,6 +172,12 @@ class SnapshotFitHost(QtCore.QObject):
         combo.setCurrentText(current)
 
     def _request(self, action, inputs, destination=None):
+        source = getattr(self.dialog, 'source_row', None)
+        reason = '' if source is None else source.input_refusal()
+        if reason:
+            self.dialog.status.setText(reason)
+            source.report_problem(reason)
+            return
         settings = self._request_settings(action)
         self.owner.forget()
         self.dialog.status.setText({'reload': 'Loading…', 'export': 'Exporting…',
@@ -251,7 +257,11 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.status.setText('FIT_INPUT_CHANGED: reload the current selection')
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED:
-            self.dialog.status.setText(terminal.failure_message or terminal.status.value)
+            message = terminal.failure_message or terminal.status.value
+            self.dialog.status.setText(message)
+            source = getattr(self.dialog, 'source_row', None)
+            if source is not None and 'FIT_SOURCE_' in message:
+                source.report_problem(message)
             return False
         if request.action == 'export':
             self.dialog.status.setText(f'Exported {terminal.payload}')

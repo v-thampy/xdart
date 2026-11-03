@@ -631,6 +631,24 @@ class FitSourceRow(CurveFileRow):
         """Why the chosen file cannot be read now ("" when it can, or with Int's display)."""
         return self._reason
 
+    def input_refusal(self) -> str:
+        """A refused editor must not silently reuse the previously committed frame or unit."""
+        if self._source is not None:
+            if self._source.kind == "nexus" and self.frame_row.refusal():
+                return f"FIT_SOURCE_INVALID: Frame: {self.frame_row.refusal()}"
+            if self._source.kind == "xye" and not self.unit_row.current_value():
+                return "FIT_SOURCE_UNIT_REQUIRED: choose the source's x unit"
+        return ""
+
+    def report_problem(self, detail: str) -> None:
+        """A worker's read refusal, once for this source; reporting it changes no source or routing state."""
+        if self._source is None:
+            return
+        notice = (self._source.to_pairs(), str(detail))
+        if notice != self._announced:
+            self._announced = notice
+            self._notify(f"{Path(self._source.path).name}: cannot be read", str(detail))
+
     def use_display(self) -> None:
         """Follow Int's display again."""
         if self._source is None:
