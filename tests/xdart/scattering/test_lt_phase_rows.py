@@ -180,10 +180,13 @@ def test_p1_include_checks_follow_real_indicator_clicks_and_space(qapp, tmp_path
         assert len(_of(commands, 'phase_references')) == 1 and _flags(page)[b.id] is False
         assert _options(page).phase_floors == floors
 
-        # Empty space below the rows is no instruction (the shared navigation filter): nothing changes.
-        selected, commands[:] = _selected(source), []
-        _click(qapp, scans.viewport(), QtCore.QPoint(8, scans.viewport().height() - 3))
-        assert _selected(source) == selected and not commands
+        # Empty space below the rows is no instruction (the shared navigation filter): nothing changes. The halved
+        # list (NEXT-128-WINDOW-POLISH PA3) may hold no empty space below three rows; then there is nothing to click.
+        last = scans.visualItemRect(scans.item(scans.count() - 1))
+        if last.bottom() < scans.viewport().height() - 4:
+            selected, commands[:] = _selected(source), []
+            _click(qapp, scans.viewport(), QtCore.QPoint(8, scans.viewport().height() - 3))
+            assert _selected(source) == selected and not commands
 
         # With the top bar's Phases off, a check still edits the include flag; back on, only B is missing.
         flags = _flags(page)
@@ -346,14 +349,14 @@ def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_p
         assert TIN in _row(source, tin.id).toolTip()
         assert scans.sizeHint().width() <= min(cap, screen)
 
-        # A much longer phase joins while the window is open: boxes stay whole, the name elides, nothing scrolls.
+        # A much longer phase joins while the window is open: boxes stay whole and the name elides; the halved list
+        # (NEXT-128-WINDOW-POLISH PA3, "the height of the phases window can be reduced by 50%") scrolls its rows.
         long_name = 'Ti2AlN_mp-1234_conventional_standard_' + 'superlattice' * 8
         lattice = source.add_lattice(long_name, a=3.0, space_group=221)
         _settle(qapp, view)
         _rows_fit(qapp, source)
         assert long_name in _row(source, lattice.id).toolTip()
         assert scans.sizeHint().width() <= min(cap, screen)
-        assert not scans.verticalScrollBar().isVisible(), 'three rows fit under the list maximum height'
 
         # Narrowed to its minimum and widened again: the boxes stay inside the visible list.
         height = window.height()

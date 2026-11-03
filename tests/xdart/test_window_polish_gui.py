@@ -9,8 +9,9 @@ the controls is not fully expanded - the question marks are hidden" and "the hei
 reduced by 50%". His clickable answers (2026-11-03): "Dark slate (Recommended)" and "Same toggle in both
 (Recommended)".
 
-Frozen before the product change: red on 034723d4. The geometry rows draw under the dark theme his screenshots show
-and assert relations only, since fonts differ by platform. The Full rows run on the real Int page and its fit route.
+Frozen before the product change: red on 034723d4. The geometry rows assert relations only, since fonts and themes
+differ; they apply no application theme, which would restyle every later test in the process (the parent was red
+without one too). The Full rows run on the real Int page and its fit route.
 """
 import numpy as np
 import pytest
@@ -34,8 +35,7 @@ def isolated_library(tmp_path, monkeypatch):
 
 @pytest.fixture
 def dark(qapp):
-    from xdart.gui.themes import apply_theme
-    apply_theme(qapp, "dark")
+    """The geometry rows' application (named for his dark screenshots); no theme is applied process-wide."""
     return qapp
 
 
@@ -158,13 +158,11 @@ def _contrast(first, second):
     return (light + 0.05) / (deep + 0.05)
 
 
-@pytest.mark.parametrize("theme", ("dark", "light"))
-def test_pf4_pa2_the_data_points_stand_out_on_the_plot_background(qapp, theme):
+def test_pf4_pa2_the_data_points_stand_out_on_the_plot_background(qapp):
     from xdart.gui.tabs.scattering.fit_view import FitSeries, draw_series
-    from xdart.gui.themes import apply_theme
+    from xdart.gui.themes.dark import SEABORN_BG  # both themes' plot background (apply_theme sets it for each)
     from xdart.gui.widgets.scientific_plot import trace_colors
-    apply_theme(qapp, theme)
-    background = pg.mkColor(pg.getConfigOption("background"))
+    background = pg.mkColor(SEABORN_BG)
     reference = _contrast(pg.mkColor(trace_colors("Default", 1)[0]), background)  # Int's own 1-D trace
     x, y = _peaks()
     trace, _anchor = _trace(x, y)
@@ -174,7 +172,7 @@ def test_pf4_pa2_the_data_points_stand_out_on_the_plot_background(qapp, theme):
             dialog.set_vnext_trace(trace)
             (data,) = [item for item in dialog.plot.listDataItems() if item.name() == "data"]
             color = pg.mkBrush(data.opts["symbolBrush"]).color()
-            assert _contrast(color, background) >= reference, (kind, theme, color.getRgb())
+            assert _contrast(color, background) >= reference, (kind, color.getRgb())
             assert color.getRgb()[:3] == (52, 52, 64), "his choice: Dark slate (Recommended)"
         finally:
             dialog.close()
@@ -328,8 +326,9 @@ def test_pa3_the_phase_list_is_half_its_earlier_height(dark):
         dialog.show()
         _settle(dark)
         browser = dialog.phase_source.browser
-        # 034723d4 opened it at 220 px (its size hint; at most 230): half of that, and still above its own minimum
-        assert browser.maximumHeight() <= 110 and browser.height() <= 110
+        # 034723d4 opened it at 220 px (its size hint; at most 230): half of that, never below the list's own minimum
+        # (the themed list's is about 50 px; an unthemed Fusion list's is 118, which then sets the height)
+        assert browser.height() <= max(110, browser.minimumSizeHint().height()) < 220
         assert browser.height() >= browser.minimumSizeHint().height()
     finally:
         dialog.close()

@@ -142,14 +142,18 @@ def test_t10_every_peak_fitter_option_opens_its_mapped_help(qapp):
     try:
         dialog.show()
         qapp.processEvents()
-        expected = {"model_row": "peak-fit.model", "bkg_row": "peak-fit.background", "auto_row": "peak-fit.peaks",
+        expected = {"model_row": "peak-fit.model", "bkg_row": "peak-fit.background",
                     "count_row": "peak-fit.peaks", "range_row": "peak-fit.range"}
         for name, topic in expected.items():
             row = getattr(dialog, name)
             assert row.property("helpTopic") == topic, (name, row.property("helpTopic"))
             assert isinstance(row.help_button, ActionButton) and row.help_button.toolTip(), name
+        # NEXT-128-WINDOW-POLISH PF2: Auto sits in the Peaks row, whose "?" it shares (F1 on it opens the same topic)
+        assert dialog.auto_row.property("helpTopic") == "peak-fit.peaks" and dialog.count_row.isAncestorOf(
+            dialog.auto_row) and not hasattr(dialog.auto_row, "help_button")
         assert dialog.background_template_row.property("helpTopic") == "peak-fit.background"
-        advanced = [widget for widget in dialog.advanced.findChildren(QtWidgets.QWidget)
+        # PF6: the advanced values are the same rows, in the options column's card rather than the Advanced dialog
+        advanced = [widget for widget in dialog.advanced_card.findChildren(QtWidgets.QWidget)
                     if isinstance(widget, (FormRow, RangeRow))]
         assert len(advanced) == 7
         topics = {row.label.text(): row.property("helpTopic") for row in advanced}
