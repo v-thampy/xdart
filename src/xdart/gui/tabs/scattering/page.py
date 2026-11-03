@@ -1400,7 +1400,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             dialog.finished.connect(lambda _value, t=target, d=dialog:
                                     self._analysis_dialog_closed(t, d))
         dialog.show(); dialog.raise_(); dialog.activateWindow()
-        if target in {"peak", "phase"}: self._refresh_fit_trace(target)
+        if target in {"peak", "phase"} and dialog.fit_source() is None:
+            self._refresh_fit_trace(target)
         elif target == "metadata":
             from .analysis_mount import analysis_result_matches
             current_request = self._current_analysis_request(
