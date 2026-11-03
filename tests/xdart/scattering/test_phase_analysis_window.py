@@ -372,9 +372,12 @@ def test_w8_int_lifts_the_texture_hold_and_keeps_batch_and_sequential_held(qapp)
         dialog = _open(qapp, page)
         assert dialog.texture_row.editor.isEnabled()
         assert diagnostic_text("P3_7_PHASE_TEXTURE_UNAVAILABLE") not in dialog.texture_row.toolTip()
-        batch_reason = diagnostic_text("P3_7_BATCH_DISPLAY_PROJECTION_UNAVAILABLE")
+        # NEXT-128-WINDOW-POLISH item 11: Int's Batch is no longer held; with nothing shown it waits, saying why, and
+        # Sequential follows it
+        batch_reason = dialog.batch_btn.toolTip()
+        assert "processed NeXus result" in batch_reason
         assert not dialog.batch_btn.isEnabled() and not dialog.sequential_row.editor.isEnabled()
-        assert batch_reason in dialog.sequential_row.toolTip() or batch_reason in dialog.sequential_row.editor.toolTip()
+        assert batch_reason in dialog.sequential_row.toolTip() and batch_reason in dialog.sequential_row.editor.toolTip()
         assert dialog.sequential_batch() is False
 
 

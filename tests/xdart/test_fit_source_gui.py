@@ -129,7 +129,10 @@ def test_s2_a_nexus_source_reloads_and_fits_its_frame_on_the_stored_axis(qapp, t
         outcome = host.outcomes[-1]
         single = _single(int_frame_snapshot(path, 3, mode="default"), dialog.vnext_fit_values())
         assert outcome.ok and outcome.parameter_values == dict(zip(single.parameter_names, single.parameter_values))
-        dialog.source_row.frame_row.editor.setValue(9)
+        editor = dialog.source_row.frame_row.editor
+        editor.setText("9")
+        editor.editingFinished.emit()  # the user types another frame: it is read at once and refused by name
+        _drain(qapp, host)
         dialog.fit_btn.click()
         _drain(qapp, host)
         assert "FIT_SOURCE_FRAME_MISSING" in dialog.status.text() + dialog.status.toolTip()
@@ -255,6 +258,7 @@ def test_s6_a_nexus_source_exports_a_notebook_naming_its_file_and_frames(qapp, t
     try:
         dialog, host = _window(page, "peak")
         _choose_nexus(dialog, path, 3)
+        _drain(qapp, host)  # the chosen frame is shown at once
         dialog.fit_btn.click()
         _drain(qapp, host)
         fitted = host.outcomes[-1]
@@ -293,6 +297,7 @@ def test_s7_an_xye_source_cannot_batch_and_a_running_batch_holds_ints_fits(qapp,
         assert dialog.fit_source().kind == "xye"
         assert not dialog.batch_btn.isEnabled() and "one curve" in dialog.batch_btn.toolTip()
         _choose_nexus(dialog, path, 0)
+        _drain(qapp, host)  # the chosen frame is shown at once
         assert dialog.batch_btn.isEnabled()
         allowed = analysis_start_allowed(page)
         dialog.batch_btn.click()

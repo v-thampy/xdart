@@ -308,12 +308,14 @@ def test_held_controls_stay_held_through_a_fit(monkeypatch, qapp):
         phase = _show(page, monkeypatch, "phase", trace, anchor)
         peak.fit_btn.click()
         assert page._consume_analysis_update(_settle(page))
-        for dialog, controls in ((peak, (("live_check", "peak_live"), ("batch_btn", "peak_batch"))),
-                                 (phase, (("batch_btn", "phase_batch"),))):
-            for name, reason in controls:
-                control = getattr(dialog, name)
-                # a held control explains its code through the shared guidance text (c47d4a9f)
-                assert not control.isEnabled() and control.toolTip() == diagnostic_text(mount.HELD_REASONS[reason])
+        # a held control explains its code through the shared guidance text (c47d4a9f)
+        assert not peak.live_check.isEnabled()
+        assert peak.live_check.toolTip() == diagnostic_text(mount.HELD_REASONS["peak_live"])
+        # NEXT-128-WINDOW-POLISH item 11 lifted Int's Batch hold (the maintainer, 2026-11-03: "Include in 1.2.8"):
+        # with a NeXus frame shown, Batch fits that result's frames from their stored curves and its tooltip says so
+        for dialog in (peak, phase):
+            tip = dialog.batch_btn.toolTip()
+            assert dialog.batch_btn.isEnabled() and "a.nxs" in tip and "stored" in tip, tip
         assert not peak.live_check.isChecked()
         assert phase.texture_combo.isEnabled()  # PHASE-ANALYSIS-128 lifted the texture hold
     finally:
