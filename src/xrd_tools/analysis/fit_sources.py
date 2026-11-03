@@ -248,7 +248,8 @@ class IntResultRows:
             except ValueError as error:
                 # Only the reader's explicit byte preflight refusal shrinks a chunk. Its scientific and
                 # single-row limits stay strict, and the rejected bundle/reader closes before another read.
-                if str(error) == 'Frame 1-D result byte projection exceeds limit' and self._chunk > 1:
+                if str(error) in {'Frame 1-D result byte projection exceeds limit',
+                                  'retained physical-root bytes exceed limit'} and self._chunk > 1:
                     self._chunk = max(1, self._chunk // 2)
                     continue
                 if str(error).startswith('FIT_SOURCE_'):

@@ -298,6 +298,9 @@ class SnapshotFitHost(QtCore.QObject):
                 self.dialog.table.show_rows(*peak_parameter_rows(outcome.result))
         if self.kind != 'phase' or outcome.overlay is None:
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
+        source = getattr(self.dialog, 'source_row', None)
+        if source is not None and 'FIT_SOURCE_' in (outcome.message or ''):
+            source.report_problem(outcome.message)
         return outcome.ok
 
     def _draw_outcome(self, outcome):
