@@ -634,8 +634,11 @@ class FitSourceRow(CurveFileRow):
     def input_refusal(self) -> str:
         """A refused editor must not silently reuse the previously committed frame or unit."""
         if self._source is not None:
-            if self._source.kind == "nexus" and self.frame_row.refusal():
-                return f"FIT_SOURCE_INVALID: Frame: {self.frame_row.refusal()}"
+            if self._source.kind == "nexus":
+                reason = self.frame_row.refusal() or (
+                    "choose a source frame" if self.frame_row.editor.value() is None else "")
+                if reason:
+                    return f"FIT_SOURCE_INVALID: Frame: {reason}"
             if self._source.kind == "xye" and not self.unit_row.current_value():
                 return "FIT_SOURCE_UNIT_REQUIRED: choose the source's x unit"
         return ""
