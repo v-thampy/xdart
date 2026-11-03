@@ -1581,6 +1581,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _mount_fit_host(self, kind, dialog):
         from xdart.gui.analysis.snapshot_fit_host import SnapshotFitHost
+        from xdart.gui.pages.values import PageCleanup
+        # a closed window's host is kept only while its worker drains
+        self._retired_fit_hosts = [retired for retired in self._retired_fit_hosts
+                                   if retired.shutdown().status is not PageCleanup.CLEAN]
         host = SnapshotFitHost(kind, parent=self, current=lambda: self._fit_file_target(kind),
                                scope=lambda: self._fit_scope(kind), batch=lambda: self._fit_batch_targets(kind),
                                dialog=dialog, owns_phase_source=False)
@@ -1662,10 +1666,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     "frame number.")
 
     def _sync_fit_batches(self):
+        """After a render: each open window following Int's display re-evaluates its Batch (never failing a render)."""
         for kind in tuple(self._fit_hosts):
             dialog = self._fit_dialog(kind)
-            if dialog is not None and dialog.isVisible() and dialog.fit_source() is None:
+            if dialog is None or not dialog.isVisible() or dialog.fit_source() is not None:
+                continue
+            try:
                 self._sync_fit_batch(kind)
+            except Exception:  # noqa: BLE001 - a Batch tooltip never breaks Int's render
+                _LOG.exception("Fit window Batch state failed")
 
     def _fit_batch_targets(self, kind):
         from xdart.gui.analysis.snapshot_fit_host import FitTarget
@@ -1745,8 +1754,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
         if dialog is None:
             return
-        if host is not None and dialog.fit_source() is not None:
-            host._export(path)
+        source = dialog.fit_source()
+        if host is not None and source is not None:
+            if source.kind == "nexus":
+                host._export(path)  # the frame and every frame of its result, named
+            else:  # an .xye file has no frames to batch: its notebook carries the one curve
+                host._request("export", (host.current(),), Path(path))
             return
         from xdart.gui.analysis.fit_export import write_fit_notebook
         snapshot = dialog.export_snapshot()
@@ -7713,13 +7726,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._last_scientific_projection = (None
                 if scientific.processing_mode == "Int 1D" and heavy is not None
                 and heavy.detector_source == "full" else scientific)
-            self._sync_fit_batches()  # a fit window's Batch follows what Int shows
             self._context_controller.commit_navigation_projection(
                 tuple(frame for frame in self._shell.scientific.trace_history_keys
                       if self._context_controller.owns_frame(frame)),
                 excluded=tuple(frame for frame in self._shell.scientific.excluded_trace_keys
                                if self._context_controller.owns_frame(frame)),
             )
+            self._sync_fit_batches()  # a fit window's Batch follows what Int shows
             rendered_axis = self._shell.scientific.rendered_image_axis
             if rendered_axis is not None:
                 self._rendered_image_axis = rendered_axis

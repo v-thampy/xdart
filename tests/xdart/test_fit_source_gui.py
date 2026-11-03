@@ -307,3 +307,25 @@ def test_s7_an_xye_source_cannot_batch_and_a_running_batch_holds_ints_fits(qapp,
         assert analysis_start_allowed(page) == allowed
     finally:
         _close_page(page, qapp)
+
+
+def test_s6_an_xye_source_exports_its_one_curve_as_a_captured_input(qapp, tmp_path):
+    """Found in the self-review of 0453a194: an .xye source has no frames to batch, so its export asked for a batch,
+    was refused, and wrote nothing. Its notebook carries the one curve as a captured sidecar."""
+    xye = tmp_path / "pattern.xye"
+    xye.write_text("".join(f"{q:.6f} {y:.6f}\n" for q, y in zip(Q, _peak(2.5))), encoding="utf-8")
+    page = _page()
+    try:
+        dialog, host = _window(page, "peak")
+        row = dialog.source_row
+        row._file_chooser = lambda: str(xye)
+        row._ask_unit = lambda *_args: "q_A^-1"
+        row.choose_btn.click()
+        _drain(qapp, host)
+        destination = tmp_path / "fit.ipynb"
+        dialog.export_actions.export(destination)
+        _drain(qapp, host)
+        assert destination.is_file(), dialog.status.text()
+        assert len(tuple(tmp_path.glob("fit.ipynb*.input.npz"))) == 1
+    finally:
+        _close_page(page, qapp)
