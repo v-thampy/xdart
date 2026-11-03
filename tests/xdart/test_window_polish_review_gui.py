@@ -60,3 +60,31 @@ def test_each_template_file_gets_its_message_even_when_the_text_matches(qapp, tm
             boxes.append(box)
     finally:
         row.close()
+
+
+def test_real_phase_host_keeps_a_fraction_like_phase_name_a_cell_trend(qapp):
+    """User phase names may start with frac_: the request, not the spelling, names the phase."""
+    from xdart.gui.analysis.snapshot_fit_host import SnapshotFitHost
+    from tests.xdart.scattering.test_snapshot_fit_host import drain, sample
+    snapshot = sample()
+    host = SnapshotFitHost("phase", current=lambda: snapshot, scope=lambda: snapshot.key)
+    try:
+        host.reload()
+        drain(qapp, host)
+        dialog = host.dialog
+        dialog.phase_source.add_lattice("frac_Film", a=4.2, space_group=221)
+        qapp.processEvents()
+        dialog._maxfev_row.set_number(8)
+        dialog.fit_btn.click()
+        drain(qapp, host)
+        assert host.outcomes and host.outcomes[0].ok, dialog.status.text()
+        assert "frac_Film_a" in host.outcomes[0].params
+        assert not host.outcomes[0].result.phase_fractions, "a lattice-only phase reports no fractions"
+        trend = dialog.trend
+        families = {trend.family.itemData(i) for i in range(trend.family.count())}
+        assert "a" in families and "frac" not in families, families
+        actions = {action.text() for action in trend.members.menu().actions() if action.text()}
+        assert actions == {"All", "frac_Film"}
+    finally:
+        host.dialog.close()
+        assert host.shutdown().status.value == "clean"
