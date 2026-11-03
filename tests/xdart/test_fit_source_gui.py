@@ -21,7 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pyqtgraph.Qt import QtWidgets
 
 import xdart.gui.tabs.scattering.analysis_mount as mount
-from tests.core.test_int_fit_source import Q, _peak, _result
+from tests.core.test_int_fit_source import Q, _peak, _result, _stored
 from tests.xdart.scattering.test_fit_tools_preservation import _close_page, _page
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey
 from xdart.gui.tabs.scattering.events import RunIdentity
@@ -60,10 +60,10 @@ def _displayed(path, label, *, unit="q_A^-1", wavelength=1.0):
     with ``convert_radial_axis`` at the file's wavelength)."""
     from xrd_tools.core.containers import convert_radial_axis
     frame = DisplayFrameKey(RunIdentity(2, "run-fingerprint"), "sample", str(path), label, 9)
-    x = Q if unit == "q_A^-1" else convert_radial_axis(Q, "q_A^-1", unit, wavelength)
+    x = _stored(Q) if unit == "q_A^-1" else convert_radial_axis(_stored(Q), "q_A^-1", unit, wavelength)
     projection = ScientificProjection(traces=(TraceProjection(
         frame, AxisProjection(np.asarray(x, dtype="<f8"), "Q" if unit == "q_A^-1" else "2θ", unit),
-        np.asarray(_peak(2.0 + 0.1 * label), dtype="<f8"), "sample_2", 1700000000.25),))
+        np.asarray(_stored(_peak(2.0 + 0.1 * label)), dtype="<f8"), "sample_2", 1700000000.25),))
     return mount.displayed_trace_input(projection, frame), SimpleNamespace(frame=frame)
 
 
@@ -122,7 +122,7 @@ def test_s2_a_nexus_source_reloads_and_fits_its_frame_on_the_stored_axis(qapp, t
         assert dialog.source_row.status.text().startswith("sample_int1d.nexus, frame 3")
         dialog.refresh_btn.click()
         _drain(qapp, host)
-        assert np.array_equal(dialog._x, Q) and np.array_equal(dialog._y, _peak(2.3))
+        assert np.array_equal(dialog._x, _stored(Q)) and np.array_equal(dialog._y, _stored(_peak(2.3)))
         dialog.fit_btn.click()
         _drain(qapp, host)
         assert page._analysis_identity is None  # Int's display slot is not asked
@@ -149,7 +149,7 @@ def test_s2_int_display_returns_fit_and_reload_to_the_page(qapp, tmp_path, monke
         monkeypatch.setattr(page, "_capture_analysis_trace", lambda _kind: (trace, anchor))
         monkeypatch.setattr(mount, "display_anchor_matches", lambda *args: True)
         dialog.refresh_btn.click()
-        assert np.array_equal(dialog._y, _peak(2.2)) and not host.computing  # the page's own Reload
+        assert np.array_equal(dialog._y, _stored(_peak(2.2))) and not host.computing  # the page's own Reload
         dialog.fit_btn.click()
         assert page._analysis_identity is not None and not host.computing  # the page's slot fits the display
     finally:
@@ -174,7 +174,7 @@ def test_s3_batch_fits_every_frame_of_a_nexus_source_and_shows_the_last(qapp, tm
         for frame, center in zip(range(5), columns["center_0"]):
             single = _single(int_frame_snapshot(path, frame, mode="default"), values)
             assert center == dict(zip(single.parameter_names, single.parameter_values))["p0_center"]
-        assert np.array_equal(dialog._y, _peak(2.4))  # the last frame is shown
+        assert np.array_equal(dialog._y, _stored(_peak(2.4)))  # the last frame is shown
     finally:
         _close_page(page, qapp)
 

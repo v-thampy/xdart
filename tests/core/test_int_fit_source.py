@@ -28,6 +28,11 @@ def _sources():
     return import_module("xrd_tools.analysis.fit_sources")
 
 
+def _stored(values):
+    """Values as an Int result stores them: its 1-D axis, rows and σ are float32 (read back as float64)."""
+    return np.asarray(values, dtype=np.float32).astype(np.float64)
+
+
 def _peak(center, height=400.0):
     return 10.0 + height * np.exp(-0.5 * ((Q - center) / 0.04) ** 2)
 
@@ -79,8 +84,8 @@ def test_a_frame_is_its_stored_row_on_its_stored_axis_at_the_files_wavelength(tm
     mode = _mode(path)
     snapshot = _sources().int_frame_snapshot(path, 3, mode=mode)
     axis, = snapshot.axes
-    assert (axis.name, axis.unit) == ("Q", "q_A^-1") and np.array_equal(axis.values, Q)
-    assert np.array_equal(snapshot.values, _peak(2.3)) and np.array_equal(snapshot.sigma, np.full(Q.size, 2.0))
+    assert (axis.name, axis.unit) == ("Q", "q_A^-1") and np.array_equal(axis.values, _stored(Q))
+    assert np.array_equal(snapshot.values, _stored(_peak(2.3))) and np.array_equal(snapshot.sigma, np.full(Q.size, 2.0))
     assert snapshot.wavelength_angstrom == pytest.approx(WAVELENGTH, rel=1e-12, abs=0.0)
     key = snapshot.key
     assert key.path == str(path) and key.generation == 0 and key.background == "none"
@@ -107,7 +112,7 @@ def test_a_missing_frame_or_mode_is_refused_by_name(tmp_path) -> None:
 def test_a_frame_in_a_secondary_mode_is_that_modes_row(tmp_path) -> None:
     path = _result(tmp_path / "gi_int2d.nexus", gi=True)
     snapshot = _sources().int_frame_snapshot(path, 1, mode="q_ip")
-    assert snapshot.axes[0].unit == "qip_A^-1" and np.array_equal(snapshot.values, _peak(2.9))
+    assert snapshot.axes[0].unit == "qip_A^-1" and np.array_equal(snapshot.values, _stored(_peak(2.9)))
 
 
 def test_a_displayed_unit_converts_q_and_two_theta_with_ints_function_and_refuses_others(tmp_path) -> None:
@@ -117,8 +122,8 @@ def test_a_displayed_unit_converts_q_and_two_theta_with_ints_function_and_refuse
     snapshot = _sources().int_frame_snapshot(path, 2, mode=mode, unit="2th_deg")
     axis, = snapshot.axes
     assert axis.unit == "2th_deg" and axis.name == axis_from_unit("2th_deg", axis.values).label
-    assert np.array_equal(axis.values, convert_radial_axis(Q, "q_A^-1", "2th_deg", WAVELENGTH))
-    assert np.array_equal(snapshot.values, _peak(2.2)) and dict(snapshot.key.selection)["unit"] == "2th_deg"
+    assert np.array_equal(axis.values, convert_radial_axis(_stored(Q), "q_A^-1", "2th_deg", WAVELENGTH))
+    assert np.array_equal(snapshot.values, _stored(_peak(2.2))) and dict(snapshot.key.selection)["unit"] == "2th_deg"
     with pytest.raises(ValueError, match="FIT_SOURCE_AXIS_MISMATCH"):
         _sources().int_frame_snapshot(path, 2, mode=mode, unit="qip_A^-1")
     no_wavelength = _result(tmp_path / "unknown_int1d.nexus", wavelength=None)
