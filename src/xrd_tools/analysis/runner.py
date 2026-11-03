@@ -715,12 +715,20 @@ def _displayed_outcome(label: str, plan: Any, result: Any, params: "dict[str, fl
                            values, errors, units)
 
 
+#: a peak's trend families after its centre and the centre's error, in this order; the shape's own follow
+_PEAK_TREND_ORDER = ("fwhm", "height", "amplitude", "sigma")
+#: a peak parameter named apart in the trend: a Voigt's γ is no phase fit's lattice γ family
+_PEAK_TREND_NAMES = {"gamma": "voigt_gamma"}
+
+
 @dataclass
 class DisplayedPeakFitAnalyzer:
     """``run_displayed_peak_fit`` as a frame-unit analyzer: each input (a ``FitInputSnapshot`` or an
     :class:`AnalysisInput`) fitted with ``settings``, ``DisplayedPeakFitPlan``'s fields but its trace. Its params are
-    each peak's ``center_i``, ``center_err_i`` (only when the fit estimated it: an unknown error is no zero),
-    ``fwhm_i`` and ``amplitude_i``, the trend's families; its result the ``DisplayedPeakFitResult``.
+    each peak's ``center_i``, ``center_err_i`` (only when the fit estimated it: an unknown error is no zero), then
+    every other parameter of the peak as ``<name>_i`` (``fwhm``, ``height``, ``amplitude``, ``sigma``, then the
+    shape's: ``fraction``, ``sigma_r``, ``expon``, a Voigt's γ as ``voigt_gamma``), and the background's own
+    (``bg_…``, a template's ``bg_A`` and ``bgx_…``), the trend's families; its result the ``DisplayedPeakFitResult``.
     ``cancel_token`` cancels a fit between its steps; an lmfit solve under way is drained, not interrupted."""
 
     settings: "dict[str, Any]" = field(default_factory=dict)
@@ -745,9 +753,19 @@ class DisplayedPeakFitAnalyzer:
                 params[f"center_{index}"] = float(values[f"{prefix}center"])
             if errors.get(f"{prefix}center") is not None:
                 params[f"center_err_{index}"] = float(errors[f"{prefix}center"])
-            for family in ("fwhm", "amplitude"):
-                if f"{prefix}{family}" in values:
-                    params[f"{family}_{index}"] = float(values[f"{prefix}{family}"])
+            # every other parameter of the peak, the derived FWHM and height among them (NEXT-128-WINDOW-POLISH item
+            # 14: "the track options should also show the other peak pars like fraction for PV and height (even
+            # though it is derived)"): the widths, height and area first, then the shape's own
+            names = [name[len(prefix):] for name in result.parameter_names
+                     if name.startswith(prefix) and name != f"{prefix}center"]
+            for name in sorted(names, key=lambda name: (_PEAK_TREND_ORDER.index(name) if name in _PEAK_TREND_ORDER
+                                                        else len(_PEAK_TREND_ORDER), names.index(name))):
+                params[f"{_PEAK_TREND_NAMES.get(name, name)}_{index}"] = float(values[f"{prefix}{name}"])
+        # the background's own parameters, peak-independent (his "as well as the peak independent bg pars"): a fitted
+        # background's (bg_), a template's scale (bg_A) and the part added to it (bgx_)
+        for name in result.parameter_names:
+            if name.startswith(("bg_", "bgx_")):
+                params[name] = float(values[name])
         return _displayed_outcome(label, plan, result, params)
 
     def analyze_scan(self, inputs: Sequence[AnalysisInput]) -> AnalysisOutcome:

@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.analysis.peak_fit_util import (
-    CURVE_PENS, FAMILY_LABELS, FAMILY_UNITS, X_UNIT_FAMILIES, group_families, member_label,
+    CURVE_PENS, FAMILY_UNITS, X_UNIT_FAMILIES, family_label, group_families, is_background, member_label,
 )
 from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style, plot_font
@@ -395,7 +395,7 @@ class TrendView(QtWidgets.QWidget):
             if none:
                 combo.addItem("None", None)
             for name in families:
-                combo.addItem(FAMILY_LABELS.get(name, name), name)
+                combo.addItem(family_label(name), name)
             if current is not None and combo.findData(current) >= 0:
                 combo.setCurrentIndex(combo.findData(current))
             del blocker
@@ -416,8 +416,8 @@ class TrendView(QtWidgets.QWidget):
         for row in self._rows.values():
             keys += [key for key in row.params if key not in keys]
         members: list = []
-        for entries in self._grouped(keys).values():
-            members += [member for _key, member in entries if member not in members]
+        for entries in self._grouped(keys).values():  # a background's families have no member to choose
+            members += [member for _key, member in entries if member is not None and member not in members]
         numbers = sorted(member for member in members if isinstance(member, int))
         members = tuple(numbers + [member for member in members if not isinstance(member, int)])
         if members != self._members:
@@ -458,9 +458,11 @@ class TrendView(QtWidgets.QWidget):
     def _axis_label(self, family: str) -> str:
         if family in FAMILY_UNITS:
             unit = FAMILY_UNITS[family]
+        elif is_background(family):  # a coefficient's unit is its power of x's; a template's scale has none
+            unit = ""
         else:
             unit = self._value_unit if family in X_UNIT_FAMILIES else "Intensity"
-        label = FAMILY_LABELS.get(family, family)
+        label = family_label(family)
         return f"{label} ({unit})" if unit else label
 
     def _set_enabled(self, enabled: bool) -> None:

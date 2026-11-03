@@ -36,7 +36,10 @@ def test_a_batch_fits_each_snapshot_with_the_displayed_policy_and_projects_the_t
     assert all(outcome.ok for outcome in outcomes)
     np.testing.assert_allclose([outcome.params["center_0"] for outcome in outcomes], (2.40, 2.45, 2.50), atol=1e-3)
     for outcome in outcomes:
-        assert set(outcome.params) == {"center_0", "center_err_0", "fwhm_0", "amplitude_0"}
+        # NEXT-128-WINDOW-POLISH item 14 (the maintainer's "the track options should also show the other peak pars
+        # ... as well as the peak independent bg pars"): every peak parameter and the background's own
+        assert set(outcome.params) == {"center_0", "center_err_0", "fwhm_0", "height_0", "amplitude_0", "sigma_0",
+                                       "bg_c"}
         assert outcome.params["fwhm_0"] == pytest.approx(2.354820 * 0.03, rel=0.02)
         overlay = outcome.overlay
         assert overlay.x.shape == overlay.traces["fit"].shape == overlay.traces["residual"].shape

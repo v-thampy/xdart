@@ -7,22 +7,51 @@ into per-peak *families* for the trend plot (one curve per peak), and the
 table for CSV export.  No Qt / pyqtgraph here so it is unit-testable headlessly
 and shared by the embedded third-row plot."""
 
-#: param-family key -> friendly label.  Families a peak analyzer emits are
-#: ``center`` / ``center_err`` / ``fwhm`` / ``amplitude`` (see _peak_params).
+#: param-family key -> friendly label.  Families a peak analyzer emits are ``center`` / ``center_err`` / ``fwhm`` /
+#: ``amplitude`` (see _peak_params), and the displayed fits' every other peak parameter and background parameter
+#: (NEXT-128-WINDOW-POLISH item 14; a background's are named by ``family_label``).
 FAMILY_LABELS = {
     "center": "Peak center",
     "center_err": "Center uncertainty",
     "fwhm": "FWHM",
     "amplitude": "Amplitude",
+    "height": "Height",
+    "sigma": "σ",
+    "sigma_r": "σ (right side)",
+    "fraction": "Lorentzian fraction",
+    "expon": "Pearson VII exponent",
+    "voigt_gamma": "Voigt γ",
     # a phase fit's kinds (NEXT-128-WINDOW-POLISH), one member per phase: ``frac_<phase>`` and ``<phase>_<cell>``
     "frac": "Phase fraction",
     "a": "Lattice a", "b": "Lattice b", "c": "Lattice c",
     "alpha": "Lattice α", "beta": "Lattice β", "gamma": "Lattice γ",
 }
 #: families whose VALUES are in the pattern's x-unit (vs. intensity).
-X_UNIT_FAMILIES = {"center", "center_err", "fwhm"}
+X_UNIT_FAMILIES = {"center", "center_err", "fwhm", "sigma", "sigma_r", "voigt_gamma"}
 #: families with a unit of their own: a fraction has none; cell lengths are in Å, cell angles in degrees
-FAMILY_UNITS = {"frac": "", "a": "Å", "b": "Å", "c": "Å", "alpha": "°", "beta": "°", "gamma": "°"}
+FAMILY_UNITS = {"frac": "", "a": "Å", "b": "Å", "c": "Å", "alpha": "°", "beta": "°", "gamma": "°",
+                "fraction": "", "expon": ""}
+#: a background's own parameters, families of their own with no peak (NEXT-128-WINDOW-POLISH item 14, "the peak
+#: independent bg pars"): ``bg_`` a fitted background's or a template's scale (``bg_A``), ``bgx_`` the part added to
+#: a template
+BACKGROUND_PREFIXES = ("bg_", "bgx_")
+_BACKGROUND_LABELS = {"slope": "Background slope", "intercept": "Background intercept", "c": "Background constant",
+                      "A": "Template scale"}
+
+
+def is_background(key):
+    """Whether ``key`` is a background's own parameter (peak-independent)."""
+    return str(key).startswith(BACKGROUND_PREFIXES)
+
+
+def family_label(family):
+    """A family as Track names it: its label, a background parameter by what it is ("Background c0"), else its key."""
+    if family in FAMILY_LABELS:
+        return FAMILY_LABELS[family]
+    if is_background(family):
+        tail = str(family).split("_", 1)[1]
+        return _BACKGROUND_LABELS.get(tail, f"Background {tail}")
+    return family
 _CELL_KEYS = ("a", "b", "c", "alpha", "beta", "gamma")
 
 #: per-curve colors (one per peak within a family).
@@ -65,7 +94,8 @@ def group_families(keys, *, phase=False, phase_names=()):
                                     if head and tail in _CELL_KEYS))
     fam = {}
     for key in keys:
-        f, member = _phase_family(key, phases) or split_family(key)
+        # a background's parameter is a family of its own with no peak or phase: the chooser never hides it
+        f, member = (key, None) if is_background(key) else (_phase_family(key, phases) or split_family(key))
         fam.setdefault(f, []).append((key, member))
     order = {phase: position for position, phase in enumerate(phases)}
     for f in fam:
