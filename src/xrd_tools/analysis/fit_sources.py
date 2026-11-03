@@ -131,11 +131,12 @@ def _source_refused(code: str, detail: str) -> ValueError:
     return ValueError(f'FIT_SOURCE_{code}: {detail}')
 
 
-def _row_digest(mode, unit, axis, values, sigma) -> str:
-    """The content identity of one fit input: its mode, unit, axis, values and σ (a rewritten row is another input)."""
+def _row_digest(mode, unit, axis, values, sigma, *, wavelength=None) -> str:
+    """One scientific fit input: mode, unit, arrays and wavelength (including unconverted q rows)."""
     import hashlib
     digest = hashlib.sha256()
-    parts = (json.dumps({'mode': mode, 'unit': unit}, sort_keys=True).encode('utf-8'),
+    parts = (json.dumps({'mode': mode, 'unit': unit, 'wavelength_angstrom': wavelength},
+                       sort_keys=True).encode('utf-8'),
              np.ascontiguousarray(axis, dtype='<f8').tobytes(), np.ascontiguousarray(values, dtype='<f8').tobytes(),
              b'' if sigma is None else np.ascontiguousarray(sigma, dtype='<f8').tobytes())
     for part in parts:
@@ -162,9 +163,24 @@ class IntResultRows:
         self._labels = None
         self._rows = None
         self._wavelength = _UNREAD
+        self._file_facts = None
+
+    def _check_file(self):
+        """One loader binds one file generation, including cached rows and its separately read wavelength."""
+        try:
+            facts = self.path.stat()
+        except OSError as error:
+            raise _source_refused('UNREADABLE', f'the source file cannot be read: {self.path} ({error})') from None
+        current = (facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
+        if self._file_facts is None:
+            self._file_facts = current
+        elif current != self._file_facts:
+            raise _source_refused('CHANGED', f'{self.path.name} changed while its fit inputs were being read; '
+                                            'choose or reload the source again')
 
     def _open(self):
         from xrd_tools.io.frame_view import FrameViewReader
+        self._check_file()
         if not self.path.is_file():
             raise _source_refused('UNREADABLE', f'the source file is missing: {self.path}')
         return FrameViewReader(self.path, entry=self.entry, include_thumbnail=False, resolve_source=False)
@@ -183,10 +199,12 @@ class IntResultRows:
 
     def labels(self) -> tuple[int, ...]:
         """The frames with a stored row in the mode, ascending."""
+        self._check_file()
         if self._labels is None:
             try:
                 with self._open() as reader:
                     self._inventory(reader)
+                    self._check_file()
             except ValueError as error:
                 if str(error).startswith('FIT_SOURCE_'):
                     raise
@@ -197,6 +215,7 @@ class IntResultRows:
 
     def wavelength_angstrom(self) -> float | None:
         """The file's recorded wavelength in Å (None: not recorded), read once."""
+        self._check_file()
         if self._wavelength is _UNREAD:
             from xrd_tools.core.energy import wavelength_m_to_angstrom
             from xrd_tools.io.browse_presentation import read_browse_presentation
@@ -206,28 +225,37 @@ class IntResultRows:
                 raise self._unreadable(error) from None
             value = presentation.get('wavelength_m')
             self._wavelength = None if value is None else wavelength_m_to_angstrom(value, allow_default_sentinel=True)
+            self._check_file()
         return self._wavelength
 
     def _rows_with(self, frame: int):
-        held = self._rows
-        if held is not None and frame in held.labels:
-            return held
+        self._check_file()
+        if self._rows is not None and frame in self._rows.labels:
+            return self._rows
         from bisect import bisect_left
         self._rows = None  # the held chunk goes before the next is read
-        try:
-            with self._open() as reader:
-                labels = self._inventory(reader)
-                index = bisect_left(labels, frame)
-                if index == len(labels) or labels[index] != frame:
-                    raise _source_refused('FRAME_MISSING', f'{self.path.name} has no frame {frame} in 1-D mode '
-                                                           f'{self.mode!r}')
-                rows = reader.read_1d_rows(tuple(labels[index:index + self._chunk]), modes=(self.mode,))
-        except ValueError as error:
-            if str(error).startswith('FIT_SOURCE_'):
-                raise
-            raise self._unreadable(error) from None
-        except (OSError, RuntimeError, KeyError, TypeError) as error:
-            raise self._unreadable(error) from None
+        while True:
+            try:
+                with self._open() as reader:
+                    labels = self._inventory(reader)
+                    index = bisect_left(labels, frame)
+                    if index == len(labels) or labels[index] != frame:
+                        raise _source_refused('FRAME_MISSING', f'{self.path.name} has no frame {frame} in 1-D mode '
+                                                               f'{self.mode!r}')
+                    rows = reader.read_1d_rows(tuple(labels[index:index + self._chunk]), modes=(self.mode,))
+                    self._check_file()
+                break
+            except ValueError as error:
+                # Only the reader's explicit byte preflight refusal shrinks a chunk. Its scientific and
+                # single-row limits stay strict, and the rejected bundle/reader closes before another read.
+                if str(error) == 'Frame 1-D result byte projection exceeds limit' and self._chunk > 1:
+                    self._chunk = max(1, self._chunk // 2)
+                    continue
+                if str(error).startswith('FIT_SOURCE_'):
+                    raise
+                raise self._unreadable(error) from None
+            except (OSError, RuntimeError, KeyError, TypeError) as error:
+                raise self._unreadable(error) from None
         self._rows = next(mode for mode in rows.modes if mode.mode == self.mode)
         return self._rows
 
@@ -250,12 +278,15 @@ class IntResultRows:
                                                              f'converting {unit} to {self.unit} needs')
             x = convert_radial_axis(np.asarray(x, dtype=float), unit, self.unit, wavelength)
             label, unit = axis_from_unit(self.unit, x).label, self.unit
-        selection = (('meaning', 'radial'), ('frame', frame), ('mode', self.mode))
+        selection = (('meaning', 'radial'), ('frame', frame), ('mode', self.mode), ('entry', self.entry))
         if self.unit is not None:
             selection += (('unit', self.unit),)
-        key = FitInputKey(f'{self.path.stem} frame {frame}', str(self.path), _row_digest(self.mode, unit, x, values,
-                                                                                        sigma), 0, selection)
-        return FitInputSnapshot(key, (FitAxis(label, unit, x),), values, wavelength_angstrom=wavelength, sigma=sigma)
+        key = FitInputKey(f'{self.path.stem} frame {frame}', str(self.path),
+                          _row_digest(self.mode, unit, x, values, sigma, wavelength=wavelength), 0, selection)
+        snapshot = FitInputSnapshot(key, (FitAxis(label, unit, x),), values,
+                                    wavelength_angstrom=wavelength, sigma=sigma)
+        self._check_file()
+        return snapshot
 
 
 def int_frame_snapshot(path, frame, *, mode, entry='entry', unit=None) -> FitInputSnapshot:
