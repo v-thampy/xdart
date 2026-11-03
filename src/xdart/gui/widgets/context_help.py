@@ -6,7 +6,6 @@ pages can be mounted in Main without creating a second shortcut or window.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
 import os
 from pathlib import Path
 
@@ -67,17 +66,6 @@ def _help_action(widget):
     from .controls_panel import ActionButton
     from xrd_tools.session.readiness import ControlAction
     return isinstance(widget, ActionButton) and widget.spec.action is ControlAction.HELP
-
-
-@contextmanager
-def _teaching_busy(missing):
-    if missing:
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
-    try:
-        yield
-    finally:
-        if missing:
-            QtWidgets.QApplication.restoreOverrideCursor()
 
 
 class HelpWindow(ReadOnlyTextWindow):
@@ -270,8 +258,7 @@ class HelpWindow(ReadOnlyTextWindow):
         self.feature_row.setVisible(step == 2)
         from xrd_tools.geometry_figures import teaching_cache
         cache = teaching_cache()
-        with _teaching_busy(not cache.has_finding(step)):
-            finding = cache.get_finding(step)
+        finding = cache.get_finding(step)  # no wait cursor; see _draw_figure_key
         with QtCore.QSignalBlocker(self.figure_row.editor):
             self.figure_row.editor.setCurrentIndex(topic.figures.index(key))
         self._draw_figure_key(key, finding.reason)
@@ -314,8 +301,10 @@ class HelpWindow(ReadOnlyTextWindow):
         from xdart.gui.tabs.scattering.shell_values import KeyedFigureProjection, KeyedPanelsProjection
         cache = teaching_cache()
         index = max(0, self.candidate_row.editor.currentIndex())
-        with _teaching_busy(not cache.has_figures(key, index)):
-            figures = cache.get_figures(key, index)
+        # No wait cursor while a cold draw runs (up to about 1 s): on macOS, Qt 6.11.1 builds it from an
+        # ICC-tagged image whose colour space it frees before use, which crashed Help on macOS 27.2
+        # (NEXT-128-HELP-CURSOR).
+        figures = cache.get_figures(key, index)
         if finding_reason:
             from dataclasses import replace
             figures = tuple(replace(f, caption=f.caption+' Synthetic result: '+finding_reason) for f in figures)
