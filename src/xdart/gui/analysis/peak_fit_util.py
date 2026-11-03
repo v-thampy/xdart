@@ -54,9 +54,14 @@ def family_label(family):
     return family
 _CELL_KEYS = ("a", "b", "c", "alpha", "beta", "gamma")
 
-#: per-curve colors (one per peak within a family).
+#: per-curve colors (one per ROI on an image; the trend draws with ``TREND_COLORS``).
 CURVE_PENS = [(189, 147, 249), (80, 250, 123), (255, 184, 108),
               (139, 233, 253), (255, 121, 198), (241, 250, 140)]
+#: the trend's curves, one per peak or phase within a family, for the light panel every trend is drawn on
+#: (NEXT-128-WINDOW-POLISH item 14: ``CURVE_PENS``'s green, cyan and yellow were 1.07 to 1.16:1 on SEABORN_BG); each at
+#: least 3:1 there (probes/p14/contrast.py), the fit view's overlay hues first
+TREND_COLORS = ((126, 64, 214), (0, 120, 80), (196, 30, 70), (20, 100, 180), (160, 100, 0), (0, 125, 140),
+                (140, 86, 75), (190, 0, 140))
 
 
 def split_family(key):

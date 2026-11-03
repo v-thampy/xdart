@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.analysis.peak_fit_util import (
-    CURVE_PENS, FAMILY_UNITS, X_UNIT_FAMILIES, family_label, group_families, is_background, member_label,
+    FAMILY_UNITS, TREND_COLORS, X_UNIT_FAMILIES, family_label, group_families, is_background, member_label,
 )
 from xdart.gui.gui_utils import GridAxisItem, RectViewBox
 from xdart.gui.themes import apply_seaborn_plot_style, plot_font
@@ -227,7 +227,7 @@ class TrendView(QtWidgets.QWidget):
         for index, (series, x, y) in enumerate(prepared):
             if not (np.isfinite(x).any() and np.isfinite(y).any()):
                 continue
-            color = CURVE_PENS[index % len(CURVE_PENS)]
+            color = TREND_COLORS[index % len(TREND_COLORS)]
             pen = pg.mkPen(color, width=3)
             if series.right:
                 item = add_right_series(self.right_view_box, self.legend, x, y, pen=pen, name=series.name,
@@ -351,7 +351,7 @@ class TrendView(QtWidgets.QWidget):
         family = self.family.currentData()
         if family is not None:
             for key, _member in self._shown(grouped.get(family, [])):
-                pen = CURVE_PENS[colour % len(CURVE_PENS)]
+                pen = TREND_COLORS[colour % len(TREND_COLORS)]
                 colour += 1
                 y = np.asarray([columns[key][index] for index in drawn], dtype=float)
                 self.plot.plot(x, y, pen=pg.mkPen(pen, width=2), name=key, symbol="o", symbolSize=5, symbolBrush=pen)
@@ -360,7 +360,7 @@ class TrendView(QtWidgets.QWidget):
         any_right = False
         if right is not None and right != family:
             for key, _member in self._shown(grouped.get(right, [])):
-                pen = CURVE_PENS[colour % len(CURVE_PENS)]
+                pen = TREND_COLORS[colour % len(TREND_COLORS)]
                 colour += 1
                 y = np.asarray([columns[key][index] for index in drawn], dtype=float)
                 add_right_series(self.right_view_box, self.legend, x, y,

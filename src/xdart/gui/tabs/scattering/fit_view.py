@@ -38,32 +38,43 @@ from xdart.gui.widgets.scientific_plot import PlotCursorReadout, scaled_intensit
 #: discerned. need darker more prominent colors to make it more visible", and his "Dark slate (Recommended)"): 10.3:1
 #: against the plots' background (the themes' SEABORN_BG in both themes), and no fit, background or component colour
 _DATA = (52, 52, 64)
-_FIT = (189, 147, 249)
-_BACKGROUND = (130, 200, 160)
+#: the overlays, for the light panel every fit plot is drawn on in both themes (NEXT-128-WINDOW-POLISH item 14: the
+#: maintainer, 2026-11-03, "the fit lines are now very hard to see"; their colours were chosen for a dark plot, 1.3 to
+#: 2.2:1 on SEABORN_BG). On that panel (probes/p14/contrast.py): the fit 4.89:1, its background 4.62:1, the residual
+#: 4.85:1, every other overlay at least 3:1 (WCAG 1.4.11), each a hue apart from the slate points.
+_FIT = (126, 64, 214)
+_BACKGROUND = (0, 120, 80)
 #: PHASE-ANALYSIS-128: a phase fit's own components, a background refined with the phases and an amorphous peak
-_FIT_BACKGROUND = (110, 170, 230)
-_AMORPHOUS = (235, 150, 95)
-_RESIDUAL = (230, 133, 151)
-_REJECTED = (230, 110, 110)
+_FIT_BACKGROUND = (20, 100, 180)
+_AMORPHOUS = (190, 85, 0)
+_RESIDUAL = (196, 30, 70)
+_REJECTED = (190, 0, 140)
 _ZERO = (130, 130, 140)
-_MARKER = (240, 200, 90)
-_RANGE = (189, 147, 249, 30)
+_MARKER = (160, 100, 0)
+#: a component's line where no colour map colours it (Int's windows colour each from the top bar's map)
+_COMPONENT = (140, 86, 75)
+_RANGE = (126, 64, 214, 28)
+#: the fit range's draggable edges (pyqtgraph's own default, (200, 200, 100), is 1.47:1 on the panel)
+_RANGE_EDGE = (126, 64, 214)
 
 #: Each role's look: points ("o" filled, "x" crosses) or a line, its colour (None: the theme's
 #: foreground; "group": the 1-D plot's trace colour for the series' group) and size or width.
 _ROLES = {
     "data": ("o", _DATA, 4),
     "data_line": ("line", _DATA, 1),
-    "fit": ("line", _FIT, 2),
-    "background": ("dash", _BACKGROUND, 1.3),
-    "fit_background": ("dash", _FIT_BACKGROUND, 1.3),
-    "amorphous": ("dash", _AMORPHOUS, 1.3),
-    "component": ("line", None, 1.2),
+    "fit": ("line", _FIT, 2.5),
+    "background": ("dash", _BACKGROUND, 2),
+    "fit_background": ("dash", _FIT_BACKGROUND, 2),
+    "amorphous": ("dash", _AMORPHOUS, 2),
+    "component": ("line", _COMPONENT, 1.5),
     "group": ("o", "group", 5),
     "rejected": ("x", _REJECTED, 7),
-    "residual": ("line", _RESIDUAL, 1),
+    "residual": ("line", _RESIDUAL, 1.5),
     "residual_points": ("o", _RESIDUAL, 5),
 }
+#: each role's stacking (item 14): the fit over its components and backgrounds, all over the points, whatever order a
+#: host lists them in
+_ROLE_Z = {"fit": 3, "component": 2, "background": 1, "fit_background": 1, "amorphous": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,14 +147,18 @@ def draw_series(plot, series: FitSeries, *, group_count: int = 1, color=None):
         colour = trace_colors("Default", max(group_count, series.group + 1))[series.group]
     x, y = np.asarray(series.x, dtype=float), np.asarray(series.y, dtype=float)
     if kind == "o":
-        return plot.plot(x, y, pen=None, symbol="o", symbolSize=size, symbolBrush=colour,
+        item = plot.plot(x, y, pen=None, symbol="o", symbolSize=size, symbolBrush=colour,
                          symbolPen=None, name=series.name)
-    if kind == "x":
-        return plot.plot(x, y, pen=None, symbol="x", symbolSize=size, symbolPen=pg.mkPen(colour),
+    elif kind == "x":
+        item = plot.plot(x, y, pen=None, symbol="x", symbolSize=size, symbolPen=pg.mkPen(colour),
                          name=series.name)
-    style = QtCore.Qt.PenStyle.DashLine if kind == "dash" else QtCore.Qt.PenStyle.SolidLine
-    pen = pg.mkPen(width=size, style=style) if colour is None else pg.mkPen(colour, width=size, style=style)
-    return plot.plot(x, y, pen=pen, name=series.name)
+    else:
+        style = QtCore.Qt.PenStyle.DashLine if kind == "dash" else QtCore.Qt.PenStyle.SolidLine
+        pen = pg.mkPen(width=size, style=style) if colour is None else pg.mkPen(colour, width=size, style=style)
+        item = plot.plot(x, y, pen=pen, name=series.name)
+    if series.role in _ROLE_Z:
+        item.setZValue(_ROLE_Z[series.role])
+    return item
 
 
 def draw_marker(plot, position: float):
@@ -272,7 +287,8 @@ class FitView(QtWidgets.QWidget):
         # the fit range: one region, behind the series, re-added after each redraw clears the upper panel
         self._range: tuple[float, float] | None = None
         self._setting_range = False
-        self._region = pg.LinearRegionItem(brush=_RANGE)
+        self._region = pg.LinearRegionItem(brush=_RANGE, pen=pg.mkPen(_RANGE_EDGE, width=1.5),
+                                           hoverPen=pg.mkPen(_RANGE_EDGE, width=3))
         self._region.setZValue(-10)
         self._region.hide()
         self._region.sigRegionChanged.connect(self._region_moved)
