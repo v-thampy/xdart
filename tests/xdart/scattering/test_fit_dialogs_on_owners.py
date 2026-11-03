@@ -32,24 +32,26 @@ def _rows(dialog):
     return [widget for widget in dialog.findChildren(QtWidgets.QWidget) if isinstance(widget, (FormRow, RangeRow))]
 
 
-def test_the_peak_fit_mounts_the_shared_owners_and_its_advanced_values_are_the_advanced_dialogs_rows(qapp):
+def test_the_peak_fit_mounts_the_shared_owners_and_its_advanced_values_are_its_advanced_cards_rows(qapp):
+    """NEXT-128-WINDOW-POLISH PF6 (the maintainer, 2026-11-03: "i think there's enogh space in the peak fitting window
+    left panel that the advanced options can be accommodated there"): the rarely changed values are the same shared
+    rows, now in an Advanced card in the options column rather than the shared Advanced dialog."""
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
+    from xdart.gui.widgets.controls_panel import SectionCard
     dialog = PeakFitDialog(vnext_submit=lambda *_args: None)
     try:
         assert isinstance(dialog.fit_view, FitView) and (dialog.plot, dialog.resid_plot) == (
             dialog.fit_view.plot, dialog.fit_view.residuals)
         assert isinstance(dialog.table, ResultsTable) and isinstance(dialog.trend, TrendView)
-        assert isinstance(dialog.advanced, AdvancedDialog) and dialog.advanced.parent() is dialog
+        assert isinstance(dialog.advanced_card, SectionCard) and dialog.split.controls.isAncestorOf(dialog.advanced_card)
+        assert not dialog.findChildren(AdvancedDialog)
         assert isinstance(dialog.npeaks_spin, IntegerLineEdit) and dialog.model_combo.objectName() == "controlsComboBox"
         assert (dialog.range_lo, dialog.range_hi) == dialog.range_row.editors
         advanced = {dialog.adv_centers, dialog.adv_sigma_init, dialog.adv_sigma_min, dialog.adv_sigma_max,
                     dialog.adv_center_delta, dialog.adv_fraction, dialog.adv_maxfev, dialog.use_uncertainties}
-        assert all(dialog.advanced.isAncestorOf(editor) for editor in advanced)
-        assert len(_rows(dialog.advanced)) == 7
+        assert all(dialog.advanced_card.isAncestorOf(editor) for editor in advanced)
+        assert len(_rows(dialog.advanced_card)) == 7
         assert not dialog.use_uncertainties.isChecked()  # the original unweighted default is held
-        dialog.show()
-        dialog.advanced_btn.click()
-        assert dialog.advanced.isVisible()
     finally:
         dialog.close()
 

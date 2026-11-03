@@ -120,6 +120,29 @@ def test_pf2_pf3_peaks_and_auto_share_a_row_and_every_question_mark_is_one_colum
         dialog.close()
 
 
+# ---- PF6 the Peak Fitter's advanced options in its options column ----------------------------------------------------
+
+def test_pf6_the_peak_fitters_advanced_options_sit_in_its_options_column(dark):
+    """His addition, 2026-11-03: "i think there's enogh space in the peak fitting window left panel that the advanced
+    options can be accommodated there". Frozen red on 80834b4d (they were the shared Advanced dialog's rows)."""
+    from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
+    dialog = _dialog("peak")
+    try:
+        dialog.show()
+        _settle(dark)
+        assert not dialog.findChildren(AdvancedDialog) and not hasattr(dialog, "advanced_btn"), "no Advanced window"
+        editors = (dialog.adv_centers, dialog.adv_sigma_init, dialog.adv_sigma_min, dialog.adv_sigma_max,
+                   dialog.adv_center_delta, dialog.adv_fraction, dialog.adv_maxfev, dialog.use_uncertainties)
+        column = dialog.split.controls.widget()
+        assert all(column.isAncestorOf(editor) and editor.isVisible() for editor in editors)
+        rows = {editor.parentWidget() for editor in editors}  # each editor's row; σ min and max share one
+        assert len(rows) == 7
+        rights = [_right(row.help_button, column) for row in rows] + [_right(dialog.model_row.help_button, column)]
+        assert max(rights) - min(rights) <= 1, "the advanced rows' ? sit in the fit rows' ? column"
+    finally:
+        dialog.close()
+
+
 # ---- PF4, PA2 the data points stand out on the plot background, in both themes and both windows ---------------------
 
 def _luminance(color):
