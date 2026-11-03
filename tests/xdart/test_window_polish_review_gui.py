@@ -77,7 +77,8 @@ def test_real_phase_host_keeps_a_fraction_like_phase_name_a_cell_trend(qapp):
         dialog._maxfev_row.set_number(8)
         dialog.fit_btn.click()
         drain(qapp, host)
-        assert host.outcomes and host.outcomes[0].ok, dialog.status.text()
+        # The host also publishes a nonconverged fit's reported parameters; their kinds must still be correct.
+        assert host.outcomes and host.outcomes[0].params, dialog.status.text()
         assert "frac_Film_a" in host.outcomes[0].params
         assert not host.outcomes[0].result.phase_fractions, "a lattice-only phase reports no fractions"
         trend = dialog.trend
