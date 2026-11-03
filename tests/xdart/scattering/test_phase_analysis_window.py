@@ -99,8 +99,13 @@ def _marker(view, identifier):
 
 
 def _row(source, identifier):
-    index = next(i for i, (entry, _shown) in enumerate(source.listed_entries()) if entry.id == identifier)
-    return source.browser.scans.item(index)
+    """The entry's row in the list that shows it. CALIBRANT-GROUP-128 (declared oracle repair): a calibrant is listed
+    under Reference lines (not fitted), so a row is found by its identity in either list, not by its selection index."""
+    for browser in (source.browser, source.reference_browser):
+        listed = browser.listed_results()
+        if identifier in listed:
+            return browser.scans.item(listed.index(identifier))
+    raise AssertionError(f"{identifier} is listed in neither list")
 
 
 def _check(qapp, source, identifier, checked):

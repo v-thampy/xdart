@@ -68,12 +68,14 @@ def _focus_state(qapp, window, editor, line):
 
 
 def _selected(source):
-    return [item.text() for item in source.browser.scans.selectedItems()]
+    """The selected rows' names. CALIBRANT-GROUP-128 (declared oracle repair): of both lists, the phases and the
+    reference lines, since one Remove acts on either."""
+    return [item.text() for browser in (source.browser, source.reference_browser)
+            for item in browser.scans.selectedItems()]
 
 
 def _remove_follows_selection(source):
-    assert source.remove_btn.isEnabled() == bool(source.browser.scans.selectedItems()), (
-        source.remove_btn.isEnabled(), _selected(source))
+    assert source.remove_btn.isEnabled() == bool(_selected(source)), (source.remove_btn.isEnabled(), _selected(source))
     assert source.remove_btn.toolTip(), 'Remove explains itself, enabled or not'
 
 
@@ -238,8 +240,10 @@ def test_p2_remove_acts_only_on_the_selected_phase_in_the_window(qapp, tmp_path)
         _click(qapp, source.remove_btn)
         assert _ids(source) == [a.id, b.id, LAB6] and not commands
 
-        # A label click on the last row (its box disabled) selects it; Remove removes exactly that phase.
-        _click(qapp, scans.viewport(), _label_point(scans, _row(source, LAB6)))
+        # A label click on the calibrant's row selects it; Remove removes exactly that entry. CALIBRANT-GROUP-128
+        # (declared oracle repair): the calibrant is listed under Reference lines (not fitted), so it is clicked there.
+        references = source.reference_browser.scans
+        _click(qapp, references.viewport(), _label_point(references, _row(source, LAB6)))
         assert _selected(source) == [_row(source, LAB6).text()]
         _remove_follows_selection(source)
         _click(qapp, source.remove_btn)
@@ -342,7 +346,10 @@ def test_p3_value_rows_fit_the_window_at_open_after_adds_and_resizes(qapp, tmp_p
 
         # At open: every number box shows whole, beside the full names; the opening width stays bounded.
         _rows_fit(qapp, source)
-        for identifier in (LAB6, tin.id):
+        # CALIBRANT-GROUP-128 (declared oracle repair): the calibrant is listed under Reference lines (not fitted),
+        # which have no number box, so only the lattice row has a box to fit beside its full name
+        assert source.cutoff_editor(LAB6) is None and _row(source, LAB6).listWidget() is source.reference_browser.scans
+        for identifier in (tin.id,):
             item = _row(source, identifier)
             room = source.cutoff_editor(identifier).geometry().left() - _indicator(scans, item).right()
             assert room >= scans.fontMetrics().horizontalAdvance(item.text()), (item.text(), room)

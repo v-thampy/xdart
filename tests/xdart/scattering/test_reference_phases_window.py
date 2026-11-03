@@ -51,9 +51,13 @@ def _commands(view):
 
 
 def _row(source, identifier):
-    scans = source.browser.scans
-    index = next(index for index, entry in enumerate(source.listed_entries()) if entry[0].id == identifier)
-    return scans.item(index)
+    """The entry's row in the list that shows it. CALIBRANT-GROUP-128 (declared oracle repair): a calibrant is listed
+    under Reference lines (not fitted), so a row is found by its identity in either list, not by its selection index."""
+    for browser in (source.browser, source.reference_browser):
+        listed = browser.listed_results()
+        if identifier in listed:
+            return browser.scans.item(listed.index(identifier))
+    raise AssertionError(f'{identifier} is listed in neither list')
 
 
 def _check(qapp, source, identifier, checked):
@@ -159,15 +163,18 @@ def test_rw2_rows_switch_and_coherent_selection_floor_updates(qapp, tmp_path):
         for identifier in (a_id, b_id):
             editor = source.cutoff_editor(identifier)
             assert not editor.isEnabled() and 'same minimum' in editor.toolTip().lower()
-        for identifier in (LAB6, lattice.id):
-            editor = source.cutoff_editor(identifier)
-            assert not editor.isEnabled() and 'intensit' in editor.toolTip().lower()
+        editor = source.cutoff_editor(lattice.id)
+        assert not editor.isEnabled() and 'intensit' in editor.toolTip().lower()
+        # CALIBRANT-GROUP-128 (declared oracle repair): the calibrant is a reference line, listed with no minimum box;
+        # its row says it has no intensities
+        assert source.cutoff_editor(LAB6) is None and 'intensit' in _row(source, LAB6).toolTip().lower()
         source.global_switch.editor.click()
         _settle(qapp, view)
         options = _options(page)
         assert options.phase_global_floor is False
         assert dict(options.phase_floors) == {a_id: 5., b_id: 5.}, 'switching off materializes the global value'
-        assert source.cutoff_editor(a_id).isEnabled() and not source.cutoff_editor(LAB6).isEnabled()
+        assert source.cutoff_editor(a_id).isEnabled() and not source.cutoff_editor(lattice.id).isEnabled()
+        assert source.cutoff_editor(LAB6) is None, 'a reference line never gets a minimum (CALIBRANT-GROUP-128)'
         _type(qapp, source.cutoff_editor(a_id), '1')
         _settle(qapp, view)
         assert dict(_options(page).phase_floors) == {a_id: 1., b_id: 5.}
