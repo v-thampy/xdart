@@ -223,12 +223,14 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
     def set_capture(self, trace, candidate=None, reason="") -> None:
         """The host's capture of the displayed trace, and the file, frame and mode it names (``candidate``, a
         ``BackgroundTemplateSource``) or why it names none (``reason``)."""
+        self._announced = ""
         self._template, self._source, self._identity, self._file = trace, candidate, None, None
         self._reason = "" if candidate is not None else (
             reason or f"the displayed {self._what} has no NeXus file and frame behind it")
         self._sync()
 
     def clear(self) -> None:
+        self._announced = ""
         self._template = self._source = self._identity = self._file = None
         self._reason = ""
         self._sync()
@@ -315,11 +317,15 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         return "cannot be used: see its message" if reason else ""
 
     def _announce(self) -> None:
-        """A message about the template's file, once, in a popup (``_notify``)."""
+        """A message about this source, once, in a popup (``_notify``); another file gets its own message."""
         reason = self._reason
-        if not reason or reason == self._announced:
+        if not reason:
+            self._announced = ""
             return
-        self._announced = reason
+        notice = (self._file, None if self._source is None else self._source.to_pairs(), reason)
+        if notice == self._announced:
+            return
+        self._announced = notice
         name = (Path(self._file[1]).name if self._file is not None else
                 Path(self._source.path).name if self._source is not None else f"The displayed {self._what}")
         self._notify(f"{name}: {self._short()}", reason)
@@ -416,6 +422,7 @@ class BackgroundTemplateRow(QtWidgets.QWidget):
         path = self._file_chooser()
         if not path:
             return
+        self._announced = ""  # a deliberate new selection can report the same refusal again
         kind = "nexus" if Path(path).suffix.casefold() in _NEXUS_SUFFIXES else "xye"
         if kind == "xye":
             # a name never fixes the scale (Codex REVIEW-3 F1): xdart writes iq_ for Å⁻¹ and nm⁻¹ alike, so the popup
