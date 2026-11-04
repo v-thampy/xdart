@@ -78,7 +78,9 @@ def test_a_series_role_is_its_look_and_an_unknown_role_is_refused() -> None:
     # the same primitive draws on any plot (the analysis dialogs' older path draws through it)
     fit = draw_series(plot, FitSeries(np.arange(3.0), np.ones(3), "fit", "fit"))
     background = draw_series(plot, FitSeries(np.arange(3.0), np.zeros(3), "background", "background"))
-    assert fit.opts["pen"].width() == 2 and background.opts["pen"].style() != fit.opts["pen"].style()
+    # NEXT-128-WINDOW-POLISH item 14 (the maintainer's "the fit lines are now very hard to see"): the fit is 2.5 wide
+    # (it was 2; QPen.width() rounds 2.5 to 3, so the row reads widthF)
+    assert fit.opts["pen"].widthF() == 2.5 and background.opts["pen"].style() != fit.opts["pen"].style()
     assert [item.name() for item in plot.listDataItems()] == ["fit", "background"]
 
 
