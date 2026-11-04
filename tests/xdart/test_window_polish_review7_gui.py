@@ -1,6 +1,7 @@
 """R7: real reader, fit host and Int Browse route; only OS file answers are supplied."""
 import numpy as np
 import pytest
+import threading
 from pyqtgraph.Qt import QtWidgets
 
 from tests.core.test_int_fit_source import Q, _result
@@ -39,6 +40,55 @@ def test_binding_a_template_keeps_the_batch_on_a_same_settings_refit(qapp, tmp_p
         assert len(host.outcomes) == 5 and len(dialog.trend.table()[0]) == 5
         assert host.outcomes[3].ok and host.outcomes[3].result is not None
     finally:
+        _close_page(page, qapp)
+
+
+@pytest.mark.parametrize("file_source", (False, True))
+def test_a_single_fit_holds_the_frame_navigator_until_its_terminal(qapp, tmp_path, monkeypatch, file_source):
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait
+    from tests.xdart.scattering.test_p3_experiment_operation_composition import _page as _real_page
+    from tests.xdart.test_fit_frame_navigator_gui import _until
+    from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
+    from xrd_tools.analysis import display_fit_operations as operations
+    path = _result(tmp_path / "sample_int1d.nexus")
+    page, _store = _real_page(tmp_path, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    original = operations.run_displayed_peak_fit
+
+    def gated(*args, **kwargs):
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    try:
+        request = page._context_controller.begin_browse(str(path), source_root=str(path.parent))
+        outcome = _wait(page._context_controller.poll_browse, timeout=30)
+        assert outcome.request is request and outcome.status is BrowseLoadStatus.READY
+        page.show()
+        page._refresh_shell()
+
+        def painted():
+            page._drain_executor()
+            value = page._last_scientific_projection
+            return value if value is not None and value.traces else None
+        _wait(painted, timeout=30)
+        dialog, host = _window(page, "peak")
+        if file_source:
+            _choose_nexus(dialog, path, 2)
+            _drain(qapp, host)
+        monkeypatch.setattr(operations, "run_displayed_peak_fit", gated)
+        dialog.fit_btn.click()
+        assert _until(qapp, entered.is_set)
+        assert not dialog.source_row.frames_row.editor.isEnabled()
+        assert dialog.batch_btn.text() == "Batch"  # a single Fit does not become a cancellable Batch
+    finally:
+        release.set()
+
+        def finished():
+            page._drain_executor()
+            return page._analysis_identity is None and not page._fit_hosts.get("peak", host).computing
+        assert _until(qapp, finished)
+        assert dialog.source_row.frames_row.editor.isEnabled()
         _close_page(page, qapp)
 
 
