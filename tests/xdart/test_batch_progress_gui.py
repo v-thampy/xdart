@@ -145,3 +145,23 @@ def test_a_batch_counts_its_frames_and_streams_each_fitted_frame_into_the_trend(
     host.dialog.close()
     while host.shutdown().status.value == "pending":
         QtWidgets.QApplication.processEvents()
+
+
+def test_a_peak_batch_is_refused_up_front_while_its_degree_is_refused(qapp):
+    """The background degree (item 14): a Peak Batch checks the window's refusal before it starts, as Phase Analysis's
+    does, instead of refusing every frame by the plan."""
+    from xdart.gui.analysis.snapshot_fit_host import FitTarget, SnapshotFitHost
+    state = [_sample()]
+    host = SnapshotFitHost("peak", current=lambda: state[0], scope=lambda: state[0].key,
+                           batch=lambda: tuple(FitTarget(f"frame {index}", lambda index=index: _sample(f"f{index}"))
+                                               for index in range(2)))
+    dialog = host.dialog
+    dialog.show()
+    assert dialog.bkg_degree_row.isVisible()  # Polynomial, the default, takes a degree
+    dialog.bkg_degree_row.editor.setText("9")  # Polynomial takes 0 to 7
+    dialog.batch_btn.click()
+    assert not host.computing, "no batch starts"
+    assert dialog.status.text().startswith("Degree:"), dialog.status.text()
+    dialog.close()
+    while host.shutdown().status.value == "pending":
+        QtWidgets.QApplication.processEvents()

@@ -390,6 +390,11 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             return self.background_template_row.fit_refusal()
         return ""
 
+    def fit_refusal(self):
+        """Why Fit or Batch cannot start with these options ("" when they can), as Phase Analysis names its own: the
+        host checks it before a Batch (NEXT-128-WINDOW-POLISH item 14: a refused degree refused once, up front)."""
+        return self._refusal()
+
     def _background(self):
         """The background the fit takes: the choice with its degree when it takes one, "polynomial1" (the core's own
         string, so plans, notebooks and settings need no other key)."""

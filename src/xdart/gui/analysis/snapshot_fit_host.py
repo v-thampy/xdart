@@ -318,7 +318,7 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.set_batch_running(False)
             self.dialog.status.setText('Cancelled; the running solve is draining')
             return
-        refusal = self.dialog.fit_refusal() if self.kind == 'phase' else ''
+        refusal = self.dialog.fit_refusal()  # both windows name why their options cannot fit (item 14)
         if refusal:
             self.dialog.status.setText(refusal)
             return

@@ -61,4 +61,6 @@ def test_total_fit_is_solid():
 def test_background_is_dashed_and_thicker():
     bg = _draw()["background"]
     assert bg["pen"].style() == QtCore.Qt.PenStyle.DashLine
-    assert bg["pen"].widthF() == pytest.approx(1.3)   # +30% over the old width 1
+    # NEXT-128-WINDOW-POLISH item 14 (the maintainer's "the fit lines are now very hard to see"): width 2, still
+    # thicker than the old width 1 (UI-5's 1.3 was a +30% step on a dark plot's pastel line)
+    assert bg["pen"].widthF() == pytest.approx(2.0)
