@@ -6,6 +6,7 @@ import builtins
 import hashlib
 import math
 import os
+import re
 import stat
 import threading
 from collections.abc import Callable, Mapping
@@ -65,8 +66,61 @@ _PHASE_OPTION_DEFAULTS = (
 #: exact, so a captured trace is its file's curve when both arrays agree within this relative tolerance
 _TEMPLATE_CAPTURE_RTOL = 1e-6
 _PEAK_MODELS = frozenset({"pseudovoigt", "gaussian", "lorentzian", "voigt", "pearson7", "split_pseudovoigt"})
-_PEAK_BACKGROUNDS = frozenset({"linear", "constant", "none", "chebyshev3", "template", "template+linear",
-                               "template+chebyshev3"})
+#: NEXT-128 (the maintainer, 2026-11-03: "Polynomial (this can replace Linear, constant)", and a degree for Chebyshev
+#: and the template's corrections): each degree family's bounds. A peak plan names the degree in its background
+#: ("polynomial2", "template+chebyshev5"). Its polynomial is lmfit's PolynomialModel, which stops at 7; ChebyshevModel
+#: takes any degree, bounded at Phase Analysis's 15.
+PEAK_BACKGROUND_DEGREES = {"polynomial": (0, 7), "chebyshev": (0, 15)}
+#: Phase Analysis's, the knots of a spline too: its kernel builds a polynomial past lmfit's 7, and a spline needs four
+PHASE_BACKGROUND_DEGREES = {"polynomial": (0, 15), "chebyshev": (0, 15), "spline": (4, 15)}
+#: the earlier peak backgrounds, as the choices that replace them; a plan naming one still fits it as it did
+_PEAK_BACKGROUND_ALIASES = {"linear": ("polynomial", 1), "constant": ("polynomial", 0),
+                            "template+linear": ("template+polynomial", 1)}
+_PEAK_DEGREE_BACKGROUND = re.compile(r"((?:template\+)?(polynomial|chebyshev))(0|[1-9][0-9]*)?")
+#: the degrees a phase plan takes: the window's, and an earlier spline's two or three knots, fitted with four
+#: (``_fit_background_spec``); a background without a degree ignores it, within the widest bounds
+_PHASE_PLAN_DEGREES = {**PHASE_BACKGROUND_DEGREES, "spline": (2, 15)}
+_ANY_PHASE_DEGREE = (0, 15)
+
+
+def peak_background_choice(background: Any) -> tuple[str, int | None]:
+    """A peak background as the Peak Fitter shows it, its choice and degree: ``("polynomial", 2)`` for
+    ``"polynomial2"``, ``("template", None)`` for one without a degree. An earlier spelling is the choice that replaces
+    it: "linear" is Polynomial 1, "constant" Polynomial 0 and "template+linear" Template + polynomial 1 ("chebyshev3"
+    is Chebyshev 3). ValueError, saying why, for a background the fit does not take: another name, or a degree outside
+    its family's bounds (``PEAK_BACKGROUND_DEGREES``) or not written plainly."""
+    if type(background) is not str:  # exactly a str: a subclass's equality is not the plan's
+        raise ValueError("is not one of its choices")
+    if background in _PEAK_BACKGROUND_ALIASES:
+        return _PEAK_BACKGROUND_ALIASES[background]
+    if background in ("none", "template"):
+        return background, None
+    match = _PEAK_DEGREE_BACKGROUND.fullmatch(background)
+    if match is None:
+        raise ValueError("is not one of its choices")
+    low, high = PEAK_BACKGROUND_DEGREES[match[2]]
+    if match[3] is None or not low <= int(match[3]) <= high:  # none named (a window's refused box), or beyond
+        raise ValueError(f"needs a {match[2]} degree from {low} to {high}")
+    return match[1], int(match[3])
+
+
+def peak_background(choice: str, degree: int | None) -> str:
+    """The background a peak plan names for a Peak Fitter choice and its degree, ``"polynomial2"``; a choice without
+    a degree (None) is its own name."""
+    return choice if degree is None else f"{choice}{int(degree)}"
+
+
+def phase_background_choice(fit_background: str, degree: Any) -> tuple[str, Any]:
+    """A phase plan's fitted background as Phase Analysis shows it, its choice and degree (a spline's knots). The
+    earlier "linear" and "template+linear" are Polynomial 1 and Substrate + polynomial 1, the fits they ran; an earlier
+    spline of two or three knots is the four it fitted with (``_fit_background_spec``). Anything else is as given."""
+    if fit_background in ("linear", "template+linear"):
+        return fit_background.replace("linear", "polynomial"), 1
+    if fit_background == "spline" and type(degree) is int and degree in (2, 3):
+        return "spline", 4
+    return fit_background, degree
+
+
 def _tuple_once(value: Any) -> tuple[Any, ...]:
     if type(value) is tuple:
         return value
@@ -440,8 +494,12 @@ def _validate_peak(plan: DisplayedPeakFitPlan) -> tuple[np.ndarray, np.ndarray, 
     _fit_trace(plan.trace)
     if type(plan.selection_mode) is not str or plan.selection_mode not in {"auto", "count"} or type(plan.n_peaks) is not int or not 1 <= plan.n_peaks <= 12:
         raise _Refusal("INVALID_PEAK_PLAN", "invalid peak selection")
-    if type(plan.model) is not str or plan.model not in _PEAK_MODELS or type(plan.background) is not str or plan.background not in _PEAK_BACKGROUNDS:
+    if type(plan.model) is not str or plan.model not in _PEAK_MODELS:
         raise _Refusal("INVALID_PEAK_PLAN", "invalid peak model")
+    try:  # within its degree's bounds, so a polynomial past lmfit's 7 is refused here, never a TypeError in the fit
+        peak_background_choice(plan.background)
+    except ValueError as error:
+        raise _Refusal("INVALID_PEAK_PLAN", f"invalid peak background ({error})") from None
     _validate_template(plan, plan.background.startswith("template"), "INVALID_PEAK_PLAN", inverse_angstrom=False)
     finite_axis = plan.trace.axis[np.isfinite(plan.trace.axis)]
     if finite_axis.size == 0:
@@ -710,7 +768,8 @@ def _validate_phase_options(plan: DisplayedPhaseFitPlan, finite: np.ndarray) -> 
         raise _invalid("snip_width")
     if not _choice(plan.fit_background, _FIT_BACKGROUNDS):
         raise _invalid("fit_background")
-    if type(plan.fit_background_degree) is not int or not 2 <= plan.fit_background_degree <= 15:
+    low, high = _PHASE_PLAN_DEGREES.get(plan.fit_background.rpartition("+")[2], _ANY_PHASE_DEGREE)
+    if type(plan.fit_background_degree) is not int or not low <= plan.fit_background_degree <= high:
         raise _invalid("fit_background_degree")
     _validate_template(plan, plan.fit_background.startswith("template"), "INVALID_PHASE_PLAN", inverse_angstrom=True)
     if not _choice(plan.amorphous_peak, _AMORPHOUS_PROFILES):

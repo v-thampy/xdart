@@ -335,7 +335,8 @@ def _bad_cases():
         ("snip_width", {"prefit_background": "snip", "snip_width": 0}),
         ("snip_width", {"prefit_background": "snip", "snip_width": 1.5}),
         ("fit_background", {"fit_background": "cubic"}),
-        ("fit_background_degree", {"fit_background": "polynomial", "fit_background_degree": 1}),
+        # NEXT-128: Polynomial 1 (the earlier Linear) and 0 are admitted, so the polynomial's refused row is below 0
+        ("fit_background_degree", {"fit_background": "polynomial", "fit_background_degree": -1}),
         ("fit_background_degree", {"fit_background": "chebyshev", "fit_background_degree": 16}),
         ("background_template", {"fit_background": "template"}),
         ("background_template", {"fit_background": "none", "background_template": substrate}),

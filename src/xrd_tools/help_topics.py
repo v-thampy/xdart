@@ -506,19 +506,23 @@ processed with the same calibration and displayed (for example an Average result
 Steps
 1. Pre-fit background: None, SNIP (width in points in Advanced; blank is 5 % of the
    trace) or Chebyshev; it is subtracted before the fit and has no free parameters.
-2. Fitted background: Linear, Polynomial, Chebyshev or Spline of the chosen degree
-   (Spline uses at least four knots), refined with the phases.
+2. Fitted background: Polynomial or Chebyshev of the degree in the box beside it (0 to
+   15; Polynomial 1 is a straight line, the earlier Linear), or Spline of the knots in
+   that box (4 to 15), refined with the phases. The box shows only for these choices.
 3. Substrate: in the template row, Use displayed captures the displayed pattern
    (named by its file, frame and mode once a fit confirms that file holds it), or
    Choose file… takes a NeXus result or an .xye file. Then choose Substrate (one free
-   amplitude) or Substrate plus linear, polynomial or Chebyshev. Clear forgets it.
+   amplitude) or Substrate plus polynomial or Chebyshev, of the degree beside it.
+   Clear forgets it.
 4. Amorphous peak: Gaussian, pseudo-Voigt, Lorentzian, Voigt or Lorentzian², with a
    starting centre and σ.
 
 Units and conventions
 A captured substrate is in q (Å⁻¹), through the same input path as the fit; a file's
 unit must convert to Å⁻¹ (nm⁻¹ does, 2θ does not). Centre and σ are in Å⁻¹. Outside
-the template's q range its value is held flat.
+the template's q range its value is held flat. A settings file from an earlier version
+names Linear or Substrate plus linear: it loads as Polynomial 1 or Substrate plus
+polynomial 1, the same fit; its spline of two or three knots loads as the four it used.
 
 Assumptions
 The substrate pattern scales as a whole; its shape does not change between samples.
@@ -674,17 +678,20 @@ xrd_tools/analysis/fitting/fit.py — fit_peaks and its profiles.
 xrd_tools/analysis/fitting/models.py — the split pseudo-Voigt model.
 """),
     HelpTopic("peak-fit.background", "Peak Fitter: background and templates", """Purpose
-Model the intensity under the peaks: a constant, linear or Chebyshev background, or a
-measured template (a substrate's or an empty holder's pattern) scaled by one
-amplitude, alone or plus a linear or Chebyshev correction.
+Model the intensity under the peaks: a polynomial (a constant, linear or of higher
+degree) or Chebyshev background, or a measured template (a substrate's or an empty
+holder's pattern) scaled by one amplitude, alone or plus a polynomial or Chebyshev
+correction.
 
 Required inputs
 For a template: the bare background's displayed trace, or its file: a NeXus result
 (a frame and a 1-D mode) or an .xye file with its x unit.
 
 Steps
-1. Background: Linear, Constant, None or Chebyshev (3); or Template, Template plus
-   linear, or Template plus Chebyshev (3).
+1. Background: None, Polynomial or Chebyshev; or Template, Template plus polynomial,
+   or Template plus Chebyshev. A polynomial or Chebyshev takes the degree in the box
+   beside the choice, shown only for them: Polynomial 0 to 7 (0 a constant, 1 linear,
+   the default), Chebyshev 0 to 15 (3 to start). Each keeps its own degree.
 2. Template row (it waits until a Template background is chosen): Use displayed
    captures the displayed trace and names it by its file, frame and mode; Choose
    file… takes a NeXus file (a popup asks its frame and mode unless the display shows
@@ -697,7 +704,12 @@ Units and conventions
 A template's x must be in the fit's unit or convert to it without other data: Å⁻¹
 and nm⁻¹ of the same axis, or degrees and radians; 2θ never converts to q here.
 Outside its range the template is held flat. Its amplitude bg_A is at least 0, and a
-correction is fitted under bgx_ names.
+correction is fitted under bgx_ names. A polynomial's coefficients are bg_c0 (the
+constant) to bg_cN in the fit's x; a Chebyshev's map the fit range onto −1 to 1. A
+settings file from an earlier version names Linear, Constant or Template plus linear:
+it loads as Polynomial 1, Polynomial 0 or Template plus polynomial 1, the same fit
+under the polynomial's names: bg_c0 and bg_c1 for bg_intercept and bg_slope, bg_c0 for
+a constant's bg_c, and bgx_ likewise.
 
 Assumptions
 The template has the background's shape; only its scale changes. Uncertainties are
@@ -717,11 +729,13 @@ BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE: export waits for a named, recorded fil
 Common mistakes and corrective actions
 A template processed with another calibration or mask does not match the sample:
 process it with the same settings. A missing .xye unit is never guessed: choose it.
+A high degree can bend under broad peaks and take their intensity: keep it low
+(Polynomial 1 or 2, Chebyshev 3) unless the background visibly curves.
 
 Worked example
 A film on silicon: process the bare wafer, choose its NeXus result (frame 0, mode
-default), choose Template plus linear, Fit, then export a notebook that reads the
-same file.
+default), choose Template plus polynomial at degree 1, Fit, then export a notebook that
+reads the same file.
 
 References
 xrd_tools/analysis/background_template.py — sources, reading and units.

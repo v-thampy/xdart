@@ -290,9 +290,10 @@ svg .flow { stroke: var(--muted); stroke-width: 1.4; fill: none; }
     <ul>
       <li><b>Pre-fit background</b> (SNIP or Chebyshev) is subtracted before the fit and has no free
         parameters.</li>
-      <li><b>Fitted background</b> (linear, polynomial, Chebyshev or spline) is refined with the phases.</li>
+      <li><b>Fitted background</b> (a polynomial or Chebyshev of the degree in the box beside the choice, polynomial 1
+        a straight line, or a spline of the knots in that box) is refined with the phases.</li>
       <li><b>Substrate</b>: a measured substrate pattern, captured with <b>Use displayed as substrate</b> or read with
-        <b>Choose file…</b>, scaled by one free amplitude, alone or plus a linear, polynomial or Chebyshev correction. It must
+        <b>Choose file…</b>, scaled by one free amplitude, alone or plus a polynomial or Chebyshev correction. It must
         be in q, or convert to it (nm⁻¹ does, 2θ does not); beyond its range its value is held flat.</li>
       <li><b>Amorphous peak</b>: one broad peak with a starting centre and σ in Å⁻¹, for glass or other
         non-crystalline material.</li>

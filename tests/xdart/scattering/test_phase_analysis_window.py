@@ -319,8 +319,7 @@ def test_w6_the_2d_viewer_greys_the_list_while_fit_keeps_its_own_reason(qapp, tm
 
 ROWS = {
     "shape": ("profile_row", "width_model_row", "texture_row"),
-    "background": ("bkg_row", "fit_background_row", "fit_background_degree_row", "amorphous_row",
-                   "amorphous_center_row", "amorphous_sigma_row"),
+    "background": ("bkg_row", "fit_background_row", "amorphous_row", "amorphous_center_row", "amorphous_sigma_row"),
     "constraints": ("lattice_row", "q_shift_row", "cross_phase_row", "fit_range_row"),
     "batch": ("sequential_row",),
 }
@@ -339,6 +338,11 @@ def test_w7_every_option_has_its_row_tooltip_and_section_help(qapp):
                 assert row.toolTip() or row.editor.toolTip(), name
                 assert row.property("helpTopic") == TOPICS[section], (name, row.property("helpTopic"))
                 assert isinstance(row.help_button, ActionButton) and row.help_button.toolTip(), name
+        # NEXT-128 background degrees: the degree is a box in the Fitted background row, whose "?" it shares (F1 on it
+        # opens the same topic), as the Peak Fitter's Auto shares its Peaks row's
+        degree = dialog.fit_background_degree_row
+        assert degree.property("helpTopic") == TOPICS["background"] and dialog.fit_background_row.isAncestorOf(degree)
+        assert not hasattr(degree, "help_button") and degree.toolTip()
         for section, names in ADVANCED.items():
             for name in names:
                 assert getattr(dialog, name).property("helpTopic") == TOPICS[section], name

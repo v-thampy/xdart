@@ -133,7 +133,9 @@ def test_t10_both_tools_mount_the_one_template_row_and_the_settings_owner(qapp, 
         models = [peak.model_combo.itemText(index) for index in range(peak.model_combo.count())]
         backgrounds = [peak.bkg_combo.itemText(index) for index in range(peak.bkg_combo.count())]
         assert models[4:] == ["Pearson VII", "Split pseudo-Voigt"]
-        assert backgrounds[4:] == ["Template", "Template + linear", "Template + Chebyshev (3)"]
+        # NEXT-128 background degrees (2026-11-03): Template + polynomial replaces Template + linear, each correction
+        # of the degree beside the choice
+        assert backgrounds[3:] == ["Template", "Template + polynomial", "Template + Chebyshev"]
     finally:
         _close_page(page, qapp)
 
@@ -186,7 +188,7 @@ def test_t6_the_dialog_fits_pearson_vii_and_binds_a_file_template_for_export(qap
         assert dialog.vnext_fit_values()["model"] == "pearson7"
         row = dialog.background_template_row
         _choose(qapp, row, _template_file(tmp_path))
-        dialog.bkg_combo.setCurrentText("Template + linear")
+        dialog.bkg_combo.setCurrentText("Template + polynomial")  # NEXT-128: at degree 1, the earlier Template + linear
         qapp.processEvents()
         assert row.source is not None and row.identity is None and row.template is None
         assert "BACKGROUND_TEMPLATE_NOTEBOOK_UNAVAILABLE" in row.export_reason()
@@ -194,11 +196,11 @@ def test_t6_the_dialog_fits_pearson_vii_and_binds_a_file_template_for_export(qap
         _fit(qapp, page, dialog)
         result = page._peak_result
         assert result.code == "OK" and len(result.background_template_identity) == 64, page._notice_text
-        assert "bg_A" in result.parameter_names and "bgx_slope" in result.parameter_names
+        assert "bg_A" in result.parameter_names and "bgx_c1" in result.parameter_names  # PolynomialModel(1)'s names
         assert row.identity == result.background_template_identity and row.export_reason() == ""
         assert all(button.isEnabled() for button in _export_buttons(dialog))
         values = dialog.vnext_fit_values()
-        assert values["background"] == "template+linear"
+        assert values["background"] == "template+polynomial1"
         assert values["background_template_source"] == row.source.to_pairs()
         assert values["background_template_identity"] == row.identity
 
@@ -278,7 +280,7 @@ def test_t9_the_peak_fitter_saves_and_loads_its_source_and_fit_values(qapp, monk
         dialog._settings_path_chooser = lambda action, start: str(document_path)
         row = dialog.background_template_row
         dialog.model_combo.setCurrentText("Split pseudo-Voigt")
-        dialog.bkg_combo.setCurrentText("Template + Chebyshev (3)")
+        dialog.bkg_combo.setCurrentText("Template + Chebyshev")  # NEXT-128: its degree 3 by default, as before
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(3)
         dialog.adv_fraction.setText("0.3")
@@ -292,7 +294,7 @@ def test_t9_the_peak_fitter_saves_and_loads_its_source_and_fit_values(qapp, monk
         assert (document["kind"], document["version"]) == ("xdart-peak-fit-settings", 1)
         assert document["background_template"] == {"source": dict(row.source.to_pairs()), "identity": identity}
         assert all(not isinstance(value, str) or not value.startswith("(") for value in document["fields"].values())
-        _press(qapp, row.clear_btn)  # PF9: Clear waits for a template background, so before Linear
+        _press(qapp, row.clear_btn)  # PF9: Clear waits for a template background, so before None (index 0)
         dialog.model_combo.setCurrentIndex(0)
         dialog.bkg_combo.setCurrentIndex(0)
         dialog.auto_check.setChecked(True)
