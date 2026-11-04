@@ -1162,6 +1162,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_target, self._analysis_identity = target, identity
         self._analysis_anchor, self._analysis_fingerprint = anchor, fingerprint
         self._analysis_request = request
+        if fit:
+            self._sync_fit_frames(kind)
         self._ensure_timer()
         if target == "scan_roi" and self._scan_roi_dialog is not None:
             self._scan_roi_dialog.set_analysis_busy(kind)
@@ -1694,6 +1696,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         row = None if dialog is None else getattr(dialog, "source_row", None)
         if row is None:
             return
+        row.set_busy("A fit is running; step frames when it is done." if self._fit_busy(kind) else "")
         source = dialog.fit_source()
         if source is not None:
             if source.kind == "nexus":
@@ -2103,6 +2106,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._analysis_generation = self._analysis_anchor = None
         self._analysis_request = None
         self._analysis_fingerprint = ""
+        if kind in {"peak", "phase"}:
+            self._sync_fit_frames(kind)
         if target == "scan_roi" and self._scan_roi_dialog is not None:
             self._scan_roi_dialog.set_analysis_busy()
         if payload is None:
@@ -6003,6 +6008,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 analysis_identity is self._analysis_identity
                 and not analysis_slot.owned
             ):
+                fit_kind = self._analysis_kind
                 self._analysis_identity = None
                 self._analysis_kind = None
                 self._analysis_target = None
@@ -6010,6 +6016,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._analysis_anchor = None
                 self._analysis_request = None
                 self._analysis_fingerprint = ""
+                if fit_kind in {"peak", "phase"}:
+                    self._sync_fit_frames(fit_kind)
                 if self._scan_roi_dialog is not None: self._scan_roi_dialog.set_analysis_busy()
                 message = "Analysis failed before terminal publication."
                 self._notice(message)

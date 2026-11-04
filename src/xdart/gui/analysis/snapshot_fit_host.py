@@ -233,6 +233,8 @@ class SnapshotFitHost(QtCore.QObject):
         if action == 'batch':
             self.dialog.set_batch_running(True)
             self.dialog.trend.clear()  # the batch's own rows join as its frames are fitted
+        elif action == 'fit' and source is not None:
+            source.set_busy('A fit is running; step frames when it is done.')
         elif action == 'reload':
             self.dialog.fit_btn.setEnabled(False)
         sequential = action == 'batch' and self.kind == 'phase' and self.dialog.sequential_batch()
@@ -460,6 +462,8 @@ class SnapshotFitHost(QtCore.QObject):
         self.outcomes, self._keys, self._trend_rows, self._trend_phases = (), {}, [], ()
         if self.dialog is not None:
             self.dialog.clear_input()
+            if self.dialog.source_row is not None:
+                self.dialog.source_row.set_busy('')
             self.dialog.trend.clear()
 
     def forget_shown(self):
@@ -471,6 +475,8 @@ class SnapshotFitHost(QtCore.QObject):
         self.snapshot = self._shown_outcome = None
         if self.dialog is not None:
             self.dialog.clear_input()
+            if self.dialog.source_row is not None:
+                self.dialog.source_row.set_busy('')
 
     def read_frame(self):
         """Read the current input (the stepped frame) with what is shown forgotten first (``forget_shown``), the
