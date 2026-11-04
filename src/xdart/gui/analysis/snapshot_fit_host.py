@@ -370,18 +370,30 @@ class SnapshotFitHost(QtCore.QObject):
                 return False
             self._show_trace()
             return True
-        self.outcomes, self.snapshot, self._keys, xs = terminal.payload
-        self._last_settings = plain_settings(dict(request.settings))
-        self._adopt_template(self.outcomes)
+        outcomes, self.snapshot, keys, xs = terminal.payload
+        settings = plain_settings(dict(request.settings))
+        rows = [(each.label, x if request.column or x is not None else float(position), each.params)
+                for position, each in enumerate(outcomes) for x in (xs.get(each.label),)]
+        known = {each.label for each in self.outcomes}
+        if (request.action == 'fit' and outcomes and settings == self._last_settings
+                and all(each.label in known for each in outcomes)):
+            # a re-fit of the batch's own frame with its settings (NEXT-128-WINDOW-POLISH item 14: the Frame row steps
+            # through them): its outcome and trend row are replaced at the batch's x; the batch's others stay
+            fresh, params = {each.label: each for each in outcomes}, {row[0]: row[2] for row in rows}
+            self.outcomes = tuple(fresh.get(each.label, each) for each in self.outcomes)
+            self._keys = {**self._keys, **keys}
+            self._trend_rows = [(label, x, params.get(label, values)) for label, x, values in self._trend_rows]
+        else:
+            self.outcomes, self._keys, self._trend_rows = tuple(outcomes), keys, rows
+            self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
+        self._last_settings = settings
+        self._adopt_template(outcomes)
         self.dialog.trend.clear()
         # every row in one redraw (item 14): one ``set_row`` per outcome redrew every row each time
-        self._trend_rows = [(outcome.label, x if request.column or x is not None else float(position), outcome.params)
-                            for position, outcome in enumerate(self.outcomes) for x in (xs.get(outcome.label),)]
-        self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
         self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
-        if not self.outcomes:
+        if not outcomes:
             return False
-        outcome = self.outcomes[-1]
+        outcome = outcomes[-1]
         self._shown_outcome = None
         if outcome.overlay is not None and self.snapshot is not None:
             self._show_trace()
@@ -447,6 +459,28 @@ class SnapshotFitHost(QtCore.QObject):
         if self.dialog is not None:
             self.dialog.clear_input()
             self.dialog.trend.clear()
+
+    def forget_shown(self):
+        """A step to another frame of the same result (NEXT-128-WINDOW-POLISH item 14): the shown frame and its fit go
+        and a request still computing is dropped; the batch's rows and trend stay, since they cover every frame."""
+        self.owner.release()
+        self._batching = False
+        self._end_stream()
+        self.snapshot = self._shown_outcome = None
+        if self.dialog is not None:
+            self.dialog.clear_input()
+
+    def read_frame(self):
+        """Read the current input (the stepped frame) with what is shown forgotten first (``forget_shown``), the
+        batch's rows and trend kept: Reload's read without Reload's invalidation."""
+        self.forget_shown()
+        try:
+            target = self.current()
+            if target is None:
+                raise ValueError('FIT_INPUT_REQUIRED: select a result')
+            self._request('reload', (target,))
+        except Exception as error:
+            self.dialog.status.setText(str(error))
 
     def retire(self):
         """The window closed (Int's page): drop its fit and the window, keeping the worker for ``shutdown``."""

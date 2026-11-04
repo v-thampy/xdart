@@ -818,6 +818,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         #: each open fit window's shared fit host (its file-source fits, batches and exports), and the hosts of closed
         #: windows whose worker still drains (NEXT-128-WINDOW-POLISH item 11)
         self._fit_hosts, self._retired_fit_hosts = {}, []
+        #: item 14: a frame a fit window stepped Int to, by kind, until Int shows it; a NeXus source's frame labels;
+        #: each window's source as last seen (a step within one result keeps its batch)
+        self._fit_follow, self._fit_frame_labels, self._fit_seen_sources = {}, {}, {}
         # Live Auto's one question whether its Run expects metadata sidecars (_sync_metadata_question).
         self._metadata_question_dialog = None
         self._metadata_question_shown_for = None
@@ -1592,9 +1595,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._fit_hosts[kind] = host
         dialog.batch_btn.clicked.connect(lambda _checked=False: self._fit_batch(kind))
         dialog.source_row.changed.connect(lambda: self._fit_source_changed(kind))
+        dialog.source_row.frameChosen.connect(lambda frame: self._fit_frame_chosen(kind, frame))
         dialog.source_row.describe_displayed = lambda: self._displayed_template(kind)
         dialog.export_actions.export = lambda path: self._fit_export(kind, path)
+        self._fit_seen_sources[kind] = dialog.fit_source()
         self._sync_fit_batch(kind)
+        self._sync_fit_frames(kind)
 
     def _fit_window_action(self, kind, action, values):
         """Int's fit windows' actions: Int's display source to this page's slot, a file source to the window's host."""
@@ -1667,16 +1673,84 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                                     "frame number.")
 
     def _sync_fit_batches(self):
-        """After a render: each open window following Int's display re-evaluates its Batch (never failing a render;
-        a page double without fit windows has none, as ``analysis_start_allowed`` reads it)."""
+        """After a render: each open window following Int's display re-evaluates its Batch and mirrors Int's frames
+        (never failing a render; a page double without fit windows has none, as ``analysis_start_allowed`` reads
+        it)."""
         for kind in tuple(getattr(self, "_fit_hosts", None) or ()):
             dialog = self._fit_dialog(kind)
             if dialog is None or not dialog.isVisible() or dialog.fit_source() is not None:
                 continue
             try:
                 self._sync_fit_batch(kind)
-            except Exception:  # noqa: BLE001 - a Batch tooltip never breaks Int's render
-                _LOG.exception("Fit window Batch state failed")
+                self._sync_fit_frames(kind)
+            except Exception:  # noqa: BLE001 - a Batch tooltip or a frame list never breaks Int's render
+                _LOG.exception("Fit window Batch or frames state failed")
+
+    def _sync_fit_frames(self, kind):
+        """The Source card's Frame row (item 14): Int's frames, mirrored from its footer, while the window follows
+        Int's display, and a frame the window stepped Int to followed once Int shows it; a NeXus source's own frame
+        selected. Cheap after a render: Int's prefix rule adds only the frames Int gained."""
+        dialog = self._fit_dialog(kind)
+        row = None if dialog is None else getattr(dialog, "source_row", None)
+        if row is None:
+            return
+        source = dialog.fit_source()
+        if source is not None:
+            if source.kind == "nexus":
+                row.select_frame(source.frame)
+            return
+        footer = self._shell.scientific.frame_selector
+        row.mirror_frames(footer)
+        follow = getattr(self, "_fit_follow", None)
+        wanted = None if follow is None else follow.get(kind)
+        if wanted is None:
+            return
+        if self._context_controller.navigation.current is not wanted:
+            if footer.currentData() is not wanted:
+                follow.pop(kind, None)  # Int was moved elsewhere: nothing more to follow
+            return
+        trace, _anchor = self._capture_analysis_trace(kind)
+        if trace is not None:  # Int shows the stepped frame's trace: this window shows it too
+            follow.pop(kind, None)
+            self._refresh_fit_trace(kind)
+
+    def _fit_frame_chosen(self, kind, frame):
+        """A step or pick in the Source card's Frame row (item 14; the maintainer's "Mirror Int's frames"): a NeXus
+        source's frame, read on the window's host while Int stays put; following Int's display, Int's own frame
+        selector moves (its footer's path) and the window shows that frame's trace once Int does."""
+        dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
+        if dialog is None or host is None:
+            return
+        if self._fit_busy(kind):
+            dialog.status.setText(self._FIT_WAITS)
+            self._sync_fit_frames(kind)  # back to the frame shown
+            return
+        source = dialog.fit_source()
+        if source is not None:
+            if source.kind == "nexus":
+                dialog.source_row.step_frame(frame)
+            return
+        footer = self._shell.scientific.frame_selector
+        index = next((position for position, item in enumerate(footer.exact_frames) if item is frame), -1)
+        if index < 0:
+            self._sync_fit_frames(kind)
+            return
+        self._fit_follow[kind] = frame
+        footer.setCurrentIndex(index)
+
+    def _fit_source_labels(self, source):
+        """A NeXus source's frame labels for its Frame row, read once per file, mode and entry (a few ms); none when
+        the file cannot be read now (the source row says why)."""
+        from xrd_tools.analysis.fit_sources import IntResultRows
+        key = (source.path, source.mode, source.entry)
+        cached = self._fit_frame_labels.get(key)
+        if cached is None:
+            try:
+                cached = tuple(IntResultRows(source.path, mode=source.mode, entry=source.entry).labels())
+            except (OSError, ValueError, KeyError):
+                cached = ()
+            self._fit_frame_labels = {key: cached}  # one file's labels kept
+        return cached
 
     def _fit_batch_targets(self, kind):
         from xdart.gui.analysis.snapshot_fit_host import FitTarget
@@ -1721,6 +1795,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
         if dialog is None or host is None:
             return
+        source, prior = dialog.fit_source(), self._fit_seen_sources.get(kind)
+        self._fit_seen_sources[kind] = source
+        if (source is not None and prior is not None and source.kind == prior.kind == "nexus"
+                and (source.path, source.mode, source.entry) == (prior.path, prior.mode, prior.entry)
+                and not dialog.source_row.reason):
+            # another frame of the same result (item 14's Frame row): the shown frame and its fit go, the batch's rows
+            # and trend stay (they cover every frame), and the frame is read at once
+            dialog.source_row.select_frame(source.frame)
+            from .analysis_mount import analysis_start_allowed
+            if not analysis_start_allowed(self, except_host=host):
+                host.forget_shown()
+                dialog.status.setText(self._FIT_WAITS)
+                return
+            host.read_frame()
+            return
         from .analysis_mount import cancel_owned
         setattr(self, f"_{kind}_generation", getattr(self, f"_{kind}_generation") + 1)
         if self._analysis_target == kind:
@@ -1731,8 +1820,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._phase_result = None
         host.invalidate()
         dialog.set_batch_running(False)
+        self._fit_follow.pop(kind, None)
         self._sync_fit_batch(kind)
-        if dialog.fit_source() is None:
+        if source is not None and source.kind == "nexus":  # its own frames in the Frame row (item 14)
+            dialog.source_row.set_frame_labels(() if dialog.source_row.reason else self._fit_source_labels(source))
+        if source is None:
+            self._sync_fit_frames(kind)
             self._refresh_fit_trace(kind)
         elif not dialog.source_row.reason:
             self._fit_window_action(kind, "reload", None)

@@ -83,6 +83,8 @@ SOURCE_TOPIC = "fit.source"
 SOURCE_TIP = ("What Fit, Reload and Batch read: the trace Int shows (the default) or a file you choose, a processed "
               "NeXus result's frame or an .xye file.")
 _BATCH_TIP = "Fit every frame in the scan with these settings, then plot the parameters vs frame number."
+#: why the Source card's Frame row waits (NEXT-128-WINDOW-POLISH item 14), in both windows
+_FRAMES_WAIT = "A batch is fitting; step frames when it is done."
 #: the Peak Fitter's saved settings (Save settings…, Load settings…); no last-session restore
 PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_settings", "Peak Fitter",
                                  sections=("background_template",))
@@ -488,6 +490,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
         self.background_template_row.set_busy('A batch is fitting; capture the template when it is done.'
                                               if running else '')
+        if self.source_row is not None:  # a step would change the source under the batch (item 14)
+            self.source_row.set_busy(_FRAMES_WAIT if running else '')
 
     def set_batch_reason(self, reason="", tooltip=""):
         """The host's Batch (NEXT-128-WINDOW-POLISH item 11): enabled when ``reason`` is "", its tooltip then saying

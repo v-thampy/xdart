@@ -920,12 +920,19 @@ Steps
    frame, 1-D mode, axis, χ slice, normalization and Set BG).
 2. Choose file…: pick the file; a popup asks a NeXus result's frame and 1-D mode,
    or an .xye file's x unit (a file name's prefix only suggests it). The chosen
-   frame is read and shown at once; change the Frame or 1-D mode row to read
-   another.
-3. Batch fits every frame of the source's NeXus result (Int's display: the file
+   frame is read and shown at once; step the Frame row or change the 1-D mode row
+   to read another.
+3. The Frame row is the main window's < frame >: step with < and > or pick a frame
+   from its list. Following Int's display it lists Int's frames, and a step moves
+   the main window to that frame; this window then shows that frame's trace. With
+   a NeXus file it lists that file's frames and Int stays where it is. A running
+   Batch holds it.
+4. Batch fits every frame of the source's NeXus result (Int's display: the file
    and 1-D mode it shows) from each frame's stored 1-D curve, then shows the last
-   frame; the trend plots the results against the frame number.
-4. Export Jupyter… or Export marimo… with a NeXus source names the file and its
+   frame; the trend plots the results against the frame number. Stepping through
+   the frames afterwards keeps the trend, and Fit on one of them replaces only
+   that frame's row.
+5. Export Jupyter… or Export marimo… with a NeXus source names the file and its
    frames in the notebook, which reads them again; nothing is copied.
 
 Units and conventions
@@ -941,7 +948,9 @@ not a fit setting: it is not saved with the settings.
 
 Expected observations
 The Source card names the source; its tooltip gives the file's full path. A
-batch draws the last frame and fills the trend, one row per frame.
+running batch counts its frames in the status ("Batch fitting… 312/651") and
+fills the trend as each frame is fitted; at its end it draws the last frame and
+says how many frames were fitted.
 
 Diagnostics
 FIT_SOURCE_FRAME_MISSING or FIT_SOURCE_MODE_MISSING: the file holds no such

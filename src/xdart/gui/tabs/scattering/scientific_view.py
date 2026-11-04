@@ -66,9 +66,11 @@ from .shell_widgets import (
     aggregate_traces,
     color_map_choices,
     color_map_combo,
-    CompactFrameSelector,
     ContentFitComboBox,
     frame_caption,
+    FrameNavigator,
+    FrameSteps,
+    SLICE_TIPS,
     log_toggle,
     overlay_grid_compatible,
     same_grid,
@@ -354,20 +356,11 @@ class _KeyedImagePanel:
         layout.addWidget(self.pane, 1)
         navigation = QtWidgets.QHBoxLayout()
         navigation.setContentsMargins(0, 0, 0, 0)
-        self.previous = QtWidgets.QToolButton()
-        self.previous.setObjectName("e4FrameNavigationButton")
-        self.previous.setText("<")
-        self.selector = CompactFrameSelector()
-        self.selector.setObjectName("e3FrameSelector")
-        self.next = QtWidgets.QToolButton()
-        self.next.setObjectName("e4FrameNavigationButton")
-        self.next.setText(">")
-        self.previous.setToolTip("Show the previous frame or slice, keeping the selected regions.")
-        self.next.setToolTip("Show the next frame or slice, keeping the selected regions.")
-        self.selector.setToolTip("Choose a frame or slice; use arrow keys or the mouse wheel to step.")
+        # Int's frame navigation, the one shared owner (NEXT-128-WINDOW-POLISH item 14): it steps its slices
+        self.navigator = FrameNavigator(**SLICE_TIPS)
+        self.previous, self.selector, self.next = self.navigator.widgets
         navigation.addStretch(1)
-        for widget in (self.previous, self.selector, self.next):
-            navigation.addWidget(widget)
+        navigation.addWidget(self.navigator)
         navigation.addStretch(1)
         layout.addLayout(navigation)
         self._captions: tuple[str, ...] = ()
@@ -378,14 +371,10 @@ class _KeyedImagePanel:
         self.regions: dict[str, pg.RectROI] = {}
         self.selector.currentIndexChanged.connect(
             lambda index: index >= 0 and view._emit_panel_index(key, index))
-        self.previous.clicked.connect(lambda: self.step(-1))
-        self.next.clicked.connect(lambda: self.step(1))
         self.clear()
 
     def step(self, offset: int) -> None:
-        index = self.selector.currentIndex() + offset
-        if 0 <= index < self.selector.count():
-            self.selector.setCurrentIndex(index)
+        self.navigator.step(offset)
 
     def draw(self, panel: KeyedImageProjection, color_map: str, log_scale: bool) -> None:
         signed = panel.presentation == "signed"
@@ -888,9 +877,8 @@ class ScientificView(QtWidgets.QFrame):
         self.progress = QtWidgets.QLabel("0/0")
         self.progress.setObjectName("e3GlobalProgress")
         self.footer.addWidget(self.status, 1)
-        self.footer.addWidget(self.previous_frame)
-        self.footer.addWidget(self.frame_selector)
-        self.footer.addWidget(self.next_frame)
+        for widget in self.frame_steps.widgets:  # the shared steps, each the footer's own item (its frozen order)
+            self.footer.addWidget(widget)
         self.footer.addWidget(self.progress)
         layout.addLayout(self.footer)
         self._viewer_loading_mode: str | None = None
@@ -1416,14 +1404,11 @@ class ScientificView(QtWidgets.QFrame):
         self.share_axis.setCheckable(True)
         self.share_axis.setMinimumWidth(90)
         self.share_axis.setToolTip(SHARE_AXIS_TOOLTIP)
-        self.previous_frame = QtWidgets.QToolButton()
-        self.previous_frame.setObjectName("e4FrameNavigationButton")
-        self.previous_frame.setText("<")
-        self.frame_selector = CompactFrameSelector()
-        self.frame_selector.setObjectName("e3FrameSelector")
-        self.next_frame = QtWidgets.QToolButton()
-        self.next_frame.setObjectName("e4FrameNavigationButton")
-        self.next_frame.setText(">")
+        # the footer's frame navigation: the one shared owner (NEXT-128-WINDOW-POLISH item 14), which the keyed image
+        # panels and the fit windows' Source card mount too; its < and > step the selector, whose choice
+        # ``_frame_selected`` sends
+        self.frame_steps = FrameSteps(self)
+        self.previous_frame, self.frame_selector, self.next_frame = self.frame_steps.widgets
         self.axis_display_group = _plot_toolbar_group(
             "e4AxisDisplayControls",
             (
@@ -1502,8 +1487,6 @@ class ScientificView(QtWidgets.QFrame):
         self.frame_selector.currentIndexChanged.connect(
             self._frame_selected
         )
-        self.previous_frame.clicked.connect(lambda: self._navigate(-1))
-        self.next_frame.clicked.connect(lambda: self._navigate(1))
         return row
 
     def _show_plot_options(self) -> None:
@@ -5349,16 +5332,6 @@ class ScientificView(QtWidgets.QFrame):
             rtol=0.0,
             atol=tolerance,
         )
-
-    def _navigate(self, offset: int) -> None:
-        if not self._frame_keys:
-            return
-        current = self.frame_selector.currentIndex()
-        if current < 0:
-            return
-        target = min(max(current + offset, 0), len(self._frame_keys) - 1)
-        if target != current:
-            self.frame_selector.setCurrentIndex(target)
 
     def _emit_range(self, axis: str, edge: str, value: float) -> None:
         self.commandRequested.emit(

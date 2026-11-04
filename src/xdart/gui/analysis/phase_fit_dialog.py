@@ -893,6 +893,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def set_batch_running(self, running):
         self._running = bool(running)
         self.batch_btn.setText("Cancel" if running else "Batch")
+        if self.source_row is not None:  # a step would change the source under the batch (item 14)
+            from .peak_fit_dialog import _FRAMES_WAIT
+            self.source_row.set_busy(_FRAMES_WAIT if running else '')
         self._sync_actions()
 
     def set_batch_progress(self, done, total):

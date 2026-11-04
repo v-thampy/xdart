@@ -903,6 +903,17 @@ class FormRow(QtWidgets.QWidget):
                 )
             )
             lay.addWidget(editor, 1)
+        elif kind == "frames":
+            # Int's frame navigation (NEXT-128-WINDOW-POLISH item 14: the fit windows' Source card), the one shared
+            # ``FrameNavigator`` with its own widgets' tips: a user's step or pick commits the frame chosen (a frame
+            # key or a label); its host fills it (``mirror``, ``set_labels``, ``select``), which commits nothing
+            from xdart.gui.tabs.scattering.shell_widgets import FrameNavigator
+            lay.addWidget(self.label)
+            editor = FrameNavigator(track_ends=True)
+            editor.selector.currentIndexChanged.connect(
+                lambda index: index >= 0 and self._emit_edit(editor.selector.itemData(index)))
+            lay.addWidget(editor)
+            lay.addStretch(1)
         else:
             lay.addWidget(self.label)
             editor = (IntegerLineEdit if kind == "int" else QtWidgets.QLineEdit)(self._line_display_value(value))
@@ -1061,6 +1072,8 @@ class FormRow(QtWidgets.QWidget):
         self._emit_edit(value)
 
     def current_value(self):
+        if self._kind == "frames":
+            return self.editor.selector.currentData()
         if self._kind == "float":
             return float(self.editor.value())
         if self._kind == "bool":

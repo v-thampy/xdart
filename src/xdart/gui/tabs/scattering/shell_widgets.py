@@ -675,6 +675,11 @@ class CompactFrameSelector(QtWidgets.QComboBox):
         if hasattr(self, "_exact_frames"):
             self._exact_frames.clear()
 
+    @property
+    def exact_frames(self) -> tuple:
+        """The frames behind the items, in order (what ``itemData`` returns), for a navigator that mirrors them."""
+        return tuple(self._exact_frames)
+
     def itemData(
         self,
         index: int,
@@ -748,6 +753,138 @@ class CompactFrameSelector(QtWidgets.QComboBox):
             self,
         ).width()
         self.setFixedWidth(width)
+
+
+#: the frame navigation's tips: a frame's (the footer, the fit windows' Source card) and a keyed image panel's, which
+#: steps slices too and keeps its selected regions
+FRAME_PREVIOUS_TIP = "Show the previous frame."
+FRAME_NEXT_TIP = "Show the next frame."
+FRAME_SELECTOR_TIP = "Choose a frame; use arrow keys or the mouse wheel to step."
+SLICE_TIPS = {"previous_tip": "Show the previous frame or slice, keeping the selected regions.",
+              "next_tip": "Show the next frame or slice, keeping the selected regions.",
+              "selector_tip": "Choose a frame or slice; use arrow keys or the mouse wheel to step."}
+
+
+class FrameSteps(QtCore.QObject):
+    """Int's frame navigation, one owner (NEXT-128-WINDOW-POLISH item 14; hard rule 14): ``<``, the frame selector and
+    ``>`` and their stepping, laid out by the host. The main window's footer places the three among its own items, as
+    its frozen layout has them; ``FrameNavigator`` places them in one row (Int's keyed image panels, the fit windows'
+    Source card: the maintainer, 2026-11-03, "we also want a frame selection widget like in the main window to be able
+    to go to different frames").
+
+    ``previous``, ``selector`` (a ``CompactFrameSelector``) and ``next`` are its widgets, children of ``parent``; a host
+    hears a choice from the selector's ``currentIndexChanged``. ``step`` moves the selection by an offset within the
+    frames (none selected stays none). ``mirror`` shows another selector's frames and its current one, adding only the
+    frames it gained, as Int's footer rebuilds; ``set_labels`` lists frame labels; ``select`` picks a frame. None of
+    the three emits. ``track_ends``: ``<`` and ``>`` are enabled only where there is a frame to step to (Int's footer
+    and panels set theirs from their own state)."""
+
+    def __init__(self, parent: QtWidgets.QWidget, *, track_ends: bool = False,
+                 previous_tip: str = FRAME_PREVIOUS_TIP, selector_tip: str = FRAME_SELECTOR_TIP,
+                 next_tip: str = FRAME_NEXT_TIP) -> None:
+        super().__init__(parent)
+        self.previous = QtWidgets.QToolButton(parent)
+        self.previous.setObjectName("e4FrameNavigationButton")
+        self.previous.setText("<")
+        self.selector = CompactFrameSelector(parent)
+        self.selector.setObjectName("e3FrameSelector")
+        self.next = QtWidgets.QToolButton(parent)
+        self.next.setObjectName("e4FrameNavigationButton")
+        self.next.setText(">")
+        for widget, tip in ((self.previous, previous_tip), (self.selector, selector_tip), (self.next, next_tip)):
+            widget.setToolTip(tip)
+        self._track_ends = bool(track_ends)
+        self.previous.clicked.connect(lambda: self.step(-1))
+        self.next.clicked.connect(lambda: self.step(1))
+        if self._track_ends:
+            self.selector.currentIndexChanged.connect(lambda _index: self._sync_ends())
+            self._sync_ends()
+
+    @property
+    def widgets(self) -> tuple:
+        """``(previous, selector, next)``."""
+        return (self.previous, self.selector, self.next)
+
+    def step(self, offset: int) -> None:
+        """Select the frame ``offset`` away from the current one, when there is one there."""
+        current = self.selector.currentIndex()
+        index = current + int(offset)
+        if current >= 0 and 0 <= index < self.selector.count():
+            self.selector.setCurrentIndex(index)
+
+    def mirror(self, source: CompactFrameSelector) -> None:
+        """Show ``source``'s frames, captions and tips and select its current one, adding only the frames it gained
+        when its frames extend these (Int's prefix rule); nothing is emitted."""
+        mine, theirs = self.selector.exact_frames, source.exact_frames
+        blocker = QtCore.QSignalBlocker(self.selector)
+        start = len(mine)
+        if len(theirs) < len(mine) or any(a is not b for a, b in zip(mine, theirs)):
+            self.selector.clear()
+            start = 0
+        for index in range(start, len(theirs)):
+            self.selector.add_frame(source.itemText(index), theirs[index],
+                                    str(source.itemData(index, QtCore.Qt.ItemDataRole.ToolTipRole) or ""))
+        self.selector.setCurrentIndex(source.currentIndex())
+        del blocker
+        self._sync_ends()
+
+    def set_labels(self, labels, *, current=None, tip: str = "Frame {label}") -> None:
+        """List frame ``labels`` (a NeXus result's), selecting ``current``; nothing is emitted."""
+        blocker = QtCore.QSignalBlocker(self.selector)
+        self.selector.clear()
+        for label in labels:
+            self.selector.add_frame(str(label), label, tip.format(label=label))
+        del blocker
+        self.select(current)
+
+    def select(self, frame) -> None:
+        """Select ``frame`` (a frame key by identity, a label by value; none: no selection); nothing is emitted."""
+        frames = self.selector.exact_frames
+        index = next((position for position, item in enumerate(frames) if item is frame), -1)
+        if index < 0 and frame is not None:
+            index = next((position for position, item in enumerate(frames) if item == frame), -1)
+        blocker = QtCore.QSignalBlocker(self.selector)
+        self.selector.setCurrentIndex(index)
+        del blocker
+        self._sync_ends()
+
+    def _sync_ends(self) -> None:
+        if not self._track_ends:
+            return
+        index, count = self.selector.currentIndex(), self.selector.count()
+        self.previous.setEnabled(index > 0)
+        self.next.setEnabled(0 <= index < count - 1)
+
+
+class FrameNavigator(QtWidgets.QWidget):
+    """``FrameSteps`` in one row: Int's keyed image panels and the fit windows' Source card (a ``FormRow`` of kind
+    "frames") mount it; its ``previous``, ``selector``, ``next`` and methods are its steps'."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None, **options) -> None:
+        super().__init__(parent)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.steps = FrameSteps(self, **options)
+        self.previous, self.selector, self.next = self.steps.widgets
+        for widget in self.steps.widgets:
+            layout.addWidget(widget)
+
+    @property
+    def widgets(self) -> tuple:
+        """``(previous, selector, next)``."""
+        return self.steps.widgets
+
+    def step(self, offset: int) -> None:
+        self.steps.step(offset)
+
+    def mirror(self, source: CompactFrameSelector) -> None:
+        self.steps.mirror(source)
+
+    def set_labels(self, labels, *, current=None, tip: str = "Frame {label}") -> None:
+        self.steps.set_labels(labels, current=current, tip=tip)
+
+    def select(self, frame) -> None:
+        self.steps.select(frame)
 
 
 class ContentFitComboBox(QtWidgets.QComboBox):
@@ -1406,6 +1543,8 @@ __all__ = [
     "color_map_combo",
     "foldable",
     "ContentFitComboBox",
+    "FrameNavigator",
+    "FrameSteps",
     "experiment_header_projection",
     "frame_caption",
     "log_toggle",

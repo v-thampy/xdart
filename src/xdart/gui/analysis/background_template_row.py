@@ -577,11 +577,20 @@ class FitSourceRow(CurveFileRow):
 
     "Int's display" follows Int: the host fits the trace Int shows. "Choose file…" asks the file, then its frame and
     1-D mode or its x unit in the template row's popups; ``xye=False`` (Phase Analysis) refuses an .xye file in a popup,
-    since it records no wavelength. Editing the Frame, 1-D mode or x unit row changes the source. ``changed`` is
-    emitted after every change. The row reads no file (a chosen one is checked with a stat) and the source is not
-    saved with the settings: it is the input, not the recipe."""
+    since it records no wavelength. Editing the 1-D mode or x unit row changes the source. ``changed`` is emitted after
+    every change. The row reads no file (a chosen one is checked with a stat) and the source is not saved with the
+    settings: it is the input, not the recipe.
+
+    The Frame row (NEXT-128-WINDOW-POLISH item 14: the maintainer, 2026-11-03, "we also want a frame selection widget
+    like in the main window to be able to go to different frames"; his "Mirror Int's frames (Recommended)") is Int's
+    shared ``FrameNavigator`` on the shared ``FormRow``: its host fills it with Int's frames while the source is Int's
+    display (``mirror_frames``) or a NeXus file's labels (``set_frame_labels``), and hears each user's step or pick as
+    ``frameChosen`` (a frame key, or a label), answering a file's with ``step_frame``. It replaces the typed frame field
+    and is hidden for an .xye file, which holds one curve; ``set_busy`` holds it while a batch runs."""
 
     changed = QtCore.Signal()
+    #: a user's step or pick in the Frame row: Int's frame key (Int's display) or the file's frame label
+    frameChosen = QtCore.Signal(object)
 
     def __init__(self, parent=None, *, xye=True):
         super().__init__(parent, what="source", filter_name="BACKGROUND_TEMPLATE_FILTER" if xye else "NEXUS_FILTER")
@@ -607,6 +616,13 @@ class FitSourceRow(CurveFileRow):
             button.setAutoDefault(False)
             self._buttons.addWidget(button)
         self._buttons.addStretch(1)
+        self.frames_row = FormRow(label="Frame", path=("fit_source", "frames"), value="", kind="frames")
+        self._frames_tip = ("The frame Reload and Fit read, stepped with < and > or picked from the list: following "
+                            "Int's display, Int's frames, and a step moves the main window to that frame, which this "
+                            "window then shows; with a chosen NeXus file, its frames (Int stays where it is).")
+        self.frames_row.set_purpose_tooltip(self._frames_tip)
+        self.frames_row.valueChanged.connect(lambda _path, frame: self.frameChosen.emit(frame))
+        self.layout().addWidget(self.frames_row)
         self.unit_row, self.frame_row, self.mode_row = self._curve_rows(
             "fit_source",
             unit_tip="The .xye file's x unit, chosen when the file was: a file name's xdart prefix only suggests it.",
@@ -651,6 +667,41 @@ class FitSourceRow(CurveFileRow):
         if notice != self._announced:
             self._announced = notice
             self._notify(f"{Path(self._source.path).name}: cannot be read", str(detail))
+
+    def set_help_topic(self, topic_id: str) -> None:
+        """Bind F1 and the "?"s (the buttons' and the Frame row's) to ``topic_id``."""
+        super().set_help_topic(topic_id)
+        self.frames_row.set_help_topic(topic_id, button=True)
+
+    def mirror_frames(self, selector) -> None:
+        """Int's display: the Frame row lists ``selector``'s frames (Int's footer) and its current one; emits nothing."""
+        self.frames_row.editor.mirror(selector)
+
+    def set_frame_labels(self, labels) -> None:
+        """A NeXus source: the Frame row lists its frame ``labels``, the source's selected; emits nothing."""
+        source = self._source
+        name = "" if source is None else Path(source.path).name
+        self.frames_row.editor.set_labels(tuple(labels), current=None if source is None else source.frame,
+                                          tip="Frame {label} of " + name.replace("{", "{{").replace("}", "}}"))
+
+    def select_frame(self, frame) -> None:
+        """Show ``frame`` selected in the Frame row (a frame key or a label); emits nothing."""
+        self.frames_row.editor.select(frame)
+
+    def step_frame(self, frame) -> None:
+        """A NeXus source's frame becomes ``frame`` (its 1-D mode and entry kept): the host's answer to a step."""
+        source = self._source
+        if source is None or source.kind != "nexus":
+            return
+        self._announced = ""
+        self._set(BackgroundTemplateSource("nexus", source.path, frame=int(frame), mode=source.mode,
+                                           entry=source.entry))
+        self.select_frame(int(frame))
+
+    def set_busy(self, reason: str = "") -> None:
+        """Hold the Frame row while ``reason`` says why (a running batch); "" releases it."""
+        self.frames_row.editor.setEnabled(not reason)
+        self.frames_row.set_reason(reason)
 
     def use_display(self) -> None:
         """Follow Int's display again."""
@@ -732,7 +783,9 @@ class FitSourceRow(CurveFileRow):
                                + (f"{text}. {detail}" if detail else f"{text}."))
         kind = None if source is None else source.kind
         self.unit_row.setVisible(kind == "xye")
-        self.frame_row.setVisible(kind == "nexus")
+        # the Frame row's navigator steps the frame (item 14); the typed field keeps the source's frame for its checks
+        self.frame_row.setVisible(False)
+        self.frames_row.setVisible(kind != "xye")
         self.mode_row.setVisible(kind == "nexus")
         # the frame editor is not blocked: setValue emits no row edit, and its validity display must follow
         with QtCore.QSignalBlocker(self.unit_row.editor), QtCore.QSignalBlocker(self.mode_row.editor):
