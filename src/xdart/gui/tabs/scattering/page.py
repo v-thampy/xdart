@@ -1712,6 +1712,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         trace, _anchor = self._capture_analysis_trace(kind)
         if trace is not None:  # Int shows the stepped frame's trace: this window shows it too
             follow.pop(kind, None)
+            host = self._fit_hosts.get(kind)
+            if host is not None:
+                host.forget_shown()  # keep the batch, but its old frame's fit cannot be redrawn over this trace
+                dialog.set_batch_running(False)  # the valid new trace can be fitted after clear_input held Fit
             self._refresh_fit_trace(kind)
 
     def _fit_frame_chosen(self, kind, frame):
