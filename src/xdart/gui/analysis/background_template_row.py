@@ -699,7 +699,7 @@ class FitSourceRow(CurveFileRow):
         self.select_frame(int(frame))
 
     def set_busy(self, reason: str = "") -> None:
-        """Hold the Frame row while ``reason`` says why (a running batch); "" releases it."""
+        """Hold the Frame row while ``reason`` says why (a running fit or batch); "" releases it."""
         self.frames_row.editor.setEnabled(not reason)
         self.frames_row.set_reason(reason)
 
