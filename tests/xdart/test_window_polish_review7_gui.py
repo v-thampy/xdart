@@ -75,11 +75,12 @@ def test_int_frame_step_retires_the_previous_overlay_without_losing_batch(qapp, 
             trace, _anchor = page._capture_analysis_trace("peak")
             return (trace is not None and page._context_controller.navigation.current is wanted
                     and np.array_equal(dialog._y, trace.intensity))
-        _wait(followed, timeout=30)
+        _wait(lambda: True if followed() else None, timeout=30)
         assert len(host.outcomes) == 5
         dialog.fit_view.components_toggle.click()
         drawn = {item.name() for item in dialog.fit_view.plot.getPlotItem().listDataItems()}
         assert "fit" not in drawn
         assert host._shown_outcome is None
+        assert dialog.fit_btn.isEnabled()
     finally:
         _close_page(page, qapp)
