@@ -31,13 +31,18 @@ def _browse(page, path):
     _wait(painted, timeout=30)
 
 
-def test_int_reload_clears_the_held_batch_and_leaves_fit_usable(qapp, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ("peak", "phase"))
+def test_int_reload_clears_the_held_batch_and_leaves_fit_usable(qapp, tmp_path, monkeypatch, kind):
     path = _result(tmp_path / "first_int1d.nexus")
     page, _store = _real_page(tmp_path, monkeypatch)
     try:
         page.show()
         _browse(page, path)
-        dialog, host = _window(page, "peak")
+        dialog, host = _window(page, kind)
+        if kind == "phase":
+            from xrd_tools.analysis.phase_references import PhaseLibrary
+            entry = PhaseLibrary().add_lattice("film", a=2.856, space_group="Pm-3m")
+            dialog.phase_source.add_library_entry(entry.id)
         dialog.batch_btn.click()
         _drain(qapp, host)
         assert host.holds_batch and len(host.outcomes) == 5
@@ -50,21 +55,26 @@ def test_int_reload_clears_the_held_batch_and_leaves_fit_usable(qapp, tmp_path, 
 
         def fitted():
             page._drain_executor()
-            return True if page._analysis_identity is None and page._peak_result is not None else None
+            return True if page._analysis_identity is None and getattr(page, f"_{kind}_result") is not None else None
         _wait(fitted, timeout=30)
         assert "The trend keeps the batch" not in dialog.status.text()
     finally:
         _close_page(page, qapp)
 
 
-def test_another_int_result_clears_the_old_batch_before_a_new_batch(qapp, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ("peak", "phase"))
+def test_another_int_result_clears_the_old_batch_before_a_new_batch(qapp, tmp_path, monkeypatch, kind):
     first = _result(tmp_path / "first_int1d.nexus")
     second = _result(tmp_path / "second_int1d.nexus", labels=(0, 1))
     page, _store = _real_page(tmp_path, monkeypatch)
     try:
         page.show()
         _browse(page, first)
-        dialog, host = _window(page, "peak")
+        dialog, host = _window(page, kind)
+        if kind == "phase":
+            from xrd_tools.analysis.phase_references import PhaseLibrary
+            entry = PhaseLibrary().add_lattice("film", a=2.856, space_group="Pm-3m")
+            dialog.phase_source.add_library_entry(entry.id)
         dialog.batch_btn.click()
         _drain(qapp, host)
         assert host.holds_batch and len(host.outcomes) == 5

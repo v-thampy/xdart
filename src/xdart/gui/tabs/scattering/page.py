@@ -1614,6 +1614,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if action in {"fit", "reload", "capture_template"} and host.computing:
                 dialog.status.setText(self._FIT_WAITS)
                 return None
+            if action == "reload":
+                host.invalidate()  # explicit Reload releases the held batch, just as the file-source route does
+                dialog.set_batch_running(False)
             return handler(action, values)
         if action == "capture_template":
             return self._capture_source_template(kind)
@@ -1664,6 +1667,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         facts, reason = self._fit_batch_source(kind)
         if facts is None:
             dialog.set_batch_reason(reason)
+            return
+        if dialog.fit_source() is None and self._fit_hosts[kind].batch_scope_changed():
+            self._fit_source_changed(kind)  # another Int file/mode/unit uses the existing source-reset owner
             return
         path, mode, _entry, _unit = facts
         substrate = "template" if kind == "peak" else "substrate"

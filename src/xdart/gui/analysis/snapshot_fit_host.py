@@ -170,6 +170,7 @@ class SnapshotFitHost(QtCore.QObject):
         self._trend_rows, self._trend_phases = [], ()
         #: whether the adopted rows are a batch's: a single fit then is shown and never changes them (R7 F5)
         self._batch_held = False
+        self._batch_scope = None
         self._held_rows, self._held_request, self._last_flush = [], None, 0.0
         self._flush_timer = QtCore.QTimer(self)
         self._flush_timer.setSingleShot(True)
@@ -388,6 +389,7 @@ class SnapshotFitHost(QtCore.QObject):
                                 for position, each in enumerate(outcomes) for x in (xs.get(each.label),)]
             self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
             self._batch_held = request.action == 'batch'
+            self._batch_scope = request.scope if self._batch_held else None
             # Binding the template's content identity is a result of this fit, not a settings edit: the CSV names the
             # bound form (Codex R7 F2)
             self._last_settings = plain_settings(dict(self._request_settings(request.action)))
@@ -422,6 +424,10 @@ class SnapshotFitHost(QtCore.QObject):
     def holds_batch(self):
         """Whether the adopted rows are a batch's, which a single fit leaves as they are (R7 F5)."""
         return self._batch_held
+
+    def batch_scope_changed(self):
+        """Whether held rows belong to another host scope (Int can Browse a new source without a Source-card edit)."""
+        return self._batch_held and self._batch_scope != self.scope()
 
     def note_batch_kept(self):
         """Say in the status that the trend keeps the batch's rows (a single fit's, on either route)."""
@@ -473,6 +479,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.snapshot = self._shown_outcome = None
         self.outcomes, self._keys, self._trend_rows, self._trend_phases = (), {}, [], ()
         self._batch_held = False
+        self._batch_scope = None
         if self.dialog is not None:
             self.dialog.clear_input()
             if self.dialog.source_row is not None:
