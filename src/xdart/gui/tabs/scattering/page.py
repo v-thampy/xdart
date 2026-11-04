@@ -2200,6 +2200,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:
             self._phase_result = payload
             if self._phase_dialog is not None: self._phase_dialog.set_vnext_result(payload)
+        if kind in {"peak", "phase"}:  # a single fit leaves a held batch's rows, and says so (item 14, R7 F5)
+            host = (getattr(self, "_fit_hosts", None) or {}).get(kind)
+            if host is not None and host.holds_batch:
+                host.note_batch_kept()
         self._notice("")
         return WorkspaceRefreshEffect.FULL
 

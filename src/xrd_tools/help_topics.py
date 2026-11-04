@@ -944,8 +944,8 @@ Steps
 4. Batch fits every frame of the source's NeXus result (Int's display: the file
    and 1-D mode it shows) from each frame's stored 1-D curve, then shows the last
    frame; the trend plots the results against the frame number. Stepping through
-   the frames afterwards keeps the trend, and Fit on one of them replaces only
-   that frame's row.
+   the frames afterwards keeps the trend; Fit on one of them shows that frame's
+   fit and leaves the batch's rows (Batch again to refresh them).
 5. Export Jupyter… or Export marimo… with a NeXus source names the file and its
    frames in the notebook, which reads them again; nothing is copied.
 

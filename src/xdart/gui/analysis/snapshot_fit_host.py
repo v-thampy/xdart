@@ -145,6 +145,8 @@ def _job(request, cancel, progress):
 
 _UNNAMED_CAPTURE = ("a result page's trace is not named by a NeXus file and frame; choose its file to save or export "
                     "the template")
+#: a single fit's status while a batch's rows are held (NEXT-128-WINDOW-POLISH item 14, R7 F5), on both routes
+BATCH_KEPT = "The trend keeps the batch's rows; Batch again to refresh them."
 
 
 class SnapshotFitHost(QtCore.QObject):
@@ -166,6 +168,8 @@ class SnapshotFitHost(QtCore.QObject):
         #: the adopted fits' trend rows (a cancelled or refused Batch's streamed rows give way to them again); a running
         #: Batch's rows taken but not yet drawn, its request, and when the trend last drew them
         self._trend_rows, self._trend_phases = [], ()
+        #: whether the adopted rows are a batch's: a single fit then is shown and never changes them (R7 F5)
+        self._batch_held = False
         self._held_rows, self._held_request, self._last_flush = [], None, 0.0
         self._flush_timer = QtCore.QTimer(self)
         self._flush_timer.setSingleShot(True)
@@ -373,28 +377,23 @@ class SnapshotFitHost(QtCore.QObject):
             self._show_trace()
             return True
         outcomes, self.snapshot, keys, xs = terminal.payload
-        settings = plain_settings(dict(request.settings))
-        rows = [(each.label, x if request.column or x is not None else float(position), each.params)
-                for position, each in enumerate(outcomes) for x in (xs.get(each.label),)]
-        known = {each.label for each in self.outcomes}
-        if (request.action == 'fit' and outcomes and settings == self._last_settings
-                and all(each.label in known for each in outcomes)):
-            # a re-fit of the batch's own frame with its settings (NEXT-128-WINDOW-POLISH item 14: the Frame row steps
-            # through them): its outcome and trend row are replaced at the batch's x; the batch's others stay
-            fresh, params = {each.label: each for each in outcomes}, {row[0]: row[2] for row in rows}
-            self.outcomes = tuple(fresh.get(each.label, each) for each in self.outcomes)
-            self._keys = {**self._keys, **keys}
-            self._trend_rows = [(label, x, params.get(label, values)) for label, x, values in self._trend_rows]
-        else:
-            self.outcomes, self._keys, self._trend_rows = tuple(outcomes), keys, rows
-            self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
+        # a single fit while a batch's rows are held (NEXT-128-WINDOW-POLISH item 14, Codex R7 F5) is shown and changes
+        # none of them: its input (a stored curve, or the trace Int shows) and settings need not be the batch's, so
+        # one table would mix them; the next Batch replaces the rows (Reload or another source clears them)
+        kept = self._batch_held and request.action != 'batch'
         self._adopt_template(outcomes)
-        # Binding the template's content identity is a result of this fit, not a settings edit. Remember that bound
-        # form so a same-controls re-fit of a batch frame replaces its row instead of discarding the other frames.
-        self._last_settings = plain_settings(dict(self._request_settings(request.action)))
-        self.dialog.trend.clear()
-        # every row in one redraw (item 14): one ``set_row`` per outcome redrew every row each time
-        self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
+        if not kept:
+            self.outcomes, self._keys = tuple(outcomes), keys
+            self._trend_rows = [(each.label, x if request.column or x is not None else float(position), each.params)
+                                for position, each in enumerate(outcomes) for x in (xs.get(each.label),)]
+            self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
+            self._batch_held = request.action == 'batch'
+            # Binding the template's content identity is a result of this fit, not a settings edit: the CSV names the
+            # bound form (Codex R7 F2)
+            self._last_settings = plain_settings(dict(self._request_settings(request.action)))
+            self.dialog.trend.clear()
+            # every row in one redraw (item 14): one ``set_row`` per outcome redrew every row each time
+            self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
         if not outcomes:
             return False
         outcome = outcomes[-1]
@@ -412,10 +411,23 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.status.setText(f'Batch done: {fitted} of {len(self.outcomes)} frames fitted')
         elif self.kind != 'phase' or outcome.overlay is None:
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
+        if kept:
+            self.note_batch_kept()
         source = getattr(self.dialog, 'source_row', None)
         if source is not None and 'FIT_SOURCE_' in (outcome.message or ''):
             source.report_problem(outcome.message)
         return outcome.ok
+
+    @property
+    def holds_batch(self):
+        """Whether the adopted rows are a batch's, which a single fit leaves as they are (R7 F5)."""
+        return self._batch_held
+
+    def note_batch_kept(self):
+        """Say in the status that the trend keeps the batch's rows (a single fit's, on either route)."""
+        if self.dialog is not None:
+            text = self.dialog.status.text().rstrip(". ")
+            self.dialog.status.setText(f"{text}. {BATCH_KEPT}" if text else BATCH_KEPT)
 
     def _draw_outcome(self, outcome):
         """The shown fit over the pattern (a phase fit's x back in a 2θ result's own axis); a peak fit's own peaks
@@ -460,6 +472,7 @@ class SnapshotFitHost(QtCore.QObject):
         self._end_stream()
         self.snapshot = self._shown_outcome = None
         self.outcomes, self._keys, self._trend_rows, self._trend_phases = (), {}, [], ()
+        self._batch_held = False
         if self.dialog is not None:
             self.dialog.clear_input()
             if self.dialog.source_row is not None:

@@ -38,7 +38,10 @@ def test_binding_a_template_keeps_the_batch_on_a_same_settings_refit(qapp, tmp_p
         dialog.fit_btn.click()
         _drain(qapp, host)
         assert len(host.outcomes) == 5 and len(dialog.trend.table()[0]) == 5
-        assert host.outcomes[3].ok and host.outcomes[3].result is not None
+        # Claude's F5 contract (item 14, R7 F5): one Fit after a batch is shown and leaves every batch row, so frame 3
+        # keeps its compact batch row (this row asserted its replacement before the contract; disclosed)
+        assert host.outcomes[3].ok and host.outcomes[3].result is None and host._shown_outcome is not None
+        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them.")
     finally:
         _close_page(page, qapp)
 
@@ -132,5 +135,16 @@ def test_int_frame_step_retires_the_previous_overlay_without_losing_batch(qapp, 
         assert "fit" not in drawn
         assert host._shown_outcome is None
         assert dialog.fit_btn.isEnabled()
+        dialog.fit_btn.click()  # Int's display: the page's analysis slot fits the stepped frame's trace
+
+        def fitted():
+            page._drain_executor()
+            return True if page._analysis_identity is None and page._peak_result is not None else None
+        _wait(fitted, timeout=30)
+        # Claude's F5 contract (item 14, R7 F5; 56e9cfe7 asked for a replacement): drawn, the batch's rows unchanged
+        assert len(host.outcomes) == 5 and len(dialog.trend.table()[0]) == 5
+        assert host.outcomes[2].result is None
+        assert "fit" in {item.name() for item in dialog.fit_view.plot.getPlotItem().listDataItems()}
+        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them."), dialog.status.text()
     finally:
         _close_page(page, qapp)

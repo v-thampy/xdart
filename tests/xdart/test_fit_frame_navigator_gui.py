@@ -178,10 +178,12 @@ def test_n4_a_nexus_source_steps_its_own_frames_and_a_batch_disables_the_navigat
         assert dialog.fit_source().frame == 3 and np.array_equal(dialog._y, _stored(_peak(2.3)))
         assert len(dialog.trend.table()[0]) == 5 and len(host.outcomes) == 5
         assert host.outcomes[3].result is None  # the compact batch kept frame 3's row only
-        dialog.fit_btn.click()  # a re-fit of the batch's frame replaces its row; the batch's others stay
+        dialog.fit_btn.click()  # one Fit after the batch is shown and leaves every batch row (R7 F5)
         _drain(qapp, host)
         assert len(dialog.trend.table()[0]) == 5 and len(host.outcomes) == 5
-        assert host.outcomes[3].result is not None and host.outcomes[3].ok
+        assert host.outcomes[3].result is None and host._shown_outcome is not None
+        assert "fit" in {item.name() for item in dialog.plot.listDataItems()}
+        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them."), dialog.status.text()
         assert dialog.trend.table()[1] == (0.0, 1.0, 2.0, 3.0, 4.0)
     finally:
         _close_page(page, qapp)
