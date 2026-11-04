@@ -194,10 +194,16 @@ class BackgroundTemplateRow(CurveFileRow):
     when it is that file."""
 
     changed = QtCore.Signal()
+    #: the row's line whenever it changes after the row is built, for the window's status line: the line itself shows
+    #: only while a template is held (NEXT-128-WINDOW-POLISH item 14: the maintainer's "there is a "No template: use the
+    #: displayed trace..." message under the Background in the panel. don't think that is required. this can go in the
+    #: bottom status")
+    messageChanged = QtCore.Signal(str)
 
     def __init__(self, parent=None, *, what="template", capture_label="Use displayed", clear_label="Clear"):
         super().__init__(parent, what=what)
         self.setObjectName("backgroundTemplateRow")
+        self._said = None  # the line last said (None: none yet, the row's first is no change)
         self._template = None   # a captured DisplayedTraceInput
         self._source = None     # a BackgroundTemplateSource: chosen, restored, bound, or a capture's candidate
         self._identity = None   # the content identity a completed fit recorded
@@ -532,6 +538,11 @@ class BackgroundTemplateRow(CurveFileRow):
     def _sync(self) -> None:
         text = self.describe()
         self.status.setText(text)
+        self.status.setVisible(self._template is not None or self._source is not None or self._file is not None)
+        if text != self._said:
+            said, self._said = self._said, text
+            if said is not None:
+                self.messageChanged.emit(text)
         detail = self._reason or (self._source.path if self._source is not None else "")
         self.status.setToolTip(
             f"The {self._what} the template backgrounds scale. " + (f"{text}. {detail}" if detail else text))

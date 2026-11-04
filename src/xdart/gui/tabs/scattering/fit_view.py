@@ -269,6 +269,10 @@ class FitView(QtWidgets.QWidget):
             self.components_toggle.setToolTip("Show each fitted component (every peak, or every phase) as its own "
                                               "line over the data.")
             self.components_toggle.toggled.connect(lambda _on: self._redraw_upper())
+            # checked, the theme draws its text bold: wide enough for that (item 14: "the Components label is clipped
+            # on both ends")
+            from xdart.gui.widgets.controls_panel import fit_bold_text
+            fit_bold_text(self.components_toggle)
         self.plot = pg.PlotWidget(viewBox=RectViewBox(), axisItems={"left": GridAxisItem("left")})
         apply_seaborn_plot_style(self.plot.getPlotItem(), grid=True)
         self.plot.addLegend(offset=(-10, 10))
@@ -358,6 +362,11 @@ class FitView(QtWidgets.QWidget):
             self._region.show()
         finally:
             self._setting_range = False
+
+    def set_fit_range_locked(self, locked: bool) -> None:
+        """Whether the fit range can be dragged: not while a window's Fit all runs (NEXT-128-WINDOW-POLISH item 14,
+        the maintainer's "Lock during a run (Recommended)"), whose options stay as it started."""
+        self._region.setMovable(not locked)
 
     def _region_moved(self) -> None:
         if self._setting_range or self._range is None:

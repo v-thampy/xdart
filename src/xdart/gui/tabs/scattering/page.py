@@ -1627,7 +1627,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return host._action(action, values)
 
     def _fit_batch(self, kind):
-        """Batch (or Cancel): every frame of the source's NeXus result, on the window's host."""
+        """Fit all (or Stop): every frame of the source's NeXus result, on the window's host."""
         dialog, host = self._fit_dialog(kind), self._fit_hosts.get(kind)
         if dialog is None or host is None:
             return
@@ -1649,13 +1649,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return (source.path, source.mode, source.entry, None), ""
         trace, anchor = self._capture_analysis_trace(kind)
         if trace is None:
-            return None, ("Batch fits the frames of a processed NeXus result: show one in Int (open it in Browse), or "
-                          "choose its file in the Source card.")
+            return None, ("Fit all fits the frames of a processed NeXus result: show one in Int (open it in Browse), "
+                          "or choose its file in the Source card.")
         from .analysis_mount import displayed_template_candidate
         candidate, why = displayed_template_candidate(self._context_controller, trace,
                                                       None if anchor is None else anchor.frame)
         if candidate is None:
-            return None, f"Batch fits the frames of a processed NeXus result: {why}."
+            return None, f"Fit all fits the frames of a processed NeXus result: {why}."
         return (candidate.path, candidate.mode, candidate.entry, trace.axis_unit or None), ""
 
     def _sync_fit_batch(self, kind):

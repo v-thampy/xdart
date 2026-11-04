@@ -128,6 +128,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._batch_tip = _BATCH_TIP
         self._fit_reason = ''
         self._running = False
+        self._stopping = False  # Stop pressed on a running Fit all (``show_run_stopping``)
         #: a host's probe of a fit it runs (Load settings waits for it); None: the host runs none in the background
         self.busy_probe = None
         self._export_trace = None
@@ -256,13 +257,15 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                                           'seeds are not saved.')
         self.refresh_btn = QtWidgets.QPushButton("Reload", self)
         self.refresh_btn.setToolTip("Re-grab the currently selected frame's pattern")
-        self.fit_btn = QtWidgets.QPushButton("Fit", self)
+        from .peak_fit_dialog import FIT_ALL, FIT_CURRENT, pause_button
+        self.fit_btn = QtWidgets.QPushButton(FIT_CURRENT, self)
         self.fit_btn.setObjectName("peakFitGo")
-        self.batch_btn = QtWidgets.QPushButton("Batch", self)
+        self.batch_btn = QtWidgets.QPushButton(FIT_ALL, self)
+        self.pause_btn = pause_button(self)  # Fit all's Pause, as the Peak Fitter's (item 14)
         for button in (self.advanced_btn, self.load_settings_btn, self.save_settings_btn):
             actions.addWidget(button)
         actions.addStretch(1)
-        for button in (self.refresh_btn, self.fit_btn, self.batch_btn):
+        for button in (self.refresh_btn, self.fit_btn, self.pause_btn, self.batch_btn):
             actions.addWidget(button)
         lay.addLayout(actions)
 
@@ -276,6 +279,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.phase_source.messageChanged.connect(self.status.setText)
         self.phase_source.changed.connect(lambda _selection: self._sync_options())
         self.trend.messageChanged.connect(self.status.setText)
+        self.background_template_row.messageChanged.connect(self.status.setText)  # its line's changes (item 14)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
         self.fit_btn.clicked.connect(self._do_fit)
         self.advanced_btn.clicked.connect(self._show_advanced)
@@ -420,7 +424,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.sequential_row = self._option(card, "batch", FormRow(
             label="Sequential", path=_path("sequential"), value=False, kind="bool", enabled=self._allow_batch,
             reason=self._batch_reason),
-            'In a Batch, seed each fit from the previous fit\'s values; a fit whose reflections differ starts fresh.')
+            'In Fit all, seed each fit from the previous fit\'s values; a fit whose reflections differ starts fresh.')
 
     def add_batch_row(self, row):
         """A host's own Batch row (Stitch's Trend column), in the Batch card."""
@@ -694,14 +698,15 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.fit_btn.setEnabled(not self._running and not fit_reason)
         self.fit_btn.setToolTip(fit_reason or _FIT_TIP)
         batch_reason = self._batch_reason or fit_reason
-        if self._running:
-            self.batch_btn.setEnabled(self._allow_batch)
-            self.batch_btn.setToolTip("Cancel the batch; the running solve finishes first.")
+        if self._running:  # Stop stays usable until pressed (item 14), whatever Int's display does meanwhile
+            from .peak_fit_dialog import STOP_TIP
+            self.batch_btn.setEnabled(not self._stopping)
+            self.batch_btn.setToolTip(STOP_TIP)
         else:
             self.batch_btn.setEnabled(not batch_reason)
             self.batch_btn.setToolTip(batch_reason or self._batch_tip)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
-        self.background_template_row.set_busy('A batch is fitting; capture the substrate when it is done.'
+        self.background_template_row.set_busy('Fit all is running; capture the substrate when it is done.'
                                               if self._running else '')
 
     def set_fit_reason(self, reason=''):
@@ -831,6 +836,11 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._vnext_submit("close", None)
         super().closeEvent(event)
 
+    def show_phase_rows(self, result):
+        """A fit's rows in the table alone (a running Fit all's latest frame, NEXT-128-WINDOW-POLISH item 14): its
+        receipts, status and phase list wait for the run's end (``show_phase_result_details``)."""
+        self._show_phase_rows(phase_result_rows(result), getattr(result, 'phase_fractions_reason', ''))
+
     def _show_phase_rows(self, projection, reason=''):
         """The table's rows; a withheld fraction (a "—" Value cell) and the fraction notice carry its reason (R4)."""
         headers, rows = projection
@@ -916,16 +926,30 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return (-np.inf, np.inf)
 
     def set_batch_running(self, running):
+        """Fit all in flight, as the Peak Fitter shows it (``show_run``: Stop and Pause, the options and Advanced…
+        locked; NEXT-128-WINDOW-POLISH item 14)."""
+        from .peak_fit_dialog import _FRAMES_WAIT, show_run
         self._running = bool(running)
-        self.batch_btn.setText("Cancel" if running else "Batch")
+        show_run(self, running)
+        self.advanced_btn.setEnabled(not running)
+        self.advanced.setEnabled(not running)  # an open Advanced window's options are the run's too
         if self.source_row is not None:  # a step would change the source under the batch (item 14)
-            from .peak_fit_dialog import _FRAMES_WAIT
             self.source_row.set_busy(_FRAMES_WAIT if running else '')
         self._sync_actions()
 
     def set_batch_progress(self, done, total):
-        """A running Batch's count (NEXT-128-WINDOW-POLISH item 14), as the Peak Fitter words it."""
-        self.status.setText(f"Batch fitting… {done}/{total}")
+        """A running Fit all's count (NEXT-128-WINDOW-POLISH item 14), as the Peak Fitter words it."""
+        self.status.setText(f"Fitting all frames… {done}/{total}")
+
+    def set_batch_paused(self, paused):
+        """A running Fit all paused or resumed, as the Peak Fitter shows it."""
+        from .peak_fit_dialog import show_run_paused
+        show_run_paused(self, paused)
+
+    def set_batch_stopping(self):
+        """Stop pressed, as the Peak Fitter shows it."""
+        from .peak_fit_dialog import show_run_stopping
+        show_run_stopping(self)
 
     def reset_param_trend(self):
         """A fresh trend (Reload, a new batch run)."""
@@ -1006,7 +1030,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _busy_reason(self):
         if self._running:
-            return "Phase Analysis is fitting a batch; load settings when it is done."
+            return "Phase Analysis is running Fit all; load settings when it is done."
         if self.phase_source.add_worker.busy:
             return "Phase Analysis is reading CIF files; load settings once they are added."
         if self.busy_probe is not None and self.busy_probe():

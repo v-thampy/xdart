@@ -150,6 +150,10 @@ class TrendView(QtWidgets.QWidget):
         self.right_row = FormRow(label="Track 2", path=("trend", "right_family"), value="", kind="combo")
         for row in (self.family_row, self.right_row):
             row.label.setMinimumWidth(0)  # the label hugs its text beside its box (NEXT-128-WINDOW-POLISH)
+            # each box as wide as its longest name as the families arrive (item 14: "make the width of the track
+            # parameter box wider so that it is not cut off ... right now it says Peak ce"): Qt's default sizes it once,
+            # when it is first shown, empty
+            row.editor.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         #: the family on the left axis and the one on the right axis (None: off)
         self.family, self.right_family = self.family_row.editor, self.right_row.editor
         self.family.clear()

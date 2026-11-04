@@ -183,7 +183,7 @@ def test_n4_a_nexus_source_steps_its_own_frames_and_a_batch_disables_the_navigat
         assert len(dialog.trend.table()[0]) == 5 and len(host.outcomes) == 5
         assert host.outcomes[3].result is None and host._shown_outcome is not None
         assert "fit" in {item.name() for item in dialog.plot.listDataItems()}
-        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them."), dialog.status.text()
+        assert dialog.status.text().endswith("The trend keeps the rows from Fit all; run Fit all again to refresh them."), dialog.status.text()
         assert dialog.trend.table()[1] == (0.0, 1.0, 2.0, 3.0, 4.0)
     finally:
         _close_page(page, qapp)
@@ -255,7 +255,7 @@ def test_n6_phase_analysis_has_the_same_frame_row_and_a_batch_holds_it(qapp):
         navigator = row.frames_row.editor
         assert navigator.selector.count() == 3 and navigator.selector.currentData() is keys[1]
         dialog.set_batch_running(True)
-        assert not navigator.isEnabled() and "batch is fitting" in row.frames_row.toolTip()
+        assert not navigator.isEnabled() and "Fit all is running" in row.frames_row.toolTip()  # item 14 names
         dialog.set_batch_running(False)
         assert navigator.isEnabled()
     finally:

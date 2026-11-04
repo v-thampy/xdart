@@ -596,11 +596,13 @@ Fit many results with the same settings, seed each fit from the previous one, sa
 reload the window's settings, and export a notebook that repeats the fit.
 
 Required inputs
-Stitch results for Batch (Int's Batch is not available here), and a writable folder
-for saved settings.
+Results for Fit all (Int's frames, a chosen NeXus result's frames, or Stitch
+results), and a writable folder for saved settings.
 
 Steps
-1. Batch fits the selected results, or all listed results, and plots the trend.
+1. Fit all fits the selected results, or all listed results, as one batch and
+   plots the trend; the Batch card holds its options. Pause and Stop work as in
+   the source's help (Stop keeps the results fitted).
 2. Sequential seeds each fit from the previous fit's values; a fit whose reflections
    differ starts fresh, and a refused fit leaves the seed as it was.
 3. The Trend column plots a scan column instead of the result order.
@@ -628,11 +630,11 @@ Sequential across a phase change carries the old values: turn it off there. Afte
 Load settings, a substrate whose file has moved says so: choose it again.
 
 Worked example
-A composition series: fit the first result, check it, then Batch with Sequential on;
-save the settings to repeat the series later or in a notebook.
+A composition series: fit the first result, check it, then Fit all with Sequential
+on; save the settings to repeat the series later or in a notebook.
 
 References
-xdart/gui/analysis/snapshot_fit_host.py — Batch and the trend.
+xdart/gui/analysis/snapshot_fit_host.py — Fit all and the trend.
 xrd_tools/notebooks/recipe.py — exported fit recipes.
 """),
     HelpTopic("peak-fit.model", "Peak Fitter: peak model", """Purpose
@@ -922,7 +924,7 @@ xrd_tools/analysis/plans.py — StrainPlan and run_strain.
     # NEXT-128-WINDOW-POLISH item 11 (2026-11-03): the fit windows' Source card, shared by both windows, appended.
     HelpTopic("fit.source", "Fit windows: the source", """Purpose
 Choose what the Peak Fitter and Phase Analysis read: the trace Int shows, or a
-file of its own, so a window can fit another result than Int's, and Batch can
+file of its own, so a window can fit another result than Int's, and Fit all can
 fit every frame of a processed NeXus result.
 
 Required inputs
@@ -930,8 +932,8 @@ Int's display (the default) or a file: a processed NeXus result, with the frame
 and 1-D mode to read, or (Peak Fitter only) an .xye file and its x unit.
 
 Steps
-1. Int's display: Reload and Fit take the trace Int shows, as it shows it (its
-   frame, 1-D mode, axis, χ slice, normalization and Set BG).
+1. Int's display: Reload and Fit current take the trace Int shows, as it shows
+   it (its frame, 1-D mode, axis, χ slice, normalization and Set BG).
 2. Choose file…: pick the file; a popup asks a NeXus result's frame and 1-D mode,
    or an .xye file's x unit (a file name's prefix only suggests it). The chosen
    frame is read and shown at once; step the Frame row or change the 1-D mode row
@@ -940,31 +942,37 @@ Steps
    from its list. Following Int's display it lists Int's frames, and a step moves
    the main window to that frame; this window then shows that frame's trace. With
    a NeXus file it lists that file's frames and Int stays where it is. A running
-   Batch holds it.
-4. Batch fits every frame of the source's NeXus result (Int's display: the file
-   and 1-D mode it shows) from each frame's stored 1-D curve, then shows the last
-   frame; the trend plots the results against the frame number. Stepping through
-   the frames afterwards keeps the trend; Fit on one of them shows that frame's
-   fit and leaves the batch's rows (Batch again to refresh them).
+   Fit all holds it.
+4. Fit all fits every frame of the source's NeXus result as one batch (Int's
+   display: the file and 1-D mode it shows) from each frame's stored 1-D curve;
+   the plot and the table follow each frame as it is fitted, and the trend plots
+   the results against the frame number. Pause holds the run after the frame
+   being fitted (Resume goes on); Stop ends it there and keeps every frame fitted
+   so far. While it runs, its options, the fit range on the plot and Reload are
+   locked.
+   Stepping through the frames afterwards keeps the trend; Fit current on one of
+   them shows that frame's fit and leaves the run's rows (run Fit all again to
+   refresh them).
 5. Export Jupyter… or Export marimo… with a NeXus source names the file and its
    frames in the notebook, which reads them again; nothing is copied.
 
 Units and conventions
-A file's frame is fitted on its stored axis. With Int's display, Batch places
+A file's frame is fitted on its stored axis. With Int's display, Fit all places
 each stored curve on the axis Int shows: q (Å⁻¹) and 2θ (°) convert at the
 file's recorded wavelength, as Int's plot converts them.
 
 Assumptions
-Batch fits stored curves as saved: Int's χ slice, normalization and Set BG are
+Fit all fits stored curves as saved: Int's χ slice, normalization and Set BG are
 display-only and are not applied, so remove a substrate with the template
 (substrate) background, which a notebook also replays. The source is the input,
 not a fit setting: it is not saved with the settings.
 
 Expected observations
 The Source card names the source; its tooltip gives the file's full path. A
-running batch counts its frames in the status ("Batch fitting… 312/651") and
-fills the trend as each frame is fitted; at its end it draws the last frame and
-says how many frames were fitted.
+running Fit all counts its frames in the status ("Fitting all frames…
+312/651"), fills the trend and shows each fitted frame; at its end it shows the
+last frame and says how many were fitted ("Done: 651 of 651 frames fitted", or
+"Stopped: 312 of 651 frames fitted").
 
 Diagnostics
 FIT_SOURCE_FRAME_MISSING or FIT_SOURCE_MODE_MISSING: the file holds no such
@@ -974,13 +982,13 @@ file is missing or not an xdart NeXus result. Phase Analysis refuses an .xye
 file when it is chosen: it records no wavelength.
 
 Common mistakes and corrective actions
-Expecting Batch to fit Int's χ slice or Set BG-subtracted traces: it fits the
+Expecting Fit all to fit Int's χ slice or Set BG-subtracted traces: it fits the
 stored curves; use the template background for a substrate. A changed file is
 reported in an exported notebook as INPUT_CHANGED: export it again.
 
 Worked example
 A 651-frame temperature series: choose its _int1d.nexus file, frame 0, mode
-default; set the range around one reflection; press Batch, then follow the
+default; set the range around one reflection; press Fit all, then follow the
 center and FWHM against the frame number in the trend.
 
 References

@@ -113,7 +113,7 @@ def test_file_single_fit_with_changed_settings_keeps_the_whole_batch_and_csv(qap
         assert host._shown_outcome.result.model == "gaussian"
         host.export_csv(csv)
         assert csv.read_bytes() == original
-        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them.")
+        assert dialog.status.text().endswith("The trend keeps the rows from Fit all; run Fit all again to refresh them.")
         dialog.batch_btn.click()
         _drain(qapp, host)
         assert host.holds_batch and host.outcomes is not outcomes

@@ -41,7 +41,7 @@ def test_binding_a_template_keeps_the_batch_on_a_same_settings_refit(qapp, tmp_p
         # Claude's F5 contract (item 14, R7 F5): one Fit after a batch is shown and leaves every batch row, so frame 3
         # keeps its compact batch row (this row asserted its replacement before the contract; disclosed)
         assert host.outcomes[3].ok and host.outcomes[3].result is None and host._shown_outcome is not None
-        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them.")
+        assert dialog.status.text().endswith("The trend keeps the rows from Fit all; run Fit all again to refresh them.")
     finally:
         _close_page(page, qapp)
 
@@ -83,7 +83,7 @@ def test_a_single_fit_holds_the_frame_navigator_until_its_terminal(qapp, tmp_pat
         dialog.fit_btn.click()
         assert _until(qapp, entered.is_set)
         assert not dialog.source_row.frames_row.editor.isEnabled()
-        assert dialog.batch_btn.text() == "Batch"  # a single Fit does not become a cancellable Batch
+        assert dialog.batch_btn.text() == "Fit all"  # a single Fit does not become a stoppable Fit all (item 14 names)
     finally:
         release.set()
 
@@ -145,6 +145,6 @@ def test_int_frame_step_retires_the_previous_overlay_without_losing_batch(qapp, 
         assert len(host.outcomes) == 5 and len(dialog.trend.table()[0]) == 5
         assert host.outcomes[2].result is None
         assert "fit" in {item.name() for item in dialog.fit_view.plot.getPlotItem().listDataItems()}
-        assert dialog.status.text().endswith("The trend keeps the batch's rows; Batch again to refresh them."), dialog.status.text()
+        assert dialog.status.text().endswith("The trend keeps the rows from Fit all; run Fit all again to refresh them."), dialog.status.text()
     finally:
         _close_page(page, qapp)

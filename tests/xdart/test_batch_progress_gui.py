@@ -128,18 +128,18 @@ def test_a_batch_counts_its_frames_and_streams_each_fitted_frame_into_the_trend(
     host.dialog.batch_btn.click()
     assert host.computing and trend.table()[0] == ()  # the earlier result's rows go as the batch starts
     gates[0].set()
-    assert _until(lambda: status.text() == "Batch fitting… 1/3"), status.text()
+    assert _until(lambda: status.text() == "Fitting all frames… 1/3"), status.text()  # item 14 names (disclosed)
     assert _until(lambda: len(trend.table()[0]) == 1), trend.table()[0]
     assert trend.table()[1] == (10.0,)
     gates[1].set()
-    assert _until(lambda: status.text() == "Batch fitting… 2/3"), status.text()
+    assert _until(lambda: status.text() == "Fitting all frames… 2/3"), status.text()
     assert _until(lambda: len(trend.table()[0]) == 2), trend.table()[0]  # held rows reach the trend unprompted
     assert trend.table()[1] == (10.0, 11.0)
     gates[2].set()
     assert _until(lambda: not host.computing)
     assert len(host.outcomes) == 3 and all(outcome.ok for outcome in host.outcomes)
     assert trend.table()[1] == (10.0, 11.0, 12.0)
-    assert status.text() == "Batch done: 3 of 3 frames fitted", status.text()
+    assert status.text() == "Done: 3 of 3 frames fitted", status.text()
     assert per_row == []  # streamed and final rows go through the trend's one-redraw bulk
     assert counted[-1] == (3, 3) or counted[-1] == (2, 3)
     host.dialog.close()

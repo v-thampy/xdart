@@ -8,7 +8,7 @@ from pathlib import PurePath
 import logging
 import os
 
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
 from xdart.gui.themes.spacing import SpacingTokens, current_spacing_tokens
 from xrd_tools.core.filters import GRAMMAR_HELP
@@ -33,6 +33,9 @@ def _spaced(base: int, tokens: SpacingTokens) -> int:
 
 PROCESSING_ROW_LABEL_WIDTH = 72
 PROCESSING_ROW_GAP = 5
+#: a FormRow's label is at least this wide and its box this far after it (``align_row_labels`` lines up a column's)
+FORM_ROW_LABEL_WIDTH = 76
+FORM_ROW_GAP = 6
 PROCESSING_PILL_TOP_MARGIN = 3
 
 
@@ -830,11 +833,11 @@ class FormRow(QtWidgets.QWidget):
         self._help_focus_transfer = False
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
+        lay.setSpacing(FORM_ROW_GAP)
 
         self.label = QtWidgets.QLabel(label)
         self.label.setObjectName("controlsFieldLabel")
-        self.label.setMinimumWidth(76)
+        self.label.setMinimumWidth(FORM_ROW_LABEL_WIDTH)
 
         if kind == "bool":
             # The Qt-backed integrator panel uses checkable QPushButtons for
@@ -1620,6 +1623,66 @@ class RangeRow(QtWidgets.QWidget):
         # Even when two exact model values share one rounded presentation,
         # this accepted unfocused projection supersedes the prior UI draft.
         edit.setModified(False)
+
+
+def align_row_labels(root: QtWidgets.QWidget) -> int:
+    """One label column for the rows under ``root`` (NEXT-128-WINDOW-POLISH item 14: the maintainer's "the spacing
+    between the labels and the input boxes is inconsistent", and his "Whole panel (Recommended)"): every FormRow's and
+    RangeRow's label is as wide as the widest of them (never narrower than a FormRow's own), so every first box starts
+    at one x, one FormRow gap after it (a RangeRow's tighter gap is made up in its label). A row inside another row (a
+    background's Degree, the Peaks row's Auto) and a row whose label is hidden (a toggle) keep their own. Hidden rows
+    count, so the column stays put as options show and hide rows. Returns the column's width (0: no row)."""
+    rows = []
+    for widget in root.findChildren(QtWidgets.QWidget):
+        if not isinstance(widget, (FormRow, RangeRow)) or widget.label.isHidden():
+            continue
+        parent = widget.parentWidget()
+        while parent is not None and parent is not root and not isinstance(parent, (FormRow, RangeRow)):
+            parent = parent.parentWidget()
+        if parent is root:
+            rows.append(widget)
+    if not rows:
+        return 0
+    width = max(FORM_ROW_LABEL_WIDTH, *(row.label.sizeHint().width() for row in rows))
+    for row in rows:
+        row.label.setMinimumWidth(width + FORM_ROW_GAP - row.layout().spacing())
+    return width
+
+
+class _BoldTextWidth(QtCore.QObject):
+    """``fit_bold_text``'s keeper: the button's minimum width, measured again as its font or style changes."""
+
+    def __init__(self, button: QtWidgets.QPushButton) -> None:
+        super().__init__(button)
+        self._button = button
+        button.installEventFilter(self)
+        self.apply()
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in (QtCore.QEvent.Type.Polish, QtCore.QEvent.Type.FontChange,
+                            QtCore.QEvent.Type.StyleChange):
+            self.apply()
+        return False
+
+    def apply(self) -> None:
+        button = self._button
+        font = QtGui.QFont(button.font())
+        font.setBold(True)
+        metrics = QtGui.QFontMetrics(font)
+        option = QtWidgets.QStyleOptionButton()
+        option.initFrom(button)
+        option.text = button.text()
+        content = metrics.size(QtCore.Qt.TextFlag.TextShowMnemonic, button.text())  # as QPushButton measures it
+        size = button.style().sizeFromContents(QtWidgets.QStyle.ContentsType.CT_PushButton, option, content, button)
+        button.setMinimumWidth(max(size.width(), button.sizeHint().width()))
+
+
+def fit_bold_text(button: QtWidgets.QPushButton) -> None:
+    """Keep a checkable ``button`` wide enough for its text in bold, as the theme draws a checked button's
+    (``QPushButton:checked``'s font-weight) while its size hint is the normal text's (NEXT-128-WINDOW-POLISH item 14:
+    "the Components label is clipped on both ends"): the style's size for the bold text, as ``CompactFrameSelector``
+    measures its field, kept through font and style changes."""
+    _BoldTextWidth(button)
 
 
 class PillRow(QtWidgets.QWidget):

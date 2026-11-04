@@ -84,11 +84,19 @@ TOPICS = {"model": "peak-fit.model", "background": "peak-fit.background", "peaks
           "range": "peak-fit.range", "weighting": "peak-fit.weighting"}
 #: the Source card's help, shared with Phase Analysis (NEXT-128-WINDOW-POLISH item 11)
 SOURCE_TOPIC = "fit.source"
-SOURCE_TIP = ("What Fit, Reload and Batch read: the trace Int shows (the default) or a file you choose, a processed "
-              "NeXus result's frame or an .xye file.")
+SOURCE_TIP = ("What Fit current, Fit all and Reload read: the trace Int shows (the default) or a file you choose, a "
+              "processed NeXus result's frame or an .xye file.")
 _BATCH_TIP = "Fit every frame in the scan with these settings, then plot the parameters vs frame number."
 #: why the Source card's Frame row waits (NEXT-128-WINDOW-POLISH item 14), in both windows
-_FRAMES_WAIT = "A batch is fitting; step frames when it is done."
+_FRAMES_WAIT = "Fit all is running; step frames when it is done."
+#: the run buttons' words (NEXT-128-WINDOW-POLISH item 14, the maintainer, 2026-11-04: "add a Pause/Resume button in
+#: addition to Cancel. And replace Cancel with Stop. Also replace Fit/Batch with Fit Current/Fit All or something like
+#: that for clarity"), in both windows, with their tips
+FIT_CURRENT, FIT_ALL, STOP, PAUSE, RESUME = "Fit current", "Fit all", "Stop", "Pause", "Resume"
+FIT_CURRENT_TIP = "Fit the frame shown with these settings."
+STOP_TIP = "Stop after the frame being fitted: every frame fitted so far stays in the trend, the table and Save CSV."
+PAUSE_TIP = "Pause after the frame being fitted; Resume continues with the next frame."
+RESUME_TIP = "Continue fitting with the next frame."
 #: the Peak Fitter's saved settings (Save settings…, Load settings…); no last-session restore
 PEAK_FIT_SETTINGS = SettingsKind("xdart-peak-fit-settings", 1, "peak_fit_settings", "Peak Fitter",
                                  sections=("background_template",))
@@ -107,6 +115,54 @@ def _trace_title(trace):
     """The fit view's title for a displayed trace: its title and frame."""
     frame = getattr(getattr(trace, "receipt", None), "frame_label", "")
     return f"{trace.title} · frame {frame}" if frame else trace.title
+
+
+def pause_button(parent=None):
+    """Fit all's Pause, beside its Stop: shown only while a run runs (both windows)."""
+    button = QtWidgets.QPushButton(PAUSE, parent)
+    button.setObjectName("fitRunPause")
+    button.setAutoDefault(False)
+    button.setToolTip(PAUSE_TIP)
+    button.hide()
+    return button
+
+
+def show_run(dialog, running):
+    """A window as its Fit all starts or ends (both windows): Fit all reads Stop and Pause shows, unpaused; the run's
+    options, the fit range on the plot and Reload are locked until it ends (the maintainer's "Lock during a run
+    (Recommended)": an option changed mid-run would make the run's results unadoptable)."""
+    running = bool(running)
+    dialog._stopping = False
+    dialog.batch_btn.setText(STOP if running else FIT_ALL)
+    dialog.pause_btn.setVisible(running)
+    dialog.pause_btn.setEnabled(running)
+    show_run_paused(dialog, False)
+    dialog.split.set_options_locked(running)
+    dialog.fit_view.set_fit_range_locked(running)
+    dialog.refresh_btn.setEnabled(not running)
+
+
+def show_run_paused(dialog, paused):
+    """A running Fit all paused (Pause reads Resume) or resumed."""
+    dialog.pause_btn.setText(RESUME if paused else PAUSE)
+    dialog.pause_btn.setToolTip(RESUME_TIP if paused else PAUSE_TIP)
+
+
+def show_fitted_trace(dialog, trace):
+    """A running Fit all's latest fitted frame in either window, before its host draws the fit over it: the points
+    and title only, every option as it is (``set_vnext_trace`` writes typed range bounds and the uncertainty switch;
+    NEXT-128-WINDOW-POLISH item 14)."""
+    dialog._x = np.asarray(trace.axis, dtype=float)
+    dialog._y = np.asarray(trace.intensity, dtype=float)
+    dialog._x_label = trace.label or "q"
+    dialog.fit_view.set_title(_trace_title(trace))
+
+
+def show_run_stopping(dialog):
+    """Stop pressed: the run ends after the frame being fitted, and neither Stop nor Pause does more meanwhile."""
+    dialog._stopping = True
+    dialog.batch_btn.setEnabled(False)
+    dialog.pause_btn.setEnabled(False)
 
 
 def _combo(label, name, choices, default=None):
@@ -136,6 +192,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         #: Int's windows choose their input in a Source card (NEXT-128-WINDOW-POLISH item 11); other hosts have none
         self._source_enabled = bool(source)
         self._batch_reason, self._batch_tip = "", _BATCH_TIP
+        self._stopping = False  # Stop pressed on a running Fit all (``show_run_stopping``)
         self._export_trace = None
         self._export_snapshot_provider = None
         self._provider = (
@@ -278,10 +335,12 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.live_check.setToolTip(
             "Re-fit automatically as new frames arrive during a scan "
             "(latest-wins — the fit tracks the newest frame).")
-        self.fit_btn = QtWidgets.QPushButton("Fit")
+        self.fit_btn = QtWidgets.QPushButton(FIT_CURRENT)
         self.fit_btn.setObjectName("peakFitGo")
-        self.batch_btn = QtWidgets.QPushButton("Batch")
+        self.fit_btn.setToolTip(FIT_CURRENT_TIP)
+        self.batch_btn = QtWidgets.QPushButton(FIT_ALL)
         self.batch_btn.setToolTip(_BATCH_TIP)
+        self.pause_btn = pause_button(self)
         self.load_settings_btn = QtWidgets.QPushButton("Load settings…")
         self.load_settings_btn.setToolTip("Restore every option and the template's file from a saved Peak Fitter "
                                           "settings file; a captured trace not named by its file is not saved.")
@@ -296,6 +355,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         actions.addWidget(self.refresh_btn)
         actions.addWidget(self.live_row)
         actions.addWidget(self.fit_btn)
+        actions.addWidget(self.pause_btn)
         actions.addWidget(self.batch_btn)
         lay.addLayout(actions)
 
@@ -305,6 +365,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.status.setToolTip("Peak Fitter status: the loaded trace, refusals and the fit's result.")
         lay.addWidget(self.status)
         self.trend.messageChanged.connect(self.status.setText)
+        self.background_template_row.messageChanged.connect(self.status.setText)  # its line's changes (item 14)
 
         self.fit_btn.clicked.connect(self._do_fit)
         self.refresh_btn.clicked.connect(self.refresh_pattern)
@@ -507,26 +568,25 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._show_pattern(x, y, x_label, clear_fit=True)
 
     def set_batch_running(self, running):
-        """Reflect a batch run in flight: the Batch button becomes Cancel and
-        the single-frame controls are disabled (the workspace owns the run)."""
-        self.batch_btn.setText("Cancel" if running else "Batch")
+        """Reflect a Fit all run in flight: Fit all becomes Stop beside a Pause, the options are locked
+        (``show_run``) and the single-frame controls are disabled (the host owns the run)."""
         self.fit_btn.setEnabled(not running)
         self.live_check.setEnabled(not running and not self._vnext)
         self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
-        self.batch_btn.setToolTip("Cancel the batch; the running solve finishes first." if running else
-                                  self._batch_reason or self._batch_tip)
+        self.batch_btn.setToolTip(STOP_TIP if running else self._batch_reason or self._batch_tip)
+        show_run(self, running)
         # a capture shares the host's fit worker: it waits for a running batch rather than replace it
-        self.background_template_row.set_busy('A batch is fitting; capture the template when it is done.'
+        self.background_template_row.set_busy('Fit all is running; capture the template when it is done.'
                                               if running else '')
         if self.source_row is not None:  # a step would change the source under the batch (item 14)
             self.source_row.set_busy(_FRAMES_WAIT if running else '')
 
     def set_batch_reason(self, reason="", tooltip=""):
         """The host's Batch (NEXT-128-WINDOW-POLISH item 11): enabled when ``reason`` is "", its tooltip then saying
-        what it fits (``tooltip``); otherwise disabled, its tooltip saying why. A running batch keeps its Cancel."""
+        what it fits (``tooltip``); otherwise disabled, its tooltip saying why. A running batch keeps its Stop."""
         self._batch_reason, self._batch_tip = str(reason or ""), str(tooltip or _BATCH_TIP)
         self._allow_batch = not self._batch_reason
-        if self.batch_btn.text() != "Cancel":
+        if self.batch_btn.text() != STOP:
             self.batch_btn.setEnabled(not self._vnext or self._allow_batch)
             self.batch_btn.setToolTip(self._batch_reason or self._batch_tip)
 
@@ -535,9 +595,17 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         return None if self.source_row is None else self.source_row.source
 
     def set_batch_progress(self, done, total):
-        """A running Batch's count (NEXT-128-WINDOW-POLISH item 14: "there is no update progress and i have no idea
-        where things stand"); the host draws its fitted frames into the trend as they come."""
-        self.status.setText(f"Batch fitting… {done}/{total}")
+        """A running Fit all's count (NEXT-128-WINDOW-POLISH item 14: "there is no update progress and i have no idea
+        where things stand"); the host draws its fitted frames into the trend, the plot and the table as they come."""
+        self.status.setText(f"Fitting all frames… {done}/{total}")
+
+    def set_batch_paused(self, paused):
+        """A running Fit all paused or resumed (item 14: "add a Pause/Resume button"): Pause reads Resume meanwhile."""
+        show_run_paused(self, paused)
+
+    def set_batch_stopping(self):
+        """Stop pressed (item 14: "replace Cancel with Stop"): the run ends after the frame being fitted."""
+        show_run_stopping(self)
 
     def _pattern_panel(self, *series, markers=()):
         """The upper panel: the pattern's points ("data", the 1-D plot's markers), then ``series`` (fit,

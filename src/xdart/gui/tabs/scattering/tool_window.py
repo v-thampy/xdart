@@ -6,11 +6,19 @@ on the right"). The options column is Int's controls column (``_HugWidthScrollAr
 never narrower than its widest row, so the splitter shrinks the plots, never the options, and every "?" stays in view
 ("when it opens the left panel with the controls is not fully expanded - the question marks are hidden"). The
 displays stack in a vertical splitter, and each pane scrolls on its own when the window is small.
+
+The options column keeps one label column (NEXT-128-WINDOW-POLISH item 14: the maintainer's "the spacing between the
+labels and the input boxes is inconsistent ... same in the Peak Fitting window", his "Whole panel (Recommended)"): every
+box starts at one x, set by the column's longest label, measured again as rows are added and as fonts and styles
+change. ``set_options_locked`` locks every card's rows while a window's Fit all runs (his "Lock during a run
+(Recommended)"), each card's header, and its "?", staying usable.
 """
 
 from __future__ import annotations
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+from xdart.gui.widgets.controls_panel import align_row_labels
 
 from .workspace_shell import _HugWidthScrollArea
 
@@ -20,6 +28,9 @@ OPENING_SIZE = (1400, 1200)
 OPTIONS_WIDTH = 440
 
 _WIDTH_TIP = "Drag to share the width between the options and the plots."
+#: the options column's events that may change a label's width or add a row: its label column is measured again
+_REALIGN = (QtCore.QEvent.Type.Show, QtCore.QEvent.Type.LayoutRequest, QtCore.QEvent.Type.FontChange,
+            QtCore.QEvent.Type.StyleChange)
 _HEIGHT_TIP = "Drag to share the height between the fit, the trend and the table."
 
 
@@ -41,6 +52,8 @@ class ToolWindowSplit(QtWidgets.QSplitter):
         self._cards.setContentsMargins(0, 0, 6, 0)
         self._cards.addStretch(1)
         self.controls.setWidget(column)
+        self._column, self._card_widgets = column, []
+        column.installEventFilter(self)
         area = QtWidgets.QScrollArea(self)
         area.setObjectName(f"{name}Displays")
         area.setWidgetResizable(True)
@@ -56,6 +69,24 @@ class ToolWindowSplit(QtWidgets.QSplitter):
     def add_card(self, widget: QtWidgets.QWidget) -> None:
         """A card (or row) at the end of the options column, above its closing stretch."""
         self._cards.insertWidget(self._cards.count() - 1, widget)
+        self._card_widgets.append(widget)
+        self.align_labels()
+
+    def align_labels(self) -> int:
+        """Line up every box of the options column after one label column (``align_row_labels``); its width."""
+        return align_row_labels(self._column)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._column and event.type() in _REALIGN:
+            self.align_labels()
+        return super().eventFilter(watched, event)
+
+    def set_options_locked(self, locked: bool) -> None:
+        """Lock (or unlock) every card's rows: a card's body, or a bare row, is disabled, so its header and "?" stay
+        usable, and unlocking gives each row back the state its window gave it (Qt keeps a row disabled on its own)."""
+        for card in self._card_widgets:
+            body = getattr(card, "body", None)
+            (card if body is None else body).setEnabled(not locked)
 
     def add_display(self, widget: QtWidgets.QWidget, stretch: int) -> None:
         """A display below the others, taking ``stretch`` shares of the height as the window grows."""
