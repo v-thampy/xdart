@@ -233,3 +233,28 @@ def test_n5_following_ints_display_it_lists_ints_frames_and_a_step_moves_int_the
         assert navigator.selector.currentIndex() == target
     finally:
         _close_page(page, qapp)
+
+
+def test_n6_phase_analysis_has_the_same_frame_row_and_a_batch_holds_it(qapp):
+    """Both windows (his "Mirror Int's frames"): Phase Analysis's Source card mirrors Int's footer in its Frame row, and
+    its Batch holds the row as the Peak Fitter's does."""
+    from tests.xdart.test_fit_source_gui import _window
+    page = _page()
+    try:
+        dialog, _host = _window(page, "phase")
+        row = dialog.source_row
+        assert row.frames_row.isVisible() and row.frames_row.help_button is not None
+        footer = page._shell.scientific.frame_selector
+        keys = [object() for _ in range(3)]
+        for index, key in enumerate(keys):
+            footer.add_frame(f"f{index}", key, f"scan:{index}")
+        footer.setCurrentIndex(1)
+        page._sync_fit_frames("phase")
+        navigator = row.frames_row.editor
+        assert navigator.selector.count() == 3 and navigator.selector.currentData() is keys[1]
+        dialog.set_batch_running(True)
+        assert not navigator.isEnabled() and "batch is fitting" in row.frames_row.toolTip()
+        dialog.set_batch_running(False)
+        assert navigator.isEnabled()
+    finally:
+        _close_page(page, qapp)
