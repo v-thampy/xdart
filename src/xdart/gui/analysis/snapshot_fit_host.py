@@ -386,8 +386,10 @@ class SnapshotFitHost(QtCore.QObject):
         else:
             self.outcomes, self._keys, self._trend_rows = tuple(outcomes), keys, rows
             self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
-        self._last_settings = settings
         self._adopt_template(outcomes)
+        # Binding the template's content identity is a result of this fit, not a settings edit. Remember that bound
+        # form so a same-controls re-fit of a batch frame replaces its row instead of discarding the other frames.
+        self._last_settings = plain_settings(dict(self._request_settings(request.action)))
         self.dialog.trend.clear()
         # every row in one redraw (item 14): one ``set_row`` per outcome redrew every row each time
         self.dialog.trend.set_rows(self._trend_rows, phase_names=self._trend_phases)
