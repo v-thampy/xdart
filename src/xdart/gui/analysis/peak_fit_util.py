@@ -99,8 +99,9 @@ def group_families(keys, *, phase=False, phase_names=()):
                                     if head and tail in _CELL_KEYS))
     fam = {}
     for key in keys:
-        # a background's parameter is a family of its own with no peak or phase: the chooser never hides it
-        f, member = (key, None) if is_background(key) else (_phase_family(key, phases) or split_family(key))
+        # Declared phase names can start with bg_/bgx_. Resolve their cells before treating the remaining keys as
+        # independent background parameters (which the chooser never hides).
+        f, member = _phase_family(key, phases) or ((key, None) if is_background(key) else split_family(key))
         fam.setdefault(f, []).append((key, member))
     order = {phase: position for position, phase in enumerate(phases)}
     for f in fam:
