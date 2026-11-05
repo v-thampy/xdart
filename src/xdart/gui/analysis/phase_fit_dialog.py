@@ -116,6 +116,10 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     """The Phase Analysis window; ``vnext_submit(action, values)`` is its host's ("reload", "fit", "close",
     "capture_template"), and ``allow_batch`` whether the host can fit a batch (Stitch can; Int's is held)."""
 
+    #: the topic whose illustrated guide this window's Help offers for the topics the fit windows share (the Source
+    #: card's, NEXT-129-SOURCE-GUIDE): Phase Analysis's
+    help_guide_topic = TOPICS["phases"]
+
     def __init__(self, parent=None, *, vnext_submit=None, allow_batch=False, source=False):
         super().__init__(parent)
         #: Int's windows choose their input in a Source card (NEXT-128-WINDOW-POLISH item 11); other hosts have none
@@ -157,8 +161,9 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         # The shared split's opening size, within the screen; the fit first, each splitter keeps its proportions.
         self.split.open(self, heights=(600, 260, 140))
         # F1 opens help for the focused option from the first keystroke. The illustrated guide opens from the Help
-        # window's Illustrated guide, for any of this window's topics (NEXT-128-WINDOW-POLISH retired the window's top
-        # "?": the maintainer, 2026-11-02, "Remove it (Recommended)").
+        # window's Illustrated guide, for any of this window's topics, the shared Source card's too (its
+        # ``help_guide_topic``, NEXT-129-SOURCE-GUIDE). NEXT-128-WINDOW-POLISH retired the window's top "?": the
+        # maintainer, 2026-11-02, "Remove it (Recommended)".
         from xdart.gui.widgets.context_help import owner_for
         owner_for(self)
 

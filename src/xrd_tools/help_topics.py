@@ -1015,6 +1015,9 @@ _FIGURES = {
 #: "?" or F1; NEXT-128-WINDOW-POLISH retired the tool windows' top "?"). Its figures are drawn by
 #: xrd_tools.guide_figures from xdart's own models.
 _GUIDES = {"peak-fit": "peak-fit.html", "phase-analysis": "phase-analysis.html", "strain": "strain.html"}
+#: The family of the topics the fit windows share (the Source card's "fit.source"): no one tool owns them, so they name
+#: no guide, and the Help window offers the guide of the tool window it was opened from (NEXT-129-SOURCE-GUIDE).
+SHARED_FAMILY = "fit"
 GUIDE_DIR = Path(__file__).resolve().parent / "assets" / "help"
 TOPICS = tuple(replace(t, figures=_FIGURES.get(t.identifier, ()),
                       run_key='orientation-check' if t.identifier == 'geometry.orientation' else None,
