@@ -62,14 +62,17 @@ def _opens(window, opened, qapp, name):
 
 
 def _pick(window, qapp, identifier):
-    """Select a topic in the Help window's own topic list with a click, as a user does."""
-    from xrd_tools.help_topics import get_topic
+    """Select a topic in the Help window's own topic list as a user does: search for it, then click it (the pattern
+    test_context_help runs on CI)."""
+    search = window.search_row.editor
+    search.clear()
+    QtTest.QTest.keyClicks(search, identifier)
+    qapp.processEvents()
     scans = window.browser.scans
-    item = next(scans.item(row) for row in range(scans.count())
-                if scans.item(row).text() == get_topic(identifier).title)
-    scans.scrollToItem(item)
-    QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
-                            pos=scans.visualItemRect(item).center())
+    assert scans.count() == 1, identifier
+    rect = scans.visualItemRect(scans.item(0))
+    assert scans.viewport().rect().contains(rect.center()), identifier
+    QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.MouseButton.LeftButton, pos=rect.center())
     qapp.processEvents()
     assert window.topic_id == identifier
 
