@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from xrd_tools.help_topics import TOPICS, get_topic, search_topics
+from xrd_tools.help_topics import SHARED_FAMILY, TOPICS, get_topic, search_topics
 from .read_only_text import ReadOnlyTextWindow
 
 
@@ -80,6 +80,7 @@ class HelpWindow(ReadOnlyTextWindow):
         from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
         self._entry_type = BrowserResult
         self.topic_id = None
+        self._guide_topic = None  # the topic whose tool's guide Illustrated guide opens (``_guide_for``)
         self.figure_view = None
         self._walkthrough = False
         self._details = ''
@@ -126,12 +127,25 @@ class HelpWindow(ReadOnlyTextWindow):
                                              for t in topics), self.topic_id)
 
     def _open_guide(self) -> None:
-        reason = open_guide(self.topic_id) if self.topic_id else "Select a topic first."
+        reason = open_guide(self._guide_topic or self.topic_id) if self.topic_id else "Select a topic first."
         if reason:
             self.pane.appendPlainText("\n" + reason)
 
+    def _guide_for(self, topic):
+        """The topic whose tool's guide Illustrated guide opens for ``topic``, or None: the topic's own tool's; for a
+        topic the fit windows share (``SHARED_FAMILY``, the Source card's), the tool window's this help belongs to, the
+        topic it names as ``help_guide_topic`` (NEXT-129-SOURCE-GUIDE: the maintainer, 2026-11-05, "the button that
+        brought up the illustrated guides is no longer there in the help windows")."""
+        if topic.guide is not None:
+            return topic.identifier
+        if topic.identifier.split(".", 1)[0] != SHARED_FAMILY:
+            return None
+        own = get_topic(str(getattr(self.parentWidget(), "help_guide_topic", "") or ""))
+        return own.identifier if own is not None and own.guide is not None else None
+
     def show_index(self, requested: str | None = None, details: str = "") -> None:
         self.topic_id = None
+        self._guide_topic = None
         self.guide_button.hide()
         if self.figure_view is not None:
             for widget in self._figure_widgets:
@@ -153,7 +167,8 @@ class HelpWindow(ReadOnlyTextWindow):
         self.topic_id = identifier
         self._details = details
         self._walkthrough = identifier == 'geometry.orientation'
-        self.guide_button.setVisible(topic.guide is not None)
+        self._guide_topic = self._guide_for(topic)
+        self.guide_button.setVisible(self._guide_topic is not None)
         self._search(self.search_row.editor.text())
         self.set_text(topic.title + "\n" + topic.identifier + "\n\n" + topic.text +
                       ("\n\nCurrent context\n" + details if details else ""))
