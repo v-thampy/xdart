@@ -932,7 +932,7 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._running = bool(running)
         show_run(self, running)
         self.advanced_btn.setEnabled(not running)
-        self.advanced.setEnabled(not running)  # an open Advanced window's options are the run's too
+        self.advanced.set_editors_enabled(not running)  # lock its options while contextual header help stays usable
         if self.source_row is not None:  # a step would change the source under the batch (item 14)
             self.source_row.set_busy(_FRAMES_WAIT if running else '')
         self._sync_actions()
