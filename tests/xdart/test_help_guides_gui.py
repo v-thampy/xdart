@@ -8,6 +8,15 @@ illustrated guide button in any of the help windows, right?", then "Remove it (R
 neither window has it, every section "?" reaches the guide through the Help window's Illustrated guide, F1 in an option
 still opens help before any help was opened, and the missing-guide and browser-refusal rows go through the Help window.
 Frozen before that change (red on 034723d4).
+
+NEXT-129-SOURCE-GUIDE (the maintainer, 2026-11-05, on 1.2.8: "the button that brought up the illustrated guides is no
+longer there in the help windows"): the Source card's "?" opened "fit.source", the topic both fit windows share, which no
+one tool's guide owned, so the Help window hid Illustrated guide there. The windows are now built as Int's page builds
+them (``source=True``), so the every-"?" row reaches the Source card's three "?" (a disclosed oracle repair: that row
+built them without the card, and it checked the topic's own guide, which a shared topic has none of, where it now
+checks the guide that opens). The shared topic offers the guide of the window it was opened from, by "?", by F1 and from
+the Help window's topic list; a topic another tool owns keeps its own guide, a topic of no tool offers none, and a
+window that is not a tool's offers none for the shared topic. Frozen before the product change (red on 64466046).
 """
 from pathlib import Path
 
@@ -35,10 +44,34 @@ def isolated_library(tmp_path, monkeypatch):
     monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
 
 
-def _dialog(kind):
+def _dialog(kind, source=False):
     from xdart.gui.analysis.peak_fit_dialog import PeakFitDialog
     from xdart.gui.analysis.phase_fit_dialog import PhaseFitDialog
-    return (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None)
+    return (PeakFitDialog if kind == "peak" else PhaseFitDialog)(vnext_submit=lambda *_args: None, source=source)
+
+
+def _opens(window, opened, qapp, name):
+    """Illustrated guide is offered and opens the packaged guide ``name`` in the system browser."""
+    assert not window.guide_button.isHidden() and window.guide_button.toolTip(), window.topic_id
+    before = len(opened)
+    window.guide_button.click()
+    qapp.processEvents()
+    assert len(opened) == before + 1, window.topic_id
+    path = Path(opened[-1].toLocalFile())
+    assert opened[-1].isLocalFile() and path.name == name and path.is_file(), (window.topic_id, path)
+
+
+def _pick(window, qapp, identifier):
+    """Select a topic in the Help window's own topic list with a click, as a user does."""
+    from xrd_tools.help_topics import get_topic
+    scans = window.browser.scans
+    item = next(scans.item(row) for row in range(scans.count())
+                if scans.item(row).text() == get_topic(identifier).title)
+    scans.scrollToItem(item)
+    QtTest.QTest.mouseClick(scans.viewport(), QtCore.Qt.MouseButton.LeftButton,
+                            pos=scans.visualItemRect(item).center())
+    qapp.processEvents()
+    assert window.topic_id == identifier
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -58,30 +91,67 @@ def test_tq_neither_tool_window_has_a_top_question_mark(qapp, kind):
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_tq_every_section_question_mark_offers_its_tools_guide_in_the_help_window(qapp, opened, kind):
-    from xrd_tools.help_topics import get_topic
     from xdart.gui.widgets.context_help import owner_for
     from xdart.gui.widgets.controls_panel import ActionButton
-    dialog = _dialog(kind)
+    dialog = _dialog(kind, source=True)  # as Int's page builds it: the Source card first (NEXT-129-SOURCE-GUIDE)
     try:
         dialog.show()
         qapp.processEvents()
         buttons = [button for button in dialog.findChildren(ActionButton) if button.text() == "?"]
         assert buttons
+        topics = set()
         for button in buttons:
             button.click()
             qapp.processEvents()
             window = owner_for(dialog).window
             assert window is not None and window.isVisible()
-            assert get_topic(window.topic_id).guide == GUIDES[kind], window.topic_id
-            assert not window.guide_button.isHidden() and window.guide_button.toolTip()
-            before = len(opened)
-            window.guide_button.click()
-            qapp.processEvents()
-            assert len(opened) == before + 1
-            path = Path(opened[-1].toLocalFile())
-            assert opened[-1].isLocalFile() and path.name == GUIDES[kind] and path.is_file()
+            topics.add(window.topic_id)
+            _opens(window, opened, qapp, GUIDES[kind])
+        assert "fit.source" in topics and len(topics) > 1, topics
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_sg_f1_and_the_topic_list_offer_the_windows_guide_for_the_shared_source_topic(qapp, opened, kind):
+    dialog = _dialog(kind, source=True)
+    try:
+        dialog.show()
+        dialog.activateWindow()
+        dialog.source_row.choose_btn.setFocus()
+        qapp.processEvents()
+        QtTest.QTest.keyClick(dialog.source_row.choose_btn, QtCore.Qt.Key.Key_F1)
+        qapp.processEvents()
+        owner = getattr(dialog, "_context_help_owner", None)
+        assert owner is not None and owner.window is not None
+        window = owner.window
+        assert window.topic_id == "fit.source"
+        _opens(window, opened, qapp, GUIDES[kind])
+        # from the Help window's own list: a topic another tool owns keeps its tool's guide, a topic of no tool has
+        # none, and the shared topic again offers this window's
+        other = "phase" if kind == "peak" else "peak"
+        _pick(window, qapp, "phase-analysis.phases" if other == "phase" else "peak-fit.weighting")
+        _opens(window, opened, qapp, GUIDES[other])
+        _pick(window, qapp, "calibration.multi-step")
+        assert window.guide_button.isHidden()
+        _pick(window, qapp, "fit.source")
+        _opens(window, opened, qapp, GUIDES[kind])
+    finally:
+        dialog.close()
+
+
+def test_sg_the_shared_source_topic_offers_no_guide_outside_a_tool_window(qapp, opened):
+    from xdart.gui.widgets.context_help import owner_for
+    root = QtWidgets.QWidget()
+    try:
+        owner = owner_for(root)
+        owner.show_topic("fit.source")
+        window = owner.window
+        assert window.topic_id == "fit.source" and window.guide_button.isHidden()
+        assert not opened
+    finally:
+        owner_for(root).shutdown()
+        root.deleteLater()
 
 
 def test_g3_the_help_window_offers_the_guide_only_for_topics_that_have_one(qapp, opened):
