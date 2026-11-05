@@ -68,6 +68,7 @@ class _BatchRun:
     def __init__(self):
         self._lock = threading.Lock()
         self._rows, self._shown = [], None
+        self._shown_pending = False
         self._resume, self._stop = threading.Event(), threading.Event()
         self._resume.set()
 
@@ -79,12 +80,19 @@ class _BatchRun:
                 self._rows.append(row)
             if shown is not None:
                 self._shown = shown
+                self._shown_pending = True
 
     def take(self):
         """The rows put since the last take, and the latest frame to show since then (or None)."""
         with self._lock:
-            rows, shown, self._rows, self._shown = self._rows, self._shown, [], None
+            rows, shown, self._rows = self._rows, self._shown if self._shown_pending else None, []
+            self._shown_pending = False
         return rows, shown
+
+    def latest(self):
+        """The last drawable frame, retained after progress takes its notification so terminal adoption can use it."""
+        with self._lock:
+            return self._shown
 
     @property
     def paused(self):
@@ -506,18 +514,19 @@ class SnapshotFitHost(QtCore.QObject):
             return True
         outcomes, snapshot, keys, xs = terminal.payload
         run = request.stream if request.action == 'batch' else None
+        latest = None if run is None else run.latest()
         stopped = run is not None and run.stopped and len(outcomes) < len(request.inputs)
-        if stopped and not any(each.ok for each in outcomes):
+        if stopped and latest is None:
             # Stop before any frame was fitted (item 14): nothing replaces the rows held before the run
             self._restore_trend()
             self.dialog.status.setText(_STOPPED_EMPTY)
             return False
-        self.snapshot = snapshot
+        self.snapshot = snapshot if latest is None else latest[1]
         # a single fit while a batch's rows are held (NEXT-128-WINDOW-POLISH item 14, Codex R7 F5) is shown and changes
         # none of them: its input (a stored curve, or the trace Int shows) and settings need not be the batch's, so
         # one table would mix them; the next Batch replaces the rows (Reload or another source clears them)
         kept = self._batch_held and request.action != 'batch'
-        self._adopt_template(outcomes)
+        self._adopt_template(outcomes if latest is None else (latest[0],))
         if not kept:
             self.outcomes, self._keys = tuple(outcomes), keys
             self._trend_rows = [(each.label, x if request.column or x is not None else float(position), each.params)
@@ -534,15 +543,16 @@ class SnapshotFitHost(QtCore.QObject):
         if not outcomes:
             return False
         outcome = outcomes[-1]
+        displayed = outcome if latest is None else latest[0]
         self._shown_outcome = None
-        if outcome.overlay is not None and self.snapshot is not None:
+        if displayed.overlay is not None and self.snapshot is not None:
             self._show_trace()
-            self._shown_outcome = outcome
-            self._draw_outcome(outcome)
+            self._shown_outcome = displayed
+            self._draw_outcome(displayed)
             if self.kind == 'phase':
-                self.dialog.show_phase_result_details(outcome.result)
+                self.dialog.show_phase_result_details(displayed.result)
             else:
-                self.dialog.table.show_rows(*peak_parameter_rows(outcome.result))
+                self.dialog.table.show_rows(*peak_parameter_rows(displayed.result))
         if request.action == 'batch':  # where the run stands at its end (item 14), a stopped one's frames kept
             fitted = sum(1 for each in self.outcomes if each.ok)
             self.dialog.status.setText((_STOPPED if stopped else _DONE).format(fitted=fitted,
