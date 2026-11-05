@@ -25,6 +25,7 @@ alone or after Template, each of the degree in the shared box in the Background 
 
 import logging
 import math
+from pathlib import Path
 
 from xrd_tools.help_topics import diagnostic_text
 from xrd_tools.session.readiness import (
@@ -111,10 +112,27 @@ def _path(name):
     return ("peak_fit", name)
 
 
-def _trace_title(trace):
-    """The fit view's title for a displayed trace: its title and frame."""
-    frame = getattr(getattr(trace, "receipt", None), "frame_label", "")
-    return f"{trace.title} · frame {frame}" if frame else trace.title
+def _trace_title(trace, number=None):
+    """The fit view's title for a trace: its name and its frame as Int's footer numbers it (``number``, from 1;
+    NEXT-128-WINDOW-POLISH item 14: "Fit Should also start from 1 like Int"). A stored row's receipt carries its
+    selection, which is never shown (it named the frame "meaning='radial';frame=4;..."): its name is its file's."""
+    receipt = getattr(trace, "receipt", None)
+    label = str(getattr(receipt, "frame_label", ""))
+    stored = "=" in label
+    if number is not None:
+        return f"{Path(receipt.artifact).stem if stored else trace.title} · frame {number}"
+    return trace.title if stored or not label else f"{trace.title} · frame {label}"
+
+
+def _frame_title(dialog, trace):
+    """``trace``'s title in ``dialog``, numbered by the host's ``frame_number`` (Int's windows; others keep theirs)."""
+    number = None
+    if callable(getattr(dialog, "frame_number", None)):
+        try:
+            number = dialog.frame_number(trace)
+        except (OSError, ValueError, KeyError, TypeError):
+            number = None
+    return _trace_title(trace, number)
 
 
 def pause_button(parent=None):
@@ -155,7 +173,7 @@ def show_fitted_trace(dialog, trace):
     dialog._x = np.asarray(trace.axis, dtype=float)
     dialog._y = np.asarray(trace.intensity, dtype=float)
     dialog._x_label = trace.label or "q"
-    dialog.fit_view.set_title(_trace_title(trace))
+    dialog.fit_view.set_title(_frame_title(dialog, trace))
 
 
 def show_run_stopping(dialog):
@@ -193,6 +211,8 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._source_enabled = bool(source)
         self._batch_reason, self._batch_tip = "", _BATCH_TIP
         self._stopping = False  # Stop pressed on a running Fit all (``show_run_stopping``)
+        #: a host's numbering of a trace's frame as Int numbers it (Int's page; None: the trace's own label)
+        self.frame_number = None
         self._export_trace = None
         self._export_snapshot_provider = None
         self._provider = (
@@ -907,7 +927,7 @@ class PeakFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if trace.sigma is None:
             self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.label or "q", clear_fit=True, x_unit=trace.axis_unit)
-        self.fit_view.set_title(_trace_title(trace))
+        self.fit_view.set_title(_frame_title(self, trace))
         self.status.setText("Displayed trace captured. Click Fit.")
 
     def _draw_fitted(self):

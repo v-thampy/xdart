@@ -72,7 +72,8 @@ def test_n1_the_shared_navigator_steps_mirrors_and_lists_labels(qapp):
     assert navigator.selector.count() == 2 and navigator.selector.currentIndex() == 0 and seen == [3]
     assert not navigator.previous.isEnabled() and navigator.next.isEnabled()
     navigator.set_labels((10, 11, 12), current=12)
-    assert [navigator.selector.itemText(index) for index in range(3)] == ["10", "11", "12"]
+    # numbered by place from 1, as Int's footer numbers frames (item 14, DECISIONS 23; this row pinned the labels)
+    assert [navigator.selector.itemText(index) for index in range(3)] == ["1", "2", "3"]
     assert navigator.selector.currentData() == 12 and seen == [3]
     navigator.step(1)  # at the end: nothing
     assert navigator.selector.currentIndex() == 2 and seen == [3]
@@ -160,7 +161,7 @@ def test_n4_a_nexus_source_steps_its_own_frames_and_a_batch_disables_the_navigat
         _choose_nexus(dialog, path, 3)
         _drain(qapp, host)
         assert [navigator.selector.itemText(index) for index in range(navigator.selector.count())] == [
-            "0", "1", "2", "3", "4"]
+            "1", "2", "3", "4", "5"]  # Int's numbers (item 14, DECISIONS 23; this row pinned the labels 0-4)
         assert navigator.selector.currentData() == 3
         navigator.next.click()
         _drain(qapp, host)
@@ -184,7 +185,7 @@ def test_n4_a_nexus_source_steps_its_own_frames_and_a_batch_disables_the_navigat
         assert host.outcomes[3].result is None and host._shown_outcome is not None
         assert "fit" in {item.name() for item in dialog.plot.listDataItems()}
         assert dialog.status.text().endswith("The trend keeps the rows from Fit all; run Fit all again to refresh them."), dialog.status.text()
-        assert dialog.trend.table()[1] == (0.0, 1.0, 2.0, 3.0, 4.0)
+        assert dialog.trend.table()[1] == (1.0, 2.0, 3.0, 4.0, 5.0)  # Int's numbers (DECISIONS 23; were labels 0-4)
     finally:
         _close_page(page, qapp)
 

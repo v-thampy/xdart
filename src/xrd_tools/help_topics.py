@@ -939,10 +939,11 @@ Steps
    frame is read and shown at once; step the Frame row or change the 1-D mode row
    to read another.
 3. The Frame row is the main window's < frame >: step with < and > or pick a frame
-   from its list. Following Int's display it lists Int's frames, and a step moves
-   the main window to that frame; this window then shows that frame's trace. With
-   a NeXus file it lists that file's frames and Int stays where it is. A running
-   Fit all holds it.
+   from its list. Frames are numbered as Int numbers them, from 1, here, in the
+   title and in the trend. Following Int's display it lists Int's frames, and a
+   step moves the main window to that frame; this window then shows that frame's
+   trace. With a NeXus file it lists that file's frames and Int stays where it is.
+   A running Fit all holds it.
 4. Fit all fits every frame of the source's NeXus result as one batch (Int's
    display: the file and 1-D mode it shows) from each frame's stored 1-D curve;
    the plot and the table follow each frame as it is fitted, and the trend plots
@@ -952,7 +953,8 @@ Steps
    locked.
    Stepping through the frames afterwards keeps the trend; Fit current on one of
    them shows that frame's fit and leaves the run's rows (run Fit all again to
-   refresh them).
+   refresh them). A run stays on the file it started on: Browsing another result
+   in Int keeps its rows until Fit current, Reload or Fit all follows Int.
 5. Export Jupyter… or Export marimo… with a NeXus source names the file and its
    frames in the notebook, which reads them again; nothing is copied.
 

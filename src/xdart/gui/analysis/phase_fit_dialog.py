@@ -129,6 +129,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._fit_reason = ''
         self._running = False
         self._stopping = False  # Stop pressed on a running Fit all (``show_run_stopping``)
+        #: a host's numbering of a trace's frame as Int numbers it (Int's page; None: the trace's own label)
+        self.frame_number = None
         #: a host's probe of a fit it runs (Load settings waits for it); None: the host runs none in the background
         self.busy_probe = None
         self._export_trace = None
@@ -767,8 +769,8 @@ class PhaseFitDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self.use_uncertainties.setChecked(False)
         self._show_pattern(trace.axis, trace.intensity, trace.label or "q", clear_fit=True)
         self._sync_range_hints()
-        from .peak_fit_dialog import _trace_title
-        self.fit_view.set_title(_trace_title(trace))
+        from .peak_fit_dialog import _frame_title
+        self.fit_view.set_title(_frame_title(self, trace))
         self._fields_to_region()
         self.status.setText(self._range_reason or "Displayed trace captured. Check the phases to fit and click Fit.")
         self._sync_actions()

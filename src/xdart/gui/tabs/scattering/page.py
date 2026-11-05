@@ -1591,10 +1591,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         # a closed window's host is kept only while its worker drains
         self._retired_fit_hosts = [retired for retired in self._retired_fit_hosts
                                    if retired.shutdown().status is not PageCleanup.CLEAN]
+        # a Fit all is tied to the window and its own source, not to the result Int shows (the scope's third part):
+        # it finishes on its file and keeps its rows when Int moves on (item 14, the maintainer's "Yes fix it now")
         host = SnapshotFitHost(kind, parent=self, current=lambda: self._fit_file_target(kind),
                                scope=lambda: self._fit_scope(kind), batch=lambda: self._fit_batch_targets(kind),
-                               dialog=dialog, owns_phase_source=False)
+                               dialog=dialog, owns_phase_source=False, pin=lambda scope: scope[:2])
         self._fit_hosts[kind] = host
+        dialog.frame_number = lambda trace: self._fit_frame_number(kind, trace)  # titles number frames as Int does
         dialog.batch_btn.clicked.connect(lambda _checked=False: self._fit_batch(kind))
         dialog.source_row.changed.connect(lambda: self._fit_source_changed(kind))
         dialog.source_row.frameChosen.connect(lambda frame: self._fit_frame_chosen(kind, frame))
@@ -1617,6 +1620,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if action == "reload":
                 host.invalidate()  # explicit Reload releases the held batch, just as the file-source route does
                 dialog.set_batch_running(False)
+            if action == "fit":
+                if host.batch_scope_changed():  # rows of a result Int no longer shows: Fit current follows Int
+                    host.invalidate()
+                    dialog.set_batch_running(False)
+                self._refresh_fit_trace(kind)  # the window shows the trace it fits: the one Int shows now
             return handler(action, values)
         if action == "capture_template":
             return self._capture_source_template(kind)
@@ -1669,8 +1677,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             dialog.set_batch_reason(reason)
             return
         if dialog.fit_source() is None and self._fit_hosts[kind].batch_scope_changed():
-            self._fit_source_changed(kind)  # another Int file/mode/unit uses the existing source-reset owner
-            return
+            # Int shows another file, mode or unit: the held rows stay, tied to their file, until Fit current, Reload or
+            # Fit all follows Int (item 14, the maintainer's "Yes fix it now"; R8 dropped them here)
+            self._fit_hosts[kind].note_other_result()
         path, mode, _entry, _unit = facts
         substrate = "template" if kind == "peak" else "substrate"
         shown = ("" if dialog.fit_source() is not None else
@@ -1723,7 +1732,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             follow.pop(kind, None)
             host = self._fit_hosts.get(kind)
             if host is not None:
-                host.forget_shown()  # keep the batch, but its old frame's fit cannot be redrawn over this trace
+                if host.batch_scope_changed():  # rows of a result Int no longer shows: a step follows Int
+                    host.invalidate()
+                else:
+                    host.forget_shown()  # keep the batch, but its old frame's fit cannot be redrawn over this trace
                 dialog.set_batch_running(False)  # the valid new trace can be fitted after clear_input held Fit
             self._refresh_fit_trace(kind)
 
@@ -1752,18 +1764,45 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         footer.setCurrentIndex(index)
 
     def _fit_source_labels(self, source):
-        """A NeXus source's frame labels for its Frame row, read once per file, mode and entry (a few ms); none when
-        the file cannot be read now (the source row says why)."""
+        """A NeXus source's frame labels for its Frame row (``_fit_labels``)."""
+        return self._fit_labels(source.path, source.mode, source.entry)
+
+    def _fit_labels(self, path, mode, entry):
+        """A NeXus result's frame labels in a 1-D mode, read once per file, mode and entry (a few ms); none when the
+        file cannot be read now (the source row says why)."""
         from xrd_tools.analysis.fit_sources import IntResultRows
-        key = (source.path, source.mode, source.entry)
+        key = (str(path), mode, entry)
         cached = self._fit_frame_labels.get(key)
         if cached is None:
             try:
-                cached = tuple(IntResultRows(source.path, mode=source.mode, entry=source.entry).labels())
+                cached = tuple(IntResultRows(path, mode=mode, entry=entry).labels())
             except (OSError, ValueError, KeyError):
                 cached = ()
             self._fit_frame_labels = {key: cached}  # one file's labels kept
         return cached
+
+    def _fit_frame_number(self, kind, trace):
+        """A fit window's trace's frame as Int's footer numbers it (item 14: "Fit Should also start from 1 like Int"),
+        or None: Int's own caption for the frame it shows, else the frame's place among its result's frames, from 1."""
+        receipt = trace.receipt
+        label = str(receipt.frame_label)
+        if "=" not in label:  # Int's display: the caption Int's footer gives the frame it shows
+            current = self._context_controller.navigation.current
+            if current is None or str(getattr(current, "local_frame_label", "")) != label:
+                return None
+            footer = self._shell.scientific.frame_selector
+            index = next((position for position, frame in enumerate(footer.exact_frames) if frame is current), -1)
+            text = footer.itemText(index) if index >= 0 else ""
+            return int(text) if text.isdigit() else None
+        from ast import literal_eval
+        try:  # a stored row: its receipt names its frame, 1-D mode and entry
+            fields = {name: literal_eval(value) for name, value in
+                      (part.split("=", 1) for part in label.split(";") if "=" in part)}
+            frame, mode, entry = int(fields["frame"]), fields["mode"], fields.get("entry", "entry")
+        except (KeyError, ValueError, SyntaxError, TypeError):
+            return None
+        labels = self._fit_labels(receipt.artifact, mode, entry)
+        return labels.index(frame) + 1 if frame in labels else None
 
     def _fit_batch_targets(self, kind):
         from xdart.gui.analysis.snapshot_fit_host import FitTarget
@@ -1775,9 +1814,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         path, mode, entry, unit = facts
         rows = IntResultRows(path, mode=mode, entry=entry, unit=unit)  # one chunk held as the worker reads them
         stem = Path(path).stem
-        return tuple(FitTarget(f"{stem} frame {label}", lambda label=label: rows.snapshot(label), x=float(label),
+        # the trend's x is each frame as Int numbers it, by place from 1 (item 14: "Fit Should also start from 1 like
+        # Int"); the label stays the read's
+        return tuple(FitTarget(f"{stem} frame {label}", lambda label=label: rows.snapshot(label), x=float(number),
                                reference=lambda label=label: int_frame_reference(rows.snapshot(label)))
-                     for label in rows.labels())  # the inventory only: a few ms
+                     for number, label in enumerate(rows.labels(), 1))  # the inventory only: a few ms
 
     def _fit_file_target(self, kind):
         """The window's file source as the host's current input (read on its worker)."""
@@ -1791,7 +1832,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if source.kind == "xye":
             return FitTarget(Path(source.path).stem, lambda: xye_fit_snapshot(source.path, unit=source.unit))
         rows, frame = IntResultRows(source.path, mode=source.mode, entry=source.entry, chunk=1), source.frame
-        return FitTarget(f"{Path(source.path).stem} frame {frame}", lambda: rows.snapshot(frame), x=float(frame),
+        labels = self._fit_source_labels(source)  # its x: the frame as Int numbers it (item 14)
+        return FitTarget(f"{Path(source.path).stem} frame {frame}", lambda: rows.snapshot(frame),
+                         x=float(labels.index(frame) + 1) if frame in labels else None,
                          reference=lambda: int_frame_reference(rows.snapshot(frame)))
 
     def _fit_scope(self, kind):

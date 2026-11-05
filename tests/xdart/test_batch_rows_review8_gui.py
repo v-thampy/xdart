@@ -57,13 +57,13 @@ def test_int_reload_clears_the_held_batch_and_leaves_fit_usable(qapp, tmp_path, 
             page._drain_executor()
             return True if page._analysis_identity is None and getattr(page, f"_{kind}_result") is not None else None
         _wait(fitted, timeout=30)
-        assert "The trend keeps the batch" not in dialog.status.text()
+        assert "The trend keeps the rows from Fit all" not in dialog.status.text()  # BATCH_KEPT's text (item 14)
     finally:
         _close_page(page, qapp)
 
 
 @pytest.mark.parametrize("kind", ("peak", "phase"))
-def test_another_int_result_clears_the_old_batch_before_a_new_batch(qapp, tmp_path, monkeypatch, kind):
+def test_another_int_result_keeps_the_old_rows_until_a_new_batch(qapp, tmp_path, monkeypatch, kind):
     first = _result(tmp_path / "first_int1d.nexus")
     second = _result(tmp_path / "second_int1d.nexus", labels=(0, 1))
     page, _store = _real_page(tmp_path, monkeypatch)
@@ -79,9 +79,11 @@ def test_another_int_result_clears_the_old_batch_before_a_new_batch(qapp, tmp_pa
         _drain(qapp, host)
         assert host.holds_batch and len(host.outcomes) == 5
         _browse(page, second)
-        assert not host.holds_batch
-        assert host.outcomes == () and host._keys == {} and host._trend_rows == []
-        assert dialog.trend.table()[0] == () and dialog.fit_btn.isEnabled()
+        # the maintainer's "Yes fix it now" (DECISIONS 23): Browsing keeps the first file's rows, tied to their file,
+        # until Fit current, Reload or Fit all follows Int (this row asserted R8's clearing here; disclosed)
+        assert host.holds_batch and len(host.outcomes) == 5 and len(dialog.trend.table()[0]) == 5
+        assert all(key.path == str(first) for key in host._keys.values())
+        assert dialog.fit_btn.isEnabled() and dialog.batch_btn.isEnabled()
         dialog.batch_btn.click()
         _drain(qapp, host)
         assert host.holds_batch and len(host.outcomes) == 2

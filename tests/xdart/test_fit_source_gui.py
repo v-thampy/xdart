@@ -120,7 +120,8 @@ def test_s2_a_nexus_source_reloads_and_fits_its_frame_on_the_stored_axis(qapp, t
         dialog, host = _window(page, "peak")
         _choose_nexus(dialog, path, 3)
         assert dialog.fit_source() == BackgroundTemplateSource("nexus", str(path), frame=3, mode="default")
-        assert dialog.source_row.status.text().startswith("sample_int1d.nexus, frame 3")
+        # label 3 is Int's frame 4 (item 14, DECISIONS 23: numbered from 1 like Int; this row pinned the label)
+        assert dialog.source_row.status.text().startswith("sample_int1d.nexus, frame 4")
         dialog.refresh_btn.click()
         _drain(qapp, host)
         assert np.array_equal(dialog._x, _stored(Q)) and np.array_equal(dialog._y, _stored(_peak(2.3)))
@@ -173,7 +174,8 @@ def test_s3_batch_fits_every_frame_of_a_nexus_source_and_shows_the_last(qapp, tm
         dialog.batch_btn.click()
         _drain(qapp, host)
         labels, xs, columns = dialog.trend.table()
-        assert len(labels) == 5 and xs == (0.0, 1.0, 2.0, 3.0, 4.0)
+        # x is Int's frame number, by place from 1 (item 14, DECISIONS 23; this row pinned the labels 0-4)
+        assert len(labels) == 5 and xs == (1.0, 2.0, 3.0, 4.0, 5.0)
         values = dialog.vnext_fit_values()
         for frame, center in zip(range(5), columns["center_0"]):
             single = _single(int_frame_snapshot(path, frame, mode="default"), values)
@@ -202,7 +204,7 @@ def test_s4_ints_display_batch_fits_the_displayed_files_frames_in_the_displayed_
         dialog.batch_btn.click()
         _drain(qapp, host)
         labels, xs, columns = dialog.trend.table()
-        assert xs == (0.0, 1.0, 2.0, 3.0, 4.0)
+        assert xs == (1.0, 2.0, 3.0, 4.0, 5.0)  # Int's frame numbers (DECISIONS 23; were labels 0-4)
         values = dialog.vnext_fit_values()
         for frame, center in zip(range(5), columns["center_0"]):
             snapshot = int_frame_snapshot(path, frame, mode="default", unit="2th_deg")

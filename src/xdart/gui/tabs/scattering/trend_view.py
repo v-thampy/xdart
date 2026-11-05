@@ -473,6 +473,10 @@ class TrendView(QtWidgets.QWidget):
         for widget in (self.family, self.right_family, self.members, self.save):
             widget.setEnabled(enabled)
 
+    def save_csv(self) -> None:
+        """Save CSV… of the rows shown, for a host that otherwise writes its own table (a running Fit all's rows)."""
+        self._save_csv()
+
     def _save_csv(self) -> None:
         if not self._rows:
             return

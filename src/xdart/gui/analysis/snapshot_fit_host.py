@@ -214,12 +214,15 @@ _STOPPED = "Stopped: {fitted} of {total} frames fitted"
 _STOPPED_EMPTY = "Stopped before any frame was fitted"
 _DONE = "Done: {fitted} of {total} frames fitted"
 _RUN_WAITS = "Fit all is running; try again when it is done, or Stop it."
+#: held rows of a result Int no longer shows (item 14, the maintainer's "Yes fix it now": a run is tied to the file it
+#: started on), kept until an action follows Int
+BATCH_OTHER = "Int now shows another result: the trend keeps this Fit all's rows until Fit current, Reload or Fit all."
 
 
 class SnapshotFitHost(QtCore.QObject):
     """Mount Int's fit dialogs with explicit Batch capability, never unholding Int's own profile."""
     def __init__(self, kind, parent=None, *, current, scope, batch=None, source_root=None, dialog=None,
-                 owns_phase_source=True):
+                 owns_phase_source=True, pin=None):
         super().__init__(parent)
         from .peak_fit_dialog import PeakFitDialog
         from .phase_fit_dialog import PhaseFitDialog
@@ -238,6 +241,11 @@ class SnapshotFitHost(QtCore.QObject):
         #: whether the adopted rows are a batch's: a single fit then is shown and never changes them (R7 F5)
         self._batch_held = False
         self._batch_scope = None
+        #: what a Fit all is tied to, from a scope (NEXT-128-WINDOW-POLISH item 14, the maintainer's "Yes fix it now"):
+        #: Int's page ties a run to the window and its own source, not to the result Int shows, so a run finishes on
+        #: its file and keeps its rows when Int moves on; and the scope the "Int moved on" note was said for
+        self._pin = pin if callable(pin) else (lambda scope: scope)
+        self._noted_scope = None
         self._held_rows, self._held_shown, self._held_request, self._last_flush = [], None, None, 0.0
         #: a running Fit all's latest count (Resume shows it again)
         self._run_count = None
@@ -480,9 +488,11 @@ class SnapshotFitHost(QtCore.QObject):
             return False
         self.dialog.set_batch_running(False)
         try:
-            # plain projections on both sides: a substrate compares by its trace identity, never its arrays
-            unchanged = (request.scope == self.scope()
-                         and plain_settings(dict(request.settings))
+            # plain projections on both sides: a substrate compares by its trace identity, never its arrays; a Fit all
+            # compares only what it is tied to (``pin``)
+            scoped = (self._pin(request.scope) == self._pin(self.scope()) if request.action == 'batch'
+                      else request.scope == self.scope())
+            unchanged = (scoped and plain_settings(dict(request.settings))
                          == plain_settings(dict(self._request_settings(request.action))))
         except (ValueError, KeyError, OSError):
             unchanged = False
@@ -534,6 +544,7 @@ class SnapshotFitHost(QtCore.QObject):
             self._trend_phases = tuple(dict(request.settings).get('phase_names', ()))
             self._batch_held = request.action == 'batch'
             self._batch_scope = request.scope if self._batch_held else None
+            self._noted_scope = None
             # Binding the template's content identity is a result of this fit, not a settings edit: the CSV names the
             # bound form (Codex R7 F2)
             self._last_settings = plain_settings(dict(self._request_settings(request.action)))
@@ -561,6 +572,7 @@ class SnapshotFitHost(QtCore.QObject):
             self.dialog.status.setText(outcome.message or ('Fit complete' if outcome.ok else 'Fit refused'))
         if kept:
             self.note_batch_kept()
+        self.note_other_result()  # a run that finished after Int moved on keeps its rows, and says so
         source = getattr(self.dialog, 'source_row', None)
         if source is not None and 'FIT_SOURCE_' in (outcome.message or ''):
             source.report_problem(outcome.message)
@@ -571,9 +583,29 @@ class SnapshotFitHost(QtCore.QObject):
         """Whether the adopted rows are a batch's, which a single fit leaves as they are (R7 F5)."""
         return self._batch_held
 
+    def shows_other_result(self):
+        """Whether held rows are of a result the window no longer shows while their run's tie (``pin``) holds: Int's
+        display moved on (a file source's own frame step changes its tie, and keeps its rows by design)."""
+        if not self._batch_held:
+            return False
+        scope = self.scope()
+        return self._batch_scope != scope and self._pin(self._batch_scope) == self._pin(scope)
+
     def batch_scope_changed(self):
         """Whether held rows belong to another host scope (Int can Browse a new source without a Source-card edit)."""
         return self._batch_held and self._batch_scope != self.scope()
+
+    def note_other_result(self):
+        """Say once, while Int shows another result than the held rows' (``batch_scope_changed``), that the trend
+        keeps them until an action follows Int (Int's page calls it after each render)."""
+        if self.dialog is None or self.computing or not self.shows_other_result():
+            return
+        scope = self.scope()
+        if scope == self._noted_scope:
+            return
+        self._noted_scope = scope
+        text = self.dialog.status.text().rstrip(". ")
+        self.dialog.status.setText(f"{text}. {BATCH_OTHER}" if text else BATCH_OTHER)
 
     def note_batch_kept(self):
         """Say in the status that the trend keeps the batch's rows (a single fit's, on either route)."""
@@ -626,7 +658,7 @@ class SnapshotFitHost(QtCore.QObject):
         self.snapshot = self._shown_outcome = None
         self.outcomes, self._keys, self._trend_rows, self._trend_phases = (), {}, [], ()
         self._batch_held = False
-        self._batch_scope = None
+        self._batch_scope = self._noted_scope = None
         if self.dialog is not None:
             if running:  # a dropped run's Stop, Pause and locks go with it
                 self.dialog.set_batch_running(False)
@@ -695,6 +727,11 @@ class SnapshotFitHost(QtCore.QObject):
         Path(path).write_text(table_csv(table), encoding='utf-8')
 
     def _choose_csv(self):
+        if self._batching and self.dialog is not None:
+            # a running Fit all: the frames fitted so far, as the trend shows them, as Int's windows save them (item
+            # 14: "Also the other two old behaviors"); its own table follows when the run ends
+            self.dialog.trend.save_csv()
+            return
         from xdart.gui.widgets.file_dialogs import browse
         path = '' if self.snapshot is None else self.snapshot.key.path
         picks = browse(self.dialog, 'Save fit results', save=True, current=path,

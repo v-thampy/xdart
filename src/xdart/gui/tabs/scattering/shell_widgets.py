@@ -828,12 +828,14 @@ class FrameSteps(QtCore.QObject):
         del blocker
         self._sync_ends()
 
-    def set_labels(self, labels, *, current=None, tip: str = "Frame {label}") -> None:
-        """List frame ``labels`` (a NeXus result's), selecting ``current``; nothing is emitted."""
+    def set_labels(self, labels, *, current=None, tip: str = "Frame {number}") -> None:
+        """List frame ``labels`` (a NeXus result's), selecting ``current``; nothing is emitted. Each is captioned as
+        Int's footer numbers its frames, by place from 1 (NEXT-128-WINDOW-POLISH item 14: "Fit Should also start from 1
+        like Int"); the label stays its data. ``tip`` may name ``{number}`` and ``{label}``."""
         blocker = QtCore.QSignalBlocker(self.selector)
         self.selector.clear()
-        for label in labels:
-            self.selector.add_frame(str(label), label, tip.format(label=label))
+        for number, label in enumerate(labels, 1):
+            self.selector.add_frame(str(number), label, tip.format(label=label, number=number))
         del blocker
         self.select(current)
 
@@ -880,7 +882,7 @@ class FrameNavigator(QtWidgets.QWidget):
     def mirror(self, source: CompactFrameSelector) -> None:
         self.steps.mirror(source)
 
-    def set_labels(self, labels, *, current=None, tip: str = "Frame {label}") -> None:
+    def set_labels(self, labels, *, current=None, tip: str = "Frame {number}") -> None:
         self.steps.set_labels(labels, current=current, tip=tip)
 
     def select(self, frame) -> None:

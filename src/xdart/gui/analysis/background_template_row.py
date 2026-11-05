@@ -71,13 +71,14 @@ class CurveFileRow(QtWidgets.QWidget):
         self._buttons.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(self._buttons)
 
-    def _curve_rows(self, root, *, unit_tip, frame_tip, mode_tip):
-        """The x unit, Frame and 1-D mode rows under ``root`` (a settings path's first part), added to the layout."""
+    def _curve_rows(self, root, *, unit_tip, frame_tip, mode_tip, frame_minimum=0):
+        """The x unit, Frame and 1-D mode rows under ``root`` (a settings path's first part), added to the layout; the
+        Frame row takes Int's numbers from 1 when ``frame_minimum`` is 1, stored labels from 0 otherwise."""
         unit_row = FormRow(label="x unit", path=(root, "unit"), value="", kind="combo",
                            choices=("", *(unit for unit, _label in XYE_UNITS)),
                            choice_labels={"": "Choose the unit…", **dict(XYE_UNITS)})
         unit_row.set_purpose_tooltip(unit_tip)
-        frame_row = FormRow(label="Frame", path=(root, "frame"), value="", kind="int", minimum=0,
+        frame_row = FormRow(label="Frame", path=(root, "frame"), value="", kind="int", minimum=frame_minimum,
                             maximum=1_000_000_000, allow_blank=True)
         frame_row.set_purpose_tooltip(frame_tip)
         mode_row = FormRow(label="1-D mode", path=(root, "mode"), value=NEXUS_MODES[0], kind="combo",
@@ -99,6 +100,40 @@ class CurveFileRow(QtWidgets.QWidget):
         box.setWindowModality(QtCore.Qt.WindowModality.NonModal)
         box.show()
         self.message_box = box
+
+    # ---- frames as Int numbers them -------------------------------------------------
+    def _frame_labels(self, path, mode, entry="entry") -> tuple:
+        """A NeXus file's frame labels in a 1-D mode, read once per file and mode; () when it cannot be read now."""
+        key = (str(path), str(mode), str(entry))
+        if getattr(self, "_labels_key", None) != key:
+            from xrd_tools.analysis.fit_sources import IntResultRows
+            try:
+                labels = tuple(IntResultRows(path, mode=mode, entry=entry).labels())
+            except (OSError, ValueError, KeyError, RuntimeError):
+                labels = ()
+            self._labels_key, self._labels = key, labels
+        return self._labels
+
+    def _frame_number(self, path, mode, label, entry="entry"):
+        """Stored frame ``label`` as Int's footer numbers it (NEXT-128-WINDOW-POLISH item 14: "Fit Should also start
+        from 1 like Int"): its place among the file's frames, from 1; label + 1 when they cannot be read."""
+        if label is None:
+            return None
+        labels = self._frame_labels(path, mode, entry)
+        return labels.index(label) + 1 if label in labels else int(label) + 1
+
+    def _source_number(self, source):
+        """A NeXus source's frame as Int numbers it (None for an .xye file)."""
+        if source is None or source.kind != "nexus":
+            return None
+        return self._frame_number(source.path, source.mode, source.frame, source.entry)
+
+    def _frame_label(self, path, mode, number, entry="entry"):
+        """The stored label of Int's frame ``number`` (``_frame_number``'s inverse)."""
+        if number is None:
+            return None
+        labels = self._frame_labels(path, mode, entry)
+        return labels[number - 1] if 1 <= number <= len(labels) else int(number) - 1
 
     # ---- the popups that ask -----------------------------------------------------
     def _ask_unit(self, path: str, hint) -> str:
@@ -133,7 +168,8 @@ class CurveFileRow(QtWidgets.QWidget):
         try:
             if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 return None
-            return frame_row.editor.value(), mode_row.current_value()
+            mode = mode_row.current_value()
+            return self._frame_label(path, mode, frame_row.editor.value()), mode  # Int's number, read back as a label
         finally:
             dialog.deleteLater()
 
@@ -142,9 +178,10 @@ class CurveFileRow(QtWidgets.QWidget):
         note.setWordWrap(True)
         note.setToolTip("A processed NeXus result holds many frames; the display names one only when it shows this "
                         "file.")
-        frame_row = FormRow(label="Frame", path=_path("frame"), value="" if frame is None else str(frame), kind="int",
-                            minimum=0, maximum=1_000_000_000)
-        frame_row.set_purpose_tooltip("The frame label to read.")
+        number = self._frame_number(path, mode, frame)
+        frame_row = FormRow(label="Frame", path=_path("frame"), value="" if number is None else str(number),
+                            kind="int", minimum=1, maximum=1_000_000_000)
+        frame_row.set_purpose_tooltip("The frame to read, as Int numbers it (from 1).")
         mode_row = FormRow(label="1-D mode", path=_path("mode"), value=mode, kind="combo", choices=NEXUS_MODES)
         mode_row.set_purpose_tooltip("The 1-D curve to read: default for a single result, or a grazing-incidence "
                                      "mode.")
@@ -236,7 +273,9 @@ class BackgroundTemplateRow(CurveFileRow):
             unit_tip="The .xye file's x unit. A file name's xdart prefix (iq_, itth_, iqip_, iqoop_, iexit_) only "
                      "suggests it: confirm it. It must be the fit's unit, or convert to it without a wavelength (Å⁻¹ "
                      "and nm⁻¹; degrees and radians).",
-            frame_tip="The NeXus result's frame label to read; a frame the file does not hold is refused at the fit.",
+            frame_tip="The NeXus result's frame to read, as Int numbers it (from 1); a frame the file does not hold is "
+                      "refused at the fit.",
+            frame_minimum=1,
             mode_tip="The NeXus result's 1-D curve: default for a single result; q_total, q_ip, q_oop, exit_angle or "
                      "chi_gi for grazing incidence. A mode the file does not hold is refused at the fit, naming the "
                      "file's modes.")
@@ -477,7 +516,7 @@ class BackgroundTemplateRow(CurveFileRow):
             if kind == "xye":
                 self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(unit)) if unit else 0)
             else:
-                self.frame_row.editor.setValue(frame)
+                self.frame_row.editor.setValue(self._frame_number(path, mode, frame))  # Int's number for the label
                 index = self.mode_row.editor.findText(mode)
                 self.mode_row.editor.setCurrentIndex(index if index >= 0 else 0)
         self._rebuild()
@@ -506,12 +545,13 @@ class BackgroundTemplateRow(CurveFileRow):
                                   "its name does not say it")
                     self._reason = f"BACKGROUND_TEMPLATE_UNIT_REQUIRED: choose the .xye file's x unit; {suggestion}"
             else:
-                frame = self.frame_row.editor.value() if not self.frame_row.refusal() else None
+                number = self.frame_row.editor.value() if not self.frame_row.refusal() else None
+                mode = self.mode_row.current_value()
+                frame = self._frame_label(path, mode, number)  # the typed number is Int's: its stored label
                 if frame is None:
                     self._reason = "BACKGROUND_TEMPLATE_INVALID_SOURCE: enter the frame to read from this NeXus file"
                 else:
-                    self._source = BackgroundTemplateSource("nexus", path, frame=frame,
-                                                            mode=self.mode_row.current_value())
+                    self._source = BackgroundTemplateSource("nexus", path, frame=frame, mode=mode)
         except BackgroundTemplateRefused as refused:
             self._reason = str(refused)
         self._sync()
@@ -530,7 +570,7 @@ class BackgroundTemplateRow(CurveFileRow):
         if source is not None:
             state = self._short() if self._reason else (
                 "recorded" if self._identity is not None else "read at the first fit")
-            return f"{source.describe()}: {state}"
+            return f"{source.describe(self._source_number(source))}: {state}"
         if self._file is not None:
             return f"{Path(self._file[1]).name}: {self._short()}"
         return f"No {self._what}: use the displayed trace or choose a file"
@@ -555,7 +595,7 @@ class BackgroundTemplateRow(CurveFileRow):
             if source is not None and source.kind == "xye":
                 self.unit_row.editor.setCurrentIndex(max(0, self.unit_row.editor.findData(source.unit)))
             elif source is not None:
-                self.frame_row.editor.setValue(source.frame)
+                self.frame_row.editor.setValue(self._source_number(source))
                 index = self.mode_row.editor.findText(source.mode)
                 self.mode_row.editor.setCurrentIndex(index if index >= 0 else 0)
         self._apply_controls()
@@ -693,7 +733,8 @@ class FitSourceRow(CurveFileRow):
         source = self._source
         name = "" if source is None else Path(source.path).name
         self.frames_row.editor.set_labels(tuple(labels), current=None if source is None else source.frame,
-                                          tip="Frame {label} of " + name.replace("{", "{{").replace("}", "}}"))
+                                          tip="Frame {number} of " + name.replace("{", "{{").replace("}", "}}")
+                                              + " (stored frame {label})")
 
     def select_frame(self, frame) -> None:
         """Show ``frame`` selected in the Frame row (a frame key or a label); emits nothing."""
@@ -782,7 +823,7 @@ class FitSourceRow(CurveFileRow):
         """The source in one short line: Int's display, or the file and what is read from it."""
         if self._source is None:
             return _DISPLAY_TEXT
-        text = self._source.describe()
+        text = self._source.describe(None if self._reason else self._source_number(self._source))
         return f"{text}: cannot be read" if self._reason else text
 
     def _sync(self) -> None:

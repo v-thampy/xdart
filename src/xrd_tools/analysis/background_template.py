@@ -168,13 +168,14 @@ class BackgroundTemplateSource:
             return cls("nexus", values["path"], frame=values["frame"], mode=values["mode"], entry=values["entry"])
         return cls("xye", values["path"], unit=values["unit"])
 
-    def describe(self) -> str:
-        """The source as the template row names it: its file name and what is read from it."""
+    def describe(self, number: int | None = None) -> str:
+        """The source as the template row names it: its file name and what is read from it. ``number``: its frame as
+        Int's footer numbers it (its place among the file's frames, from 1), shown instead of the stored label."""
         name = Path(self.path).name
         if self.kind == "xye":
             return f"{name} ({dict(XYE_UNITS).get(self.unit, self.unit)})"
         entry = "" if self.entry == "entry" else f", {self.entry}"
-        return f"{name}, frame {self.frame}, {self.mode}{entry}"
+        return f"{name}, frame {self.frame if number is None else number}, {self.mode}{entry}"
 
 
 def _readonly(values: Any) -> np.ndarray:
