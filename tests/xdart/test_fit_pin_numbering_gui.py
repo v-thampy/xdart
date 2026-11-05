@@ -243,3 +243,23 @@ def test_a_nexus_templates_frame_field_shows_ints_number(qapp, tmp_path):
         assert row.source.frame == 6, "Int's frame 5 is label 6"
     finally:
         row.close()
+
+
+def test_the_int_moved_on_note_is_said_once(qapp, tmp_path, monkeypatch):
+    """Added at the advisor's pre-push review: Browsing on again says it once, not once per result."""
+    first = _result(tmp_path / "first_int1d.nexus")
+    second = _result(tmp_path / "second_int1d.nexus", labels=(0, 1))
+    third = _result(tmp_path / "third_int1d.nexus", labels=(0, 1, 2))
+    page, _store = _real_page(tmp_path, monkeypatch)
+    try:
+        page.show()
+        _browse(page, first)
+        dialog, host = _window(page, "peak")
+        dialog.batch_btn.click()
+        _drain(qapp, host)
+        _browse(page, second)
+        _browse(page, third)
+        assert host.holds_batch
+        assert dialog.status.text().count("Int now shows another result") == 1, dialog.status.text()
+    finally:
+        _close_page(page, qapp)
