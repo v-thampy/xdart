@@ -194,7 +194,9 @@ def test_pause_holds_the_run_between_frames_and_resume_continues(qapp):
         assert _until(lambda: dialog.status.text().startswith("Paused at 2/3")), dialog.status.text()
         _settle()
         assert loaded == [0, 1] and host.computing, "a paused run reads no further frame"
-        assert len(dialog.trend.table()[0]) == 2 and dialog.fit_view.title.text() == "frame1"
+        # the paused frame's row and plot follow within one flush interval (0.5 s), as a running one's do (CI
+        # 41938821859 checked them 0.3 s after the pause, before the throttled flush; disclosed timing repair)
+        assert _until(lambda: len(dialog.trend.table()[0]) == 2 and dialog.fit_view.title.text() == "frame1")
         dialog.pause_btn.click()  # Resume
         assert dialog.pause_btn.text() == "Pause"
         assert _until(lambda: loaded == [0, 1, 2])
