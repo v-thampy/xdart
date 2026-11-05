@@ -106,7 +106,7 @@ def test_tq_every_section_question_mark_offers_its_tools_guide_in_the_help_windo
         for button in buttons:
             button.click()
             qapp.processEvents()
-            window = owner_for(dialog).window
+            window = owner_for(button).window  # Advanced cards have their own top-level help owner.
             assert window is not None and window.isVisible()
             topics.add(window.topic_id)
             _opens(window, opened, qapp, GUIDES[kind])
