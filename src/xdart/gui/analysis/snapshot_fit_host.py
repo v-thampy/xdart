@@ -605,6 +605,8 @@ class SnapshotFitHost(QtCore.QObject):
             return
         self._noted_scope = scope
         text = self.dialog.status.text().rstrip(". ")
+        if BATCH_OTHER.rstrip(".") in text:  # Browsing on again: said already
+            return
         self.dialog.status.setText(f"{text}. {BATCH_OTHER}" if text else BATCH_OTHER)
 
     def note_batch_kept(self):
