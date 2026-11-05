@@ -1,7 +1,7 @@
 """R9: terminal display and partial-result retention through real fits and the run owner."""
 import threading
 
-from tests.xdart.test_fit_run_controls_gui import _close, _loaded_host, _until, qapp  # noqa: F401
+from tests.xdart.test_fit_run_controls_gui import _close, _host, _loaded_host, _until, qapp  # noqa: F401
 
 
 def test_final_read_failure_still_shows_the_last_fitted_frame(qapp):
@@ -48,4 +48,23 @@ def test_stop_keeps_completed_nonconverged_fits_and_their_parameter_rows(qapp):
         assert dialog.fit_view.title.text() == "frame1"
         assert "Stopped before any frame" not in dialog.status.text()
     finally:
+        _close(host)
+
+
+def test_phase_advanced_editors_lock_but_its_header_help_stays_usable(qapp):
+    from xdart.gui.widgets.controls_panel import SubsectionCard
+    host = _host(2, kind="phase")
+    dialog = host.dialog
+    try:
+        dialog.show()
+        dialog._show_advanced()
+        cards = dialog.advanced.findChildren(SubsectionCard)
+        assert cards and all(card.help_button.isEnabled() for card in cards)
+        dialog.set_batch_running(True)
+        assert all(not card.body.isEnabled() for card in cards)
+        assert all(card.help_button.isEnabled() for card in cards)
+        dialog.set_batch_running(False)
+        assert all(card.body.isEnabled() for card in cards)
+    finally:
+        dialog.set_batch_running(False)
         _close(host)
