@@ -168,6 +168,15 @@ def _save_to(monkeypatch, target):
                         staticmethod(lambda *args, **kwargs: (str(target), '')))
 
 
+def _assert_preview_summary(window):
+    """A finished calibrant preview keeps its own summary in its panel: the frames it stitched and its integration
+    options (NEXT-129-SMALL-FIXES item 3, Triage close-out O2: "Calibrant preview complete." overwrote it)."""
+    projection = window.pattern_view.keyed_projection
+    assert projection is not None and projection.status.endswith(
+        ' frames · solid angle on · polarization off · normalization None'), projection
+    assert window.pattern_view.status.text() == projection.status
+
+
 def _assert_fit_shown(dialog, kind, frames):
     """A Fit or Refine says what it found in the message box and in its own window, which plots each
     control point's residual (maintainer, 2026-09-29: "the results of the refinement should also be
@@ -221,7 +230,7 @@ def test_the_guided_fit_takes_the_extension_and_saves_both_files(qapp, tmp_path,
         summary = dialog.fit_summary.toPlainText()
         assert 'Fitted arm parameters (± 1σ):' in summary and '  detector tilt on the arm: ' in summary
         assert '  sample offset, along the beam: ' in summary
-        assert dialog._calibration_fit_window.pattern_view.status.text() == 'Calibrant preview complete.'
+        _assert_preview_summary(dialog._calibration_fit_window)
         _assert_fit_shown(dialog, 'fit', len(frames))
         window = dialog._calibration_fit_window
         dialog.scales.setChecked(True)  # a changed option invalidates the fit and says what it changes
@@ -307,6 +316,55 @@ def test_a_twoc_arm_is_fitted_saved_and_adopted_with_nu_held_at_zero(qapp, tmp_p
         assert page._arm_problem() is None
         partner = json.loads((tmp_path / 'calibration' / 'twoc.xu.json').read_text())
         assert partner['acquisition']['source_motors'] == {'del': 'tth', 'nu': None}
+    finally:
+        dialog.close()
+        _dispose(page)
+
+
+def _twoc_fit(qapp, tmp_path):
+    """A twoc arm fitted from four staged frames (the row above): its fit window open, its first preview done."""
+    from xrd_tools.session.instrument import InstrumentGeometry
+    (tmp_path / 'frames').mkdir()
+    frames = _single_arm_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    dialog.set_instrument(InstrumentGeometry('twoc'))
+    dialog.geometry_editor.zero_edit('tth').setText(f'{-np.rad2deg(.05):.12g}')
+    _stage_native_pairs(dialog, frames, tmp_path / 'source')
+    dialog.fit_button.click()
+    _wait(dialog)
+    assert dialog.fit is not None, dialog.status.text()
+    window = dialog._calibration_fit_window
+    assert window is not None and window.isVisible() and window.pattern_view.keyed_projection is not None
+    return page, dialog, window
+
+
+def test_a_finished_preview_keeps_its_own_summary(qapp, tmp_path):
+    """NEXT-129-SMALL-FIXES item 3, O2 (pre-existing, Triage close-out): the stitched calibrant's panel states how many
+    frames it stitched and with which options; the end of the job no longer replaces that with "complete"."""
+    page, dialog, window = _twoc_fit(qapp, tmp_path)
+    try:
+        _assert_preview_summary(window)
+        assert window.pattern_view.page_tool('preview').isEnabled()
+    finally:
+        dialog.close()
+        _dispose(page)
+
+
+def test_a_discarded_preview_says_it_was_discarded(qapp, tmp_path):
+    """NEXT-129-SMALL-FIXES item 3, O3 (pre-existing, Triage close-out): a preview whose inputs changed while it stitched
+    is not drawn (its key no longer matches), and its panel now says so instead of "Calibrant preview complete."; the
+    preview already drawn stays, and the fit is kept."""
+    page, dialog, window = _twoc_fit(qapp, tmp_path)
+    try:
+        drawn, fit = window.pattern_view.keyed_projection, dialog.fit
+        window.pattern_view.page_tool('preview').click()
+        assert dialog.active() and dialog._job == 'stitch_preview'
+        dialog._fields['mask'].setText(str(tmp_path / 'another-mask.npy'))  # one of the preview's inputs, mid-stitch
+        _wait(dialog)
+        status = window.pattern_view.status.text()
+        assert 'discarded' in status and 'complete' not in status.casefold(), status
+        assert window.pattern_view.keyed_projection is drawn and dialog.fit is fit
+        assert window.pattern_view.page_tool('preview').isEnabled()
     finally:
         dialog.close()
         _dispose(page)

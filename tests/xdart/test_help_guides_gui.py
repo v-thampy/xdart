@@ -157,6 +157,50 @@ def test_sg_the_shared_source_topic_offers_no_guide_outside_a_tool_window(qapp, 
         root.deleteLater()
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_ig_f1_with_no_option_focused_opens_an_index_offering_the_windows_guide(qapp, opened, kind):
+    """NEXT-129-SMALL-FIXES item 9 (the maintainer's "Add it (Recommended)"; the gap NEXT-129-SOURCE-GUIDE left): in a
+    tool window, F1 with no option focused opens the help index, which offered no illustrated guide. It now offers the
+    window's own (its ``help_guide_topic``) and opens it; the Help window's own F1 returns to that index."""
+    dialog = _dialog(kind, source=True)
+    try:
+        dialog.show()
+        dialog.activateWindow()
+        dialog.split.controls.setFocus()  # the options column itself: no option, no topic
+        qapp.processEvents()
+        QtTest.QTest.keyClick(dialog.split.controls, QtCore.Qt.Key.Key_F1)
+        qapp.processEvents()
+        owner = getattr(dialog, "_context_help_owner", None)
+        assert owner is not None and owner.window is not None
+        window = owner.window
+        assert window.topic_id is None, "F1 with no option focused opens the index"
+        _opens(window, opened, qapp, GUIDES[kind])
+        _pick(window, qapp, "calibration.multi-step")  # a topic of no tool: no guide
+        assert window.guide_button.isHidden()
+        QtTest.QTest.keyClick(window.pane, QtCore.Qt.Key.Key_F1)  # the Help window's own F1: the index again
+        qapp.processEvents()
+        assert window.topic_id is None
+        _opens(window, opened, qapp, GUIDES[kind])
+    finally:
+        dialog.close()
+
+
+def test_ig_the_index_offers_no_guide_outside_a_tool_window(qapp, opened):
+    """The negative control: a root that names no ``help_guide_topic`` (a plain widget, as Int's main window) has an index
+    with no Illustrated guide."""
+    from xdart.gui.widgets.context_help import owner_for
+    root = QtWidgets.QWidget()
+    try:
+        owner = owner_for(root)
+        owner.show_index()
+        window = owner.window
+        assert window.topic_id is None and window.guide_button.isHidden()
+        assert not opened
+    finally:
+        owner_for(root).shutdown()
+        root.deleteLater()
+
+
 def test_g3_the_help_window_offers_the_guide_only_for_topics_that_have_one(qapp, opened):
     from xdart.gui.widgets.context_help import owner_for
     root = QtWidgets.QWidget()

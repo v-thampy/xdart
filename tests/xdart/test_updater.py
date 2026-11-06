@@ -818,3 +818,17 @@ def test_main_shows_the_notice_instead_of_starting(monkeypatch):
     monkeypatch.setattr(updater, "startup_update_notice", lambda: ("xdart is updating", "busy"))
     monkeypatch.setattr(update_launch, "show_native_notice", lambda title, text: shown.append((title, text)))
     assert xdart_main.main() == 0 and shown == [("xdart is updating", "busy")]
+
+
+def test_main_without_the_gui_stack_names_the_xdart_gui_extra(monkeypatch, capsys):
+    """NEXT-129-SMALL-FIXES item 1 (pre-existing): the distribution is xdart and its GUI extra is xdart[gui], as the
+    updater's own pip command says, so the missing-GUI hint and xrd_tools.gui's install line name it, not xrd-tools."""
+    import sys
+    import xrd_tools.gui
+    from xdart import xdart_main
+    monkeypatch.setattr(updater, "startup_update_notice", lambda: None)
+    monkeypatch.setitem(sys.modules, "PySide6", None)  # no GUI extra: importing PySide6 fails
+    assert xdart_main.main() == 1
+    err = capsys.readouterr().err
+    assert 'pip install "xdart[gui]"' in err and "xrd-tools" not in err, err
+    assert 'pip install "xdart[gui]"' in xrd_tools.gui.__doc__ and "xrd_tools[gui]" not in xrd_tools.gui.__doc__

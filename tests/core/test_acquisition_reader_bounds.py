@@ -114,3 +114,63 @@ def test_linked_image_target_landing_is_seen_without_master_stat_change(tmp_path
     assert (path.stat().st_size, path.stat().st_mtime_ns) == (state.st_size, state.st_mtime_ns)
     assert eiger_content(path)[1]
     np.testing.assert_array_equal(read_image_stack(path), pixels)
+
+
+def _positioner_entry(path, frames, motors, offset=0.):
+    """A raw stack whose entry holds ``motors`` per-frame positioners, m<i> = frame + i + offset (degrees)."""
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["NX_class"] = "NXentry"
+        entry.create_dataset("instrument/detector/data", shape=(frames, 8, 8), dtype="u2", chunks=(1, 8, 8))
+        for index in range(motors):
+            value = entry.create_dataset(f"instrument/positioners/m{index}/value",
+                                         data=np.arange(frames, dtype=float) + index + offset, chunks=(32,))
+            value.attrs["units"] = "deg"
+    return path
+
+
+def _datasets_in(value):
+    """Every h5py dataset reachable from ``value`` through containers."""
+    if isinstance(value, h5py.Dataset):
+        return [value]
+    if isinstance(value, dict):
+        return [found for item in value.items() for found in _datasets_in(item)]
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [found for item in value for found in _datasets_in(item)]
+    return []
+
+
+def test_streamed_rows_plan_and_admit_once_per_window_within_b4s_bounds(tmp_path, monkeypatch):
+    """NEXT-129-SMALL-FIXES item 8 (pre-existing, measured; CAL-HELD-GENERIC-ROW-COST): every streamed row re-planned the
+    entry's acquisition items and re-ran Average's admission of each dataset (about 200 us per item-row, 4 ms per row
+    with twenty positioners). A window now plans once and admits each dataset once. B4's bounds hold: every row still
+    reads its own values from the file (no row cache), the provider holds no dataset, and another file's window plans
+    and serves its own items."""
+    from xrd_tools.io import bluesky_nexus, nexus
+    frames, motors = 64, 20
+    plans, admissions, reads = [], [], []
+    plan, admit = nexus.acquisition_items, bluesky_nexus._average_fixed_numeric_dataset
+    monkeypatch.setattr(nexus, "acquisition_items", lambda *args, **kwargs: plans.append(1) or plan(*args, **kwargs))
+    monkeypatch.setattr(bluesky_nexus, "_average_fixed_numeric_dataset",
+                        lambda value, **kwargs: admissions.append(value.name) or admit(value, **kwargs))
+    original = h5py.Dataset.__getitem__
+    def observing_read(dataset, selection, *args, **kwargs):
+        if dataset.name == "/entry/instrument/positioners/m3/value":
+            reads.append(selection)
+        return original(dataset, selection, *args, **kwargs)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", observing_read)
+    for name, count, offset in (("a.nxs", motors, 0.), ("b.nxs", 4, 100.)):
+        path = _positioner_entry(tmp_path / name, frames, count, offset)
+        graph = qualify_source_execution_graph(SourceSpec(path, SourceKind.NEXUS_STACK), selected_motor="m0",
+                                               reader_binding="average_closed_v1")
+        with open_source_execution_graph(graph) as window:
+            first = window.complete_metadata_for(0)  # the window's provider plans and admits here
+            plans.clear(); admissions.clear(); reads.clear()
+            rows = [first] + [window.complete_metadata_for(index) for index in range(1, frames)]
+            held = _datasets_in(vars(window._cursor.metadata_provider()))
+        assert rows == [{f"m{motor}": float(index + motor + offset) for motor in range(count)}
+                        for index in range(frames)]
+        assert plans == [], f"{name}: {len(plans)} streamed rows planned the entry's items again"
+        assert admissions == [], f"{name}: {len(admissions)} datasets were admitted again"
+        assert reads == list(range(1, frames)), f"{name}: rows did not each read their own values: {reads!r}"
+        assert held == [], f"{name}: the provider holds datasets {held!r}"

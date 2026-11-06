@@ -10,7 +10,7 @@ from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff, _
 from xdart.gui.pages.scattering_workspace import _WorkspaceRunControl
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
-from xdart.gui.tabs.scattering.controls_inventory import MASK_FILE, PONI_FILE, SOURCE_FILE
+from xdart.gui.tabs.scattering.controls_inventory import AVERAGE_SCAN, MASK_FILE, PONI_FILE, SOURCE_FILE
 from xdart.gui.tabs.scattering.controls_projection import GI_MOTOR
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
@@ -27,7 +27,7 @@ AUTO = "GI Auto selected incidence motor eta."
 
 
 def _page(root, *, mode="Int 1D", missing=False, energy=None, gi=False,
-          motor="eta", initial_motor="Manual", wavelength=1e-10, unit="q_A^-1"):
+          motor="eta", initial_motor="Manual", wavelength=1e-10, unit="q_A^-1", directory=False):
     root.mkdir(parents=True, exist_ok=True)
     raw = root / "raw_0001.tif"
     _write_tiff(raw, 1)
@@ -46,6 +46,11 @@ def _page(root, *, mode="Int 1D", missing=False, energy=None, gi=False,
             poni.write_text(poni.read_text().replace("1.0e-10", repr(wavelength)))
     intent = _intent(raw, root / "result.nexus", poni, processing_mode=mode)
     intent.source_spec = image_series_spec(raw, metadata_format="txt" if has_metadata else None)
+    if directory:  # an Image Directory Run over the same image, its outputs in their own folder
+        from xrd_tools.sources.selection import DirectorySourceSpec
+        intent.source_spec = DirectorySourceSpec(root, suffixes=(".tif",),
+                                                 metadata_format="txt" if has_metadata else None)
+        intent.save_path = str(root / "processed")
     intent.gi.enabled = gi
     intent.gi.incidence_motor = initial_motor
     intent.gi.th_val = 0.37
@@ -376,5 +381,77 @@ def test_int_gi_auto_notice_names_only_the_owned_launch_choice(tmp_path, monkeyp
         saved = read_provenance(artifact)["config"]["run_configuration"]["gi"]
         assert saved["incidence_motor"] == frozen[0].gi.incidence_motor
         assert saved["th_val"] == 0.37
+    finally:
+        _close(page, app)
+
+
+def test_an_average_with_an_unreadable_poni_refuses_with_its_own_notice(tmp_path):
+    """NEXT-129-SMALL-FIXES item 6, N1 (pre-existing; P2 terminal-review residual): Average reads the PONI again at Run as
+    Run does. An unreadable one refused Average after a refresh with no notice of its own, the Run bar's reason the only
+    cue; it now says why, as every other Average refusal does, and averages nothing."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, poni, _artifact = _page(tmp_path / "average")
+    notices = _record_notices(page)
+    try:
+        _wait(app, lambda: page._source_selection.observation is not None)
+        _edit(page, AVERAGE_SCAN, True)
+        assert page._intents.snapshot().thaw().run_options.get("series_average") is True
+        assert page._shell.run_controls.startButton.isEnabled()
+        poni.write_text("not a calibration\n")  # unreadable since its last check, which no activation or edit repeats
+        _WorkspaceRunControl(page).run_pause()  # the real Run route, which an Average Scan source takes to Average
+        app.processEvents()
+        refusals = [row for row in notices if "PONI" in row[0]]
+        assert len(refusals) == 1 and refusals[0][0].startswith("Average"), notices
+        assert not page._shell.run_controls.startButton.isEnabled()
+        assert not list((tmp_path / "average").rglob("*.nexus"))
+    finally:
+        _close(page, app)
+
+
+def test_a_directory_runs_launch_notice_keeps_the_file_count(tmp_path):
+    """NEXT-129-SMALL-FIXES item 6, N2 (pre-existing; P2 terminal-review residual): a directory Run's launch notice (here
+    the scan-energy clause) cleared the file count until the next progress. The count stays, with the clause beside it,
+    and the clause is still brief: the next progress replaces it."""
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, _poni, _artifact = _page(tmp_path / "directory", energy=16000, directory=True)
+    notices = _record_notices(page)
+    try:
+        _run(page, app)
+        launch = [row for row in notices if ENERGY in row[0]]
+        assert len(launch) == 1, notices
+        assert "processed" in launch[0][2] and ENERGY in launch[0][2], launch
+        _brief(page, notices, ENERGY)
+    finally:
+        _close(page, app)
+
+
+def test_an_auto_scan_series_without_its_spec_file_warns_once(tmp_path, caplog):
+    """NEXT-129-SMALL-FIXES item 7 (pre-existing; multi-image R2): under Auto metadata a series named like SPEC images
+    (<name>_scanN_M) asks the SPEC search whether its images are grouped per point. Without that SPEC file one Run's
+    admission asked five times and warned each time; it warns once, and the Run completes."""
+    import logging
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    root = tmp_path / "auto"
+    root.mkdir()
+    raw = root / "sample_scan1_0001.tif"
+    _write_tiff(raw, 1)
+    _write_tiff(root / "sample_scan1_0002.tif", 1)
+    poni = root / "cal.poni"
+    write_poni(poni)
+    intent = _intent(raw, root / "result.nexus", poni)
+    intent.source_spec = image_series_spec(raw, metadata_format="auto")
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter(), executor=StandardRunExecutor(join_timeout=2),
+    )
+    page.resize(1280, 900)
+    page.show()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run(page, app)
+        assert page._progress.terminal and not page._notice_text, page._notice_text
+        missing = [record.getMessage() for record in caplog.records
+                   if "SPEC file 'sample' not found" in record.getMessage()]
+        assert len(missing) == 1, missing
     finally:
         _close(page, app)

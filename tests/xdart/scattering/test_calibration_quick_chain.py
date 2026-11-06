@@ -22,7 +22,8 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from xdart.gui.widgets.controls_panel import FormRow, SectionCard
 from xrd_tools.core.energy import wavelength_m_to_energy_eV
 from xrd_tools.core.geometry.camera import STITCH_CAMERA, UPRIGHT_CAMERA, DetectorCamera
-from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _page_with_dialog, _wait
+from tests.xdart.scattering.test_stitch_calibration_fit_dialog import (
+    _assert_preview_summary, _page_with_dialog, _wait)
 from tests.xdart.scattering.test_browse_reference_rings_run import _pump
 
 WAVELENGTH = .7293e-10
@@ -319,6 +320,35 @@ def test_quick_use_for_both_copies_only_the_effective_folder(qapp, tmp_path, pag
 
 
 @pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
+def test_a_typed_home_path_reads_its_spec_and_auto_folder_under_home(qapp, tmp_path, monkeypatch, page_name):
+    """NEXT-129-SMALL-FIXES item 2 (pre-existing, LIVE-FIX-IMAGE-FOLDER-TILDE): a hand-typed ~ SPEC path is the home
+    folder's file, so the source the window reads and its Auto image folder (which Use for both copies) are under
+    home, never a "~" folder under the current directory. The pickers give absolute paths; typing is the only way in."""
+    from xdart.gui.widgets.controls_panel import ActionButton
+    home = (tmp_path / 'home').resolve()
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('USERPROFILE', str(home))  # Windows reads ~ from it
+    spec = home / 'calibrant' / 'scan'
+    spec.parent.mkdir(parents=True)
+    spec.write_text('#F scan\n')
+    page, dialog = _window(qapp, tmp_path / 'project', page_name)
+    try:
+        _quick_card(dialog)
+        rows = dialog._quick_rows
+        _commit(rows['source'].editor, '~/calibrant/scan')
+        _wait(dialog)
+        assert Path(dialog._spec().uri) == spec
+        assert dialog._spec().options['image_dir'] == str(spec.parent)
+        copy = [button for button in rows['images'].findChildren(ActionButton) if button.text() == 'Use for both']
+        assert len(copy) == 1
+        _click(copy[0])
+        _wait(dialog)
+        assert dialog._text('beam_images') == str(spec.parent)
+    finally:
+        _close(qapp, page, dialog)
+
+
+@pytest.mark.parametrize('page_name', ['Stitch', 'RSM'])
 def test_quick_card_placement_and_shared_values(qapp, tmp_path, monkeypatch, page_name):
     """Q1 (A1, A2): the card's two scans are the same values as 2 · Rough geometry's and 3 · Calibrant scan's,
     edited in either place, full paths kept behind the file name; a scan number edited on the card keeps tab 3's
@@ -585,7 +615,7 @@ def test_quick_rerun_keeps_loaded_energy_offset_and_finds_the_scan_strip(qapp, t
         assert calibration['source_energy_eV'] == pytest.approx(recorded)
         assert 'energy_refinement' not in dialog.fit.asset['provenance']
         assert dialog.fit.rms_q < .005
-        assert dialog._calibration_fit_window.pattern_view.status.text() == 'Calibrant preview complete.'
+        _assert_preview_summary(dialog._calibration_fit_window)
         # A deliberate acquisition override is retained, and genuinely different recorded inputs still refuse.
         _commit(dialog._fields['rough_energy'], f'{(recorded + 500.) / 1000:.12g}')
         status = _run(dialog, card)
@@ -627,7 +657,7 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         assert dialog.status.text() == calibration_fit_text(dialog.fit, 'refine')
         window = dialog._calibration_fit_window
         assert window is not None and window.isVisible()
-        assert window.pattern_view.status.text() == 'Calibrant preview complete.'
+        _assert_preview_summary(window)
         assert dialog.refine_seed.currentData() == 'rough'
         after = dialog.settings()
         changed = {key for key in set(before['fields']) | set(after['fields'])
@@ -725,6 +755,42 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         from xrd_tools.integrate.stitch_calibration import load_calibration_session
         _frames, _arm, _policy, restored = load_calibration_session(session, with_resume=True)
         assert restored.fit is not None and restored.matches_source(dialog._spec())
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_a_fit_made_while_a_session_restores_is_kept(qapp, tmp_path, monkeypatch):
+    """NEXT-129-SMALL-FIXES item 4 (pre-existing, LIVE-TEST-FIXES-20261015 N3): opening a saved session restores its fit
+    once the window's background reads end, and the job buttons stay usable meanwhile. A Refine pressed in that gap
+    makes a newer fit (and saves it to the session); the restore keeps it instead of putting the session's older fit
+    back over it. Q2 above keeps the restore that should apply: nothing intervenes there, and the saved fit returns."""
+    pair = _stitch_pair(tmp_path / 'data')
+    page, dialog = _page_with_dialog(tmp_path / 'project')
+    try:
+        card = _quick_card(dialog)
+        _configure(dialog, card, pair, camera=UPRIGHT_CAMERA)
+        status = _run(dialog, card)
+        assert dialog.fit is not None and card.status.text().startswith('Done'), status
+        session = dialog.session_dir / 'calibration-session.json'
+        assert session.is_file()
+        shown, show = [], dialog._show_calibration_fit
+        def recording(*args, **kwargs):  # a pass-through: which fit each display shows
+            shown.append(dialog.fit)
+            return show(*args, **kwargs)
+        monkeypatch.setattr(dialog, '_show_calibration_fit', recording)
+        started = _starts(dialog, monkeypatch)
+        from xdart.gui.widgets import file_dialogs
+        monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
+        dialog.open_session_button.click()
+        # the restore waits for the window's own source and direct-beam reads; the job buttons stay enabled
+        assert dialog._pending_session_resume is not None and not dialog._owner.busy
+        assert dialog.refine_button.isEnabled()
+        dialog.refine_button.click()
+        assert _pump(qapp, lambda: dialog._pending_session_resume is None and not dialog.active(), 300.)
+        _wait(dialog, timeout=300)
+        assert 'refine' in started, started
+        assert shown and dialog.fit is shown[0], 'the restore put the session’s older fit back over the newer one'
+        assert len(shown) == 1, 'the restore showed the session’s fit after the newer one'
     finally:
         _close(qapp, page, dialog)
 
