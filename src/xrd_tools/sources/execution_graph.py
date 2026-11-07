@@ -912,7 +912,8 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
                    force_compact: bool = False,
                    infer_point_images: bool = True,
                    published_members: int = 0, prefix: PreparedSourceExecutionGraph | None = None,
-                   spec_cache: dict | None = None) -> PreparedSourceExecutionGraph | None:
+                   spec_cache: dict | None = None,
+                   warn_missing_spec: bool = True) -> PreparedSourceExecutionGraph | None:
     options = dict(source.options); marker = options.pop("average_compact_series_v1", None)
     if marker is not None and marker is not True: raise ValueError("compact Average TIFF marker is invalid")
     if marker is True and ({"files", "admitted_motor_values"} & set(options)):
@@ -935,7 +936,9 @@ def _qualify_tiff(source: SourceSpec, *, selected_motor: str | None, reader_bind
     qualified.pop("admitted_motor_values", None)
     if "point_images" not in qualified and infer_point_images:
         from xrd_tools.sources.point_images import inspect_point_images, PointImagesRequired
-        detection = inspect_point_images(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified))
+        # a re-check of a qualified graph (expected) never warns again of a missing SPEC file (item 7)
+        detection = inspect_point_images(SourceSpec(source.uri, SourceKind.TIFF_SERIES, options=qualified),
+                                         warn_missing_spec=warn_missing_spec and expected is None)
         if detection is not None:
             raise PointImagesRequired(detection)
     grouped_source = None
@@ -1339,8 +1342,10 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         selected_container: SelectedContainerInput | None = None,
         cancelled: Callable[[], bool] | None = None,
         infer_point_images: bool = True, published_members: int = 0,
-        prefix: PreparedSourceExecutionGraph | None = None, spec_cache: dict | None = None) -> PreparedSourceExecutionGraph:
+        prefix: PreparedSourceExecutionGraph | None = None, spec_cache: dict | None = None,
+        warn_missing_spec: bool = True) -> PreparedSourceExecutionGraph:
     """Qualify one source; ``infer_point_images=False`` (a live Run) never infers images per point.
+    ``warn_missing_spec=False``: a Run's re-check does not warn again of a TIFF series' missing SPEC file.
 
     A live TIFF series under SPEC metadata also holds each member to its own
     valid row: ``published_members`` leading members, already published by the
@@ -1367,7 +1372,7 @@ def qualify_source_execution_graph(source: SourceSpec, *, selected_motor: str | 
         return _qualify_tiff(source, selected_motor=selected_motor,
             reader_binding=reader_binding, cancelled=cancelled,
             infer_point_images=infer_point_images, published_members=published_members,
-            prefix=prefix, spec_cache=spec_cache)
+            prefix=prefix, spec_cache=spec_cache, warn_missing_spec=warn_missing_spec)
     if source.kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
         return _qualify_container(source, selected_motor=selected_motor,
                                   reader_binding=reader_binding, cancelled=cancelled,

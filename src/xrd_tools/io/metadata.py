@@ -1376,6 +1376,17 @@ def _spec_search_dirs(image_path: Path, search_dir: Path | str | None) -> list[P
     return candidate_dirs
 
 
+def _find_spec_file(
+    image_path: Path, spec_fname: str, search_dir: Path | None,
+) -> tuple[Path | None, list[Path]]:
+    """The SPEC file an image names, looked for where its reader looks
+    (``_spec_search_dirs``), or None; and the folders searched."""
+    candidate_dirs = _spec_search_dirs(image_path, search_dir)
+    found = next((sd / spec_fname for sd in candidate_dirs
+                  if (sd / spec_fname).is_file()), None)
+    return found, candidate_dirs
+
+
 def _read_spec_metadata_observed(
     image_path: Path,
     search_dir: Path | None = None,
@@ -1431,13 +1442,9 @@ def _read_spec_metadata_observed(
             )
             return ImageMetadataRead({}, None)
 
-        candidate_dirs = _spec_search_dirs(image_path, search_dir)
-        for sd in candidate_dirs:
-            candidate = sd / spec_fname
-            if candidate.is_file():
-                spec_file = candidate
-                break
-
+        spec_file, candidate_dirs = _find_spec_file(
+            image_path, spec_fname, search_dir,
+        )
         if spec_file is None:
             logger.warning(
                 "_read_spec_metadata: SPEC file %r not found in %s",

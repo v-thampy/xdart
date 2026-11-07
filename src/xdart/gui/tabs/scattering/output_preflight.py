@@ -547,7 +547,8 @@ def prepare_output(
     snapshot = capture.intent_snapshot
     intent = snapshot.thaw()
     if type(intent.source_spec) is SourceSpec:
-        detection = inspect_point_images(intent.source_spec)
+        # the qualification below warns once for this Run of a missing SPEC file (NEXT-129-SMALL-FIXES item 7)
+        detection = inspect_point_images(intent.source_spec, warn_missing_spec=False)
         if detection is not None:
             if intent.live_mode:
                 raise ValueError('Multiple images per point are unavailable in Live; choose a finite run.')
@@ -1963,6 +1964,7 @@ def validate_admitted_receipt(
                     receipt.candidate,
                     source,
                     cancelled=is_cancelled,
+                    warn_missing_spec=False,  # admission warned this Run (item 7)
                 ),),
             )
         for output in outputs:
@@ -2304,6 +2306,7 @@ def _qualify_for_admission(
     published_members: int = 0,
     prefix: PreparedSourceExecutionGraph | None = None,
     spec_cache: dict | None = None,
+    warn_missing_spec: bool = True,
 ) -> PreparedSourceExecutionGraph:
     try:
         return qualify_source_execution_graph(
@@ -2312,6 +2315,7 @@ def _qualify_for_admission(
             infer_point_images=infer_point_images,
             published_members=published_members,
             prefix=prefix, spec_cache=spec_cache,
+            warn_missing_spec=warn_missing_spec,
         )
     except InterruptedError as error:
         if error.args != ("source qualification cancelled",):
@@ -2323,10 +2327,11 @@ def _series_item(
     configuration: FrozenRunConfiguration | OutputCandidate, source: SourceSpec,
     *,
     cancelled: Callable[[], bool] = _not_cancelled,
+    warn_missing_spec: bool = True,
 ) -> PlannedOutput:
     graph = _qualify_for_admission(
         source, selected_motor=_selected_tiff_gi_motor(configuration),
-        cancelled=cancelled,
+        cancelled=cancelled, warn_missing_spec=warn_missing_spec,
     )
     directory, family = _run_output_naming(configuration, graph.group_key)
     return PlannedOutput(graph,

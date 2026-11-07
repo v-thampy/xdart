@@ -132,11 +132,13 @@ def _nexus_point_count(spec: SourceSpec, image_count: int) -> int | None:
         return points if exposures > 0 and points > 0 and exposures * points == image_count else None
 
 
-def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
+def inspect_point_images(spec: SourceSpec, *, warn_missing_spec: bool = True) -> PointImageDetection | None:
     """Inspect recorded SPEC points / declared NeXus counts and image layouts.
 
     No detector pixels are decoded. Unknown point counts and non-integral
     ratios yield no suggestion; source opening still applies its strict checks.
+    ``warn_missing_spec=False``: a TIFF series' missing SPEC file is not warned
+    of again (``resolve_spec_image_scan``).
     """
     if not isinstance(spec, SourceSpec):
         raise TypeError("point image inspection requires a SourceSpec")
@@ -163,7 +165,8 @@ def inspect_point_images(spec: SourceSpec) -> PointImageDetection | None:
         files = tuple(Path(value).expanduser() for value in options.get("files", ()))
         if not files:
             return None
-        resolved = resolve_spec_image_scan(files[0], meta_dir=options.get("meta_dir"))
+        resolved = resolve_spec_image_scan(files[0], meta_dir=options.get("meta_dir"),
+                                           warn_missing=warn_missing_spec)
         if resolved is None:
             return None
         spec_path, scan = resolved

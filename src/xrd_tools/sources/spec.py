@@ -69,17 +69,26 @@ def spec_image_stem(path: str | Path, spec_stem: str, scan: Any) -> str:
     return match[0]
 
 
-def resolve_spec_image_scan(path: str | Path, *, meta_dir: str | Path | None = None) -> tuple[Path, str] | None:
+def resolve_spec_image_scan(path: str | Path, *, meta_dir: str | Path | None = None,
+                            warn_missing: bool = True) -> tuple[Path, str] | None:
     """Resolve a numbered image's actual SPEC scan through the metadata reader.
 
     Auto sidecars remain independent metadata; only a successfully read SPEC
     point can establish grouping. The reader owns its existing folder search.
+    ``warn_missing=False``: a re-check, in a Run that has already warned that
+    the SPEC file is missing, finds it missing by the same search without
+    warning again (NEXT-129-SMALL-FIXES item 7).
     """
-    from xrd_tools.io.metadata import _extract_scan_info, read_image_metadata_observed
+    from xrd_tools.io.metadata import (
+        _extract_scan_info, _find_spec_file, _lexical_absolute, read_image_metadata_observed,
+    )
     from xrd_tools.io.spec import is_spec_file
 
-    _stem, scan, _image = _extract_scan_info(path)
+    stem, scan, _image = _extract_scan_info(path)
     if scan is None:
+        return None
+    if not warn_missing and (stem is None or _find_spec_file(
+            _lexical_absolute(path), stem, None if meta_dir in (None, "") else Path(meta_dir))[0] is None):
         return None
     observed = read_image_metadata_observed(path, "spec", meta_dir=meta_dir)
     if not observed.values or observed.source_path is None or not is_spec_file(observed.source_path):
