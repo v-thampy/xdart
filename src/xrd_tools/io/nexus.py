@@ -5000,11 +5000,17 @@ def read_acquisition_metadata_row(
     entry: h5py.Group, frame_count: int, frame_index: int, *,
     motor_names: tuple[str, ...] | None = None,
     admit: Callable[[str, bool], Any] | None = None,
+    items: tuple[AcquisitionItem, ...] | None = None,
 ) -> dict[str, float]:
-    """Read only one supported row from the held entry, without whole-scan arrays."""
+    """Read only one supported row from the held entry, without whole-scan arrays.
+
+    ``items``: the entry's plan for this *frame_count* (``acquisition_items``), when the caller keeps it for
+    its rows; without it, the entry is planned here.
+    """
     if not 0 <= frame_index < frame_count:
         return {}
-    items, _ = acquisition_items(entry, frame_count)
+    if items is None:
+        items, _ = acquisition_items(entry, frame_count)
     return {item.name: float(value) for item, value in _acquisition_values(
         entry, items, motor_names=motor_names, admit=admit, frame_index=frame_index)}
 

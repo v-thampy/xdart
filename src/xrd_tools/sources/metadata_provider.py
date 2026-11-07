@@ -341,6 +341,13 @@ class NexusMetadataProvider(MetadataProvider):
     materialization fails clearly, even if rows were streamed earlier. On
     the Average route the prevalidated motor names restrict the motors, and each
     dataset passes Average's bounded admission before it is read.
+
+    Streamed rows plan the entry's items once per provider, and pass each
+    dataset through Average's admission once (CAL-HELD-GENERIC-ROW-COST): the
+    provider keeps the plan's detached item descriptors and the admitted
+    (path, per-frame) facts, never a row, a table or a dataset (B4's bounds).
+    Its entry and frame count are fixed, so the plan is never served for
+    other inputs.
     """
 
     metadata_energy_is_eV = True
@@ -355,6 +362,8 @@ class NexusMetadataProvider(MetadataProvider):
         self._wavelength_unit = wavelength_unit
         self._all_motor_names = all_motor_names
         self._metadata: Any = None
+        self._row_items: tuple[Any, ...] | None = None  # the streamed rows' plan, planned at the first row
+        self._admitted: set[tuple[str, bool]] = set()   # (path, per frame) that passed Average's admission
 
     def frame_count(self) -> int | None:
         return self._frame_count
@@ -378,9 +387,15 @@ class NexusMetadataProvider(MetadataProvider):
                 _average_hard_path,
             )
 
+            admitted = self._admitted
+
             def admit(path: str, per_frame: bool) -> Any:
-                return _average_fixed_numeric_dataset(
+                if (path, per_frame) in admitted:  # passed for this held entry: its hard path, looked up again
+                    return entry[path]
+                dataset = _average_fixed_numeric_dataset(
                     _average_hard_path(entry, path), scalar_only=not per_frame)
+                admitted.add((path, per_frame))
+                return dataset
             return admit
         return None
 
@@ -390,12 +405,14 @@ class NexusMetadataProvider(MetadataProvider):
             return {}
         if self._metadata is not None:
             return super().complete_metadata_for(pos)
-        from xrd_tools.io.nexus import read_acquisition_metadata_row
+        from xrd_tools.io import nexus
 
-        entry = self._live_entry()
-        return read_acquisition_metadata_row(
+        entry = self._live_entry()  # a closed source refuses here, planned or not
+        if self._row_items is None:
+            self._row_items = nexus.acquisition_items(entry, self._frame_count)[0]
+        return nexus.read_acquisition_metadata_row(
             entry, self._frame_count, pos, motor_names=self._all_motor_names,
-            admit=self._admission(entry))
+            admit=self._admission(entry), items=self._row_items)
 
     def _read(self) -> Any:
         if self._metadata is not None:
