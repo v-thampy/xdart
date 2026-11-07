@@ -370,6 +370,55 @@ def test_a_discarded_preview_says_it_was_discarded(qapp, tmp_path):
         _dispose(page)
 
 
+def test_a_fit_made_while_a_session_restores_is_kept(qapp, tmp_path, monkeypatch):
+    """NEXT-129-SMALL-FIXES item 4 (pre-existing, LIVE-TEST-FIXES-20261015 N3): opening a saved session restores its fit
+    once the window's own background reads end, and its job buttons stay usable meanwhile. A Fit pressed in that gap
+    makes a newer fit; the restore keeps it, with its summary and display, instead of putting the session's older fit
+    back over it. It replaces a Quick-session row that could make no fit in the gap: a Quick session holds no prepared
+    frames for Fit, and opening it clears the fit Refine starts from. A restore with nothing in between still brings
+    the saved fit back (test_calibration_quick_chain.py, Q2)."""
+    from xdart.gui.tabs.calibration.dialog import fit_summary_text
+    from xdart.gui.widgets import file_dialogs
+    from xrd_tools.integrate.stitch_calibration import load_calibration_session
+    page, dialog, _window = _twoc_fit(qapp, tmp_path)
+    try:
+        session = dialog.session_dir / 'calibration-session.json'
+        saved = load_calibration_session(session, with_resume=True)[3]
+        assert saved is not None and saved.fit is not None, 'the session holds the fit it restores'
+        started, start = [], dialog._start
+        def recording(kind, arguments):  # a pass-through: the jobs that actually start
+            busy = dialog._owner.busy
+            start(kind, arguments)
+            if not busy and dialog._owner.busy:
+                started.append(kind)
+        monkeypatch.setattr(dialog, '_start', recording)
+        shown, show = [], dialog._show_calibration_fit
+        def showing(*args, **kwargs):  # a pass-through: the fit each display shows
+            shown.append(dialog.fit)
+            return show(*args, **kwargs)
+        monkeypatch.setattr(dialog, '_show_calibration_fit', showing)
+        monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
+        dialog.open_session_button.click()
+        assert dialog._pending_session_resume is not None and not dialog._owner.busy, dialog.status.text()
+        assert dialog.fit is None and dialog.fit_button.isEnabled()
+        dialog.fit_button.click()
+        assert started == ['fit'], (started, dialog.status.text())
+        until = time.monotonic() + 120
+        while (dialog._pending_session_resume is not None or dialog.active()) and time.monotonic() < until:
+            QtWidgets.QApplication.processEvents()
+            time.sleep(.005)
+        _wait(dialog)
+        assert dialog._pending_session_resume is None, dialog.status.text()
+        newer = shown[0] if shown else None
+        assert newer is not None and newer is not saved.fit, (shown, dialog.status.text())
+        assert dialog.fit is newer, 'the restore put the session’s older fit back over the newer one'
+        assert shown == [newer], 'the restore showed the session’s older fit after the newer one'
+        assert dialog._fit_kind == 'fit' and dialog.fit_summary.toPlainText() == fit_summary_text(newer)
+    finally:
+        dialog.close()
+        _dispose(page)
+
+
 def test_a_horizontal_twoc_arm_is_fitted_saved_and_adopted_with_del_held_at_zero(qapp, tmp_path, monkeypatch):
     from xrd_tools.session.instrument import InstrumentGeometry
     (tmp_path / 'frames').mkdir()

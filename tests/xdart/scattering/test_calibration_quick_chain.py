@@ -759,42 +759,6 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         _close(qapp, page, dialog)
 
 
-def test_a_fit_made_while_a_session_restores_is_kept(qapp, tmp_path, monkeypatch):
-    """NEXT-129-SMALL-FIXES item 4 (pre-existing, LIVE-TEST-FIXES-20261015 N3): opening a saved session restores its fit
-    once the window's background reads end, and the job buttons stay usable meanwhile. A Refine pressed in that gap
-    makes a newer fit (and saves it to the session); the restore keeps it instead of putting the session's older fit
-    back over it. Q2 above keeps the restore that should apply: nothing intervenes there, and the saved fit returns."""
-    pair = _stitch_pair(tmp_path / 'data')
-    page, dialog = _page_with_dialog(tmp_path / 'project')
-    try:
-        card = _quick_card(dialog)
-        _configure(dialog, card, pair, camera=UPRIGHT_CAMERA)
-        status = _run(dialog, card)
-        assert dialog.fit is not None and card.status.text().startswith('Done'), status
-        session = dialog.session_dir / 'calibration-session.json'
-        assert session.is_file()
-        shown, show = [], dialog._show_calibration_fit
-        def recording(*args, **kwargs):  # a pass-through: which fit each display shows
-            shown.append(dialog.fit)
-            return show(*args, **kwargs)
-        monkeypatch.setattr(dialog, '_show_calibration_fit', recording)
-        started = _starts(dialog, monkeypatch)
-        from xdart.gui.widgets import file_dialogs
-        monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
-        dialog.open_session_button.click()
-        # the restore waits for the window's own source and direct-beam reads; the job buttons stay enabled
-        assert dialog._pending_session_resume is not None and not dialog._owner.busy
-        assert dialog.refine_button.isEnabled()
-        dialog.refine_button.click()
-        assert _pump(qapp, lambda: dialog._pending_session_resume is None and not dialog.active(), 300.)
-        _wait(dialog, timeout=300)
-        assert 'refine' in started, started
-        assert shown and dialog.fit is shown[0], 'the restore put the session’s older fit back over the newer one'
-        assert len(shown) == 1, 'the restore showed the session’s fit after the newer one'
-    finally:
-        _close(qapp, page, dialog)
-
-
 @pytest.mark.parametrize('problem', ['refused', 'stale', 'stale_after_metadata', 'camera', 'sense'])
 def test_quick_stops_at_direct_beam_problem(qapp, tmp_path, monkeypatch, problem):
     """Q3: a direct-beam fit that cannot run, one whose inputs changed while it ran, one made stale by reading the
