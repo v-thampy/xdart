@@ -1985,7 +1985,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _image_folder(self, prefix=''):
         path = self._text(prefix + 'source')
-        return self._text(prefix + 'images') or (str(Path(path).resolve().parent) if path else '')
+        # a typed ~ is the user's home, as the file browser's picks are (LIVE-FIX-IMAGE-FOLDER-TILDE)
+        return self._text(prefix + 'images') or (str(Path(path).expanduser().resolve().parent) if path else '')
 
     def _build_distance(self):
         layout, form = self._form('2 · Rough geometry', 'rough')
@@ -2937,7 +2938,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if kind is SourceKind.SPEC:
             if (beam and self.beam_source_kind.currentData() == 'spec_container'
                     and self._text('beam_image_file') and not self._text('beam_images') and not self._text('beam_stem')):
-                return SourceSpec(Path(path).resolve(), kind, entry=entry,
+                return SourceSpec(Path(path).expanduser().resolve(), kind, entry=entry,
                     options={'scan': self._text('beam_scan'), 'image_file': self._text('beam_image_file'),
                              **({'nexus_entry': self._shared_nexus_entry} if self._shared_nexus_entry else {})})
             # a blank folder is the SPEC file's, as in Stitch; a blank stem is the source's default
@@ -2948,7 +2949,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 options['image_stem'] = self._text(prefix + 'stem')
         if self._shared_nexus_entry and self._data_format != 'spec_series':
             options['nexus_entry'] = self._shared_nexus_entry
-        return self.point_images.options(SourceSpec(Path(path).resolve(), kind,
+        return self.point_images.options(SourceSpec(Path(path).expanduser().resolve(), kind,
             entry=entry, options=options))
 
     def _start(self, kind, arguments):
