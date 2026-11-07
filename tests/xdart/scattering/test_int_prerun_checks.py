@@ -438,20 +438,24 @@ def test_an_auto_scan_series_without_its_spec_file_warns_once(tmp_path, caplog):
     _write_tiff(root / "sample_scan1_0002.tif", 1)
     poni = root / "cal.poni"
     write_poni(poni)
-    intent = _intent(raw, root / "result.nexus", poni)
-    intent.source_spec = image_series_spec(raw, metadata_format="auto")
-    page = ScatteringWorkspace(
-        intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
-        sources=FilesystemSourceAdapter(), executor=StandardRunExecutor(join_timeout=2),
-    )
-    page.resize(1280, 900)
-    page.show()
-    try:
-        with caplog.at_level(logging.WARNING):
-            _run(page, app)
-        assert page._progress.terminal and not page._notice_text, page._notice_text
-        missing = [record.getMessage() for record in caplog.records
-                   if "SPEC file 'sample' not found" in record.getMessage()]
-        assert len(missing) == 1, missing
-    finally:
-        _close(page, app)
+    for attempt in range(2):
+        # The same missing source in a later Run must warn again. A process-wide
+        # once-per-path warning cache would hide that Run's only explanation.
+        caplog.clear()
+        intent = _intent(raw, root / f"result-{attempt}.nexus", poni)
+        intent.source_spec = image_series_spec(raw, metadata_format="auto")
+        page = ScatteringWorkspace(
+            intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+            sources=FilesystemSourceAdapter(), executor=StandardRunExecutor(join_timeout=2),
+        )
+        page.resize(1280, 900)
+        page.show()
+        try:
+            with caplog.at_level(logging.WARNING):
+                _run(page, app)
+            assert page._progress.terminal and not page._notice_text, page._notice_text
+            missing = [record.getMessage() for record in caplog.records
+                       if "SPEC file 'sample' not found" in record.getMessage()]
+            assert len(missing) == 1, (attempt, missing)
+        finally:
+            _close(page, app)

@@ -167,10 +167,14 @@ def test_streamed_rows_plan_and_admit_once_per_window_within_b4s_bounds(tmp_path
             first = window.complete_metadata_for(0)  # the window's provider plans and admits here
             plans.clear(); admissions.clear(); reads.clear()
             rows = [first] + [window.complete_metadata_for(index) for index in range(1, frames)]
-            held = _datasets_in(vars(window._cursor.metadata_provider()))
+            repeated = window.complete_metadata_for(7)
+            provider = window._cursor.metadata_provider()
+            held = _datasets_in(vars(provider))
+            assert provider._metadata is None, "streaming materialized the whole metadata table"
         assert rows == [{f"m{motor}": float(index + motor + offset) for motor in range(count)}
                         for index in range(frames)]
+        assert repeated == rows[7]
+        assert reads == [*range(1, frames), 7], f"{name}: rows did not each read their own values: {reads!r}"
+        assert held == [], f"{name}: the provider holds datasets {held!r}"
         assert plans == [], f"{name}: {len(plans)} streamed rows planned the entry's items again"
         assert admissions == [], f"{name}: {len(admissions)} datasets were admitted again"
-        assert reads == list(range(1, frames)), f"{name}: rows did not each read their own values: {reads!r}"
-        assert held == [], f"{name}: the provider holds datasets {held!r}"
