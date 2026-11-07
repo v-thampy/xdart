@@ -197,8 +197,8 @@ def _single_geometry(label, image, calibrant, integrator):
 
     pyFAI builds the refinement from ``integrator.get_config()``, which does not carry ``auto_gc``, and its PONI setters
     then ran two full ``gc.collect()`` for every frame on the calibration worker (NEXT-129-SMALL-FIXES finding H: about
-    12 s a Refine, finalizing other threads' garbage; CI-VIEWERS-HANG-128 turned collection off on xrd_tools' own
-    integrators). Turning ``auto_gc`` off on the finished object would be too late.
+    12 s a Refine, the first collection freeing 10,949 objects; CI-VIEWERS-HANG-128 turned collection off on
+    xrd_tools' own integrators). Turning ``auto_gc`` off on the finished object would be too late.
     """
     from pyFAI.detectors import detector_factory  # noqa: PLC0415
     from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415

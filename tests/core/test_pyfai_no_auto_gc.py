@@ -116,8 +116,8 @@ def test_every_pyfai_geometry_xrd_tools_builds_turns_collection_off() -> None:
 def test_the_scan_ring_search_never_collects_garbage(tmp_path, collections) -> None:
     """NEXT-129-SMALL-FIXES finding H: pyFAI's SingleGeometry builds a refinement of its own from the integrator's
     config, which drops auto_gc, and that refinement's constructor ran two full gc.collect() per frame on the
-    calibration worker (XDART_DEBUG_CALIBRATION_GC: 128 a Refine, about 12 s, the first freeing 10,949 objects of
-    other threads' garbage); one such collection hung a GUI test run for 10.5 h. Frozen before the product change."""
+    calibration worker (XDART_DEBUG_CALIBRATION_GC: 128 a Refine, about 12 s, the first freeing 10,949 objects);
+    one such collection hung a GUI test run for 10.5 h. Frozen before the product change."""
     from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
     from xrd_tools.integrate.stitch_autocalibration import extract_scan_ring_points
 
