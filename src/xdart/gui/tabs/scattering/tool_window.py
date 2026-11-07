@@ -12,6 +12,11 @@ labels and the input boxes is inconsistent ... same in the Peak Fitting window",
 box starts at one x, set by the column's longest label, measured again as rows are added and as fonts and styles
 change. ``set_options_locked`` locks every card's rows while a window's Fit all runs (his "Lock during a run
 (Recommended)"), each card's header, and its "?", staying usable.
+
+The window opens with its first option focused (NEXT-129-SMALL-FIXES item 5: it opened with the options column itself
+focused, and a "?" as its default button). Only the first show gives it, and only when the window has focused
+nothing itself, so a raised window keeps the focus its user left. Return and Escape keep their one owner,
+``RetainedDialogKeyPolicy``.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ class ToolWindowSplit(QtWidgets.QSplitter):
         self._cards.addStretch(1)
         self.controls.setWidget(column)
         self._column, self._card_widgets = column, []
+        self._first_focus_given = False
         column.installEventFilter(self)
         area = QtWidgets.QScrollArea(self)
         area.setObjectName(f"{name}Displays")
@@ -79,7 +85,23 @@ class ToolWindowSplit(QtWidgets.QSplitter):
     def eventFilter(self, watched, event) -> bool:
         if watched is self._column and event.type() in _REALIGN:
             self.align_labels()
+            if event.type() == QtCore.QEvent.Type.Show and not self._first_focus_given:
+                self._first_focus_given = True  # the first show only: a raised window keeps its user's focus
+                focus, first = self.window().focusWidget(), self.first_option()
+                if first is not None and (focus is None or focus is self.controls):
+                    first.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
         return super().eventFilter(watched, event)
+
+    def first_option(self) -> QtWidgets.QWidget | None:
+        """The options column's first option: in its window's Tab order, the first widget inside the column that takes
+        keyboard focus, is shown (within its window) and enabled, and is not a section's "?"."""
+        from xdart.gui.widgets.context_help import _help_action
+        window = widget = self.window()
+        while (widget := widget.nextInFocusChain()) is not window:
+            if (self._column.isAncestorOf(widget) and widget.focusPolicy() & QtCore.Qt.FocusPolicy.TabFocus
+                    and widget.isVisibleTo(window) and widget.isEnabled() and not _help_action(widget)):
+                return widget
+        return None
 
     def set_options_locked(self, locked: bool) -> None:
         """Lock (or unlock) every card's rows: a card's body, or a bare row, is disabled, so its header and "?" stay
