@@ -172,6 +172,57 @@ def _gc_debug_enabled():
     return True
 
 
+_QUIET_REFINEMENT = None
+
+
+def _quiet_refinement():
+    """pyFAI's GeometryRefinement, whose parameter changes never run ``gc.collect()`` (made once, on first use)."""
+    global _QUIET_REFINEMENT
+    if _QUIET_REFINEMENT is None:
+        from pyFAI.geometryRefinement import GeometryRefinement  # noqa: PLC0415
+
+        class QuietGeometryRefinement(GeometryRefinement):
+            """Never collects garbage: its constructor sets its PONI before any caller could turn auto_gc off."""
+
+            def collect_garbage(self, collect_garbage=None):
+                return None
+
+        _QUIET_REFINEMENT = QuietGeometryRefinement
+    return _QUIET_REFINEMENT
+
+
+def _single_geometry(label, image, calibrant, integrator):
+    """``pyFAI.goniometer.SingleGeometry(label, image=image, calibrant=calibrant, geometry=integrator)``, built as its
+    constructor builds it, with a refinement that never collects garbage.
+
+    pyFAI builds the refinement from ``integrator.get_config()``, which does not carry ``auto_gc``, and its PONI setters
+    then ran two full ``gc.collect()`` for every frame on the calibration worker (NEXT-129-SMALL-FIXES finding H: about
+    12 s a Refine, finalizing other threads' garbage; CI-VIEWERS-HANG-128 turned collection off on xrd_tools' own
+    integrators). Turning ``auto_gc`` off on the finished object would be too late.
+    """
+    from pyFAI.detectors import detector_factory  # noqa: PLC0415
+    from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
+
+    single = SingleGeometry.__new__(SingleGeometry)
+    single.label, single.image, single.metadata = label, image, None
+    single.calibrant, single.control_points, single.detector = calibrant, None, None
+    config = integrator.get_config()
+    if "detector" in config:
+        single.detector = detector_factory(config["detector"], config.pop("detector_config", None))
+        config["detector"] = single.detector
+    config["calibrant"] = calibrant
+    if calibrant.wavelength:
+        config["wavelength"] = calibrant.wavelength
+    for key in ("max_shape", "poni_version"):
+        config.pop(key, None)
+    single.geometry_refinement = _quiet_refinement()(**config)
+    single.geometry_refinement.auto_gc = False
+    if single.detector is None:
+        single.detector = single.geometry_refinement.detector
+    single.pos_function, single.massif = None, None
+    return single
+
+
 def _seeded_extract(geometry, index, points_per_degree):
     """pyFAI's ring points for one frame, reproducibly.
 
@@ -281,7 +332,6 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
     the calibration's mask in the oriented image, applied with the detector's. Each image is turned by
     ``image_rotation`` and mirrored left-right by ``image_flip`` (its camera's transform into Stitch's frame).
     """
-    from pyFAI.goniometer import SingleGeometry  # noqa: PLC0415
     from xrd_tools.integrate.multi import create_multigeometry_integrator_series_from_geometry
     from xrd_tools.sources import open_source  # noqa: PLC0415
 
@@ -361,8 +411,7 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
             if debug:
                 _gc_debug('single-geometry-start', frame=int(index), gc_enabled=gc.isenabled(),
                           counts=gc.get_count(), auto_gc=getattr(integrator, 'auto_gc', None))
-            geometry_ = SingleGeometry(int(index), image=np.where(valid, image, 0.0), calibrant=cal,
-                                       geometry=integrator)
+            geometry_ = _single_geometry(int(index), np.where(valid, image, 0.0), cal, integrator)
             if debug:
                 _gc_debug('single-geometry-end', frame=int(index),
                           refinement_auto_gc=getattr(geometry_.geometry_refinement, 'auto_gc', None))

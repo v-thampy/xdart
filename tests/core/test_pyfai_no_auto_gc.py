@@ -125,3 +125,32 @@ def test_the_scan_ring_search_never_collects_garbage(tmp_path, collections) -> N
     points = extract_scan_ring_points(spec, five_parameter_seed(ROW_ANGLES), max_frames=3)
     assert points.controls, "the search found ring points"
     assert collections == [], f"{len(collections)} full collections ran during the ring search"
+
+
+def test_the_ring_searchs_single_geometry_is_built_as_pyfais_own(tmp_path, monkeypatch) -> None:
+    """Finding H's construction adapter builds what pyFAI's SingleGeometry builds for the same frame (the same
+    attributes, refinement geometry and seeded ring points), with collection off in its refinement only."""
+    import numpy as np
+    from pyFAI.goniometer import SingleGeometry
+    from tests.core.test_stitch_autocalibration import ROW_ANGLES, five_parameter_seed, ring_scan
+    from xrd_tools.integrate import stitch_autocalibration as owner
+
+    built, adapter = [], owner._single_geometry
+
+    def recording(label, image, calibrant, integrator):  # a pass-through: each frame's inputs and result
+        single = adapter(label, image, calibrant, integrator)
+        built.append((single, label, image, calibrant, integrator))
+        return single
+
+    monkeypatch.setattr(owner, "_single_geometry", recording)
+    spec = ring_scan(tmp_path / "scan", [(delta, 0.0) for delta in (6.0, 20.0, 34.0)])
+    owner.extract_scan_ring_points(spec, five_parameter_seed(ROW_ANGLES), max_frames=3)
+    assert len(built) == 3
+    for single, label, image, calibrant, integrator in built:
+        reference = SingleGeometry(label, image=image, calibrant=calibrant, geometry=integrator)
+        assert set(vars(single)) == set(vars(reference))
+        assert single.geometry_refinement.get_config() == reference.geometry_refinement.get_config()
+        assert single.geometry_refinement.auto_gc is False and reference.geometry_refinement.auto_gc is True
+        assert single.detector.get_config() == reference.detector.get_config()
+        np.testing.assert_array_equal(owner._seeded_extract(single, label, 2.0),
+                                      owner._seeded_extract(reference, label, 2.0))
