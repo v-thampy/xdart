@@ -459,3 +459,30 @@ def test_an_auto_scan_series_without_its_spec_file_warns_once(tmp_path, caplog):
             assert len(missing) == 1, (attempt, missing)
         finally:
             _close(page, app)
+
+
+def test_a_live_auto_scan_series_without_its_spec_file_still_warns_once(tmp_path, caplog):
+    """NEXT-129-SMALL-FIXES item 7, Live: a Live Run qualifies its members without inferring images per point, so its
+    admission's own point-image check is the Run's only SPEC search, and it keeps that one warning (as on b77b3295)."""
+    import logging
+    from tests.xdart.scattering.test_browse_reference_rings_run import _page as _live_page, _poni, _pump, _terminal
+    from tests.xdart.scattering.test_live_qualify_refusal_run import _frame
+    from xdart.gui.tabs.scattering.display_values import StandardEventKind
+    from xrd_tools.session.run_configuration import RunIntent
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    first = _frame(raw, "sample_scan1", 1, "txt", 1.0)
+    intent = RunIntent(
+        source_spec=image_series_spec(first, metadata_format="auto"), poni_file=str(_poni(tmp_path)),
+        project_root=str(raw), save_path=str(tmp_path / "processed"), output_mode="Overwrite",
+        processing_mode="Int 1D", live_mode=True, max_cores=1, bai_1d_args={"npt": 8, "method": "numpy"})
+    with caplog.at_level(logging.WARNING), _live_page(app, intent) as (page, _view, observed):
+        label = page._shell.run_controls.readinessLabel
+        page._shell.run_controls.startButton.click()
+        assert _pump(app, lambda: "1/1 processed" in label.full_text(), 30.), label.full_text()
+        page._shell.run_controls.stopButton.click()
+        _terminal(app, page, observed, StandardEventKind.STOPPED)
+    missing = [record.getMessage() for record in caplog.records
+               if "SPEC file 'sample' not found" in record.getMessage()]
+    assert len(missing) == 1, missing

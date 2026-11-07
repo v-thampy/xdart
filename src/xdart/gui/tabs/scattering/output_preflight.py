@@ -547,8 +547,9 @@ def prepare_output(
     snapshot = capture.intent_snapshot
     intent = snapshot.thaw()
     if type(intent.source_spec) is SourceSpec:
-        # the qualification below warns once for this Run of a missing SPEC file (NEXT-129-SMALL-FIXES item 7)
-        detection = inspect_point_images(intent.source_spec, warn_missing_spec=False)
+        # One warning a Run of a missing SPEC file (NEXT-129-SMALL-FIXES item 7): a finite Run's qualification below
+        # gives it; a Live Run's qualification never infers images per point, so this check is its only search.
+        detection = inspect_point_images(intent.source_spec, warn_missing_spec=bool(intent.live_mode))
         if detection is not None:
             if intent.live_mode:
                 raise ValueError('Multiple images per point are unavailable in Live; choose a finite run.')
