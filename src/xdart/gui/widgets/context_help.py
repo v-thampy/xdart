@@ -127,7 +127,8 @@ class HelpWindow(ReadOnlyTextWindow):
                                              for t in topics), self.topic_id)
 
     def _open_guide(self) -> None:
-        reason = open_guide(self._guide_topic or self.topic_id) if self.topic_id else "Select a topic first."
+        topic = self._guide_topic or self.topic_id  # the index offers its window's guide with no topic shown
+        reason = open_guide(topic) if topic else "Select a topic first."
         if reason:
             self.pane.appendPlainText("\n" + reason)
 
@@ -140,13 +141,20 @@ class HelpWindow(ReadOnlyTextWindow):
             return topic.identifier
         if topic.identifier.split(".", 1)[0] != SHARED_FAMILY:
             return None
+        return self._window_guide()
+
+    def _window_guide(self):
+        """The topic whose guide the tool window this help belongs to offers: the one it names as
+        ``help_guide_topic``, when that topic exists and has a guide; else None, as for Int's main window or a plain
+        widget (NEXT-129-SMALL-FIXES item 9, the maintainer's "Add it (Recommended)")."""
         own = get_topic(str(getattr(self.parentWidget(), "help_guide_topic", "") or ""))
         return own.identifier if own is not None and own.guide is not None else None
 
     def show_index(self, requested: str | None = None, details: str = "") -> None:
         self.topic_id = None
-        self._guide_topic = None
-        self.guide_button.hide()
+        # a tool window's index offers that window's guide; a root with none shows no button
+        self._guide_topic = self._window_guide()
+        self.guide_button.setVisible(self._guide_topic is not None)
         if self.figure_view is not None:
             for widget in self._figure_widgets:
                 widget.hide()
