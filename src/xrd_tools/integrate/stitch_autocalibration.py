@@ -19,10 +19,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import gc
 import hashlib
 import json
+import logging
 import math
+import os
 from pathlib import Path
+import threading
+import time
 
 import numpy as np
 
@@ -140,6 +145,31 @@ def _ring_indices(calibrant, wavelength_m):
     if index.size and np.max(np.abs(q_d[index] - q_ring) / q_ring) > 1e-9:
         raise ValueError('calibrant ring order is inconsistent with its d-spacings')
     return index
+
+
+_LOG = logging.getLogger(__name__)
+#: XDART_DEBUG_CALIBRATION_GC=1 logs each ring search's pyFAI SingleGeometry construction and every garbage
+#: collection, with its thread (NEXT-129-SMALL-FIXES finding H: a calibration worker's gc.collect() hung a GUI test run)
+_GC_DEBUG_ENV = 'XDART_DEBUG_CALIBRATION_GC'
+_gc_debug_callback = None
+
+
+def _gc_debug(event, **fields):
+    """One structured debug line: the event, its thread and a monotonic time, then its fields."""
+    _LOG.warning('calibration-gc %s thread=%s t=%.6f %s', event, threading.current_thread().name, time.monotonic(),
+                 ' '.join(f'{key}={value}' for key, value in fields.items()))
+
+
+def _gc_debug_enabled():
+    """Whether XDART_DEBUG_CALIBRATION_GC is set; the first time it is, every collection is logged from then on."""
+    global _gc_debug_callback
+    if not os.environ.get(_GC_DEBUG_ENV):
+        return False
+    if _gc_debug_callback is None:
+        def _gc_debug_callback(phase, info):
+            _gc_debug(f'collect-{phase}', **info)
+        gc.callbacks.append(_gc_debug_callback)
+    return True
 
 
 def _seeded_extract(geometry, index, points_per_degree):
@@ -327,8 +357,15 @@ def extract_scan_ring_points(spec, geometry, *, source_motors=_SOURCE_MOTORS, im
                 progress('Finding ring points', done - 1, len(keep))
             index, integrator = selected[k], integrators[k]
             image, valid = pixels(index, integrator)
+            debug = _gc_debug_enabled()
+            if debug:
+                _gc_debug('single-geometry-start', frame=int(index), gc_enabled=gc.isenabled(),
+                          counts=gc.get_count(), auto_gc=getattr(integrator, 'auto_gc', None))
             geometry_ = SingleGeometry(int(index), image=np.where(valid, image, 0.0), calibrant=cal,
                                        geometry=integrator)
+            if debug:
+                _gc_debug('single-geometry-end', frame=int(index),
+                          refinement_auto_gc=getattr(geometry_.geometry_refinement, 'auto_gc', None))
             points = np.asarray(_seeded_extract(geometry_, int(index), float(points_per_degree)),
                                 dtype=float).reshape(-1, 3)
             inside = ((points[:, 0] >= 0) & (points[:, 0] < image.shape[0])
