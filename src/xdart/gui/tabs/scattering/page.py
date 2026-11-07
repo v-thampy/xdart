@@ -3290,6 +3290,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._notice("Average requires one finite image source, Overwrite NeXus output, non-Live execution, an integration mode, and an idle workspace."); self._refresh_shell(); return
         self._refresh_poni_fact(snapshot)
         if not self._poni_ready:
+            # its own notice, in the Run gate's words (P2 terminal-review N1: it came back with none)
+            self._notice("Average needs a PONI calibration." if not intent.poni_file else
+                         "Average needs a readable, parseable PONI calibration.")
             self._refresh_shell()
             return
         try:
@@ -5042,7 +5045,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._launch_auto_motor = None
         if clauses:
             text = " ".join(clauses)
-            self._progress = replace(self._progress, detail=text, directory_files=None)
+            # a directory Run keeps its file count and carries the clause as one of its notes (P2 terminal-review
+            # N2: the count was hidden until the next progress)
+            files = self._progress.directory_files
+            self._progress = replace(self._progress, detail=text, directory_files=None if files is None else
+                                     replace(files, notes=(*files.notes, text)))
             self._refresh_shell(preserve_scientific=True)
             self.noticeChanged.emit(text)
 
