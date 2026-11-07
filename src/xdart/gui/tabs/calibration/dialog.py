@@ -3920,8 +3920,12 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             return
         self._pending_session_resume = None
         def go():
-            source = self._spec() if resume.fit is not None else None
-            if resume.fit is not None and not resume.matches_source(source):
+            # _resume cleared the fit before waiting, so a fit here was made in the gap and is newer than the
+            # session's: it is kept, and the session's fit is adopted only when there is none
+            # (LIVE-TEST-FIXES-20261015 N3); the rest of the restore applies either way
+            saved = resume.fit if self.fit is None else None
+            source = self._spec() if saved is not None else None
+            if saved is not None and not resume.matches_source(source):
                 raise ValueError('Session inputs differ from the retained fit source. Check the page Entry and '
                                  'calibrant inputs; the saved session and fit are unchanged.')
             context = resume.direct_beam_context or {}
@@ -3935,17 +3939,19 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                     self._distance_provenance_key = self._distance_key
                     self._render_direct_beam_advice()
                     self._show_direct_beam_fit(show=False)
-            if resume.fit is not None:
-                self.fit, self._fit_source = resume.fit, source
-                self._fit_kind = ('refine' if resume.fit.asset['provenance'].get('automatic_refinement') else 'fit')
-                self._fit_instrument = resume.fit.asset['provenance'].get('instrument_geometry')
+            if saved is not None:
+                self.fit, self._fit_source = saved, source
+                self._fit_kind = ('refine' if saved.asset['provenance'].get('automatic_refinement') else 'fit')
+                self._fit_instrument = saved.asset['provenance'].get('instrument_geometry')
                 self._fit_setup = self._setup_state()
-                self.fit_summary.setPlainText(fit_summary_text(resume.fit))
+                self.fit_summary.setPlainText(fit_summary_text(saved))
                 self._show_tab('calibrate')
                 self._show_calibration_fit(preview=False)  # retained residuals; stitching remains an explicit request
             self._sync_job_buttons()
             self._refresh_checklist()
-            self.status.setText('Calibration session restored; no fit was rerun.')
+            self.status.setText('Calibration session restored; the fit made while it restored is kept.'
+                                if resume.fit is not None and saved is None
+                                else 'Calibration session restored; no fit was rerun.')
         self._guard(go)
 
     #: The buttons that start a job wait while one runs (maintainer, 2026-10-09): the background direct-beam probe
