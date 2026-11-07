@@ -4254,9 +4254,10 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                     self._show_calibration_fit()
                 elif kind == 'stitch_preview':
                     window = self._calibration_fit_window
-                    if (not self._close_pending and window is not None and window.isVisible()
-                            and self._preview_key == self._preview_inputs()):
-                        window.show_preview(result)
+                    preview_adopted = (not self._close_pending and window is not None and window.isVisible()
+                                       and self._preview_key == self._preview_inputs())
+                    if preview_adopted:
+                        window.show_preview(result)  # its status line is the preview's own summary
                     self._preview_key = None
                 elif kind == 'save':  # the ring fit, or the direct-beam geometry (_save_rough)
                     finish, self._finish_after_save = self._finish_after_save, False
@@ -4318,7 +4319,11 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
                 elif kind == 'stitch_preview':
-                    self._job_status('Calibrant preview complete.')
+                    # An adopted preview keeps the summary show_preview wrote (busy ended above); one stitched for
+                    # a fit or inputs that changed meanwhile was discarded, and never says it is complete.
+                    if not preview_adopted:
+                        self._job_status('The fit or its inputs changed while stitching, so this preview was '
+                                         'discarded. Stitch calibrant again to preview the current inputs.')
                 else:
                     self.status.setText('No PONI was saved; the frame remains unchanged.' if kind == 'calibrate' and result is None else f'{kind.capitalize()} complete.')
             except Exception as error:
