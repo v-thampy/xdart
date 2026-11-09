@@ -1,5 +1,58 @@
 # Release notes
 
+## 1.2.9 (2026-11-09)
+
+### Fixes
+
+- **Stitch calibration Refine is faster:** pyFAI ran two full garbage
+  collections on the calibration worker for every frame the ring search set
+  up, about 12 s of each Refine in our tests. The ring search now sets up its
+  frames without collecting.
+- **A fit made while a calibration session restores is kept:** pressing
+  **Fit** before a saved calibration session finished restoring could put the
+  session's older fit back over the new one. The new fit now stays, and the
+  status says "Calibration session restored; the fit made while it restored is
+  kept."
+- **The calibrant preview keeps its own summary:** after **Stitch calibrant**,
+  "Calibrant preview complete." replaced the preview's summary of its frames,
+  solid angle and normalization; the summary now stays. A preview stitched for
+  a fit or inputs that changed meanwhile is discarded, and now says so: "The
+  fit or its inputs changed while stitching, so this preview was discarded.
+  Stitch calibrant again to preview the current inputs."
+- **A typed `~` in a calibration scan's file path means your home folder:** a
+  path typed as `~/…` was read inside the current folder. It, and the Auto
+  image folder found from it, now resolve under your home folder.
+- **One missing-SPEC warning per Run:** a Run of an Auto series named
+  `<name>_scanN_M` whose SPEC file is missing logged "SPEC file … not found"
+  several times; it now logs it once per Run, Live Runs included.
+- **Average with a missing or unreadable PONI says so:** it stopped without a
+  notice; it now says "Average needs a PONI calibration." or "Average needs a
+  readable, parseable PONI calibration."
+- **A folder Run keeps its file count:** a notice shown as a folder Run
+  started, such as its energy notice, hid the Run's file count until its next
+  progress update.
+- **Peak Fitting and Phase Analysis open with their first option focused:**
+  keyboard focus started on the options panel.
+- **Help in Peak Fitting and Phase Analysis offers the window's illustrated
+  guide:** F1 with no option focused opens the help index, which now offers
+  **Illustrated guide** for that window. The Source card's **?** offers it
+  again too; 1.2.8 had lost it there.
+- **The install hint names the right package:** starting xdart without its
+  GUI packages now suggests `pip install "xdart[gui]"` instead of
+  `xrd-tools[gui]`.
+
+### Changed
+
+- **Faster per-frame metadata from NeXus files with many motors:** reading
+  each frame's motor and counter values from a NeXus entry, as calibration's
+  held batches and Average do, now plans the entry once rather than for every
+  frame: 1.1 ms a frame instead of 4.5 ms with 20 positioners.
+
+### Known limitations
+
+- A `~` typed in calibration's **Image Path** or the Refine card's
+  **Geometry file** is not expanded yet; browse to it or type the full path.
+
 ## 1.2.8 (2026-11-04)
 
 ### Added
