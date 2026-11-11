@@ -17,6 +17,7 @@ import pytest
 
 from xrd_tools.core import staging
 from xrd_tools.io import browse_1d_cache
+from xrd_tools.io.viewer_2d import viewer_2d_memory_ledger
 
 _GIB = 1024 ** 3
 
@@ -72,6 +73,17 @@ def test_a_windows_host_whose_ram_cannot_be_read_keeps_every_fallback(monkeypatc
     assert staging.live_record_store_max_items(1000) == staging.LIVE_RECORD_MIN_ITEMS
     assert staging.browse_publication_max_items(1000) == staging.LIVE_RECORD_MIN_ITEMS
     assert browse_1d_cache.default_browse_1d_cache_budget() == _GIB
+
+
+def test_small_windows_viewer_2d_keeps_its_existing_memory_floor(monkeypatch):
+    """A Windows reading may increase the Viewer budget without reducing its existing floor."""
+    _windows_host(monkeypatch, 0)
+    fallback = viewer_2d_memory_ledger(1024, 1024).budget
+    assert fallback == 884_736_000
+    _windows_host(monkeypatch, 8 * _GIB)
+    assert viewer_2d_memory_ledger(1024, 1024).budget == fallback
+    _windows_host(monkeypatch, 32 * _GIB)
+    assert viewer_2d_memory_ledger(1024, 1024).budget == _GIB
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the real GlobalMemoryStatusEx exists only on Windows")

@@ -7,7 +7,9 @@ StandardRunExecutor for the Run; none replaces the seam being fixed.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,8 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_intent_profile import dump_run_intent_profile, load_run_intent_profile
 
 _PRIVATE = ("_post_g2_pipeline_v2", "_post_g2_output_diagnostics_v1", "_post_g2_unfunded_staging_diagnostic_v1")
+_STAGING_MARKER = {"mode": "UNSAFE_UNFUNDED", "checkpoint": 10_000,
+                   "staging_frame_cap": 10_008, "max_frames": 3_621}
 #: The Run kinds that cannot take a pipeline choice, as (live, output mode, batch, processing mode). Apply already
 #: drops the private options for XYE-only processing, so that kind is reached only through a stored choice.
 _INCOMPATIBLE = {
@@ -97,7 +101,7 @@ def qapp() -> QtWidgets.QApplication:
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-def _click_apply_when_shown(holder, *, timeout_ms=10_000):
+def _click_apply_when_shown(holder, *, edit=None, timeout_ms=10_000):
     """Press the real dialog's Apply once its modal loop shows it (``holder()`` returns the dialog or None)."""
     timer = QtCore.QElapsedTimer()
     timer.start()
@@ -108,19 +112,26 @@ def _click_apply_when_shown(holder, *, timeout_ms=10_000):
             if timer.elapsed() < timeout_ms:
                 QtCore.QTimer.singleShot(10, click)
             return
+        if edit is not None:
+            edit(dialog)
         box = dialog.findChild(QtWidgets.QDialogButtonBox)
         box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
 
     QtCore.QTimer.singleShot(0, click)
 
 
-def _applied_intent(qapp, intent):
+def _applied_intent(qapp, intent, monkeypatch, *, edit=None, plot_interval_ms=None):
     """The intent the real page holds after Config ▸ Performance Diagnostics… is accepted with its loaded values."""
+    monkeypatch.setenv("XDART_PERF", "0")
+    monkeypatch.setenv("XDART_PERF_QUARTILES", "0")
     page = ScatteringWorkspace(intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
                                sources=_Sources(), executor=_Executor())
     try:
-        _click_apply_when_shown(lambda: page._performance_diagnostics_dialog)
+        _click_apply_when_shown(lambda: page._performance_diagnostics_dialog, edit=edit)
         page._handle_shell_command(ShellCommand(ShellCommandKind.MENU, "Config:Performance Diagnostics…"))
+        assert os.environ["XDART_PERF"] == "1"
+        if plot_interval_ms is not None:
+            assert page._live_plot_interval_ms == plot_interval_ms
         return page._intents.snapshot().thaw()
     finally:
         _dispose(page, qapp)
@@ -158,7 +169,9 @@ def _scans(raw, names):
 
 @pytest.mark.parametrize("route", ["applied", "session"])
 @pytest.mark.parametrize("kind", sorted(_INCOMPATIBLE))
-def test_apply_with_the_dialog_values_then_an_incompatible_run_processes_every_scan(qapp, tmp_path, kind, route):
+def test_apply_with_the_dialog_values_then_an_incompatible_run_processes_every_scan(
+    qapp, tmp_path, monkeypatch, kind, route,
+):
     """Apply with the values the dialog loads, then a Live, folder Append or Batch Run, directly and after the
     session profile's round trip: every scan is processed and none is skipped for a pipeline choice."""
     raw = tmp_path / "raw"
@@ -166,15 +179,12 @@ def test_apply_with_the_dialog_values_then_an_incompatible_run_processes_every_s
     scans = ("scana", "scanb", "scanc")
     _scans(raw, scans)
     intent = _with_mode(_intent(tmp_path, raw, live=False, output="Overwrite"), kind)
-    applied = _applied_intent(qapp, intent)
+    applied = _applied_intent(qapp, intent, monkeypatch)
     if route == "session":
         applied = load_run_intent_profile(dump_run_intent_profile(applied))
     ready, terminals, events = _run(tmp_path, raw, applied, scans=scans)
-    detail = terminals[-1][1] if terminals else ""
-    if ready is not None:
-        assert ready == {stem: [1, 2] for stem in scans}, (ready, terminals)
-    else:
-        assert terminals and terminals[-1][0] == "FINISHED" and detail.startswith("Complete · 6 processed"), terminals
+    _assert_every_scan(ready, terminals, scans)
+    detail = terminals[-1][1]
     assert not _said(events, "post-G2"), terminals
     assert "skipped" not in detail.replace("0 skipped", ""), terminals
 
@@ -183,6 +193,7 @@ def _assert_every_scan(ready, terminals, scans):
     detail = terminals[-1][1] if terminals else ""
     if ready is not None:
         assert ready == {stem: [1, 2] for stem in scans}, (ready, terminals)
+        assert terminals and terminals[-1][0] == "STOPPED" and "6 processed" in detail, terminals
     else:
         assert terminals and terminals[-1][0] == "FINISHED" and detail.startswith("Complete · 6 processed"), terminals
 
@@ -221,18 +232,64 @@ def test_a_stored_pipeline_choice_is_ignored_once_by_a_run_that_cannot_take_it(q
     _assert_every_scan(ready, terminals, scans)
     notices = [record.getMessage() for record in caplog.records if "[PERF-DIAGNOSTICS]" in record.getMessage()]
     assert len(notices) == 1, notices
-    assert "not used" in notices[0], notices
+    assert any(wording in notices[0].casefold() for wording in ("ignored", "not used")), notices
 
 
-def test_apply_with_the_default_values_stores_no_private_options(qapp, tmp_path):
+def test_apply_with_the_default_pipeline_values_stores_no_private_options(qapp, tmp_path, monkeypatch):
     """Apply for timing only (the dialog's values unchanged) leaves the Run options as they were, so no later Run
     has a pipeline choice to ignore; the plot interval and timing still apply."""
     raw = tmp_path / "raw"
     raw.mkdir()
     intent = _intent(tmp_path, raw, live=True)
     intent.run_options["heavy_window"] = 32
-    applied = _applied_intent(qapp, intent)
+    def change_plot_interval(dialog):
+        editor = getattr(dialog.plot_interval, "editor", dialog.plot_interval)
+        if isinstance(editor, QtWidgets.QSpinBox):
+            editor.setValue(625)
+        else:
+            editor.setText("625")
+
+    applied = _applied_intent(qapp, intent, monkeypatch, edit=change_plot_interval, plot_interval_ms=625)
     assert applied.run_options == {"heavy_window": 32}
+
+
+def test_apply_keeps_an_explicit_output_choice_for_a_compatible_run(qapp, tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    scans = ("scana",)
+    _scans(raw, scans)
+    intent = _intent(tmp_path, raw, live=False, output="Overwrite")
+
+    def turn_off_xye(dialog):
+        editor = getattr(dialog.save_xye, "editor", dialog.save_xye)
+        editor.setChecked(False)
+
+    applied = _applied_intent(qapp, intent, monkeypatch, edit=turn_off_xye)
+    assert applied.run_options["_post_g2_output_diagnostics_v1"]["save_xye"] is False
+    _, terminals, _ = _run(tmp_path, raw, applied, scans=scans)
+    assert terminals and terminals[-1][0] == "FINISHED", terminals
+    assert terminals[-1][1].startswith("Complete · 2 processed"), terminals
+    output = Path(applied.save_path)
+    assert any(output.rglob("*.nexus")), terminals
+    assert not list(output.rglob("*.xye"))
+
+
+def test_a_lone_staging_marker_is_ignored_in_each_incompatible_run(qapp, tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", raising=False)
+    caplog.set_level(logging.INFO)
+    scans = ("scana", "scanb", "scanc")
+    for run_number in (1, 2):
+        run_path = tmp_path / str(run_number)
+        raw = run_path / "raw"
+        raw.mkdir(parents=True)
+        _scans(raw, scans)
+        intent = _with_mode(_intent(run_path, raw, live=False, output="Overwrite"), "folder-batch")
+        intent.run_options[_PRIVATE[2]] = _STAGING_MARKER.copy()
+        caplog.clear()
+        ready, terminals, _ = _run(run_path, raw, intent, scans=scans)
+        _assert_every_scan(ready, terminals, scans)
+        notices = [record for record in caplog.records if "[PERF-DIAGNOSTICS]" in record.getMessage()]
+        assert len(notices) == 1, notices
 
 
 def test_the_dialog_loads_the_adapters_defaults_and_names_the_fsync_default(qapp):
@@ -281,31 +338,43 @@ def test_the_dialog_mounts_the_shared_advanced_dialog_and_rows_with_tooltips(qap
         rows = dialog.findChildren(FormRow)
         assert len(rows) == 9
         assert all(row.editor.toolTip().strip() for row in rows), [row.label.text() for row in rows]
-        dialog.load(RunIntentStore(RunIntent()).snapshot(), 375)
-        dialog.record.editor.setText("abc")
-        dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
-        assert dialog.result() != QtWidgets.QDialog.DialogCode.Accepted
-        assert dialog.record.refusal()
+        record = next(row for row in rows if row.label.text() == "NeXus record batch")
+        box = dialog.findChild(QtWidgets.QDialogButtonBox)
+        attempts = []
+
+        def try_invalid_apply():
+            try:
+                record.editor.setText("abc")
+                box.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+                attempts.append((dialog.isVisible(), record.refusal()))
+            finally:
+                dialog.reject()
+
+        QtCore.QTimer.singleShot(0, try_invalid_apply)
+        assert dialog.edit(RunIntentStore(RunIntent()).snapshot(), 375) is None
+        assert len(attempts) == 1 and all(attempts[0]), attempts
     finally:
         dialog.deleteLater()
         qapp.processEvents()
 
 
-def test_the_profile_codec_retires_the_private_options():
-    """Config ▸ Load and notebook replay admit a profile through the same codec: a 1.2.9 profile's private options
-    are dropped on load (so a compatible Run cannot inherit fsync on), and a dump never writes them."""
-    loaded = load_run_intent_profile(_SESSION_129_PROFILE)
+def test_loading_an_old_profile_retires_all_private_options():
+    """Config ▸ Load and notebook replay both drop old session-only choices before the next Run."""
+    legacy = json.loads(_SESSION_129_PROFILE)
+    legacy["intent"]["run_options"][_PRIVATE[2]] = _STAGING_MARKER
+    loaded = load_run_intent_profile(json.dumps(legacy))
     assert loaded.run_options == {"heavy_window": 32}
-    carrying = loaded.clone_candidate()
-    carrying.run_options.update({
-        "_post_g2_pipeline_v2": {"writer_settlement_batch_size": 1, "nexus_record_batch_size": 4,
-                                 "reduction_inflight": 8, "semantic_checkpoint_frame_cap": 16,
-                                 "staging_frame_cap": 64},
-        "_post_g2_output_diagnostics_v1": {"save_xye": True, "durable_fsync": True},
-    })
-    text = dump_run_intent_profile(carrying)
-    assert not any(key in text for key in _PRIVATE), text
-    assert '"heavy_window": 32' in text
+
+
+def test_saving_a_profile_excludes_all_private_options_without_mutating_the_intent():
+    from xrd_tools.session.run_configuration import RunIntent
+
+    options = json.loads(_SESSION_129_PROFILE)["intent"]["run_options"]
+    options[_PRIVATE[2]] = _STAGING_MARKER.copy()
+    intent = RunIntent(run_options=options)
+    saved = json.loads(dump_run_intent_profile(intent))
+    assert saved["intent"]["run_options"] == {"heavy_window": 32}
+    assert all(key in intent.run_options for key in _PRIVATE)
 
 
 def test_a_session_saved_by_129_with_the_private_options_starts_clean(qapp, tmp_path, monkeypatch):

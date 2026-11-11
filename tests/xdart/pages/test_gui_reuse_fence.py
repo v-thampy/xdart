@@ -161,7 +161,7 @@ def test_debt_names_only_copies_that_still_exist():
         path = GUI / key
         found = _constructs(path) if path.exists() else Counter()
         retired += [f"{key}: {construct} (debt {count}, found {found[construct]})"
-                    for construct, count in sorted(allowed.items()) if found[construct] == 0]
+                    for construct, count in sorted(allowed.items()) if found[construct] < count]
     assert not retired, "Retired copies: remove their _DEBT entries so they cannot return:\n" + "\n".join(retired)
 
 

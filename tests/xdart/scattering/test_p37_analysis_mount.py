@@ -2817,6 +2817,8 @@ def test_metadata_dialog_selects_among_a_results_sources(qapp):
     with its note; another replaces it; a source whose table is not complete shows its code."""
     from dataclasses import replace
     from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog, MetadataSource
+    from xdart.gui.tabs.scattering.results_table import ResultsTable
+    from xdart.gui.widgets.controls_panel import FormRow
     first, second = _table(), _table(fingerprint="other")
     missing = replace(_table(), disposition=AnalysisDisposition.REFUSED, code="SOURCE_CHANGED")
     dialog = MetadataResultDialog()
@@ -2825,8 +2827,13 @@ def test_metadata_dialog_selects_among_a_results_sources(qapp):
         dialog.adopt_sources((MetadataSource("scan 1", first, (1, 2), ("1-0", "1-1"), "2 contributing frames"),
                               MetadataSource("scan 2", second, (3,), ("2-0",)),
                               MetadataSource("scan 3", missing)))
-        assert dialog.source_selector.count() == 3 and dialog.layout().indexOf(dialog.source_selector) == 0
+        assert isinstance(dialog.table, ResultsTable)
+        row = dialog.layout().itemAt(0).widget()
+        assert isinstance(row, FormRow)
+        assert row.editor is dialog.source_selector and row.editor.toolTip().strip()
+        assert dialog.source_selector.count() == 3
         assert dialog.table.rowCount() == 2 and dialog.table.verticalHeaderItem(0).text() == "1-0"
+        assert not dialog.table.verticalHeader().isHidden()
         assert dialog.status.text() == "2 contributing frames"
         dialog.source_selector.setCurrentIndex(1)
         assert dialog.table.rowCount() == 1 and dialog.table.verticalHeaderItem(0).text() == "2-0"

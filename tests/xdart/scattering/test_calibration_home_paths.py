@@ -58,24 +58,32 @@ def test_a_typed_home_image_path_is_the_home_folder(qapp, tmp_path, monkeypatch,
         _close(qapp, page, dialog)
 
 
-def test_a_typed_home_geometry_file_starts_the_refinement(qapp, tmp_path, monkeypatch):
-    """The Refine card's Geometry file "~/calibration/fixed-arm.json" is home's file: the window reads it (no
-    unreadable-file note) and the staged orientation check it enables is ready."""
+@pytest.mark.parametrize("typed_home", [True, False], ids=["home", "absolute-control"])
+def test_a_typed_home_geometry_file_starts_the_refinement(qapp, tmp_path, monkeypatch, typed_home):
+    """The typed seed qualifies in the UI, reaches guided seeding and starts the real Refine job."""
     from tests.xdart.scattering.test_lt_calibration_compact import _checklist, _orientation_row, _show, _staged
 
     home = _home(tmp_path, monkeypatch)
     dialog, saved, _value = _staged(qapp, tmp_path)
     try:
-        (home / "calibration").mkdir()
-        shutil.copyfile(saved, home / "calibration" / "fixed-arm.json")
+        seed = home / "calibration" / "fixed-arm.json"
+        seed.parent.mkdir()
+        shutil.copyfile(saved, seed)
         table = _checklist(dialog)
         _show(dialog, "4 · Calibrate and fit")
         dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData("file"))
-        _commit(dialog._fields["refine_seed_path"], "~/calibration/fixed-arm.json")
+        _commit(dialog._fields["refine_seed_path"], "~/calibration/fixed-arm.json" if typed_home else str(seed))
         _wait(dialog)
         assert dialog.refine_seed_note.text() == ""
         assert dialog.orientation_button.isEnabled(), _orientation_row(table)
+        assert dialog._seed_options()["file"] == str(seed)
+        dialog.refine_button.click()
+        assert dialog.active() and dialog._job == "refine", dialog.status.text()
+        assert dialog._point_request[1][1] == str(seed)
     finally:
+        if dialog.active():
+            dialog.cancel_button.click()
+            _wait(dialog)
         dialog.close()
         _wait(dialog)
         dialog.deleteLater()

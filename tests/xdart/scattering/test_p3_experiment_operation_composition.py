@@ -220,6 +220,8 @@ def test_calibrate_uses_dedicated_source_chooser_after_focus_settlement(
 def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker(
     tmp_path, monkeypatch, qapp,
 ) -> None:
+    from xdart.gui.widgets.controls_panel import ActionButton, FormRow
+
     source = _source(tmp_path)
     older = _candidate(tmp_path / "older.poni", mtime_ns=1_800_000_000_000_000_000)
     newest = _candidate(tmp_path / "newest.poni", mtime_ns=1_800_000_000_000_000_010)
@@ -243,6 +245,10 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
         assert owner.phase is AuthoredAssetPhase.TERMINAL_READY
         assert page._authored_asset_dialog is None
         dialog = _present_confirmation(page)
+        assert any(row.editor is dialog.paths for row in dialog.findChildren(FormRow))
+        assert dialog.paths.toolTip().strip()
+        for button in (dialog.accept_button, dialog.choose_button, dialog.cancel_button):
+            assert isinstance(button, ActionButton) and button.toolTip().strip()
         assert dialog.selected_path == newest.path
         assert dialog.paths.lineEdit().text() == newest.path
         assert dialog.paths.lineEdit().isReadOnly()

@@ -7,12 +7,13 @@ Fit), the real Import and Open session actions and a real filesystem failure; on
 """
 from __future__ import annotations
 
-import time
+from pathlib import Path
 
 import pytest
 from pyqtgraph.Qt import QtWidgets
 
 from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _dispose, _twoc_fit, _wait
+from xrd_tools.integrate.stitch_calibration import load_calibration_session
 
 
 @pytest.fixture(scope="module")
@@ -33,14 +34,6 @@ def _import_first_row_again(dialog, monkeypatch):
     return frame
 
 
-def _settled(dialog, timeout=30.0):
-    until = time.monotonic() + timeout
-    while dialog._pending_session_resume is not None and time.monotonic() < until:
-        QtWidgets.QApplication.processEvents()
-        time.sleep(0.01)
-    _wait(dialog)
-
-
 def test_an_imported_row_leaves_no_fit_in_the_saved_session(qapp, tmp_path, monkeypatch):
     """After Import replaces a row of a fitted session, the session it saved holds no fit, and Open session on that
     file restores the new row without the old fit."""
@@ -50,15 +43,21 @@ def test_an_imported_row_leaves_no_fit_in_the_saved_session(qapp, tmp_path, monk
     try:
         assert dialog.fit is not None
         old = _import_first_row_again(dialog, monkeypatch)
-        assert dialog.frames[0] is not old and dialog.frames[0].identity == old.identity
+        replacement = dialog.frames[0]
+        assert replacement.identity == old.identity
+        assert replacement.poni_path != old.poni_path and replacement.npt_path != old.npt_path
         session = dialog.session_dir / "calibration-session.json"
-        assert session.is_file(), dialog.status.text()
+        saved, _, _, resume = load_calibration_session(session, with_resume=True)
+        assert resume is not None and resume.fit is None and resume.fit_source is None, resume
+        assert (saved[0].poni_path, saved[0].npt_path) == (replacement.poni_path, replacement.npt_path)
         monkeypatch.setattr(file_dialogs, "browse", lambda *_args, **_kwargs: [str(session)])
         dialog.open_session_button.click()
-        _settled(dialog)
+        _wait(dialog)
         assert dialog.fit is None, dialog.status.text()
         assert not dialog.save_button.isEnabled()
-        assert dialog.frames[0].poni_sha256 == old.poni_sha256
+        restored = dialog.frames[0]
+        assert restored is not replacement
+        assert (restored.poni_path, restored.npt_path) == (replacement.poni_path, replacement.npt_path)
     finally:
         dialog.close()
         _dispose(page)
@@ -70,12 +69,17 @@ def test_a_failed_session_write_after_an_import_still_retires_the_fit(qapp, tmp_
     page, dialog, _window = _twoc_fit(qapp, tmp_path)
     try:
         assert dialog.fit is not None
+        session = dialog.session_dir / "calibration-session.json"
+        saved = session.read_bytes()
         (dialog.session_dir / "calibration-session.tmp").mkdir()  # the session write's temporary is a folder
         old = _import_first_row_again(dialog, monkeypatch)
         assert dialog.fit is None, dialog.status.text()
         assert not dialog.save_button.isEnabled()
-        assert dialog.frames[0] is not old and dialog.frames[0].identity == old.identity
-        assert dialog.status.text(), "the failed write says why"
+        replacement = dialog.frames[0]
+        assert replacement.identity == old.identity and replacement.poni_path != old.poni_path
+        assert dialog.frame_table.item(0, 3).text() == Path(replacement.poni_path).name
+        assert session.read_bytes() == saved
+        assert "calibration-session.tmp" in dialog.status.text(), dialog.status.text()
     finally:
         dialog.close()
         _dispose(page)
