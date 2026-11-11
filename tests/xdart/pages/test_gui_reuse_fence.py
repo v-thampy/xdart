@@ -9,6 +9,11 @@ short, the owner is extended, with tests for every consumer. A recorded reason d
 fenced later, the copies that existed when it was fenced (FIT-TOOLS-2026-10 added tables and rectangles). Each count
 is an upper bound for its file, to be lowered as the copy moves onto its owner and never raised. A new page has no
 entry: its module builds none of these.
+
+Int's own package ``tabs/scattering`` holds the shared owners and Int's page beside them. Only the owner modules
+in ``_OWNER_MODULES`` build these constructs; every other module there is fenced like a page (1.2.10 review M3:
+excluding the whole package hid a settings dialog, a results table and Int's asset editor). A class that subclasses
+a fenced construct builds one too.
 """
 from __future__ import annotations
 
@@ -19,9 +24,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 GUI = ROOT / "src" / "xdart" / "gui"
-#: Int's shared owners live in ``tabs/scattering``, ``widgets`` and ``themes``; everything else that
-#: builds a page, a tool or an analysis window is fenced.
-_OWNER_TABS = frozenset({"scattering"})
+#: Int's shared owners live in ``widgets``, ``themes`` and these modules of ``tabs/scattering`` (the catalogue in
+#: architecture.md "Reusable GUI components"); everything else that builds a page, a tool, a dialog or an analysis
+#: window is fenced, Int's own page and dialogs included.
+_OWNER_MODULES = frozenset({
+    "tabs/scattering/advanced_editor.py",
+    "tabs/scattering/browser_view.py",
+    "tabs/scattering/fit_view.py",
+    "tabs/scattering/results_table.py",
+    "tabs/scattering/scientific_curves.py",
+    "tabs/scattering/scientific_plot_options.py",
+    "tabs/scattering/scientific_view.py",
+    "tabs/scattering/shell_widgets.py",
+    "tabs/scattering/trend_view.py",
+    "tabs/scattering/volume_view.py",
+})
 
 _DISPLAY_OWNER = (
     "ScientificView (tabs/scattering/scientific_view.py): mount it and drive reconcile(); extend it for a "
@@ -65,14 +82,23 @@ _STRINGS: dict[str, str] = dict.fromkeys(
     ("DATA BROWSER", "fileMenuButton", "configMenuButton", "helpMenuButton"), _BROWSER_OWNER,
 )
 
-_DEBT: dict[str, dict[str, int]] = {}
+_DEBT: dict[str, dict[str, int]] = {
+    # Int's page's own Open/Save choosers, found when tabs/scattering was fenced (1.2.10, NEXT-1210-SMALL-FIXES D-2);
+    # they bypass file_dialogs' one Browse rule (live_findings_ledger INT-PAGE-FILE-DIALOGS-1210).
+    "tabs/scattering/page.py": {
+        "QFileDialog.getExistingDirectory": 1,
+        "QFileDialog.getOpenFileName": 4,
+        "QFileDialog.getOpenFileNames": 1,
+        "QFileDialog.getSaveFileName": 2,
+    },
+}
 
 
 def _fenced_modules() -> list[Path]:
     roots = [GUI / "pages", GUI / "tools", GUI / "analysis"]
-    roots += [path for path in sorted((GUI / "tabs").iterdir())
-              if path.is_dir() and path.name not in _OWNER_TABS and path.name != "__pycache__"]
-    return [path for root in roots for path in sorted(root.rglob("*.py"))]
+    roots += [path for path in sorted((GUI / "tabs").iterdir()) if path.is_dir() and path.name != "__pycache__"]
+    return [path for root in roots for path in sorted(root.rglob("*.py"))
+            if path.relative_to(GUI).as_posix() not in _OWNER_MODULES]
 
 
 def _owner(construct: str) -> str:
@@ -86,6 +112,11 @@ def _owner(construct: str) -> str:
 def _constructs(path: Path) -> Counter:
     found: Counter = Counter()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.ClassDef):  # a subclass of a fenced construct builds one
+            for base in node.bases:
+                name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", None)
+                if name in _CALLS:
+                    found[name] += 1
         if isinstance(node, ast.Call):
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
@@ -137,11 +168,15 @@ def test_debt_names_only_copies_that_still_exist():
 def test_fence_covers_every_page_package_and_no_new_page_has_debt():
     fenced = {path.relative_to(GUI).as_posix() for path in _fenced_modules()}
     assert "tabs/stitch/page.py" in fenced
-    assert not any(path.startswith("tabs/scattering/") for path in fenced)
+    assert {"tabs/scattering/page.py", "tabs/scattering/analysis_mount.py",
+            "tabs/scattering/performance_diagnostics.py"} <= fenced
+    assert all((GUI / key).is_file() for key in _OWNER_MODULES) and not fenced & _OWNER_MODULES
     pages = {path.name for path in (GUI / "tabs").iterdir()
-             if path.is_dir() and path.name not in _OWNER_TABS and path.name != "__pycache__"}
-    # stitch: the fence's first debt; calibration: its two tables, fenced later (FIT-TOOLS-2026-10)
-    assert {key.split("/")[1] for key in _DEBT if key.startswith("tabs/")} <= {"stitch", "calibration"} <= pages
+             if path.is_dir() and path.name != "scattering" and path.name != "__pycache__"}
+    # stitch: the fence's first debt; calibration: its two tables, fenced later (FIT-TOOLS-2026-10); scattering:
+    # Int's page's own file choosers, fenced in 1.2.10
+    assert {key.split("/")[1] for key in _DEBT if key.startswith("tabs/")} <= {"stitch", "calibration", "scattering"}
+    assert {"stitch", "calibration"} <= pages
 
 
 def test_a_copied_table_or_rectangle_is_refused_with_its_owner_named(tmp_path):
@@ -153,3 +188,13 @@ def test_a_copied_table_or_rectangle_is_refused_with_its_owner_named(tmp_path):
     found = _constructs(page)
     assert (found["QTableWidget"], found["QTableView"], found["RectROI"]) == (1, 1, 1)
     assert _owner("QTableWidget") == _owner("QTableView") == _TABLE_OWNER and _owner("RectROI") == _REGION_OWNER
+
+
+def test_a_subclassed_editor_or_table_is_refused_like_a_constructed_one(tmp_path):
+    """1.2.10 review M3: the fence matched constructor calls only, so ``class Box(QtWidgets.QComboBox)`` passed."""
+    page = tmp_path / "page.py"
+    page.write_text("from pyqtgraph.Qt import QtWidgets\n"
+                    "class Box(QtWidgets.QComboBox):\n    pass\n"
+                    "class Table(QTableWidget):\n    pass\n", encoding="utf-8")
+    found = _constructs(page)
+    assert (found["QComboBox"], found["QTableWidget"]) == (1, 1)

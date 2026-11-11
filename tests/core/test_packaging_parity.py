@@ -102,3 +102,13 @@ def test_conda_recipe_offers_only_the_python_versions_the_project_claims():
     assert minors, "pyproject declares no supported Python minor versions"
     spec = next(r for r in _recipe()["requirements"]["run"] if _name(r) == "python")
     assert f"<3.{minors[-1] + 1}" in spec.replace(" ", ""), spec
+
+
+def test_pillow_is_declared_for_the_gui_in_both_installs():
+    """The experiment-authoring editor imports PIL directly (1.2.10 review M7), but neither pyproject nor the
+    recipe declared Pillow; it arrived only as another package's dependency."""
+    gui = {_name(item) for item in _project()["optional-dependencies"]["gui"]}
+    assert "pillow" in gui
+    assert "pillow" in {_name(item) for item in _recipe()["requirements"]["run"]}
+    imports = {name for test in _recipe()["tests"] for name in test.get("python", {}).get("imports", ())}
+    assert "PIL" in imports
