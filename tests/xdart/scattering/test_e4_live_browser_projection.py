@@ -335,7 +335,7 @@ def test_post_g2_pipeline_choice_is_named_bounded_and_nonlive():
     for value in invalid:
         with pytest.raises((TypeError, ValueError)):
             dynamic_output._post_g2_pipeline_v2_choice(
-                RunIntent(run_options={"_post_g2_pipeline_v2": value}).freeze(),
+                RunIntent(output_mode="Overwrite", run_options={"_post_g2_pipeline_v2": value}).freeze(),
                 coordinated=True,
             )
 
@@ -414,13 +414,8 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
             },
         },
     ).freeze()
-    choice = dynamic_output._post_g2_output_diagnostics_choice(
-        configured,
-        pipeline_v2=dynamic_output._post_g2_pipeline_v2_choice(
-            configured,
-            coordinated=True,
-        ),
-    )
+    admitted_pipeline = dynamic_output._post_g2_pipeline_v2_choice(configured, coordinated=True)
+    choice = dynamic_output._post_g2_output_diagnostics_choice(configured, pipeline_v2=admitted_pipeline)
     assert choice.save_xye is False
     assert choice.durable_fsync is False
     assert choice.explicit is True
@@ -440,11 +435,11 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
     ):
         with pytest.raises((TypeError, ValueError)):
             dynamic_output._post_g2_output_diagnostics_choice(
-                RunIntent(run_options={
+                RunIntent(output_mode="Overwrite", run_options={
                     "_post_g2_pipeline_v2": pipeline,
                     "_post_g2_output_diagnostics_v1": value,
                 }).freeze(),
-                pipeline_v2=object(),
+                pipeline_v2=admitted_pipeline,
             )
 
     with pytest.raises(ValueError, match="V2"):
