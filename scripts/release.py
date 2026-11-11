@@ -15,7 +15,9 @@ Checks (each prints PASS/FAIL; any FAIL exits 1):
 
   version    pyproject version == importlib version of the installed
              editable dist == xdart.__version__; if a tag is given (or
-             HEAD is tagged v*), it must match.
+             HEAD is tagged v*), it must match. README.md's version lines
+             ("This README describes **xdart X.Y.Z**" and the
+             `git switch --detach vX.Y.Z` line) name the same version.
   clean      no uncommitted changes (warn-only unless --strict-tree).
   schema     the persisted-format pins + byte-compat gate test files run
              green (tests/core/test_schema_as_code.py,
@@ -68,9 +70,32 @@ def _pyproject_version() -> str:
     return m.group(1)
 
 
+_README_VERSION_LINES = (
+    re.compile(r"This README describes \*\*xdart ([^*\s]+)\*\*"),
+    re.compile(r"git switch --detach v([^`\s]+)`"),
+)
+
+
+def check_readme(version: str) -> bool:
+    """README.md names the version being released (1.2.10: it still described 1.2.3 at 1.2.9)."""
+    path = ROOT / "README.md"
+    if not path.is_file():
+        return _fail("README.md is missing")
+    text = path.read_text(encoding="utf-8")
+    ok = True
+    for pattern in _README_VERSION_LINES:
+        found = pattern.findall(text)
+        if not found:
+            ok &= _fail(f"README.md has no line matching {pattern.pattern!r}")
+        for value in found:
+            ok &= (_ok if value == version else _fail)(f"README version {value} == pyproject {version}")
+    return ok
+
+
 def check_version(tag: str | None) -> bool:
     ok = True
     pp = _pyproject_version()
+    ok &= check_readme(pp)
 
     try:
         from importlib.metadata import version as pkg_version

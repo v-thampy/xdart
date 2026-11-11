@@ -9,7 +9,7 @@ integration and [xrayutilities](https://xrayutilities.sourceforge.io/) for
 stitching and reciprocal-space mapping. The same processing tools are available
 in Python through **`xrd_tools`**, the headless core included with xdart.
 
-This README describes **xdart 1.2.3**.
+This README describes **xdart 1.2.9**.
 [Release notes](RELEASE_NOTES.md) · [Upgrading from 1.1.5](MIGRATION.md#upgrading-from-115-to-120) ·
 [Limitations and workarounds](docs/LIMITATIONS.md)
 
@@ -62,7 +62,8 @@ and analysis tools. Select a processing mode beside **Run**:
 
 Standard and grazing-incidence integration support masks, intensity thresholds,
 background subtraction, normalization, and parallel processing. Analysis tools
-include overlays, peak/phase fitting, reference phases, and notebook export.
+include overlays, **Peak Fitting**, **Phase Analysis**, reference phase rings,
+**ROI Statistics**, and notebook export.
 
 ### GUI quick start
 
@@ -76,8 +77,9 @@ include overlays, peak/phase fitting, reference phases, and notebook export.
    ranges, and conditioning. **Advanced** contains the detailed corrections.
 5. Choose **Cores**, then **Run**. **Batch** suppresses intermediate plot
    updates and displays the saved result at completion.
-6. Select saved results and frames in the **Data Browser**. Use **Raw image**,
-   **Metadata**, and the fitting tools to inspect them.
+6. Select saved results and frames in the **Data Browser**; its filename filter
+   narrows the list, and **All frames** keeps every frame of a result shown.
+   Use **Raw image**, **Metadata**, and the fitting tools to inspect them.
 
 For Q/2θ conversion, xdart uses the acquisition/calibration wavelength. For a
 fixed scattering angle, Q changes with wavelength; 2θ is an angle.
@@ -117,7 +119,7 @@ Stitch combines **raw detector frames with scan-angle metadata**. Select
    **Append** skips compatible completed outputs; **Replace/Overwrite**
    recomputes them.
 
-For fitting, return to **Full** and select **Intensity**. Phase fitting needs
+For fitting, return to **Full** and select **Intensity**. Phase Analysis needs
 an appropriate radial Q/2θ profile and wavelength; GI cuts support peak fits.
 Keep calibration, camera orientation, and recorded motor conventions consistent.
 
@@ -152,6 +154,19 @@ It is a finite workflow with **Preview**, **Run**, and **Stop**.
 Opening a saved result does not rerun the calculation or restore a complete
 processing setup. Preserve raw data and calibration for processing replay.
 
+### Fitting: Peak Fitter and Phase Analysis
+
+**Peak Fitting** opens the Peak Fitter: pseudo-Voigt, Gaussian, Lorentzian,
+Voigt, Pearson VII or split pseudo-Voigt peaks over a polynomial or Chebyshev
+background of any degree, a template background, or both. **Phase Analysis** fits
+the checked phases from CIF files or typed lattices (calibrants are reference
+lines only) and draws their reference rings on Int's plots.
+Opened from Int, both read the trace Int shows or a **Source** of their own, and offer
+**Fit current** and **Fit all** (with **Pause** and **Stop**); frames are
+numbered from 1 as Int numbers them. **Track** plots any fitted parameter across
+frames, and each fit exports to CSV, Jupyter and marimo. Every option has a
+**?**, and the Help window's **Illustrated guide** explains the physics.
+
 ### Calibration and masking
 
 For Int modes, **Calibrate** opens pyFAI calibration to produce a PONI file.
@@ -178,10 +193,18 @@ and [distance-calibration notebook](examples/direct_beam_distance_calibration.ip
 
 For supported Int 1D/2D sources, enable **Live** to process new arrivals.
 **Run** becomes **Pause / Resume**; **Stop** ends the run and closes its output.
+The status line counts processed, new, skipped and pending files, and says when
+a Live Run has caught up and is waiting for new images.
 
-- **Append** continues a compatible processed NeXus scan, skipping frames
-  already present. **Replace/Overwrite** reprocesses it. Int 1D (XYE) does not
-  support Append. Stitch/RSM Append skips complete results, as described above.
+- **Append** adds new frames to a compatible processed NeXus scan in place,
+  skipping frames and scans already processed, and says how many frames are new.
+  An image that changed since it was processed is processed again; a refused
+  Append says what differs. **Replace/Overwrite** reprocesses it. Int 1D (XYE)
+  does not support Append. Stitch/RSM Append skips complete results, as
+  described above.
+- A Folder or Live Run writes its outputs flat into the **Save Path**, never
+  reads the Save Path as input, and goes on to the next scan when one cannot be
+  processed, saying why.
 - **Single** follows the current selection; **Overlay** keeps patterns for
   comparison. Pin a slice cut with **Cmd+P** (**Ctrl+P** on Windows/Linux).
 - Processed NeXus results retain integrated data, metadata, and thumbnails.
@@ -189,6 +212,12 @@ For supported Int 1D/2D sources, enable **Live** to process new arrivals.
   Project folder after moving a project.
 - The browser can also open files in **NeXpy** or **silx view**, included with
   the GUI installation.
+- **Show log** (below Reintegrate/Advanced) opens the application log, and
+  **Warnings** filters it. **Config → Debug → Debug Logging** writes detailed
+  diagnostics to the log file, and **Performance Monitoring** adds a timing
+  summary to each Run. **Config → Performance Diagnostics…** sets the Live plot
+  interval and, for a non-Live Overwrite Run with NeXus output only, benchmark
+  pipeline values; other Runs ignore those and say so in the log.
 
 ### Data export and saving
 
@@ -262,8 +291,8 @@ pixi install --locked
 pixi run --locked xdart
 ```
 
-The default `main` branch contains the current source. To use the exact 1.2.3
-release, run `git switch --detach v1.2.3` before installing.
+The default `main` branch contains the current source. To use the exact 1.2.9
+release, run `git switch --detach v1.2.9` before installing.
 The lockfile covers Apple Silicon macOS, Linux x86-64, and Windows x86-64.
 Each machine installs its own environment; keep the shared lockfile unchanged
 when testing on another machine.
