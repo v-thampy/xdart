@@ -2912,13 +2912,18 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         for key, value in self._BOUND_DEFAULTS.items():
             self._fields[key].setText(value)
 
+    #: Folder and file fields a person may type a ~ into (LIVE-FIX-IMAGE-FOLDER-TILDE): the source paths are expanded
+    #: where their SourceSpec is built; these are read only through _text, so every reader sees home's path
+    _HOME_PATH_KEYS = frozenset({'images', 'beam_images', 'refine_seed_path'})
+
     def _text(self, key):
         field = self._fields[key]
         if isinstance(field, QtWidgets.QComboBox):
             data = field.currentData()
             return str(field.currentText() if data is None else data).strip()
         row = self._formrows.get(key)  # a file row shows its file's name: its value is the row's
-        return str(field.text() if row is None else row.current_value()).strip()
+        text = str(field.text() if row is None else row.current_value()).strip()
+        return str(Path(text).expanduser()) if key in self._HOME_PATH_KEYS and text.startswith('~') else text
 
     def _reader(self):
         return {'detector_shape': tuple(int(v) for v in self._text('shape').split(',')),
@@ -4235,11 +4240,14 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                     self._show_tab('calibrate')
                 elif kind in ('calibrate', 'import') and result is not None:
                     result, prediction = result
+                    # the new row's points replace the ones the fit was made from, so adopting the row retires the
+                    # fit before anything is saved, and the row is shown even when the session cannot be written
+                    # (1.2.10 review A1: the session kept the old fit, restorable after a crash or a failed write)
                     self.frames = tuple(result if frame.identity == self._row_identity else frame for frame in self.frames)
                     self._prediction = (self._calibrated_key(), prediction)
-                    self._save_session()
                     self._invalidate_fit()
                     self._render_frames()
+                    self._save_session()
                     self._select_next_frame(result)
                 elif kind == 'predict':
                     self._prediction = result
