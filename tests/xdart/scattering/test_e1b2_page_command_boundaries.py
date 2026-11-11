@@ -331,11 +331,8 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
             action.text() for action in config.menu().actions()
         }
         dialog = PerformanceDiagnosticsDialog(page)
-        quartile_checkbox = dialog.findChild(
-            QtWidgets.QCheckBox, "performanceQuartileTelemetry",
-        )
-        assert quartile_checkbox is not None
-        assert quartile_checkbox.text() == "Within-run quartile timing"
+        # a shared FormRow toggle since 1.2.10 (rule 14, review M3 site 1), its label its accessible name
+        assert dialog.quartile_telemetry.editor.accessibleName() == "Within-run quartile timing"
         dialog.deleteLater()
         initial = page._intents.snapshot()
         assert "_post_g2_pipeline_v2" not in initial.thaw().run_options
@@ -373,7 +370,8 @@ def test_performance_diagnostics_are_explicit_and_apply_next_run_values(
         assert os.environ["XDART_PERF"] == "1"
         assert os.environ["XDART_PERF_QUARTILES"] == "1"
         assert "next run" in page._notice_text.lower()
-        assert "crash" in page._notice_text.lower()
+        # durable fsync off is the adapter's default since 9922678d (1.2.10 review H3): no unsafe-persistence warning
+        assert "crash" not in page._notice_text.lower()
 
         monkeypatch.setenv(
             "XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", "1",

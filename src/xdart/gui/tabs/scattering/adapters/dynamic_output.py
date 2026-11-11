@@ -61,6 +61,7 @@ from xrd_tools.core.staging import (
     windows_physical_ram_bytes,
 )
 from xrd_tools.session.run_configuration import heavy_residency_choice
+from xrd_tools.session.run_intent_profile import PROCESS_PRIVATE_RUN_OPTIONS
 from xrd_tools.session.display_logic import xye_prefix_for_unit
 from xrd_tools.sources.execution_graph import (
     append_source_from_execution_graph,
@@ -122,18 +123,41 @@ class _PostG2OutputDiagnosticsChoice:
     explicit: bool = False
 
 
+#: What a Run that can take a pipeline choice uses when none is stored, and what Config ▸ Performance Diagnostics loads
+#: when nothing is stored (the dialog takes its defaults from here, never from a second tuple).
+DEFAULT_PIPELINE_V2 = _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
+DEFAULT_OUTPUT_DIAGNOSTICS = _PostG2OutputDiagnosticsChoice()
+#: The Run options Config ▸ Performance Diagnostics stores (the profile codec's process-private set); a Run that cannot
+#: take them ignores all three.
+PERFORMANCE_DIAGNOSTICS_KEYS = PROCESS_PRIVATE_RUN_OPTIONS
+
+
+def pipeline_incompatibility(configuration, *, coordinated=True) -> str:
+    """Why this Run cannot take a pipeline choice ("" when it can): only a non-Live, non-Batch, coordinated Overwrite Run
+    with NeXus output takes one."""
+    if configuration.live_mode:
+        return "a Live Run"
+    if configuration.batch_mode:
+        return "a Batch Run"
+    if configuration.output_mode != "Overwrite":
+        mode = str(configuration.output_mode)
+        return f"{'an' if mode[:1] in 'AEIOU' else 'a'} {mode} Run"
+    if not coordinated:
+        return "an uncoordinated Run"
+    if configuration.processing_mode == "Int 1D (XYE)":
+        return "an XYE-only Run"
+    return ""
+
+
 def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
+    """The Run's pipeline choice, or None for a Run that cannot take one. A stored choice is checked strictly only for a
+    Run that can take it; any other Run ignores it, whatever it holds (1.2.10 review H3: a Live, Batch or Append Run used
+    to refuse it and skip every scan), and its adapter says so once (``_note_ignored_diagnostics``)."""
     value = configuration.run_options.get("_post_g2_pipeline_v2", _MISSING)
+    if pipeline_incompatibility(configuration, coordinated=coordinated):
+        return None
     if value is _MISSING:
-        if (
-            configuration.live_mode
-            or configuration.batch_mode
-            or configuration.output_mode != "Overwrite"
-            or not coordinated
-            or configuration.processing_mode == "Int 1D (XYE)"
-        ):
-            return None
-        return _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
+        return DEFAULT_PIPELINE_V2
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
     if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
@@ -158,16 +182,6 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
             "post-G2 pipeline V2 semantic checkpoint exceeds the staging "
             "cap minus its 8-frame safety margin"
         )
-    if configuration.live_mode:
-        raise ValueError("post-G2 pipeline V2 requires a non-Live run")
-    if configuration.batch_mode:
-        raise ValueError("post-G2 pipeline V2 requires a non-batch run")
-    if configuration.output_mode != "Overwrite":
-        raise ValueError("post-G2 pipeline V2 requires Overwrite output")
-    if not coordinated:
-        raise ValueError("post-G2 pipeline V2 requires a coordinated run")
-    if configuration.processing_mode == "Int 1D (XYE)":
-        raise ValueError("post-G2 pipeline V2 requires Nexus output")
     return _PostG2PipelineV2Choice(*row)
 
 
@@ -180,7 +194,7 @@ def _unsafe_unfunded_staging_requested(
 ) -> bool:
     raw = env.get(_UNSAFE_UNFUNDED_STAGING_ENV)
     marker = run_options.get(_UNSAFE_UNFUNDED_STAGING_KEY, _MISSING)
-    if marker is _MISSING:
+    if marker is _MISSING or pipeline_v2 is None:  # a Run that takes no pipeline choice ignores the marker too
         return False
     if raw is None or not str(raw).strip():
         raise ValueError(
@@ -258,10 +272,8 @@ def _post_g2_output_diagnostics_choice(configuration, *, pipeline_v2):
         "_post_g2_output_diagnostics_v1",
         _MISSING,
     )
-    if value is _MISSING:
-        return _PostG2OutputDiagnosticsChoice()
-    if pipeline_v2 is None:
-        raise ValueError("post-G2 output diagnostics require pipeline V2")
+    if value is _MISSING or pipeline_v2 is None:  # None: a Run that takes no pipeline choice ignores these too
+        return DEFAULT_OUTPUT_DIAGNOSTICS
     if not isinstance(value, Mapping):
         raise TypeError(
             "post-G2 output diagnostics must be one exact mapping"
@@ -752,6 +764,7 @@ class DynamicOutputAdapter:
         self._command_lock = RLock()
         self._activating = False
         self._stop_requested = False
+        self._ignored_diagnostics_noted = False
         self.resource_facts: tuple[HeavyResidencyFact, ...] = ()
         # the Run's built worker integrators, which its series borrow instead of rebuilding pyFAI's tables; an
         # executor's store outlives its Runs, so a Run's first frames start warm when nothing changed
@@ -760,6 +773,20 @@ class DynamicOutputAdapter:
             integrator_reuse if integrator_reuse is not None
             else WarmIntegrators(max(1, int(configuration.max_cores)))
         )
+
+    def _note_ignored_diagnostics(self) -> None:
+        """Say once per Run that it ignores the stored Performance Diagnostics options (one adapter per Run)."""
+        if self._ignored_diagnostics_noted:
+            return
+        stored = [key for key in PERFORMANCE_DIAGNOSTICS_KEYS if key in self.configuration.run_options]
+        reason = pipeline_incompatibility(self.configuration)
+        if not stored or not reason:
+            return
+        self._ignored_diagnostics_noted = True
+        logger.warning(
+            "Performance Diagnostics pipeline and output values were not used: this is %s, and they apply only to a "
+            "non-Live, non-Batch Overwrite Run with NeXus output; timing and the plot interval still apply "
+            "[PERF-DIAGNOSTICS]", reason)
 
     @staticmethod
     def _discard_identity(values: list[Any], owner: Any) -> None:
@@ -1001,6 +1028,7 @@ class DynamicOutputAdapter:
             raise TypeError("dynamic admission preparation inputs are not exact")
         if stop_signal.is_set(): raise RuntimeError("admission cancelled")
         env = dict(os.environ); frame_count = _supported_lineage_frame_count(item.source_stamp)
+        self._note_ignored_diagnostics()
         pipeline_v2 = _post_g2_pipeline_v2_choice(self.configuration, coordinated=True)
         diagnostics = _post_g2_output_diagnostics_choice(self.configuration, pipeline_v2=pipeline_v2)
         unsafe = _unsafe_unfunded_staging_requested(

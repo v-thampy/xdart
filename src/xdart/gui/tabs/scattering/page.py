@@ -33,6 +33,7 @@ from xrd_tools.session.intent_store import (
     RunIntentSnapshot,
 )
 from xrd_tools.session.run_intent_profile import (
+    PROCESS_PRIVATE_RUN_OPTIONS,
     dump_run_intent_profile,
     load_run_intent_profile,
 )
@@ -201,6 +202,7 @@ from .source_view import SourceStatusView
 from .performance_diagnostics import (
     PerformanceDiagnosticsDialog,
     PerformanceDiagnosticsValues,
+    performance_diagnostics_are_defaults,
     performance_diagnostics_error,
 )
 from .operation_values import (
@@ -302,11 +304,8 @@ _UNSAFE_UNFUNDED_STAGING_ENV = (
 _UNSAFE_UNFUNDED_STAGING_KEY = (
     "_post_g2_unfunded_staging_diagnostic_v1"
 )
-_NEXUS_ONLY_PERFORMANCE_KEYS = (
-    "_post_g2_pipeline_v2",
-    "_post_g2_output_diagnostics_v1",
-    _UNSAFE_UNFUNDED_STAGING_KEY,
-)
+#: Config ▸ Performance Diagnostics' private Run options (the profile codec never writes them)
+_NEXUS_ONLY_PERFORMANCE_KEYS = PROCESS_PRIVATE_RUN_OPTIONS
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
 # A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup), and
@@ -8757,16 +8756,18 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return
         candidate = snapshot.thaw()
         unsafe_unfunded_staging = False
-        if candidate.processing_mode == "Int 1D (XYE)":
-            _drop_nexus_only_performance_options(candidate)
-        else:
+        # XYE-only processing takes no pipeline choice, and the defaults need none stored: a Run that cannot take a
+        # stored choice ignores it, so storing the defaults would only make it say so (1.2.10 review H3)
+        _drop_nexus_only_performance_options(candidate)
+        stores_choice = (candidate.processing_mode != "Int 1D (XYE)"
+                         and not performance_diagnostics_are_defaults(values))
+        if stores_choice:
             candidate.run_options["_post_g2_pipeline_v2"] = (
                 values.pipeline_mapping()
             )
             candidate.run_options["_post_g2_output_diagnostics_v1"] = (
                 values.output_diagnostics_mapping()
             )
-            candidate.run_options.pop(_UNSAFE_UNFUNDED_STAGING_KEY, None)
             unsafe_unfunded_staging = (
                 os.environ.get(_UNSAFE_UNFUNDED_STAGING_ENV, "").strip() == "1"
                 and (
@@ -8801,23 +8802,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             os.environ["XDART_PERF_QUARTILES"] = "1"
         else:
             os.environ.pop("XDART_PERF_QUARTILES", None)
-        xye_only = candidate.processing_mode == "Int 1D (XYE)"
-        notice = (
-            "Performance diagnostics applied: plot cadence is active now."
-            if xye_only
-            else "Performance diagnostics applied: pipeline and output values "
-            "take effect on the next run; plot cadence is active now."
-        )
-        if not xye_only and not values.durable_fsync:
+        notice = "Performance diagnostics applied: timing is on and plot cadence is active now."
+        if stores_choice:
             notice += (
-                " Diagnostic fsync is off: crash or power-loss persistence "
-                "is not guaranteed."
+                " Pipeline and output values take effect on the next Run that can take them (a non-Live, "
+                "non-Batch Overwrite Run with NeXus output); other Runs ignore them and say so in the log."
             )
+            if values.durable_fsync:
+                notice += " Durable fsync is on: each checkpoint and the close wait for the disk."
         if values.quartile_telemetry:
             notice += (
                 " Within-run quartile timing is enabled for the next run."
             )
-        if not xye_only and values.staging_frame_cap > 64:
+        if stores_choice and values.staging_frame_cap > 64:
             notice += (
                 f" Staging cap {values.staging_frame_cap} can increase memory "
                 "with frame count and is subject to exact resource admission."

@@ -32,6 +32,18 @@ from xrd_tools.sources.selection import (
 
 PROFILE_SCHEMA = "xdart.run-intent-profile"
 PROFILE_VERSION = 1
+#: Run options that belong to one process and never cross this boundary: the GUI's Performance Diagnostics benchmark
+#: choices. A profile or session written by 1.2.9 may carry them; loading drops them (1.2.10 review H3: restored, they
+#: made every later Live, Batch and Append Run skip its scans) and dumping never writes them.
+PROCESS_PRIVATE_RUN_OPTIONS = (
+    "_post_g2_pipeline_v2",
+    "_post_g2_output_diagnostics_v1",
+    "_post_g2_unfunded_staging_diagnostic_v1",
+)
+
+
+def _public_run_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in options.items() if key not in PROCESS_PRIVATE_RUN_OPTIONS}
 
 _ENVELOPE_KEYS = frozenset({"schema", "version", "intent"})
 _INTENT_KEYS = frozenset({
@@ -554,9 +566,9 @@ def _decode_versioned(document: dict[str, Any]) -> RunIntent:
         background=background,
         project_root=_text(data["project_root"], path="intent.project_root"),
         save_path=_text(data["save_path"], path="intent.save_path"),
-        run_options=_profile_mapping(
+        run_options=_public_run_options(_profile_mapping(
             data["run_options"], path="intent.run_options"
-        ),
+        )),
         generation=0,
     )
     return _validate_candidate(candidate)
@@ -622,7 +634,7 @@ def dump_run_intent_profile(intent: RunIntent) -> str:
                 "project_root": frozen.project_root,
                 "save_path": frozen.save_path,
                 "run_options": _encode_profile_value(
-                    frozen.run_options, path="intent.run_options"
+                    _public_run_options(frozen.run_options), path="intent.run_options"
                 ),
             },
         }
@@ -668,6 +680,7 @@ def load_run_intent_profile(text: str) -> RunIntent:
 
 
 __all__ = [
+    "PROCESS_PRIVATE_RUN_OPTIONS",
     "PROFILE_SCHEMA",
     "PROFILE_VERSION",
     "RunIntentProfileError",
