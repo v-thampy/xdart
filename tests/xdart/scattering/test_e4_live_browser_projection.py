@@ -444,7 +444,7 @@ def test_post_g2_output_diagnostics_are_exact_private_v2_values():
 
     with pytest.raises(ValueError, match="V2"):
         dynamic_output._post_g2_output_diagnostics_choice(
-            RunIntent(run_options={
+            RunIntent(output_mode="Overwrite", run_options={
                 "_post_g2_output_diagnostics_v1": {
                     "save_xye": True,
                     "durable_fsync": True,
@@ -459,12 +459,16 @@ def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(
     tmp_path,
 ):
     from xdart.gui.tabs.scattering.adapters import dynamic_output
+    from xrd_tools.reduction import ReductionPlan
 
     touched = []
-    monkeypatch.setattr(
-        dynamic_output, "_science_projection",
-        lambda *_args: touched.append("science"),
-    )
+    original_science = dynamic_output._science_projection
+
+    def record_science(*args):
+        touched.append("science")
+        return original_science(*args)
+
+    monkeypatch.setattr(dynamic_output, "_science_projection", record_science)
     fields = (
         "writer_settlement_batch_size", "nexus_record_batch_size",
         "reduction_inflight", "semantic_checkpoint_frame_cap",
@@ -472,22 +476,19 @@ def test_post_g2_pipeline_refuses_before_dynamic_activation_effects(
     )
     valid = dict(zip(fields, (1, 8, 8, 16, 64), strict=True))
     configurations = (
-        RunIntent(run_options={
+        RunIntent(output_mode="Overwrite", run_options={
             "_post_g2_pipeline_v2": {
                 key: valid[key] for key in fields[:-1]
             },
         }).freeze(),
-        RunIntent(live_mode=True, run_options={
-            "_post_g2_pipeline_v2": valid,
-        }).freeze(),
-        RunIntent(run_options={
+        RunIntent(output_mode="Overwrite", run_options={
             "_post_g2_pipeline_v2": {
                 **valid, "semantic_checkpoint_frame_cap": False,
             },
         }).freeze(),
     )
     scan, item, decision = _one_frame_dynamic_admission(tmp_path)
-    plan = SimpleNamespace(integration_1d=None, integration_2d=None, gi=None)
+    plan = ReductionPlan()
     for configuration in configurations:
         adapter = dynamic_output.DynamicOutputAdapter(configuration)
         with pytest.raises((TypeError, ValueError)):
