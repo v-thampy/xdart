@@ -115,8 +115,10 @@ def test_auto_last_stop_after_geometry_changes_keeps_the_saved_curve(
             np.testing.assert_allclose(curve.getData()[0], saved.axis_1d.values, rtol=1e-6)
             np.testing.assert_allclose(curve.getData()[1], saved.intensity_1d, rtol=1e-6)
             assert page._preferences.plot_axis == ("q_ip" if gi else "Q")
-            assert shell.scientific.raw.canvas.raw_image.size > 0
-            assert shell.scientific.cake.canvas.raw_image.size > 0
+            # The raw and cake images are read again from the saved output, asynchronously: a slower machine can
+            # show the curve first (hosted run 43267789395 attempt 2: raw size 0 here), as in _exercise (dcd875fa).
+            assert _wait(app, lambda: shell.scientific.raw.canvas.raw_image.size > 0
+                         and shell.scientific.cake.canvas.raw_image.size > 0), (gi, output_mode, page._notice_text)
     finally:
         release.set()
         assert _wait(app, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
