@@ -35,6 +35,7 @@ class ResultsTable(QtWidgets.QTableWidget):
         self.setObjectName(name)
         self.setHorizontalHeaderLabels(list(headers))
         self._header_tooltips = dict(header_tooltips or {})
+        self._row_labels_shown = False
         self.verticalHeader().setVisible(row_numbers)
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         if max_height is not None:
@@ -57,8 +58,14 @@ class ResultsTable(QtWidgets.QTableWidget):
 
     def show_rows(self, headers: Sequence[str], rows: Sequence[Sequence[object]], *,
                   check_states: Mapping[tuple[int, int], bool] | None = None,
-                  cell_tooltips: Mapping[tuple[int, int], str] | None = None) -> None:
-        """Replace text rows, optionally projecting enabled checkboxes and per-cell help."""
+                  cell_tooltips: Mapping[tuple[int, int], str] | None = None,
+                  row_labels: Sequence[object] | None = None) -> None:
+        """Replace text rows, optionally projecting enabled checkboxes, per-cell help and row labels (shown in the row
+        header, as the metadata table names each contributing frame; 1.2.10 review M3). A projection without labels
+        after one with them gets the default row numbers back."""
+        if row_labels is None and self._row_labels_shown:
+            self.setRowCount(0)  # drops the earlier rows' header labels
+        self._row_labels_shown = row_labels is not None
         self.setColumnCount(len(headers))
         self.setHorizontalHeaderLabels(list(headers))
         self._show_header_tooltips()
@@ -74,6 +81,8 @@ class ResultsTable(QtWidgets.QTableWidget):
                 if cell_tooltips is not None:
                     item.setToolTip(cell_tooltips.get((row, column), ""))
                 self.setItem(row, column, item)
+        if row_labels is not None:
+            self.setVerticalHeaderLabels([str(label) for label in row_labels])
 
     def clear_rows(self) -> None:
         """No rows; the headers stay."""

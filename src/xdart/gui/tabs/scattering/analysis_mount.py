@@ -313,7 +313,12 @@ class MetadataResultDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Metadata"); self.setObjectName("p37MetadataDialog")
         layout = QtWidgets.QVBoxLayout(self)
-        self.table = QtWidgets.QTableWidget(0, 0, self); self.status = QtWidgets.QLabel("")
+        from xdart.gui.tabs.scattering.results_table import ResultsTable
+        # the shared results table (rule 14; review M3): its row header names each contributing frame
+        self.table = ResultsTable(parent=self, name="p37MetadataTable", row_numbers=True)
+        self.table.setToolTip("The experimental metadata of the frames this result was made from, one row each.")
+        self.status = QtWidgets.QLabel("")
+        self.status.setToolTip("Why the table is empty or partial, when it is.")
         layout.addWidget(self.table); layout.addWidget(self.status)
         from xdart.gui.widgets.controls_panel import ActionButton
         from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
@@ -324,7 +329,9 @@ class MetadataResultDialog(QtWidgets.QDialog):
         layout.addWidget(self.plot_button)
         self._adopted_source = None
         self.plot_button.actionRequested.connect(self._plot)
-        #: Built by ``adopt_sources`` only, for a result read from several sources.
+        #: Built by ``adopt_sources`` only, for a result read from several sources: the shared FormRow combo
+        #: (``source_row``) and its editor.
+        self.source_row = None
         self.source_selector = None
         self._sources: tuple[MetadataSource, ...] = ()
     def adopt_sources(self, sources) -> None:
@@ -332,14 +339,23 @@ class MetadataResultDialog(QtWidgets.QDialog):
         shows one source's table at a time, the first at once; a source whose table is not complete shows
         its code."""
         if self.source_selector is None:
-            self.source_selector = QtWidgets.QComboBox(self)
-            self.source_selector.setObjectName("p37MetadataSourceSelector")
-            self.source_selector.setToolTip("Choose the member scan whose contributing metadata rows are shown and plotted.")
+            from xdart.gui.widgets.controls_panel import FormRow
+            self.source_row = FormRow(label="Source", path=("Metadata", "source"), value="", kind="combo", parent=self)
+            self.source_row.set_purpose_tooltip(
+                "Choose the member scan whose contributing metadata rows are shown and plotted.")
+            self.source_selector = self.source_row.editor
+            # the table follows the chosen source at once; nothing here rebuilds the row while its popup is open
             self.source_selector.currentIndexChanged.connect(self._select_source)
-            self.layout().insertWidget(0, self.source_selector)
+            self.layout().insertWidget(0, self.source_row)
         self._sources = tuple(sources)
-        self.source_selector.clear()
-        self.source_selector.addItems([source.label for source in self._sources])
+        blocked = self.source_selector.blockSignals(True)
+        try:
+            self.source_selector.clear()
+            for index, source in enumerate(self._sources):
+                self.source_selector.addItem(source.label, index)
+        finally:
+            self.source_selector.blockSignals(blocked)
+        self._select_source(self.source_selector.currentIndex())
     def _select_source(self, index: int) -> None:
         from xrd_tools.analysis.scan_operations import AnalysisDisposition
         self.clear_result()
@@ -357,9 +373,7 @@ class MetadataResultDialog(QtWidgets.QDialog):
     def clear_result(self) -> None:
         self._adopted_source = None
         self.plot_button.setEnabled(False)
-        self.table.clear()
-        self.table.setRowCount(0)
-        self.table.setColumnCount(0)
+        self.table.show_rows((), ())
         self.status.clear()
     def _plot(self, _action) -> None:
         if self._adopted_source is not None:
@@ -373,16 +387,15 @@ class MetadataResultDialog(QtWidgets.QDialog):
         selected = labels if selected_labels is None else tuple(selected_labels)
         positions = {label: index for index, label in enumerate(labels)}
         rows = [positions[label] for label in selected]
-        self.table.setColumnCount(len(columns)); self.table.setRowCount(len(rows))
-        self.table.setHorizontalHeaderLabels([column.name for column in columns])
-        if selected_labels is not None or row_labels is not None:
-            self.table.setVerticalHeaderLabels([str(label) for label in (selected if row_labels is None else row_labels)])
+        cells = [[""] * len(columns) for _ in rows]
         for col, column in enumerate(columns):
             values = column.numeric if column.numeric is not None else column.text
             for row, index in enumerate(() if values is None else rows):
                 value = values[index]
-                self.table.setItem(row, col, QtWidgets.QTableWidgetItem(
-                    "" if value is None else str(value)))
+                cells[row][col] = "" if value is None else str(value)
+        labelled = selected_labels is not None or row_labels is not None
+        self.table.show_rows([column.name for column in columns], cells,
+                             row_labels=(selected if row_labels is None else row_labels) if labelled else None)
         self.status.setText(getattr(result, "code", ""))
         if result.disposition is AnalysisDisposition.COMPLETED and rows:
             self._adopted_source = MetadataSource("Experimental metadata", result,

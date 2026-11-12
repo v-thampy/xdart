@@ -511,9 +511,14 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
             "Select the exact authored mask to adopt:",
             self,
         )
+        label.setToolTip("The newest valid file is selected; Accept adopts it for the next Run.")
         layout.addWidget(label)
-        self.paths = QtWidgets.QComboBox(self)
-        self.paths.setObjectName("authoredAssetPath")
+        from xdart.gui.widgets.controls_panel import ActionButton, FormRow
+        from xrd_tools.session.readiness import ControlAction, ControlActionSpec, SectionId
+        # the shared Controls row and buttons (rule 14; 1.2.10 review M3 site 3)
+        self.path_row = FormRow(label="File", path=("AuthoredAsset", asset), value="", kind="combo", parent=self)
+        self.path_row.label.setMinimumWidth(0)
+        self.paths = self.path_row.editor
         # A read-only editor keeps long paths scrollable/copyable in the selector.
         self.paths.setEditable(True)
         self.paths.lineEdit().setReadOnly(True)
@@ -521,17 +526,21 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
             self.paths.addItem(path, path)
         if not paths:
             self.paths.addItem("No new valid authored file was found.", None)
-        self.paths.setToolTip(paths[0] if paths else "")
-        layout.addWidget(self.paths)
+        self._show_selected_path(self.paths.currentIndex())
+        layout.addWidget(self.path_row)
         self.paths.currentIndexChanged.connect(self._show_selected_path)
         buttons = QtWidgets.QHBoxLayout()
-        self.accept_button = QtWidgets.QPushButton("Accept", self)
-        self.accept_button.setObjectName("authoredAssetAccept")
+
+        def button(text: str, tip: str) -> ActionButton:
+            action = ActionButton(ControlActionSpec(ControlAction.PREVIEW, text, SectionId.EXPERIMENT), self)
+            action.set_purpose_tooltip(tip)
+            return action
+
+        kind = "PONI" if asset == "poni" else "mask"
+        self.accept_button = button("Accept", f"Adopt the selected {kind} for the next Run.")
         self.accept_button.setEnabled(bool(paths))
-        self.choose_button = QtWidgets.QPushButton("Choose Another…", self)
-        self.choose_button.setObjectName("authoredAssetChooseAnother")
-        self.cancel_button = QtWidgets.QPushButton("Cancel", self)
-        self.cancel_button.setObjectName("authoredAssetCancel")
+        self.choose_button = button("Choose Another…", f"Choose a different existing {kind} file.")
+        self.cancel_button = button("Cancel", f"Close without adopting a {kind}; the current one stays.")
         buttons.addWidget(self.accept_button)
         buttons.addWidget(self.choose_button)
         buttons.addStretch(1)
@@ -558,8 +567,7 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
         self.cancel_button.setEnabled(enabled)
 
     def _show_selected_path(self, _index: int) -> None:
-        value = self.selected_path or ""
-        self.paths.setToolTip(value)
+        self.path_row.set_purpose_tooltip(self.selected_path or "No new valid authored file was found.")
 
     def close_inert(self) -> None:
         self._inert = True
