@@ -14,9 +14,7 @@ import time
 import tracemalloc
 import weakref
 from contextlib import contextmanager
-from functools import partial
 from threading import Event, current_thread
-from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -32,7 +30,6 @@ from xdart.modules.display_context import Viewer2DCleanupReceipt, Viewer2DCleanu
 from xrd_tools.io import viewer_2d as api
 from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
-from tests.xdart.scattering import test_p2a1_viewer_context_page as p2a1
 from tests.xdart.scattering.test_viewer_2d_navigation import _settle_2d_layout, _wait, _wait_cleanup
 
 F32 = np.dtype(np.float32)
@@ -228,36 +225,31 @@ def test_an_ordinary_frame_after_a_wide_one_is_drawn_pixel_for_pixel():
 # F5: one frame at a time. Weak references are read as they are, without forcing a collection.
 
 def test_switching_frames_releases_the_previous_frame_before_the_next_read(tmp_path, monkeypatch):
-    """Preservation: the page's clear drops the shown frame and its Log copy before the next read is submitted."""
-    path = tmp_path / "stack.npy"
-    np.save(path, (np.arange(3 * 64 * 48, dtype=np.uint32) % 997).astype(np.uint16).reshape(3, 64, 48))
-    controller = p2a1._controller()
-    controller.open_viewer_2d(str(path))
-    p2a1._await_viewer(controller)
-    view = ScientificView()
-    payload = controller.project(controller.navigation.current)
-    view.raw.render(payload.view.raw, log_scale=True)
-    canonical = weakref.ref(controller.viewer_2d_frame.array)
-    display = weakref.ref(view.raw.canvas.displayed_image)
-    assert display() is not None and not np.shares_memory(display(), canonical())
-    del payload
-    seen = []
-    submit = controller._viewer_2d_submit
+    """Preservation: the page's clear drops the shown frame and its Log copy before the next read is submitted. The
+    real 2D Viewer page with Log on, and the frame step through its own command (1.2.10 review M6, Table A row 1: this
+    row ran ScatteringWorkspace._select_frames on a SimpleNamespace page)."""
+    values = (np.arange(3 * 64 * 48, dtype=np.uint32) % 997).astype(np.uint16).reshape(3, 64, 48)
+    with _viewer_page(tmp_path, values) as (page, app, _paths):
+        controller = page._context_controller
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_LOG_SCALE, True))
+        _wait(page, app, lambda: page._shell.scientific.raw.canvas.displayed_image is not None
+              and not np.shares_memory(page._shell.scientific.raw.canvas.displayed_image,
+                                       controller.viewer_2d_frame.array))
+        canonical = weakref.ref(controller.viewer_2d_frame.array)
+        display = weakref.ref(page._shell.scientific.raw.canvas.displayed_image)
+        seen = []
+        submit = controller._viewer_2d_submit
 
-    def observed(request):
-        seen.append((canonical() is None, display() is None))
-        return submit(request)
+        def observed(request):
+            seen.append((canonical() is None, display() is None))
+            return submit(request)
 
-    monkeypatch.setattr(controller, "_viewer_2d_submit", observed)
-    page = SimpleNamespace(_context_controller=controller, _shell=SimpleNamespace(scientific=view),
-                           _last_scientific_projection=object(), _ensure_timer=lambda: None)
-    page._clear_viewer_2d_renderer = partial(ScatteringWorkspace._clear_viewer_2d_renderer, page)
-    following = controller.navigation.frames[1]
-    ScatteringWorkspace._select_frames(page, ShellCommand(ShellCommandKind.SELECT_FRAME, frame=following,
-                                                          frames=(following,)))
-    assert seen == [(True, True)], "both the canonical frame and its Log copy were gone when the next read began"
-    p2a1._await_viewer(controller)
-    assert controller.viewer_2d_frame.label == following.local_frame_label
+        monkeypatch.setattr(controller, "_viewer_2d_submit", observed)
+        following = controller.navigation.frames[1]
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=following, frames=(following,)))
+        _wait(page, app, lambda: _shows(page, following.local_frame_label))
+        assert seen and seen[0] == (True, True), (
+            "both the canonical frame and its Log copy were gone when the next read began", seen)
 
 
 def _shows(page, label):
