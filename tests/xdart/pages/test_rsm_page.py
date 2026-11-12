@@ -471,11 +471,12 @@ def test_typing_in_a_field_then_run_runs_the_typed_inputs(qapp, tmp_path, monkey
         editor.setFocus()
         qapp.processEvents()
         editor.selectAll()
-        QTest.keyClicks(editor, str(tmp_path / "typed.nexus"))  # typed, not committed: no Return or Tab
+        QTest.keyClicks(editor, str(tmp_path / "typed"))  # a folder (C-6), typed, not committed: no Return or Tab
         assert editor.hasFocus()
         page.run_bar.startButton.click()  # a click that leaves the focus in the field
         _wait(page, qapp, lambda: page.shown is not None)
-        assert page.results.item(0).text() == "typed.nexus"
+        output = Path(page.build_form().output_path)
+        assert output.parent == tmp_path / "typed" and page.results.item(0).text() == output.name
     finally:
         _close(page, qapp)
 
@@ -2089,7 +2090,7 @@ def test_a_directory_source_finds_its_spec_scans_as_stitch_does(qapp, tmp_path, 
 
 def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
     """NeXus files as the Source (the maintainer: "nexus files as source as well"): a raw NeXus stack is a member
-    by its entry (C5c), the suggested output is named from the file, and the Preview, through the one owner,
+    by its entry (C5c), the result is named from the file in the Save Path folder, and the Preview, through the one owner,
     names the entry. Its run commits, and Append finds the output up to date."""
     from tests.core.test_rsm_nexus_members import _write_rsm_nexus
     from xdart.gui.tools.rsm_values import RSMNexusMemberForm
@@ -2103,7 +2104,7 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         page.set_sources([str(nexus)])
         page.set_field("normalization", "None")
         assert page._readiness[1], page._readiness
-        assert Path(page._value("output_path")).name == "member_ub_rsm.nexus"
+        assert page._value("output_path") == str(tmp_path / "xdart_processed_data")  # the Save Path folder (C-6)
         assert "5 frames" in page.controls.source_card.status.text()
         assert "5 frames" in page.run_bar.readinessLabel.full_text()
         for key, count in zip(("grid_h", "grid_k", "grid_l"), (12, 16, 20), strict=True):
@@ -2112,6 +2113,7 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
         member, = page.build_form().members
         assert type(member) is RSMNexusMemberForm and member.entry == "entry"
+        assert Path(page.build_form().output_path).name == "member_ub_rsm.nexus"  # named from the file, in the folder
         assert "member_ub.nxs · NeXus entry entry · 5 frames" in page.preview_text.toPlainText()
         page.begin_run()  # gridded for real: five frames
         _wait(page, qapp, lambda: page.shown is not None and not page.active(), seconds=300)

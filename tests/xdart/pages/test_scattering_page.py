@@ -418,7 +418,7 @@ def test_cold_native_start_lists_saved_output_folder(
     artifact.touch()
     nested = output / "nested"
     nested.mkdir()
-    target = output / "chosen_rsm.nexus" if page_key == "rsm" else output
+    target = output  # every tool's Save Path is a folder (C-6)
     saved_output = str(target.relative_to(project) if relative else target)
     document = {"kind": f"xdart-{page_key}-settings", "version": 1,
                 "fields": {"project_root": str(project), "output_path": saved_output}}
@@ -601,17 +601,16 @@ def test_a_fresh_mode_inherits_project_and_save_folder_but_keeps_its_own(qapp, i
         stitch.run_bar.modeCombo.setCurrentText("RSM")
         rsm = window.main_widget
         assert rsm._value("project_root") == str(project)
-        assert Path(rsm._value("output_path")).parent == save
-        assert Path(rsm._value("output_path")).name.endswith("_rsm.nexus")
+        assert rsm._value("output_path") == str(save)  # the shared folder, as Stitch's (C-6)
         own = tmp_path / "rsm-project"
         own.mkdir()
         rsm.set_field("project_root", str(own))
-        rsm.set_field("output_path", str(own / "chosen.nexus"))
+        rsm.set_field("output_path", str(own / "chosen"))
         window.select_page(DEFAULT_PAGE_KEY)
         integration._shell.run_controls.modeCombo.setCurrentText("RSM")
         assert window.main_widget is rsm
         assert rsm._value("project_root") == str(own)
-        assert rsm._value("output_path") == str(own / "chosen.nexus")
+        assert rsm._value("output_path") == str(own / "chosen")
         assert integration._intents.snapshot() == prior_intent
     finally:
         window.close()
