@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -23,11 +26,12 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-@pytest.mark.parametrize("waits", (False, True), ids=("opens", "waits"))
+@pytest.mark.parametrize("case", ("opens", "opens-after-late-read", "waits"))
 @pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
 def test_int_overlay_retains_selected_point_when_browsing_another_file(
-    tmp_path, monkeypatch, qapp, mode, waits,
+    tmp_path, monkeypatch, qapp, mode, case,
 ):
+    waits = case == "waits"
     first, _ = _write_processed(tmp_path / "first", labels=(1, 2))
     second, _ = _write_processed(tmp_path / "second", labels=(1, 2))
     persisted = (get_1d(first, 2), get_1d(second, 1))
@@ -92,6 +96,19 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
             # CI-FLAKE-OVERLAY-OPENS (hosted run 40636668726): on a slow runner the first file's preview reads can
             # still hold its gate here, so the open defers as in the "waits" case; this case opens once they are done
             owner = controller._browse_hydration_owner
+            if case == "opens-after-late-read" and owner is not None:
+                # A 1-D read of the first file still in flight, done 0.3 s later (PR #8 run 43267789395: the open
+                # deferred on a pending Browse cleanup, not on the preview gate).
+                lane, busy = owner._one_d_lane, SimpleNamespace(
+                    cancelled=threading.Event(), cleanup_pending=False, running=True)
+                with lane._lock:
+                    lane._active = busy
+
+                def read_done():
+                    with lane._lock:
+                        if lane._active is busy:
+                            lane._active = None
+                threading.Timer(0.3, read_done).start()
             _wait(lambda: True if owner is None or not owner.transport.retains_gate(owner._gate) else None)
         assert open_file(second) is waits
         _click_frame(qapp, shell, 0)
