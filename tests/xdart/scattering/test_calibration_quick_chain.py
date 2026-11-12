@@ -1076,3 +1076,66 @@ def test_quick_stops_with_its_reason_when_rough_geometry_leaves_the_scan_mid_cha
         assert started.count('beam_detect') == 1 and 'distance' not in started
     finally:
         _close(qapp, page, dialog)
+
+
+def _quick_rsm_fit_outside_project(qapp, tmp_path, monkeypatch, answer):
+    """RSM's calibration window on calibrant data outside the Project, after a real Quick fit, the shared last folder
+    the data folder (he had browsed his SPEC file there), and Qt's Save panel answering with ``answer(start)``."""
+    from xdart.utils.browse import remember_browse_path
+    monkeypatch.delenv('XDART_SESSION_FRESH', raising=False)
+    monkeypatch.setenv('XDART_SESSION_FILE', str(tmp_path / 'session.json'))
+    pair = _rsm_pair(tmp_path / 'data')
+    project = tmp_path / 'project'
+    project.mkdir()
+    page, dialog = _rsm_window(qapp, project)
+    card = _quick_card(dialog)
+    _configure(dialog, card, pair)
+    status = _run(dialog, card)
+    assert dialog.fit is not None, status
+    remember_browse_path(str(pair.ring))
+    offered = []
+    # Qt's external chooser is the boundary; the shared Browse/Save path stays real.
+    monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(
+        lambda parent, title, start, filt: offered.append(start) or (answer(start), filt)))
+    return page, dialog, project, offered
+
+
+def test_save_and_use_offers_the_projects_calibration_folder_when_the_scan_is_outside_it(qapp, tmp_path, monkeypatch):
+    """C-7. His report (1.2.9): "Save geometry and use in RSM" did nothing and "the json file is not saved at all":
+    the panel offered the calibrant's own folder, outside the Project, and the inside-Project check refused it out of
+    sight. His pick, 2026-11-12: "<Project>/calibration (Recommended)". Accepting what is offered saves, uses the
+    geometry in the page and closes both windows."""
+    page, dialog, project, offered = _quick_rsm_fit_outside_project(qapp, tmp_path, monkeypatch, lambda start: start)
+    try:
+        window = dialog._calibration_fit_window
+        window.save_button.click()
+        _wait(dialog, timeout=120)
+        _pump(qapp, lambda: not dialog.isVisible(), seconds=30)
+        (start,) = offered
+        assert Path(start).parent == project.resolve() / 'calibration', start
+        used = Path(page._value('geometry_path'))
+        used = used if used.is_absolute() else project / used
+        assert used.is_file() and used.resolve().is_relative_to(project.resolve()), (used, dialog.status.text())
+        assert not dialog.isVisible() and not window.isVisible()
+        assert 'a Calibration' not in page.run_bar.readinessLabel.full_text()
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_a_refused_save_and_use_says_why_on_the_fit_window(qapp, tmp_path, monkeypatch):
+    """C-7: a refusal of "Save geometry and use" is said on the fit window the click came from (its own status line,
+    on the Stitched calibrant panel), not only on the calibration window beneath it; nothing is written and both
+    windows stay open."""
+    outside = tmp_path / 'data' / 'outside.json'
+    page, dialog, project, offered = _quick_rsm_fit_outside_project(
+        qapp, tmp_path, monkeypatch, lambda start: str(outside))
+    try:
+        window = dialog._calibration_fit_window
+        window.save_button.click()
+        _wait(dialog, timeout=60)
+        assert offered and not outside.exists() and page._value('geometry_path') == ''
+        assert dialog.isVisible() and window.isVisible()
+        assert window.panels.currentWidget() is window.pattern_view
+        assert window.pattern_view.status.text() == 'Not saved: save the geometry inside the RSM project'
+    finally:
+        _close(qapp, page, dialog)
