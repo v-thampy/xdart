@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from dataclasses import dataclass, replace
-from functools import partial
+from dataclasses import replace
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread, main_thread
 from types import SimpleNamespace
 import time
 
@@ -16,17 +15,10 @@ from xdart.gui.tabs.scattering.context_controller import ContextController
 from xdart.gui.tabs.scattering.context_projection import ContextProjection
 from xdart.gui.tabs.scattering.display_values import DisplayFrameKey, StandardEventKind, StandardRunEvent
 from xdart.gui.tabs.scattering.events import RunIdentity
-from xdart.gui.tabs.scattering.metadata_operations import MetadataOperationOwner
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
-from xdart.gui.tabs.scattering.processed_browser import ProcessedBrowserOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
-from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.state_machine import RunPhase
-from xdart.gui.tabs.scattering.workspace_operations import (
-    WorkspaceOperationOwner,
-    WorkspaceRefreshEffect,
-)
 from xdart.modules.display_context import (ContextKind, Viewer2DCleanupState, Viewer2DRendererClearReceipt,
                                            Viewer2DRendererClearRequest, Viewer2DReceiptPhase, Viewer2DState)
 from xrd_tools.session.hydration import HydrationCompletion, HydrationOutcome, HydrationScope, HydrationToken
@@ -330,210 +322,258 @@ def test_viewer_authority_census_provider_order_refusal_and_cleanup(tmp_path, mo
         assert not controller._viewer_2d_admissible()
         setattr(lifecycle, name, None)
 
-def test_page_clear_select_scan_and_delayed_event_are_fenced() -> None:
-    @dataclass(frozen=True)
-    class _ScientificProjection:
-        heavy: object
-        background_enabled: bool = True
+def _calls_through(calls, name, call):
+    """A spy: record ``(name, result)`` for each call, after making the real call."""
+    def recorded(*args, **kwargs):
+        value = call(*args, **kwargs)
+        calls.append((name, value))
+        return value
+    return recorded
 
-    @dataclass(frozen=True)
-    class _ShellProjection:
-        scientific: _ScientificProjection
-        external_tools: object = None
 
-    calls: list[object] = []
-    clear_request = object()
-    identity = RunIdentity(2, "delayed")
-    processed_browser = ProcessedBrowserOwner(
-        save_path="",
-        processing_mode="Int 2D",
-        deliver=lambda _wake: None,
-        catalog_reader=lambda _directory, **_kwargs: (),
-    )
-    controller = SimpleNamespace(
-        viewer_2d_owned=True, viewer_2d_frame=object(), run_identity=identity,
-        selection=None,
-        poll_viewer_2d=lambda: False, poll_browse_preview=lambda: False,
-        browse_pending=False, adopt_acquisition=lambda value: calls.append(("adopt", value)),
-        begin_viewer_2d_renderer_clear=lambda: clear_request,
-        acknowledge_viewer_2d_renderer_clear=lambda receipt: calls.append(("ack", receipt)) or receipt == "positive",
-        close_viewer_2d=lambda: calls.append("close") or True)
-    scientific = SimpleNamespace(
-        clear_viewer_2d=lambda _request: "forged",
-        drop_viewer_loading_snapshot=lambda: calls.append("drop-snapshot"),
-        expect_display_background=lambda _key: None,
-        trace_row_count=0,
-        bottom_waterfall_active=False,
-    )
-    page = SimpleNamespace(
-        _closing=False, _closed=False, _context_controller=controller,
-        _shell=SimpleNamespace(scientific=scientific),
-        _retain_outgoing_display=False,
-        _scientific_repaint_pending=False,
-        _waterfall_candidate_count=0,
-        _workspace_operations=WorkspaceOperationOwner(),
-        _metadata_operations=MetadataOperationOwner(),
-        _processed_browser=processed_browser,
-        _pending_viewer_2d_path=None,
-        _batch_terminal=SimpleNamespace(
-            active=False,
-            project_progress=lambda progress: progress,
-        ),
-        _analysis_operation_busy=lambda: False,
-        _experiment_operation_busy=lambda: False,
-        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(
-            revision=0,
-            thaw=lambda: SimpleNamespace(processing_mode="Int 2D"),
-        )),
-        _last_scientific_projection=object(),
-        _select_scan=lambda value, **_kwargs: calls.append(value),
-        _poll_admission=lambda: False,
-        _settle_browse_1d_before_drain=lambda: True,
-        _dispatch_deferred_metadata=lambda: WorkspaceRefreshEffect.NONE,
-        _dispatch_roi_preview=lambda: None,  # the drain dispatches ROI previews since 495c1380
-        _click_perf=None,  # the drain retires a lost click timing record since 347536e8 (BROWSE-CLICK-128)
-        _sync_metadata_question=lambda _executor: None,  # Live Auto's question, since 204651e8
-        _failed_cleanup_pending=lambda: False,  # a failed Run's pending cleanup retried, since 703753b1
-        _terminal_hold=None,  # a Run's end held for the view's paint, since 404e17b2
-        _replay_browse_reopen=lambda: False,  # a scan click kept while Browse cleanup settles, since 1254f8f2
-        _batch_ready_to_paint=lambda: None,
-        _advance_authored_asset_confirmation=lambda: None,
-        _run_executor=SimpleNamespace(drain_events=lambda: (StandardRunEvent(identity, StandardEventKind.CONTEXT_READY),)),
-        _lifecycle=SimpleNamespace(active_run_identity=identity, attempt_run_identity=None),
-        _refresh_shell=lambda: calls.append("refresh"), _polling_needed=lambda: True,
-        _run_timer=SimpleNamespace(stop=lambda: calls.append("stop")))
-    page._clear_presentation_targets = partial(ScatteringWorkspace._clear_presentation_targets, page)
-    page._retire_lost_reintegrate_successor = partial(
-        ScatteringWorkspace._retire_lost_reintegrate_successor, page)
-    page._clear_viewer_2d_renderer = partial(ScatteringWorkspace._clear_viewer_2d_renderer, page)
-    command = ShellCommand(ShellCommandKind.SELECT_SCAN, "/retained/result.nxs")
-    ScatteringWorkspace._handle_shell_command(page, command)
-    assert calls == [("ack", "forged")]
-    ScatteringWorkspace._drain_executor(page)
-    assert not any(isinstance(item, tuple) and item[0] == "adopt" for item in calls)
-    scientific.clear_viewer_2d = lambda _request: "positive"
-    ScatteringWorkspace._handle_shell_command(page, command)
-    assert calls[-3:] == [("ack", "positive"), "close", "/retained/result.nxs"]
-    assert page._last_scientific_projection is None
-    canonical = np.arange(4.0).reshape(2, 2)
-    frame, context = controller.viewer_2d_frame, object()
-    retained = _ScientificProjection(
-        heavy=SimpleNamespace(raw=canonical, frame=frame),
-    )
-    controller.viewer_2d_context = context
-    controller.__dict__.update(
-        synchronize_acquisition_scope=lambda: None,
-        browse_lifecycle_admissible=lambda: True,  # idle: the scan list is not locked (39fb9886 asks it)
-        capture_norm_aggregate_for_refresh=lambda: None,
-        cancel_browse_slices=lambda: None,
-        viewer_2d_cleanup_pending=False,
-        browse_context=None,
-        navigation=SimpleNamespace(current=None), project_navigation=lambda **_: (),
-        resident_frame_keys=(), projectable_contexts=(), selection=None,
-        norm_aggregate=None, viewer_2d_diagnostic="")
-    page._lifecycle.phase, page._lifecycle.reset_permitted = RunPhase.IDLE, False
-    page.__dict__.update(
-        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: SimpleNamespace(
-            processing_mode="2D Viewer", live_mode=False, source_spec=None, run_options={}))),
-        _project_controls=lambda _snapshot: None, _start_permitted=lambda: (True, ""), _sync_detector_demand=lambda: None,
-        _mutating_operation_busy=lambda: False,
-        _preferences=ScientificPreferences(), _retain_outgoing_display=False,
-        _external_tools=SimpleNamespace(project=lambda **_kwargs: None),
-        _qualify_external_nexus=lambda **_kwargs: None,
-        _source_selection=SimpleNamespace(observation=None),
-            _context_projection=SimpleNamespace(
-                build_shell=lambda **_: _ShellProjection(retained),
-            ),
-            _background_owner=SimpleNamespace(projection=lambda: None, active_key=None),
-            _shell_revision=0, _controls_readiness=None, _progress=None,
-        _notice_text="")
-    def fail_render(_projection, *, preserve_display=False):
-        calls.append("render-failed")
-        raise RuntimeError("render")
-    page._shell = SimpleNamespace(scientific=scientific, browser=SimpleNamespace(
-        set_filename_mode=lambda mode: calls.append(("filename-mode", mode)),
-        reconcile_detector_mode=lambda _projection: None,
-        reconcile_heavy_residency=lambda *_args, **_kwargs: None), apply_state=fail_render)
-    page._notice = lambda text: setattr(page, "_notice_text", text)
-    page._last_scientific_projection = retained
-    owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
-    assert retained.heavy.raw is canonical
-    ScatteringWorkspace._refresh_shell(page)
-    assert ("filename-mode", "2D Viewer") in calls
-    assert calls[-2:] == ["render-failed", "drop-snapshot"]
-    assert page._notice_text == "Passive shell render failed: render"
-    assert page._last_scientific_projection is None and owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
-    assert processed_browser.begin_close()
+def test_page_clear_select_scan_and_delayed_event_are_fenced(tmp_path, monkeypatch) -> None:
+    """A scan selection waits for the 2D Viewer's renderer clear (refused twice, then positive), a delayed acquisition
+    event is not adopted while the viewer owns the display (and is once it does not), and a failed render drops the
+    loading snapshot and the retained projection but keeps the viewer's owner state.
 
-def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation(monkeypatch) -> None:
-    calls = []
-    selected = "/opaque/data.npz::nested/image.npy"
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("viewer chooser entered an acquisition seam")
-    for name in (
-        "is_single_image_spec",
-        "browse_start_dir",
-        "remember_browse_path",
-    ):
-        monkeypatch.setattr(f"xdart.gui.tabs.scattering.page.{name}", forbidden)
-    filesystem = SimpleNamespace(path=SimpleNamespace(**dict.fromkeys(
-        ("abspath", "expanduser", "exists", "isfile", "realpath", "splitext"), forbidden)), stat=forbidden, open=forbidden)
-    monkeypatch.setattr("xdart.gui.tabs.scattering.page.os", filesystem)
-    controller = SimpleNamespace(
-        viewer_2d_context=None, run_identity=None,
-        open_viewer_2d=lambda path: calls.append(("open", path)) or object())
-    intent = SimpleNamespace(
-        processing_mode="2D Viewer",
-        live_mode=False,
-        run_options={},
-    )
-    page = SimpleNamespace(
-        _context_controller=controller, _lifecycle=SimpleNamespace(phase=RunPhase.IDLE),
-        _viewer_2d_start_directory=lambda: calls.append("start") or "/viewer",
-        _viewer_2d_file_chooser=lambda start: calls.append(("choose", start)) or selected,
-        _clear_viewer_2d_renderer=forbidden,
-        _intents=SimpleNamespace(snapshot=lambda: SimpleNamespace(thaw=lambda: intent), commit=forbidden),
-        _source_selection=SimpleNamespace(
-            mode="directory",
-            history={"directory": object()},
-            live_source=object(),
-        ),
-        _workspace_operations=SimpleNamespace(
-            average_pending=None,
-            average_identity=None,
-        ),
-        _retire_batch_presentation=lambda: None,
-        _retain_outgoing_display=False,
-        _notice=lambda value: calls.append(("notice", value)),
-        _ensure_timer=lambda: calls.append("timer"), _error_notice=forbidden,
-        **dict.fromkeys(("select_source", "_queue_live_source_refresh", "_begin_run"), forbidden),
-    )
-    page._choose_viewer_2d_file = partial(ScatteringWorkspace._choose_viewer_2d_file, page)
-    page._open_viewer_2d_path = partial(
-        ScatteringWorkspace._open_viewer_2d_path,
-        page,
-    )
-    source_state = (
-        page._source_selection.mode,
-        dict(page._source_selection.history),
-        page._source_selection.live_source,
-    )
-    ScatteringWorkspace._run_action(page)
-    assert calls == ["start", ("choose", "/viewer"), ("open", selected), ("notice", ""), "timer"]
-    assert source_state == (
-        page._source_selection.mode,
-        page._source_selection.history,
-        page._source_selection.live_source,
-    )
-    controller.viewer_2d_context = SimpleNamespace(original_path=selected)
-    page._viewer_2d_file_chooser = forbidden
-    def clear_renderer(*, close=False, preserve_navigation=False):
-        assert close is True and preserve_navigation is True
-        calls.append("clear")
-        return True
-    page._clear_viewer_2d_renderer = clear_renderer
-    ScatteringWorkspace._run_action(page)
-    assert calls[-4:] == ["clear", ("open", selected), ("notice", ""), "timer"]
+    Runs on the real page (1.2.10 review M6, Table A row 2), no longer on a SimpleNamespace page, controller, shell
+    and executor. A real Int 2D Run leaves its retained acquisition; the delayed CONTEXT_READY carries that Run's
+    identity on the real executor's queue and the page's real drain takes it. The 2D Viewer is opened over the
+    retained acquisition through the page's own open while Int 2D stays the mode: no gesture reaches that state (the
+    mode switch clears the viewer before it commits), and it is the state this fence guards. Injected only at the
+    view boundary: the view's two refused clear receipts, and the shell's failing render.
+    """
+    import h5py
+    from pyqtgraph.Qt import QtWidgets
+    from tests.xdart.scattering.test_gi_motorless_source import _close, _wait
+    from tests.xdart.scattering.test_int_prerun_checks import _page as run_page, _run
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, _poni, artifact = run_page(tmp_path / "run", mode="Int 2D")
+    try:
+        _run(page, app)
+        controller, executor, view = page._context_controller, page._run_executor, page._shell.scientific
+        identity = controller.run_identity
+        assert identity is not None and page._lifecycle.phase is RunPhase.IDLE, "the Run's acquisition is retained"
+
+        def viewer_shown():
+            frame = controller.viewer_2d_frame
+            return frame is not None and view._viewer_2d_payload is frame.array
+
+        def result_shown():  # the Run's result, fully drawn (its 1-D trace and 2-D image), with no Browse pending
+            frame, selection, shown = controller.navigation.current, controller.selection, page._last_scientific_projection
+            return (frame is not None and frame.artifact == str(artifact) and not controller.browse_pending
+                    and selection is not None and selection.kind in {ContextKind.BROWSE, ContextKind.ACQUISITION}
+                    and not page._scientific_repaint_pending and shown is not None and bool(shown.traces)
+                    and shown.heavy is not None)
+
+        # the Run's end shows its result in Browse, and Run is offered again (its finalized Browse has settled)
+        _wait(app, lambda: result_shown() and page._start_permitted() == (True, ""))
+        stack = tmp_path / "viewer.h5"
+        with h5py.File(stack, "w") as handle:
+            handle.create_dataset("entry/data/data", data=np.arange(3 * 12 * 16, dtype=np.uint16).reshape(3, 12, 16))
+        page._open_viewer_2d_path(str(stack))
+        _wait(app, viewer_shown)
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
+        assert controller.viewer_2d_owned and controller.selection.kind is ContextKind.VIEWER_2D
+
+        calls, adopted, refusals = [], [], []
+        clear = view.clear_viewer_2d
+
+        def clearing(request, **options):
+            return refusals.pop(0)(request) if refusals else clear(request, **options)
+
+        monkeypatch.setattr(view, "clear_viewer_2d", clearing)
+        monkeypatch.setattr(controller, "acknowledge_viewer_2d_renderer_clear", _calls_through(
+            calls, "ack", controller.acknowledge_viewer_2d_renderer_clear))
+        monkeypatch.setattr(controller, "close_viewer_2d", _calls_through(calls, "close", controller.close_viewer_2d))
+        select_scan, adopt = ScatteringWorkspace._select_scan, controller.adopt_acquisition
+
+        def selecting(self, value, **options):
+            calls.append(("select", value))
+            return select_scan(self, value, **options)
+
+        monkeypatch.setattr(ScatteringWorkspace, "_select_scan", selecting)
+        monkeypatch.setattr(controller, "adopt_acquisition", lambda value: adopted.append(value) or adopt(value))
+        event = StandardRunEvent(identity, StandardEventKind.CONTEXT_READY)
+        command = ShellCommand(ShellCommandKind.SELECT_SCAN, str(artifact))
+        frame, viewer_projection = controller.viewer_2d_frame, page._last_scientific_projection
+        assert viewer_projection is not None and viewer_projection.heavy.frame is controller.navigation.current
+        for refuse in (lambda request: Viewer2DRendererClearReceipt(replace(request), True),  # forged
+                       lambda request: Viewer2DRendererClearReceipt(request, False)):  # not cleared
+            refusals.append(refuse)
+            page._handle_shell_command(command)
+            assert calls == [("ack", False)], calls
+            assert controller.viewer_2d_owned and controller.viewer_2d_frame is frame
+            assert page._last_scientific_projection is None  # the clear drops the viewer's retained projection
+            assert controller.selection.kind is ContextKind.VIEWER_2D and not controller.browse_pending
+            calls.clear()
+            executor._events.put(event)
+            page._drain_executor()
+            assert executor._events.empty() and adopted == [], "a delayed event replaced the owned viewer"
+            assert controller.selection.kind is ContextKind.VIEWER_2D
+        page._handle_shell_command(command)
+        assert calls == [("ack", True), ("close", True), ("select", str(artifact))], calls
+        # no viewer projection survives: the real selection draws the result's own at once
+        assert not controller.viewer_2d_owned and page._last_scientific_projection is not viewer_projection
+        _wait(app, result_shown)  # the retained Run's own result: its acquisition shows it again
+        executor._events.put(event)
+        page._drain_executor()
+        assert adopted == [identity], "with the viewer closed, the same event reaches the acquisition owner"
+
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PROCESSING_MODE, "2D Viewer"))
+        _wait(app, viewer_shown)
+        events = []
+        drop, set_mode, apply_state = (view.drop_viewer_loading_snapshot, page._shell.browser.set_filename_mode,
+                                       page._shell.apply_state)
+        monkeypatch.setattr(view, "drop_viewer_loading_snapshot", lambda: events.append("drop-snapshot") or drop())
+        monkeypatch.setattr(page._shell.browser, "set_filename_mode",
+                            lambda mode: events.append(("filename-mode", mode)) or set_mode(mode))
+
+        def failing_render(_state, **_options):
+            events.append("render-failed")
+            raise RuntimeError("render")
+
+        monkeypatch.setattr(page._shell, "apply_state", failing_render)
+        owner_state = (controller.viewer_2d_frame, controller.viewer_2d_context)
+        assert page._last_scientific_projection is not None
+        page._refresh_shell()
+        monkeypatch.setattr(page._shell, "apply_state", apply_state)
+        assert ("filename-mode", "2D Viewer") in events
+        assert events[-2:] == ["render-failed", "drop-snapshot"], events
+        assert page._notice_text == "Passive shell render failed: render"
+        assert page._last_scientific_projection is None
+        assert owner_state == (controller.viewer_2d_frame, controller.viewer_2d_context)
+    finally:
+        _close(page, app)
+
+
+class _GuiThreadCalls:
+    """A module's ``os`` (and its ``os.path``) that records each listed call made on the GUI thread, then makes it."""
+
+    def __init__(self, module, names, seen):
+        self._module, self._names, self._seen = module, names, seen
+
+    def __getattr__(self, name):
+        value = getattr(self._module, name)
+        if name == "path":
+            return _GuiThreadCalls(value, self._names, self._seen)
+        if name not in self._names:
+            return value
+
+        def recorded(*args, **kwargs):
+            if current_thread() is main_thread():
+                self._seen.append((name, args))
+            return value(*args, **kwargs)
+        return recorded
+
+
+def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation(tmp_path, monkeypatch) -> None:
+    """Run in 2D Viewer opens the chosen file under exactly the spelling the chooser returned, then reloads it without
+    the chooser, leaves the source selection alone, never enters an acquisition seam (select_source,
+    _queue_live_source_refresh, _begin_run, the browse-path helpers, an intent commit), and makes no filesystem or
+    path-normalizing call from page code on the GUI thread during either click.
+
+    Runs on the real page (1.2.10 review M6, Table A row 3), no longer on a SimpleNamespace page: a real 2D Viewer
+    page with a directory source, Run pressed on its real button, only the operating system's file chooser answered.
+    The spies record and then call the real methods.
+    """
+    import os
+    from pyqtgraph.Qt import QtWidgets
+    from tests.xdart.scattering.test_gi_motorless_source import _close, _wait
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    import xdart.gui.tabs.scattering.page as page_module
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    from xrd_tools.sources.selection import DirectorySourceSpec
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    (tmp_path / "nested").mkdir()
+    base = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    a0._npz(tmp_path / "data.npz", [("image.npy", a0._npy_bytes(np.stack((base, base + 20))))])
+    selected = str(tmp_path / "nested" / ".." / "data.npz")  # a spelling the page must pass on, not normalize
+    calls, entered, chosen = [], [], []
+
+    def chooser(start):
+        chosen.append(start)
+        calls.append(("choose", start))
+        return selected
+
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="2D Viewer", project_root=str(tmp_path),
+                                         save_path=str(tmp_path),
+                                         source_spec=DirectorySourceSpec(tmp_path, suffixes=(".tif",)))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(), viewer_2d_file_chooser=chooser)
+    page.resize(1200, 800)
+    page.show()
+    try:
+        controller, view, button = page._context_controller, page._shell.scientific, page._shell.run_controls.startButton
+        _wait(app, button.isEnabled)
+
+        def entering(name, call):
+            def recorded(*args, **kwargs):
+                entered.append(name)
+                return call(*args, **kwargs)
+            return recorded
+
+        for name in ("select_source", "_queue_live_source_refresh", "_begin_run", "_error_notice"):
+            monkeypatch.setattr(ScatteringWorkspace, name, entering(name, getattr(ScatteringWorkspace, name)))
+        for name in ("is_single_image_spec", "browse_start_dir", "remember_browse_path"):
+            monkeypatch.setattr(page_module, name, entering(name, getattr(page_module, name)))
+        monkeypatch.setattr(page._intents, "commit", entering("commit", page._intents.commit))
+        start, notice, timer, clear_renderer = (
+            ScatteringWorkspace._viewer_2d_start_directory, ScatteringWorkspace._notice,
+            ScatteringWorkspace._ensure_timer, ScatteringWorkspace._clear_viewer_2d_renderer)
+
+        def starting(self):
+            value = start(self)
+            calls.append(("start", value))
+            return value
+
+        def clearing(self, **options):
+            value = clear_renderer(self, **options)
+            calls.append(("clear", options, value))
+            return value
+
+        monkeypatch.setattr(ScatteringWorkspace, "_viewer_2d_start_directory", starting)
+        monkeypatch.setattr(ScatteringWorkspace, "_notice", lambda self, text: calls.append(("notice", text))
+                            or notice(self, text))
+        monkeypatch.setattr(ScatteringWorkspace, "_ensure_timer", lambda self: calls.append("timer") or timer(self))
+        monkeypatch.setattr(ScatteringWorkspace, "_clear_viewer_2d_renderer", clearing)
+        open_viewer = controller.open_viewer_2d
+        monkeypatch.setattr(controller, "open_viewer_2d", lambda path: calls.append(("open", path))
+                            or open_viewer(path))
+        source = page._source_selection
+        source_state = (source.mode, source.history, source.live_source)
+        assert source_state[1] == {source_state[0]: DirectorySourceSpec(tmp_path, suffixes=(".tif",))}
+
+        def shown():
+            frame, context = controller.viewer_2d_frame, controller.viewer_2d_context
+            return (frame is not None and view._viewer_2d_payload is frame.array
+                    and context is not None and context.original_path == selected)
+
+        filesystem = []
+        for expected in (
+            [("start", ""), ("choose", ""), ("open", selected), ("notice", ""), "timer"],
+            [("clear", {"close": True, "preserve_navigation": True}, True), ("open", selected), ("notice", ""),
+             "timer"],
+        ):
+            calls.clear()
+            with monkeypatch.context() as patch:
+                patch.setattr(page_module, "os", _GuiThreadCalls(os, {
+                    "abspath", "expanduser", "exists", "isfile", "realpath", "splitext", "stat", "open"}, filesystem))
+                button.click()
+            assert calls == expected, calls
+            _wait(app, shown)
+            assert controller.viewer_2d_context.original_path == selected
+        assert chosen == [""], "the second Run reloads the shown file without the chooser"
+        assert entered == [] and filesystem == [], (entered, filesystem)
+        assert (source.mode, source.history, source.live_source) == source_state
+    finally:
+        _close(page, app)
+
+
 def _scientific(monkeypatch, *, failing=False):
     """Observe real widget calls; only render/clear failures are injected."""
     view = ScientificView()
