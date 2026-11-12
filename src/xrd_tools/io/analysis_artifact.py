@@ -9,7 +9,7 @@ publication owner.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace as _rebind
 from enum import Enum
 import hashlib
 import json
@@ -29,10 +29,13 @@ from xrd_tools.io.output_transaction import (
     TargetSnapshot,
     TargetChanged,
     TransactionStateError,
+    capture_target_revision,
     capture_target_snapshot,
     get_output_transaction_coordinator,
     revalidate_stream_terminal,
+    revalidate_target_snapshot,
     stream_terminal_object_revision,
+    target_revision_key,
 )
 from xrd_tools.io.finite_artifact import _FinitePublicationSession
 from xrd_tools.io.output_safety import check_output_not_source
@@ -3120,8 +3123,28 @@ def read_analysis_artifact(
         ) from error
 
 
+def _target_unchanged(path: str | Path, expected: TargetSnapshot) -> bool:
+    """An existing slot by its exact revision key (never rehashed); an absent one as before (no hash while absent)."""
+    if expected.exists:
+        return target_revision_key(capture_target_revision(path)) == target_revision_key(expected)
+    return capture_target_snapshot(path) == expected
+
+
+def _post_rename_revision(path: str | Path) -> TargetSnapshot:
+    """The public file's revision right after the owned rename: no content digest, the descriptor's ctime."""
+    return capture_target_revision(path)
+
+
 class AnalysisArtifactOutput:
-    """One analysis schema adapter over the shared finite publication owner."""
+    """One analysis schema adapter over the shared finite publication owner.
+
+    It verifies its result once (NEXT-1210-VERIFY-ONCE B-1): one whole-file hash of the closed candidate and one
+    semantic inspection of it. Revision fences carry both, without rereading, to the public name: the same name's
+    full revision key (ctime included), and across the owned rename the (device, inode, size, mtime) the rename
+    keeps (it moves ctime). The old target of a Replace is held by its revision key, never rehashed. A retry after
+    a failed post-rename check compares the revision that check recorded, exactly, or, when none was recorded,
+    hashes the public file once against the candidate's digest. Neither inspects again.
+    """
 
     def __init__(self, request: AnalysisArtifactRequest, *,
                  coordinator: OutputTransactionCoordinator,
@@ -3136,6 +3159,9 @@ class AnalysisArtifactOutput:
         self._writer_started = False
         self._writer_finished = False
         self._validated_candidate: TargetSnapshot | None = None
+        self._candidate_inspection: AnalysisArtifactInspection | None = None
+        self._post_rename_attempted = False
+        self._post_rename_observed: TargetSnapshot | None = None
         self._receipt: AnalysisArtifactReceipt | None = None
         self._completed = False
         self._close_pending = False
@@ -3144,7 +3170,8 @@ class AnalysisArtifactOutput:
         try:
             self._ordinal = self._publication.ordinal
             self._check_input_aliases()
-            self._expected_target = capture_target_snapshot(request.target)
+            # The slot's revision, not its content: Replace never rereads the result it replaces.
+            self._expected_target = capture_target_revision(request.target)
             if request.overwrite is AnalysisArtifactOverwrite.CREATE_NEW and (
                 self._expected_target.exists or os.path.lexists(request.target)
             ):
@@ -3157,7 +3184,7 @@ class AnalysisArtifactOutput:
                 except OlderStitchArtifact as older:  # Replace stitches it again, as its refusal says
                     if older.kind is not request.kind:
                         raise
-                if capture_target_snapshot(request.target) != self._expected_target:
+                if not _target_unchanged(request.target, self._expected_target):
                     raise TargetChanged("previous analysis changed during admission")
         except BaseException:
             self._publication.abort()
@@ -3257,97 +3284,75 @@ class AnalysisArtifactOutput:
         captured: TargetSnapshot,
         prepublish: Callable[[], object] | None,
     ) -> None:
-        before = capture_target_snapshot(candidate)
-        if before != captured:
-            raise TargetChanged(
-                "analysis candidate changed before semantic readback"
-            )
-        inspect_analysis_artifact(
+        if not captured.exists or captured.digest is None or captured.ctime_ns is None:
+            raise TargetChanged("analysis candidate lacks exact storage facts")
+
+        def fence(message: str) -> None:
+            try:
+                revalidate_target_snapshot(candidate, captured)
+            except TargetChanged as error:
+                raise TargetChanged(message) from error
+
+        fence("analysis candidate changed before semantic readback")
+        inspection = inspect_analysis_artifact(
             candidate,
             expected_request=self.request,
             _candidate_claim=_ANALYSIS_CANDIDATE_INSPECTION,
         )
-        after = capture_target_snapshot(candidate)
-        if not after.exists or before != after:
-            raise TargetChanged(
-                "analysis candidate changed during semantic readback"
-            )
+        fence("analysis candidate changed during semantic readback")
         if prepublish is not None:
             prepublish()
         self._check_input_aliases()
-        final = capture_target_snapshot(candidate)
-        if final != after:
-            raise TargetChanged(
-                "analysis candidate changed after prepublication checks"
-            )
-        self._validated_candidate = final
+        fence("analysis candidate changed after prepublication checks")
+        self._validated_candidate = captured
+        self._candidate_inspection = inspection
         self._writer_finished = True
 
     def _terminal(self) -> tuple[StreamTerminal, AnalysisArtifactInspection]:
-        before = capture_target_snapshot(self.request.target)
-        inspection = inspect_analysis_artifact(
-            self.request.target, expected_request=self.request
-        )
-        captured = capture_target_snapshot(self.request.target)
+        candidate, inspection = self._validated_candidate, self._candidate_inspection
         if (
-            before != captured
-            or self._validated_candidate is None
-            or captured != self._validated_candidate
-            or not captured.exists
-            or captured.size is None
-            or captured.digest is None
-            or captured.device is None
-            or captured.inode is None
-            or captured.mtime_ns is None
+            candidate is None or inspection is None or not candidate.exists or candidate.size is None
+            or candidate.digest is None or candidate.device is None or candidate.inode is None
+            or candidate.mtime_ns is None
         ):
             raise TargetChanged("committed analysis artifact lacks exact storage facts")
-        state = os.stat(self.request.target)
+        target = self.request.target
+        if self._post_rename_observed is not None:
+            # A retry after a later fence failed: this name's recorded revision, exactly (ctime included).
+            revision = _post_rename_revision(target)
+            if target_revision_key(revision) != target_revision_key(self._post_rename_observed):
+                raise TargetChanged("analysis artifact changed after its post-rename check")
+        elif self._post_rename_attempted:
+            # A retry whose post-rename check never recorded a revision: the rename-kept tuple cannot prove the
+            # bytes, so hash the public file once against the candidate's digest (his "Hash once on that retry").
+            revision = capture_target_snapshot(target)
+            if revision.digest != candidate.digest:
+                raise TargetChanged("analysis artifact content changed after publication")
+        else:
+            self._post_rename_attempted = True
+            revision = _post_rename_revision(target)
         if (
-            int(state.st_dev),
-            int(state.st_ino),
-            int(state.st_size),
-            int(state.st_mtime_ns),
-        ) != (
-            captured.device,
-            captured.inode,
-            captured.size,
-            captured.mtime_ns,
+            not revision.exists or revision.ctime_ns is None
+            or (revision.device, revision.inode, revision.size, revision.mtime_ns)
+            != (candidate.device, candidate.inode, candidate.size, candidate.mtime_ns)
         ):
             raise TargetChanged("analysis artifact changed while sealing commit")
-        # The terminal's object revision is the capture's descriptor view
-        # (its ctime is the change time on win32, never the pathname stat's
-        # creation time), the origin ``revalidate_stream_terminal`` holds
-        # its own descriptor views to.
+        self._post_rename_observed = revision
+        # The terminal's object revision is the post-rename descriptor view (its ctime is the change time on win32),
+        # the origin ``revalidate_stream_terminal`` holds its own descriptor views to; its digest is the candidate's.
         terminal = StreamTerminal(
-            self.request.target,
-            captured.size,
-            captured.digest,
+            target,
+            candidate.size,
+            candidate.digest,
             self._ordinal,
-            captured.device,
-            captured.inode,
-            captured.mtime_ns,
-            captured.ctime_ns,
+            revision.device,
+            revision.inode,
+            revision.mtime_ns,
+            revision.ctime_ns,
         )
-        revalidate_stream_terminal(self.request.target, terminal)
-        final_capture = capture_target_snapshot(self.request.target)
-        final_state = os.stat(self.request.target)
-        if (
-            final_capture != captured
-            or final_capture.ctime_ns != terminal.ctime_ns
-            or (
-                int(final_state.st_dev),
-                int(final_state.st_ino),
-                int(final_state.st_size),
-                int(final_state.st_mtime_ns),
-            ) != (
-                terminal.device,
-                terminal.inode,
-                terminal.size,
-                terminal.mtime_ns,
-            )
-        ):
-            raise TargetChanged("analysis artifact changed after terminal validation")
-        return terminal, inspection
+        revalidate_stream_terminal(target, terminal)
+        # The candidate's inspection, rebound to the public name and revision: what a fresh inspection returns.
+        return terminal, _rebind(inspection, path=target, storage_revision=_comparable_terminal_revision(terminal))
 
     def _seal_receipt(self) -> AnalysisArtifactReceipt:
         if self._receipt is None:
@@ -3404,7 +3409,7 @@ class AnalysisArtifactOutput:
         try:
             candidate = self._publication.candidate
             self._check_input_aliases()
-            if capture_target_snapshot(self.request.target) != self._expected_target:
+            if not _target_unchanged(self.request.target, self._expected_target):
                 raise TargetChanged("analysis target changed before writing")
             self._write_candidate(write_result)
             if not self._publication.close_document():

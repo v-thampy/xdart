@@ -39,10 +39,12 @@ from xrd_tools.io.output_safety import paths_same_file
 from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.io.output_transaction import (
     StreamTerminal,
+    capture_target_revision,
     capture_target_snapshot,
     get_output_transaction_coordinator,
     replace_into_place,
     revalidate_stream_terminal,
+    target_revision_key,
 )
 
 
@@ -2513,7 +2515,13 @@ class _FinitePublicationSession:
                 raise RuntimeError("finite publication lost its reservation")
             if not self._file_synced:
                 _fsync_publication_candidate(descriptor, candidate, self._reservation)
-            if expected_target is not None and capture_target_snapshot(self.target) != expected_target:
+            if expected_target is not None and (
+                # An existing target's revision (no content digest; the analysis owner's) by its exact revision
+                # key; a content snapshot (Average's) by its content; an absent one as before (no hash while absent).
+                target_revision_key(capture_target_revision(self.target)) != target_revision_key(expected_target)
+                if expected_target.exists and expected_target.digest is None
+                else capture_target_snapshot(self.target) != expected_target
+            ):
                 raise FiniteArtifactIntegrityError("finite public target changed")
             rename_attempted = True
             if type(descriptor) is int:
