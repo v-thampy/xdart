@@ -27,20 +27,27 @@ def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+_PROFILE_FILTER = "XDART profiles (*.json);;All files (*)"
 _CASES = {
-    "profile save": ("_choose_profile_path_dialog", ("save",), "getSaveFileName", "profile.json", False),
-    "profile load": ("_choose_profile_path_dialog", ("load",), "getOpenFileName", "profile.json", False),
-    "notebook export": ("_choose_results_notebook_dialog", (), "getSaveFileName", "results.ipynb", False),
-    "1D Viewer": ("_choose_viewer_1d_dialog", (), "getOpenFileNames", "pattern.xye", True),
-    "2D Viewer": ("_choose_viewer_2d_dialog", (), "getOpenFileName", "image.tif", False),
-    "processed folder": ("_choose_directory_dialog", ("",), "getExistingDirectory", "processed", False),
-    "authoring source": ("_choose_authoring_source_dialog", ("poni",), "getOpenFileName", "calibrant.tif", False),
+    "profile save": ("_choose_profile_path_dialog", ("save",), "getSaveFileName", "profile.json", _PROFILE_FILTER),
+    "profile load": ("_choose_profile_path_dialog", ("load",), "getOpenFileName", "profile.json", _PROFILE_FILTER),
+    "notebook export": ("_choose_results_notebook_dialog", (), "getSaveFileName", "results.ipynb",
+                        "Jupyter notebooks (*.ipynb);;All files (*)"),
+    "1D Viewer": ("_choose_viewer_1d_dialog", (), "getOpenFileNames", "pattern.xye", "1-D data (*)"),
+    "2D Viewer": ("_choose_viewer_2d_dialog", (), "getOpenFileName", "image.tif", "All files (*)"),
+    "processed folder": ("_choose_directory_dialog", ("",), "getExistingDirectory", "processed", None),
+    "calibration source": ("_choose_authoring_source_dialog", ("poni",), "getOpenFileName", "calibrant.tif",
+                           "Calibration sources (*.tif *.tiff *.h5 *.hdf5 *.nxs "
+                           "*.nexus *.edf *.cbf *.img *.mar3450 *.raw);;All files (*)"),
+    "mask source": ("_choose_authoring_source_dialog", ("mask",), "getOpenFileName", "image.nxs",
+                    "Mask sources (*.tif *.tiff *.h5 *.hdf5 *.nxs *.nexus)"),
 }
 
 
 @pytest.mark.parametrize("case", sorted(_CASES))
 def test_int_page_choosers_open_through_the_shared_file_dialog(qapp, tmp_path, monkeypatch, case):
-    method, leading, static, name, many = _CASES[case]
+    method, leading, static, name, expected_filter = _CASES[case]
+    many = static == "getOpenFileNames"
     start = str(tmp_path / "start")
     Path(start).mkdir()
     picked = str(tmp_path / name)
@@ -61,8 +68,8 @@ def test_int_page_choosers_open_through_the_shared_file_dialog(qapp, tmp_path, m
         result = getattr(page, method)(*leading, start)
         assert len(asked) == 1, f"{case}: the chooser did not open through file_dialogs.ask"
         assert asked[0]["start"] == start and len(opened) == 1 and opened[0][1] == start, (asked, opened)
-        if static != "getExistingDirectory":
-            assert asked[0]["file_filter"] == opened[0][2][0] and asked[0]["file_filter"], asked
+        if expected_filter is not None:
+            assert asked[0]["file_filter"] == opened[0][2][0] == expected_filter, (asked, opened)
         assert result == ((picked,) if many else picked), result
     finally:
         _dispose(page, qapp)

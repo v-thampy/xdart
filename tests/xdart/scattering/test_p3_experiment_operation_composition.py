@@ -317,6 +317,37 @@ def test_zero_candidate_choose_another_uses_existing_chooser_at_exact_root(
         _close(page, qapp)
 
 
+def test_choose_another_parents_the_picker_to_the_confirmation(tmp_path, monkeypatch, qapp):
+    from xdart.gui.widgets.file_dialogs import PONI_FILTER
+
+    source = _source(tmp_path)
+    alternate = _candidate(tmp_path / "existing.poni")
+    opened = []
+
+    def picker(parent, title, start, file_filter):
+        opened.append((parent, title, start, file_filter))
+        return (alternate.path if len(opened) == 2 else ""), file_filter
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(picker))
+    page, store = _page(tmp_path, monkeypatch)
+    try:
+        assert _queue_calibration(page, store, source, ())[0]
+        dialog = _present_confirmation(page)
+        qapp.processEvents()
+        dialog.choose_button.click()
+        expected = (dialog, "Choose existing PONI", str(tmp_path), PONI_FILTER)
+        assert opened == [expected]
+        assert page._authored_assets.phase is AuthoredAssetPhase.CONFIRM_PRESENTED
+        assert store.snapshot().thaw().poni_file == ""
+
+        dialog.choose_button.click()
+        assert opened == [expected, expected]
+        _finish_validation(page)
+        assert store.snapshot().thaw().poni_file == alternate.path
+    finally:
+        _close(page, qapp)
+
+
 def test_cancel_duplicate_stale_and_forged_result_are_zero_write(
     tmp_path, monkeypatch, qapp,
 ) -> None:

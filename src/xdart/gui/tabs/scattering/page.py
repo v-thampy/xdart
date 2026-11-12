@@ -2674,7 +2674,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             selected = (chooser(control, current, directory)
                         if chooser is not None else
                         next(iter(file_dialogs.ask(
-                            self,
+                            dialog,
                             "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
                             start=directory,
