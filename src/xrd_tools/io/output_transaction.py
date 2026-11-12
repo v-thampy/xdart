@@ -1288,10 +1288,13 @@ class OutputTransactionCoordinator:
         durable_fsync: bool = True,
         fast_regenerable: bool = False,
         in_place: bool = False,
+        fast_if_absent: bool = False,
     ) -> "OutputTransaction":
         """Bind one exact transaction and target owner to a stable snapshot. ``in_place`` (finite Append) admits
         an existing output by its stat alone and binds the transaction to stream into it in place; a missing
-        output keeps the ordinary creation route."""
+        output keeps the ordinary creation route. ``fast_if_absent`` (a finite, non-rollback Append) makes that
+        creation the fast regenerable route when this same admission finds the target absent (NEXT-1210-VERIFY-ONCE
+        B-2); it never changes how an existing target is admitted."""
         if not isinstance(transaction_owner, OwnerToken):
             raise TypeError("transaction_owner must be an OwnerToken")
         if not isinstance(target_owner, OwnerToken):
@@ -1302,6 +1305,8 @@ class OutputTransactionCoordinator:
             raise TypeError("fast_regenerable must be an exact bool")
         if type(in_place) is not bool:
             raise TypeError("in_place must be an exact bool")
+        if type(fast_if_absent) is not bool:
+            raise TypeError("fast_if_absent must be an exact bool")
         normalized = _normalize_target(target)
         admission = TargetAdmission(
             normalized,
@@ -1314,7 +1319,7 @@ class OutputTransactionCoordinator:
             transaction_owner=transaction_owner,
             target_owner=target_owner,
             durable_fsync=durable_fsync,
-            fast_regenerable=fast_regenerable,
+            fast_regenerable=fast_regenerable or (fast_if_absent and not admission.snapshot.exists),
             in_place=in_place and admission.snapshot.exists,
         )
 

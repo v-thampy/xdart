@@ -2091,7 +2091,10 @@ class NexusSink:
             else:
                 snapshot = self._transaction.abort_stream(
                     self._attempt, lease=self._lease,
-                    retain_partial=bool(writer and writer.written_labels and self._replacement is None and not self.rollback_until_commit),
+                    # The fast route keeps nothing it has not verified: a failed write removes its own partial and
+                    # the next Run reprocesses the scan (his "Fix in packet B", 2026-11-11).
+                    retain_partial=bool(writer and writer.written_labels and self._replacement is None
+                                        and not self.rollback_until_commit and not self._transaction.fast_regenerable),
                 )
                 if snapshot.partial_path:
                     warnings.warn(f"writer abort preserved non-final data at {snapshot.partial_path}", RuntimeWarning, stacklevel=2)
@@ -2119,6 +2122,7 @@ class NexusSink:
                     before_admit=self._require_current_append_target,
                     in_place=self._in_place_append,
                     durable_fsync=self.durable_fsync,
+                    fast_if_absent=self._in_place_append,
                 )
             except AppendPreflightCleanupError as error:
                 self.append_preflight = error.owner
@@ -2135,6 +2139,10 @@ class NexusSink:
                 raise
             binding = self.append_preflight._consume(self.path)
             self._transaction = binding.transaction
+            # A finite Append whose admission found no output was admitted to the fast route (B-2): the writer
+            # follows the transaction, the one owner of that decision.
+            if binding.transaction.fast_regenerable:
+                self._fast_regenerable = True
             self._lease = binding.lease
             self._transaction_owners = (
                 binding.transaction_owner,
@@ -2151,6 +2159,9 @@ class NexusSink:
                     seed_mode=(
                         StreamSeedMode.IN_PLACE
                         if binding.transaction.in_place
+                        # A fast fresh Append has no base to preserve: it starts empty, as a finite Overwrite does.
+                        else StreamSeedMode.EMPTY_REPLACEMENT
+                        if binding.transaction.fast_regenerable
                         else StreamSeedMode.PRESERVE_BASE
                     ),
                 )

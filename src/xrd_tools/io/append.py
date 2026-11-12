@@ -1430,6 +1430,7 @@ def prepare_append_preflight(
     image_drift: bool = False,
     acquisition_proof: bool = True,
     durable_fsync: bool = True,
+    fast_if_absent: bool = False,
 ) -> AppendPreflight:
     """Admit, lease and qualify one Append target under its file lock.
 
@@ -1437,9 +1438,13 @@ def prepare_append_preflight(
     output in place (finite Append; maintainer, 2026-10-23): no whole-file hash
     at admission, no backup and no copy.  A missing target keeps the ordinary
     creation route.  ``image_drift`` and ``acquisition_proof`` qualify as :func:`qualify_append` does.
+    ``fast_if_absent`` (a finite, non-rollback Append) writes a target this admission finds absent through the fast
+    finite writer, as a finite Overwrite does (NEXT-1210-VERIFY-ONCE B-2; the transaction carries the decision).
     """
     if type(in_place) is not bool:
         raise TypeError("in_place must be an exact bool")
+    if type(fast_if_absent) is not bool:
+        raise TypeError("fast_if_absent must be an exact bool")
     if type(image_drift) is not bool or type(acquisition_proof) is not bool:
         raise TypeError("image_drift and acquisition_proof must be exact bools")
     from .output_transaction import (
@@ -1468,6 +1473,7 @@ def prepare_append_preflight(
                 target_owner=target_owner,
                 in_place=in_place,
                 durable_fsync=durable_fsync,
+                fast_if_absent=fast_if_absent,
             )
             lease = transaction.acquire_lease(
                 admission=transaction.admission,

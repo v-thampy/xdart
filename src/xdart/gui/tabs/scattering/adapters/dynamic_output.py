@@ -1307,6 +1307,9 @@ class DynamicOutputAdapter:
                     image_drift=True,
                     acquisition_proof=not self.configuration.live_mode,
                     durable_fsync=output_diagnostics.durable_fsync,
+                    # A finite Append that creates its output writes it as a finite Overwrite does: the fast
+                    # writer and its final scientific readback (NEXT-1210-VERIFY-ONCE B-2).
+                    fast_if_absent=not self.configuration.live_mode,
                 )
             except AppendPreflightCleanupError as error:
                 self._pending_preflights.append(error.owner)

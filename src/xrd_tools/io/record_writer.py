@@ -2165,16 +2165,17 @@ class NexusRecordWriter:
         # The ordinary non-Live, non-Append Run binds a same-run intent, so a
         # fresh finite Overwrite legitimately carries an append decision that
         # records its first lineage epoch.  A successor epoch that extends an
-        # already committed artifact is excluded by overwrite plus the
-        # transaction's own fast_regenerable admission: NexusSink refuses an
-        # Append preflight under Overwrite and hard-codes fast_regenerable=False
-        # on the successor-epoch writer.  Rejecting every non-None decision here
-        # instead disabled the exact route this fast path exists for.
+        # already committed artifact is excluded by a fresh output plus the
+        # transaction's own fast_regenerable admission: an Overwrite, or an
+        # Append whose admission found no output (NEXT-1210-VERIFY-ONCE B-2);
+        # NexusSink hard-codes fast_regenerable=False on the successor-epoch
+        # writer.  Rejecting every non-None decision here instead disabled the
+        # exact route this fast path exists for.
         if fast_regenerable and (
             transaction_binding is None
             or type(transaction_binding) is not WriterTransactionBinding
             or transaction_binding.transaction.fast_regenerable is not True
-            or not self.overwrite
+            or not (self.overwrite or not transaction_binding.transaction.admission.snapshot.exists)
             or defer_epoch_durability
             or seeded_document is not None
             or any(value is not None for value in replacement_values)
@@ -4369,7 +4370,26 @@ class NexusRecordWriter:
             )
             evidence.text("average-counts:1", expected.sha256, count_digest)
             read_bytes += count_bytes
+        self._verify_committed_lineage(evidence)
         return evidence.hexdigest(), read_bytes
+
+    def _verify_committed_lineage(self, evidence: _EvidenceBuilder) -> None:
+        """The fast final readback's Append lineage: the committed scalar the next Append qualifies against.
+
+        The final checkpoint clears ``_lineage_dirty`` before close, so this compares the committed value whenever an
+        Append decision is bound, not only while dirty (NEXT-1210-VERIFY-ONCE B-2).
+        """
+        if self._append_decision is None:
+            return
+        if self._lineage_expected is None:
+            raise WriterStateError("fast close has no committed Append lineage to compare")
+        dataset = self._entry_group().get("reduction/config/append_lineage")
+        if not isinstance(dataset, h5py.Dataset) or dataset.shape != ():
+            raise WriterStateError("fast close lost its Append lineage")
+        observed = self._text_value(dataset[()])
+        if observed != self._lineage_expected:
+            raise WriterStateError("fast close changed its Append lineage")
+        evidence.text(f"{dataset.name}", self._lineage_expected, observed)
 
     def _clear_dirty_evidence(self) -> None:
         self._dirty_modes.clear()
