@@ -11,7 +11,7 @@ Two things are pinned here:
    asserting it in-process is order-fragile (any earlier Qt-importing test in
    the same session would satisfy it vacuously);
 RULE 10: every invocation of this module must set ``XDART_SESSION_FILE`` to a
-unique path under ``/Users/vthampy/repos/tmp``.
+unique scratch path, never the user's own session file.
 """
 
 from __future__ import annotations

@@ -40,7 +40,7 @@ def test_real_single_rebind_uses_stat_proof_and_matches_cold(monkeypatch, tmp_pa
     from time import perf_counter
     from xrd_tools.reduction import background as module
 
-    source = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data")) / "Tiff" / "LaB6_detz190_dety72_th5_03261554_0001.tif"
+    source = Path(os.environ.get("XDART_TEST_DATA") or "XDART_TEST_DATA-is-unset") / "Tiff" / "LaB6_detz190_dety72_th5_03261554_0001.tif"
     if not source.is_file():
         pytest.skip("actual Rayonix TIFF is unavailable")
     original = hashlib.sha256(source.read_bytes()).hexdigest()

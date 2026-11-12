@@ -33,7 +33,7 @@ from xrd_tools.sources.selection import image_series_spec
 def test_real_spec_points_match_ordinary_reader_and_recorded_epochs(
         relative, sha, scan, index, epoch):
     """Real inherited headers, duplicate columns and final rows, through the public metadata API."""
-    root = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data"))
+    root = Path(os.environ.get("XDART_TEST_DATA") or "XDART_TEST_DATA-is-unset")
     path = root / relative
     if not path.is_file():
         pytest.skip("authenticated real SPEC input is unavailable")
@@ -60,7 +60,7 @@ def test_actual_sto_scan43_average_preserves_mean_counts_and_metadata(tmp_path):
     from xrd_tools.reduction.core import integrate_1d
     from xrd_tools.session.experiment_state import CalibrationState, FactStatus, PoniValues
 
-    root = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data")) / "RSM"
+    root = Path(os.environ.get("XDART_TEST_DATA") or "XDART_TEST_DATA-is-unset") / "RSM"
     spec = root / "STO_align"
     selected = root / "images/b_thampy_STO_align_scan43_0000.raw"
     if not spec.is_file() or not selected.is_file():
@@ -139,7 +139,7 @@ def test_real_large_spec_admits_average_with_original_point_metadata(tmp_path):
     from xrd_tools.reduction.average import AverageScanRunner, get_average_finite_counts
     from xrd_tools.session.experiment_state import CalibrationState, FactStatus, PoniValues
 
-    root = Path(os.environ.get("XDART_TEST_DATA", "/Users/vthampy/repos/test_data"))
+    root = Path(os.environ.get("XDART_TEST_DATA") or "XDART_TEST_DATA-is-unset")
     spec_path = root / "stitching/data/efield/R2C1_extralong"
     if not spec_path.is_file():
         pytest.skip("real large SPEC input is unavailable")
