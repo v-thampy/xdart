@@ -1195,18 +1195,21 @@ def test_create_new_published_inspection_retry_does_not_replay_science_or_writer
     target = Path(request.module.output.target)
     coordinator = OutputTransactionCoordinator()
     from xrd_tools.io import analysis_artifact as artifact_api
-    real_inspect = artifact_api.inspect_analysis_artifact
+    # The post-rename revision check fails once (NEXT-1210-VERIFY-ONCE B-1: the published file is no longer
+    # inspected a second time, so the injected failure moved from that inspection to the check replacing it).
+    from xrd_tools.io import output_transaction
+    real_revision = output_transaction.capture_target_revision
     real_write = rsm_operation.write_rsm
     real_science = rsm_operation.run_rsm
     failures = []
     writes = []
     science = []
 
-    def fail_published_inspection_once(path, **kwargs):
+    def fail_published_inspection_once(path, *args, **kwargs):
         if Path(path) == target and not failures:
             failures.append(path)
             raise OSError("published inspection transient")
-        return real_inspect(path, **kwargs)
+        return real_revision(path, *args, **kwargs)
 
     def write_once(*args, **kwargs):
         writes.append("write")
@@ -1219,7 +1222,7 @@ def test_create_new_published_inspection_retry_does_not_replay_science_or_writer
     # Finite publication owns its slot directly; the former streamed
     # coordinator._release seam is no longer on this path.
     monkeypatch.setattr(
-        artifact_api, "inspect_analysis_artifact", fail_published_inspection_once,
+        artifact_api, "_post_rename_revision", fail_published_inspection_once, raising=False,
     )
     monkeypatch.setattr(rsm_operation, "write_rsm", write_once)
     monkeypatch.setattr(rsm_operation, "run_rsm", science_once)

@@ -1280,18 +1280,21 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
     request = _prepared(tmp_path)
     coordinator = OutputTransactionCoordinator()
     from xrd_tools.io import analysis_artifact as artifact_api
-    real_inspect = artifact_api.inspect_analysis_artifact
+    # The post-rename revision check fails once (NEXT-1210-VERIFY-ONCE B-1: the published file is no longer
+    # inspected a second time, so the injected failure moved from that inspection to the check replacing it).
+    from xrd_tools.io import output_transaction
+    real_revision = output_transaction.capture_target_revision
     real_write = stitch_operation.write_stitch_projection
     real_science = stitch_operation.run_stitch
     failures = []
     writes = []
     science = []
 
-    def fail_published_inspection_once(path, **kwargs):
+    def fail_published_inspection_once(path, *args, **kwargs):
         if Path(path) == Path(request.module.output.target) and not failures:
             failures.append(path)
             raise OSError("published inspection transient")
-        return real_inspect(path, **kwargs)
+        return real_revision(path, *args, **kwargs)
 
     def write_once(*args, **kwargs):
         writes.append("write")
@@ -1301,7 +1304,7 @@ def test_published_inspection_retry_does_not_replay_science_or_writer(
         science.append("science")
         return real_science(*args, **kwargs)
 
-    monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_published_inspection_once)
+    monkeypatch.setattr(artifact_api, "_post_rename_revision", fail_published_inspection_once, raising=False)
     monkeypatch.setattr(stitch_operation, "write_stitch_projection", write_once)
     monkeypatch.setattr(stitch_operation, "run_stitch", science_once)
     with pytest.raises(StitchOperationCleanupPending) as pending:

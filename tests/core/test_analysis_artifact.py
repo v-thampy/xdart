@@ -1755,21 +1755,25 @@ def test_transient_final_readback_retries_without_writer_replay(
         request,
         coordinator=OutputTransactionCoordinator(),
     )
-    real_inspect = artifact_api.inspect_analysis_artifact
+    # The post-rename revision check fails once (NEXT-1210-VERIFY-ONCE B-1: the public file is no longer
+    # inspected a second time, so this row's failure moved from that inspection to the check replacing it).
+    from xrd_tools.io import output_transaction
+
+    real_revision = output_transaction.capture_target_revision
     failed = []
     writes = []
 
-    def fail_final_once(path, **kwargs):
+    def fail_final_once(path, *args, **kwargs):
         if Path(path) == Path(request.target) and not failed:
             failed.append("final")
-            raise OSError("final readback transient")
-        return real_inspect(path, **kwargs)
+            raise OSError("post-rename revision transient")
+        return real_revision(path, *args, **kwargs)
 
     def write_once(entry):
         writes.append("writer")
         _writer(request)(entry)
 
-    monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_final_once)
+    monkeypatch.setattr(artifact_api, "_post_rename_revision", fail_final_once, raising=False)
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.publish(write_once)
     assert output.snapshot.published
@@ -1793,16 +1797,20 @@ def test_committed_readback_retry_refuses_changed_target(tmp_path, monkeypatch):
         request,
         coordinator=OutputTransactionCoordinator(),
     )
-    real_inspect = artifact_api.inspect_analysis_artifact
+    # The post-rename revision check fails once (NEXT-1210-VERIFY-ONCE B-1: the public file is no longer
+    # inspected a second time, so this row's failure moved from that inspection to the check replacing it).
+    from xrd_tools.io import output_transaction
+
+    real_revision = output_transaction.capture_target_revision
     failed = []
 
-    def fail_final_once(path, **kwargs):
+    def fail_final_once(path, *args, **kwargs):
         if Path(path) == Path(request.target) and not failed:
             failed.append("final")
-            raise OSError("final readback transient")
-        return real_inspect(path, **kwargs)
+            raise OSError("post-rename revision transient")
+        return real_revision(path, *args, **kwargs)
 
-    monkeypatch.setattr(artifact_api, "inspect_analysis_artifact", fail_final_once)
+    monkeypatch.setattr(artifact_api, "_post_rename_revision", fail_final_once, raising=False)
     with pytest.raises(AnalysisArtifactCleanupPending):
         output.publish(_writer(request))
     assert output.snapshot.published
