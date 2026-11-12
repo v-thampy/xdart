@@ -55,6 +55,7 @@ from xrd_tools.sources.selection import (
     is_single_image_spec,
 )
 from xdart.utils.browse import browse_start_dir, remember_browse_path
+from xdart.gui.widgets import file_dialogs
 from xdart.gui.widgets.file_dialogs import MASK_FILTER, PONI_FILTER
 from .advanced_editor import AdvancedSettingsDialog
 from .point_images_editor import PointImagesSettings
@@ -2672,13 +2673,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         try:
             selected = (chooser(control, current, directory)
                         if chooser is not None else
-                        QtWidgets.QFileDialog.getOpenFileName(
+                        next(iter(file_dialogs.ask(
                             self,
                             "Choose existing PONI" if asset == "poni"
                             else "Choose existing detector mask",
-                            directory,
-                            PONI_FILTER if asset == "poni" else MASK_FILTER,
-                        )[0])
+                            start=directory,
+                            file_filter=PONI_FILTER if asset == "poni" else MASK_FILTER,
+                        )), ""))
         except Exception as error:
             self._error_notice("Asset chooser failed", error); return
         if type(selected) is not str or not selected:
@@ -4238,30 +4239,22 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     ) -> str | None:
         file_filter = "XDART profiles (*.json);;All files (*)"
         if action == "save":
-            selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
-                self,
-                "Save scattering profile",
-                start_directory,
-                file_filter,
-            )
+            selected = next(iter(file_dialogs.ask(
+                self, "Save scattering profile", start=start_directory, save=True, file_filter=file_filter,
+            )), "")
         elif action == "load":
-            selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-                self,
-                "Load scattering profile",
-                start_directory,
-                file_filter,
-            )
+            selected = next(iter(file_dialogs.ask(
+                self, "Load scattering profile", start=start_directory, file_filter=file_filter,
+            )), "")
         else:  # pragma: no cover - private callers are closed above
             raise ValueError("profile action must be 'save' or 'load'")
         return selected or None
 
     def _choose_results_notebook_dialog(self, start_directory: str) -> str | None:
-        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Export Analyze Results Notebook",
-            start_directory,
-            "Jupyter notebooks (*.ipynb);;All files (*)",
-        )
+        selected = next(iter(file_dialogs.ask(
+            self, "Export Analyze Results Notebook", start=start_directory, save=True,
+            file_filter="Jupyter notebooks (*.ipynb);;All files (*)",
+        )), "")
         return selected or None
 
     def _selected_results_notebook_sources(
@@ -8369,9 +8362,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._ensure_timer()
 
     def _choose_viewer_1d_dialog(self, start: str):
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileNames(
-            self, "Open 1D Viewer sources", start, "1-D data (*)")
-        return tuple(selected)
+        return tuple(file_dialogs.ask(self, "Open 1D Viewer sources", start=start, many=True,
+                                      file_filter="1-D data (*)"))
 
     def _viewer_1d_start_directory(self) -> str:
         context = self._context_controller.viewer_1d_context
@@ -8453,8 +8445,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._ensure_timer()
 
     def _choose_viewer_2d_dialog(self, start: str) -> str | None:
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open 2D Viewer source", start, "All files (*)")
+        selected = next(iter(file_dialogs.ask(self, "Open 2D Viewer source", start=start,
+                                              file_filter=file_dialogs.ANY_FILTER)), "")
         return selected or None
 
     def _viewer_2d_start_directory(self) -> str:
@@ -9251,11 +9243,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         _current: str,
         start_directory: str,
     ) -> str | None:
-        chosen = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "Open processed data folder",
-            start_directory,
-        )
+        chosen = next(iter(file_dialogs.ask(self, "Open processed data folder", start=start_directory,
+                                            folder=True)), "")
         return chosen or None
 
     def _choose_authoring_source_dialog(
@@ -9274,9 +9263,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         else:
             return None
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self, title, start_directory, file_filter,
-        )
+        selected = next(iter(file_dialogs.ask(self, title, start=start_directory, file_filter=file_filter)), "")
         return selected or None
 
     def _choose_control_path(self, path: object) -> None:
