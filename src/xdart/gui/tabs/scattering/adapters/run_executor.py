@@ -4739,7 +4739,9 @@ class StandardRunExecutor:
                 )
             if "writer_finish_close" in perf:
                 logger.info(
-                    "[PERF-WRITER-FINISH] %s (science-readback is included in close)",
+                    "[PERF-WRITER-FINISH] %s (science_readback and close_readback are included in close; "
+                    "checkpoint_readback sums the Run's checkpoint readbacks; terminal includes the whole-file hash "
+                    "when the route makes one)",
                     " ".join(f"{key.removeprefix('writer_finish_')}={value:.3f}s"
                              for key, value in perf.items()
                              if key.startswith("writer_finish_")),

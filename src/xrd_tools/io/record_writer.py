@@ -3675,8 +3675,11 @@ class NexusRecordWriter:
         dirty, labels = self._dirty_frames, tuple(sorted(self._dirty_frames))
         if labels not in ((), (1,)): raise WriterStateError("Average count proof requires exact frame 1")
         self._dirty_frames = {}
+        started = time.perf_counter() if self._perf_enabled else 0.0
         try: digest, read_bytes, rows, mode_proofs, frame_proofs = self._verify_dirty_evidence()
-        finally: self._dirty_frames = dirty
+        finally:
+            self._dirty_frames = dirty
+            self._record_finish_perf("checkpoint_readback", started)
         expected = getattr(counts, "evidence", None); prior = self._durable_frame_proofs.get(1); evidence = _EvidenceBuilder()
         if labels: self._verify_average_frame_row(evidence, dirty[1])
         elif type(prior) not in (_DurableFrameProof, _DurableAverageFrameProof): raise WriterStateError("Average count proof requires retained frame 1")
@@ -4415,7 +4418,8 @@ class NexusRecordWriter:
         return WriterOperationVector(**self._vector)
 
     def perf_snapshot(self) -> dict[str, float]:
-        """Opt-in finish timings; science readback is included in close."""
+        """Opt-in finish timings: science and close readback are included in close; checkpoint readback sums the
+        Run's checkpoint readbacks; terminal includes the whole-file hash when the route makes one."""
         return dict(self._perf_finish)
 
     def _record_finish_perf(self, owner: str, started: float) -> None:
@@ -5761,7 +5765,12 @@ class NexusRecordWriter:
             if self._fast_regenerable:
                 verified = self._fast_checkpoint_evidence()
             else:
-                verified = self._verify_dirty_evidence()
+                # Timed for the Run's summary (B-4): every checkpoint readback, summed over the Run.
+                started = time.perf_counter() if self._perf_enabled else 0.0
+                try:
+                    verified = self._verify_dirty_evidence()
+                finally:
+                    self._record_finish_perf("checkpoint_readback", started)
         (digest, read_bytes, rows, mode_proofs, frame_proofs) = verified
         binding = self._transaction_binding
         # A dynamic same-run lineage facade cannot publish additive H10
@@ -5956,13 +5965,18 @@ class NexusRecordWriter:
                 or self._durable_frame_proofs
             )
             if retained_proofs and not self._fast_regenerable:
-                if self._stream_close_attempt is not None:
-                    self._seal_verified_stream_close(binding)
-                else:
-                    self._seal_verified_stream_close(
-                        binding, verification_path, verification_descriptor,
-                        seal_transaction=False,
-                    )
+                # Timed for the Run's summary (B-4): the close's own readback, or its seal from retained proofs.
+                started = time.perf_counter() if self._perf_enabled else 0.0
+                try:
+                    if self._stream_close_attempt is not None:
+                        self._seal_verified_stream_close(binding)
+                    else:
+                        self._seal_verified_stream_close(
+                            binding, verification_path, verification_descriptor,
+                            seal_transaction=False,
+                        )
+                finally:
+                    self._record_finish_perf("close_readback", started)
             elif self._stream_close_attempt is not None:
                 binding.transaction.seal_stream_close(
                     binding.attempt,
