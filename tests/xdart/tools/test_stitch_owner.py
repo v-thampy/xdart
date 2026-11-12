@@ -298,6 +298,39 @@ def test_published_inspection_failure_reaches_owner_with_publication_truth(monke
     assert owner.close().status is PageCleanup.CLEAN
 
 
+def test_a_failed_first_read_of_the_published_result_is_retried_as_verification(monkeypatch, preflight):
+    """The first full read of the published file is the operation's strict result read, after commit (B-1 removed the
+    publisher's second inspection). A transient failure there leaves the file published and pending verification, and
+    a verification retry commits it without replaying the Run."""
+    from xrd_tools.io import analysis_artifact
+
+    for path in Path(preflight.form.image_dir).glob("*.raw"):
+        np.ones((195, 487), dtype=np.int32).tofile(path)
+    preflight = prepare_stitch_tool(replace(preflight.form, detector_shape=(195, 487)))
+    target = Path(preflight.request.module.output.target)
+    inspect = analysis_artifact.inspect_analysis_artifact
+    failures = []
+
+    def inspect_once(path, **kwargs):
+        if Path(path) == target and not failures:
+            failures.append(Path(path))
+            raise OSError("transient read of the published result")
+        return inspect(path, **kwargs)
+
+    monkeypatch.setattr(analysis_artifact, "inspect_analysis_artifact", inspect_once)
+    owner = _prepare_owner(preflight)
+    assert owner.begin_run() is not None
+    pending = _poll_terminal(owner, timeout=10)
+    assert failures == [target]
+    assert pending.outcome.kind is StitchOwnerOutcomeKind.VERIFICATION_PENDING
+    assert target.exists()
+    assert owner.begin_retry_verification() is not None
+    completed = _poll_terminal(owner, timeout=10)
+    assert completed.outcome.result.terminal.disposition is ModuleDisposition.COMMITTED
+    assert target.exists()
+    assert owner.close().status is PageCleanup.CLEAN
+
+
 def test_a_run_takes_its_frame_workers_from_the_caller(monkeypatch, preflight):
     """The page passes the run bar's Cores (PERF-STITCH-2); the execution runs with them and nothing else
     about the run changes (a command other than a Run carries none)."""
