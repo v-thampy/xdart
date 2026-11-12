@@ -376,7 +376,7 @@ def test_deep_selection_save_reload_equivalence_and_foreign_late_inert(mount, tm
     reloaded = read_frame_view(processed, 513)
     # the science _write_result saved for label 513, known independently of the read (Codex's A9: this row compared
     # one read with another of the same row); the saved 2-D stack is (chi, q), the transpose of pyFAI's result
-    np.testing.assert_array_equal(reloaded.axis_1d.values, [0.1, 0.2, 0.3])
+    np.testing.assert_array_equal(reloaded.axis_1d.values, np.float32([0.1, 0.2, 0.3]))  # the axis is stored float32
     np.testing.assert_array_equal(reloaded.intensity_1d, np.array([1.0, 2.0, 3.0]) + 513)
     np.testing.assert_array_equal(reloaded.intensity_2d, (np.arange(6.0).reshape(3, 2) + 513).T)
     assert_frameview_equivalent(read_frame_view(processed, 513), reloaded)

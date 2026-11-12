@@ -220,6 +220,12 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         run = executor._exact_run(identity)
         assert run is not None
         assert run.worker is not None and not run.worker.is_alive()
+        # The preview worker clears itself after its last queued read, which can finish just after the Run is idle
+        # on a slow runner (nightly #184: still alive at this line); a worker that never retires still fails here.
+        retire_by = time.monotonic() + 10.0
+        while run.display.hydration_thread is not None and time.monotonic() < retire_by:
+            qapp.processEvents()
+            time.sleep(0.01)
         assert run.display.hydration_thread is None
         assert executor.delivered_labels == list(
             range(1, _J3_FRAME_COUNT + 1)

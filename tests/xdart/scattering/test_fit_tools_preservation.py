@@ -389,8 +389,13 @@ def test_phase_refusals_are_named_and_adopt_nothing(case, monkeypatch, qapp, tmp
 
 
 @pytest.mark.skipif(not _TIN.is_file(), reason="needs XDART_TEST_DATA (HZO_Fitting/CIF Files/TiN.cif)")
-def test_phase_fits_a_real_cif_and_shows_its_receipt_lattice_component_markers_and_residual(monkeypatch, qapp):
+def test_phase_fits_a_real_cif_and_shows_its_receipt_lattice_component_markers_and_residual(monkeypatch, qapp,
+                                                                                         tmp_path):
     from xrd_tools.analysis.phase import PhaseModel
+
+    # Its own phase library: unset, Add CIF wrote TiN into the user's ~/.xdart/phases, and the assertion below read a
+    # variable only an earlier test in the same process had left set (found in the 1.2.10 terminal battery).
+    monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
 
     reference = PhaseModel.from_cif(_TIN)
     reference.calculate_peaks(wavelength=1.0)
