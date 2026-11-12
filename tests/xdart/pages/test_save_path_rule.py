@@ -219,3 +219,20 @@ def test_rsm_takes_the_shared_project_and_save_path_folder(qapp, tmp_path):
         assert handle.project_location.location() == (str(tmp_path), str(chosen))
     finally:
         _close(page, qapp)
+
+
+def test_rsm_shows_a_following_save_path_in_full_and_moves_it_with_the_project(qapp, tmp_path):
+    """The maintainer, 2026-11-12: "when i changed the project folder the save path didn't change to follow the
+    project path" (his RSM Save Path read the relative "xdart_processed_data"). A following Save Path shows the
+    Project's folder in full, as Int and Stitch show it, so a Project change visibly moves it."""
+    first, second = tmp_path / "A", tmp_path / "B"
+    for folder in (first, second):
+        folder.mkdir()
+    page = _page(qapp)
+    try:
+        page.set_field("project_root", str(first))
+        page.set_field("output_path", "xdart_processed_data")
+        page.set_field("project_root", str(second))
+        assert page._value("output_path") == str(second / "xdart_processed_data")
+    finally:
+        _close(page, qapp)

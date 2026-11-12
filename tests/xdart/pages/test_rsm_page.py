@@ -3313,3 +3313,18 @@ def test_plot_options_offer_no_predicted_ring_choice(qapp):
         dialog.reject()
     finally:
         _close(page, qapp)
+
+
+def test_the_refinement_toggle_says_whether_the_calibrations_refinement_is_used(qapp):
+    """The maintainer, 2026-11-12, on RSM's "Use the calibration's refinement": "is it selected right now? maybe it
+    should say "Using the..." when selected and "Use the ..." when unselected for clarity" (NEXT-1210 C-8)."""
+    page = _page(qapp)
+    try:
+        editor = page._rows["refinement"].editor
+        assert editor.isChecked() and editor.text() == "Using the calibration's refinement"
+        page.set_field("refinement", False)
+        assert not editor.isChecked() and editor.text() == "Use the calibration's refinement"
+        editor.setChecked(True)  # the toggle's own signal, as a click delivers it
+        assert editor.text() == "Using the calibration's refinement" and page._value("refinement") is True
+    finally:
+        _close(page, qapp)
