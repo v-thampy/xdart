@@ -143,10 +143,19 @@ def _field_tooltip(path, reason: str = "") -> str:
 #: Toggles whose text says their state after the label ("Record angular coverage: On"); the accessible name
 #: stays the label (COVERAGE-EXPORT-FOLLOWUP-20261014, the maintainer's approved wording).
 _STATE_TEXT_PATHS = frozenset({("Int1D", "record_angular_support")})
+#: Toggles whose text says what each state does, (checked, unchecked). The maintainer, 2026-11-12, on RSM's refinement
+#: toggle: "maybe it should say "Using the..." when selected and "Use the ..." when unselected for clarity".
+_STATE_LABELS = {
+    ("RSM", "refinement"): ("Using the calibration's refinement", "Use the calibration's refinement"),
+}
 
 
 def _toggle_text(path, label: str, checked: bool) -> str:
-    """A toggle's text: its label, followed by On or Off for the toggles that say their state."""
+    """A toggle's text: its label, followed by On or Off for the toggles that say their state, or its own text for
+    each state."""
+    states = _STATE_LABELS.get(tuple(path))
+    if states is not None:
+        return states[0] if checked else states[1]
     return f"{label}: {'On' if checked else 'Off'}" if tuple(path) in _STATE_TEXT_PATHS else label
 
 

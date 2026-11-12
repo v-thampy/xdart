@@ -47,7 +47,9 @@ from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindo
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
-from xdart.gui.tabs.scattering.controls_editing import processed_data_folder, save_path_follows_project
+from xdart.gui.tabs.scattering.controls_editing import (
+    _same_folder, processed_data_folder, save_path_follows_project,
+)
 from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
 from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -1297,9 +1299,11 @@ class RSMPage(QtWidgets.QWidget):
         if not (self._output_suggested and project):
             return False
         current = str(self._value("output_path")).strip()
-        if current and save_path_follows_project(current, project):
-            return False
         suggestion = processed_data_folder(project)
+        # shown in full, as Int and Stitch show it: a relative spelling of the default becomes the Project's folder, so
+        # a Project change visibly moves it (maintainer, 2026-11-12: "the save path didn't change to follow")
+        if current and Path(current).expanduser().is_absolute() and _same_folder(current, suggestion):
+            return False
         self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
         self._rows["output_path"].apply_field(self._fields["output_path"])
         return True
