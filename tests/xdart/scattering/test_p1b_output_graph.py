@@ -3847,9 +3847,9 @@ def test_post_g2_unsafe_unfunded_staging_accepts_exact_eiger(
         return session
 
     monkeypatch.setenv("XDART_UNSAFE_UNFUNDED_STAGING_DIAGNOSTIC", "1")
-    monkeypatch.setattr(
-        dynamic_output, "total_physical_ram_bytes", lambda: 128 * 1024 ** 3,
-    )
+    # A 128 GiB host for every RAM read on this path; the unfunded-staging guard reads the POSIX value (1.2.10 A-5).
+    for reader in ("total_physical_ram_bytes", "posix_physical_ram_bytes"):
+        monkeypatch.setattr(dynamic_output, reader, lambda: 128 * 1024 ** 3)
     monkeypatch.setattr(
         dynamic_output, "resolve_session_policy", fixed_envelope,
     )
