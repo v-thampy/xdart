@@ -18,7 +18,18 @@ def qapp():
 
 def _browse(page, path):
     from xdart.gui.tabs.scattering.browse_values import BrowseLoadStatus
-    request = page._context_controller.begin_browse(str(path), source_root=str(path.parent))
+    from xdart.gui.tabs.scattering.events import BrowseCleanupPending
+
+    def begin():
+        # The controller refuses a scan while the shown scan's Browse cleanup settles; the page keeps that click and
+        # opens it once the cleanup has settled (BROWSE-REOPEN-CLEANUP-PENDING). This route calls the controller
+        # directly, so it waits the same way instead of failing on the refusal.
+        try:
+            return page._context_controller.begin_browse(str(path), source_root=str(path.parent))
+        except BrowseCleanupPending:
+            page._drain_executor()
+            return None
+    request = _wait(begin, timeout=30)
     outcome = _wait(page._context_controller.poll_browse, timeout=30)
     assert outcome.request is request and outcome.status is BrowseLoadStatus.READY
     page._refresh_shell()
