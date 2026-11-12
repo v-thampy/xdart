@@ -57,7 +57,7 @@ from xrd_tools.analysis.scan_operations import (
     ScanPlotPlan, ScanPlotResult,
 )
 from xrd_tools.analysis.display_fit_operations import (
-    CifAssetReceipt, DisplayedPeakFitPlan, DisplayedPeakFitResult,
+    DisplayedPeakFitPlan, DisplayedPeakFitResult,
     DisplayedPhaseFitPlan, DisplayedPhaseFitResult,
 )
 from xrd_tools.core.roi import RoiSpec
@@ -1899,9 +1899,99 @@ def test_roi_preview_shape_change_preserves_accepted_image_and_marks(tmp_path, q
         _close_page(page, qapp)
 
 
-def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
-        monkeypatch, qapp) -> None:
+def _two_peak_result(root, *, wavelength=None):
+    """A real processed result whose one frame's 1-D curve is three Gaussian peaks on a sloped background, two of them
+    inside 1.5-3.0 Å⁻¹ (``test_fit_tools_preservation._peaks``), written with the same NeXus writers as the other
+    real-page rows (``test_e4_preview_transport._write_processed``, whose 3-point curves hold no peak to fit).
+    ``wavelength`` (Å) is recorded on the monochromator, where a Run records it."""
+    import h5py
+    import tifffile
+    from tests.xdart.scattering.test_fit_tools_preservation import _peaks
+    from xrd_tools.core.containers import IntegrationResult1D
+    from xrd_tools.io.nexus import write_integrated_stack
+    from xrd_tools.io.nexus_record import ensure_frames_container, stamp_source_base, write_frame_record
+
+    raw = np.arange(16, dtype=np.uint16).reshape(4, 4)
+    raw_path = root / "raw" / "image.tif"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(raw_path, raw)
+    processed = root / "xdart_processed_data" / "scan.nexus"
+    processed.parent.mkdir(exist_ok=True)
+    x, y = _peaks()
+    with h5py.File(processed, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs["ssrl_schema"] = "xrd_tools.processed_scan"
+        entry.attrs["ssrl_schema_version"] = 3
+        write_integrated_stack(entry, frame_indices=[1],
+                               results_1d=[IntegrationResult1D(radial=x, intensity=y, unit="q_A^-1")])
+        base = stamp_source_base(entry, root)
+        write_frame_record(ensure_frames_container(entry), "frame_0001", thumbnail=raw[::2, ::2],
+                           source_path=raw_path, source_frame_index=0, source_base=base)
+        if wavelength is not None:
+            entry.require_group("instrument/monochromator").create_dataset("wavelength", data=wavelength)
+    return processed, x, y
+
+
+def _showing(tmp_path, processed):
+    """The real Int 1D page showing frame 1 of ``processed``, opened in Browse, settled, its display anchor live."""
     import xdart.gui.tabs.scattering.analysis_mount as mount
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait as until
+
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(project_root=str(tmp_path), processing_mode="Int 1D")),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter())
+    page.resize(1200, 800)
+    page.show()
+    page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(processed), path=("artifact",)))
+    controller = page._context_controller
+
+    def shown():
+        frame = controller.navigation.current
+        return True if (frame is not None and frame.artifact == str(processed) and frame.local_frame_label == 1
+                        and not controller.browse_pending and not page._scientific_repaint_pending
+                        and not page._shell.browser.frame_selection_pending
+                        and mount.capture_display_anchor(page, "probe", 0) is not None) else None
+
+    until(shown)
+    return page
+
+
+def _close_showing(page, qapp):
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait as until
+    until(lambda: True if page.close_workspace().cleanup_status is CleanupStatus.CLEANED else None)
+    page.deleteLater()
+    qapp.processEvents()
+
+
+def _launch(qapp, page, tool):
+    """A fit window through Int's real Tools button."""
+    from pyqtgraph.Qt import QtTest
+    button = page._shell.tools.findChild(QtWidgets.QPushButton, f"e3Tool_{tool}")
+    assert button is not None and button.isEnabled()
+    QtTest.QTest.mouseClick(button, QtCore.Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+
+
+def _adopted(page, field):
+    """Once the page's own drain has taken the real worker's terminal: what it adopted into ``field``, and its notice."""
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait as until
+    until(lambda: True if page._analysis_identity is None else None, timeout=60)
+    return getattr(page, field), page._notice_text
+
+
+def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
+        monkeypatch, qapp, tmp_path) -> None:
+    """The peak fit takes the exact displayed trace and the window's count-mode selection (2 peaks in 1.5-3.0), runs
+    the headless kernel, and the page adopts and projects its real result.
+
+    Runs on the real page (1.2.10 review M6, Table A row 4): a real processed result open in Int 1D, the Peak Fit
+    window from Int's Tools button, Fit clicked; ``_capture_analysis_trace``, the display anchor and
+    ``begin_peak_fit`` are the page's own (a spy records the plan and calls the real ``begin_peak_fit``), and the
+    page's drain adopts the worker's real terminal. The pure ``displayed_trace_input`` epoch rows stay as they were.
+    """
+    import xdart.gui.tabs.scattering.analysis_mount as mount
+    from xdart.gui.tabs.scattering.results_table import peak_parameter_rows
+    from xrd_tools.analysis.display_fit_operations import displayed_fit_axis
 
     for epoch in (None, 1700000000.25, -0.0):
         current, projection = _projection(epoch=epoch)
@@ -1914,16 +2004,16 @@ def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
         if epoch == -0.0:
             assert trace.epoch != mount.epoch_token(0.0) and trace.epoch != 0
 
-    page = _page()
+    processed, x, y = _two_peak_result(tmp_path)
+    page = _showing(tmp_path, processed)
     try:
-        page._open_analysis_mount("peak")
+        controller = page._context_controller
+        shown = mount.displayed_trace_input(page._last_scientific_projection, controller.navigation.current)
+        np.testing.assert_allclose(shown.axis, x, rtol=1e-6)  # the written curve, as the display holds it
+        np.testing.assert_allclose(shown.intensity, y, rtol=1e-6)
+        _launch(qapp, page, "peak_fitting")
         dialog = page._peak_dialog
-        trace = _trace(); anchor = SimpleNamespace(frame=_frame())
-        monkeypatch.setattr(page, "_capture_analysis_trace",
-                            lambda kind: (trace, anchor))
-        monkeypatch.setattr(mount, "display_anchor_matches",
-                            lambda *args: True)
-        dialog.set_vnext_trace(trace)
+        assert dialog is not None and dialog.fit_source() is None  # the window follows Int's display
         dialog.auto_check.setChecked(False)
         dialog.npeaks_spin.setValue(2)
         dialog.full_btn.setChecked(False)  # NEXT-128-WINDOW-POLISH PF5: Full is on by default and locks the range
@@ -1931,42 +2021,47 @@ def test_p37b_peak_uses_exact_current_trace_and_headless_selection_policy(
         dialog._fields_to_region()
         dialog.adv_centers.setText("")
         plans = []
-        identity = OperationIdentity(71)
+        begin = page._analysis_slot.begin_peak_fit
         monkeypatch.setattr(page._analysis_slot, "begin_peak_fit",
-            lambda plan, stamp: plans.append(plan) or identity)
+                            lambda plan, stamp: plans.append(plan) or begin(plan, stamp))
         dialog.fit_btn.click()
-        plan = plans[-1]
-        assert plan.trace is trace and plan.manual_centers == ()
+        assert len(plans) == 1, page._notice_text
+        plan = plans[0]
+        assert plan.trace.trace_fingerprint == shown.trace_fingerprint
+        np.testing.assert_array_equal(plan.trace.axis, shown.axis)
+        np.testing.assert_array_equal(plan.trace.intensity, shown.intensity)
+        assert plan.manual_centers == ()
         assert plan.fit_bounds == (1.5, 3.0)
         assert plan.selection_mode == "count" and plan.n_peaks == 2
-        result = DisplayedPeakFitResult(
-            AnalysisDisposition.COMPLETED, "OK", diagnostics=("peak-detail",),
-            trace_fingerprint=trace.trace_fingerprint,
-            trace_receipt=trace.receipt, plan_fingerprint="headless-plan",
-            policy_fingerprint="headless-policy", fit_success=True,
-            message="fit complete", label=trace.label,
-            axis_unit=trace.axis_unit,
-            parameter_names=("center", "sigma"),
-            parameter_values=(2.1, 0.2), parameter_stderr=(0.01, None),
-            fit=np.array([8.0, 9.0]), background=np.array([1.0, 1.0]),
-            residual=np.array([0.1, -0.1]), marker_positions=np.array([2.1]),
-            storage_bytes=128, result_fingerprint="peak-result")
-        assert page._consume_analysis_update(_returned(identity, result))
-        assert page._peak_result is result
+        result, notice = _adopted(page, "_peak_result")
+        assert type(result) is DisplayedPeakFitResult, notice
+        assert result.disposition is AnalysisDisposition.COMPLETED and result.code == "OK" and result.fit_success
+        assert result.trace_fingerprint == plan.trace.trace_fingerprint and result.trace_receipt == plan.trace.receipt
+        assert len(result.marker_positions) == 2 and all(1.5 <= value <= 3.0 for value in result.marker_positions)
+        fitted = displayed_fit_axis(plan)
         projected_x = [item.getData()[0] for item in dialog.plot.listDataItems()]
-        assert any(np.array_equal(values, np.array([2.0, 3.0]))
-                   for values in projected_x)
+        assert any(np.array_equal(values, fitted) for values in projected_x)
         assert dialog.resid_plot.listDataItems()
-        assert dialog.table.rowCount() == 2
-        assert "peak-detail" in dialog.status.text()
-        assert "headless-plan" in dialog.status.toolTip()
+        assert dialog.table.rowCount() == len(peak_parameter_rows(result)[1]) > 0
+        assert dialog.status.text() == "; ".join((result.message or result.code, *result.diagnostics))
+        assert result.plan_fingerprint in dialog.status.toolTip()
     finally:
-        _close_page(page, qapp)
+        _close_showing(page, qapp)
 
 
 def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
         monkeypatch, qapp, tmp_path) -> None:
+    """The phase fit takes the library entries (no CIF paths), the displayed trace and the recorded wavelength, runs
+    the headless kernel, and the page adopts its real result with each CIF's receipt under that CIF's library id; the
+    list still refuses a ninth phase.
+
+    Runs on the real page (1.2.10 review M6, Table A row 5): a real processed result recording a 1.0 Å wavelength open
+    in Int 1D, the Phase Analysis window from Int's Tools button, Fit clicked with the solve bounded by the window's
+    own Max iterations; a spy records the plan and calls the real ``begin_phase_fit``, the page's drain adopts the
+    worker's real terminal, and its receipts are the kernel's. The pure ``phase_wavelength_angstrom`` rows stay.
+    """
     import xdart.gui.tabs.scattering.analysis_mount as mount
+    from xdart.gui.tabs.scattering.results_table import phase_result_rows
 
     for wavelength_m, expected in ((1.234e-10, 1.234), (1.0e-10, 1.0)):
         calls = []
@@ -1981,78 +2076,65 @@ def test_p37b_phase_captures_paths_only_and_preserves_q_refusal_cif_receipts(
     controller.resolve_projection = lambda request: SimpleNamespace(wavelength_m=None)
     assert mount.phase_wavelength_angstrom(controller, _frame()) is None
 
-    page = _page()
+    # PHASE-ANALYSIS-128: every CIF joins the phase library through the shared source (the deferred-path list,
+    # and its name-limit and duplicate-path refusals, are retired with it); receipts follow each CIF's id.
+    monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
+    from tests.xdart.scattering.test_p34_reintegrate_operation import _wait as until
+    from tests.xdart.scattering.test_phase_reference_overlays import _cif
+    from xrd_tools.analysis.phase_references import PhaseLibrary
+    processed, _x, _y = _two_peak_result(tmp_path, wavelength=1.0)
+    page = _showing(tmp_path, processed)
     try:
-        page._open_analysis_mount("phase")
+        controller = page._context_controller
+        assert mount.phase_wavelength_angstrom(controller, controller.navigation.current) == 1.0  # recorded, unpatched
+        _launch(qapp, page, "phase_analysis")
         dialog = page._phase_dialog
-        trace = _trace(); anchor = SimpleNamespace(frame=_frame())
-        monkeypatch.setattr(page, "_capture_analysis_trace",
-                            lambda kind: (trace, anchor))
-        monkeypatch.setattr(mount, "display_anchor_matches",
-                            lambda *args: True)
-        monkeypatch.setattr(mount, "phase_wavelength_angstrom",
-                            lambda controller, frame: 1.0)
-        # PHASE-ANALYSIS-128: every CIF joins the phase library through the shared source (the deferred-path list,
-        # and its name-limit and duplicate-path refusals, are retired with it); receipts follow each CIF's id.
-        monkeypatch.setenv("XDART_PHASE_LIBRARY", str(tmp_path / "phase-library"))
-        from tests.xdart.scattering.test_phase_reference_overlays import _cif
-        from xrd_tools.analysis.phase_references import PhaseLibrary
+        assert dialog is not None and dialog.fit_source() is None
         source = dialog.phase_source
         source.library = PhaseLibrary()
         alpha, beta = _cif(tmp_path, "alpha", 4.1), _cif(tmp_path, "beta", 4.25)
         source.add_cif_paths((str(alpha), str(beta), str(alpha)))  # the duplicate selects nothing new
         assert [entry.name for entry, _shown in source.listed_entries()] == ["alpha", "beta"]
-        dialog.set_vnext_trace(trace)
+        view = page._shell.scientific
+        until(lambda: True if not view.phase_worker.busy else None)  # the view's reflections for both phases
+        dialog.max_nfev.setValue(5)
+        shown = mount.displayed_trace_input(page._last_scientific_projection, controller.navigation.current)
         plans = []
-        identity = OperationIdentity(81)
+        begin = page._analysis_slot.begin_phase_fit
         monkeypatch.setattr(page._analysis_slot, "begin_phase_fit",
-            lambda plan, stamp: plans.append(plan) or identity)
+                            lambda plan, stamp: plans.append(plan) or begin(plan, stamp))
         dialog.fit_btn.click()
-        plan = plans[-1]
-        assert plan.trace is trace and plan.cif_paths == ()
+        assert len(plans) == 1, (page._notice_text, dialog.status.text())
+        plan = plans[0]
+        assert plan.trace.trace_fingerprint == shown.trace_fingerprint
+        np.testing.assert_array_equal(plan.trace.intensity, shown.intensity)
+        assert plan.cif_paths == ()
         assert plan.phase_names == ("alpha", "beta")
         assert tuple(entry.name for entry in plan.phase_entries) == ("alpha", "beta")
-        assert plan.wavelength_angstrom == 1.0
+        assert plan.wavelength_angstrom == 1.0 and plan.max_nfev == 5
         entries = plan.phase_entries
-        states = (1, 2, 3, 4, 5, 6)
-        receipts = tuple(CifAssetReceipt(
-            entry.cif_path, entry.cif_path, entry.name, 100 + index, entry.id, entry.id, states, states,
-            f"receipt-{entry.name}") for index, entry in enumerate(entries))
-        result = DisplayedPhaseFitResult(
-            AnalysisDisposition.COMPLETED, "OK", diagnostics=("phase-detail",),
-            trace_fingerprint=trace.trace_fingerprint,
-            trace_receipt=trace.receipt, plan_fingerprint="phase-plan",
-            policy_fingerprint="phase-policy", cif_receipts=receipts,
-            wavelength_angstrom=1.0, fit_success=True,
-            message="phase fit complete", label=trace.label,
-            axis_unit=trace.axis_unit, parameter_names=("scale",),
-            parameter_values=(3.0,), parameter_stderr=(0.2,),
-            phase_fractions=(("alpha", 0.6), ("beta", 0.4)),
-            lattice_parameters=(("alpha", (("a", 4.1),)),
-                                ("beta", (("a", 5.2),))),
-            phase_components=(np.array([3.0, 4.0, 5.0]),
-                              np.array([2.0, 2.0, 2.0])),
-            fit=np.array([5.0, 6.0, 7.0]),
-            background=np.array([1.0, 1.0, 1.0]),
-            residual=np.array([0.1, 0.0, -0.1]),
-            marker_positions=np.array([1.5, 2.5]), storage_bytes=256,
-            result_fingerprint="phase-result", phase_names=("alpha", "beta"))
-        assert page._consume_analysis_update(_returned(identity, result))
-        assert page._phase_result is result
-        assert len(dialog.plot.listDataItems()) >= 5
+        result, notice = _adopted(page, "_phase_result")
+        assert type(result) is DisplayedPhaseFitResult, notice
+        assert result.disposition is AnalysisDisposition.COMPLETED and result.code == "OK"
+        assert result.trace_fingerprint == plan.trace.trace_fingerprint and result.wavelength_angstrom == 1.0
+        assert [(receipt.phase_name, receipt.sha256) for receipt in result.cif_receipts] == [
+            (entry.name, entry.id) for entry in entries]
+        assert len(dialog.plot.listDataItems()) >= 5  # the trace, fit, background and each phase's component
         assert dialog.resid_plot.listDataItems()
-        assert dialog.table.rowCount() == 3
+        assert dialog.table.rowCount() == len(phase_result_rows(result)[1]) > 0
         assert entries[0].id in dialog.cif_list.item(0).toolTip()
         assert entries[1].id in dialog.cif_list.item(1).toolTip()
-        assert "phase-detail" in dialog.status.text()
-        assert "phase-plan" in dialog.status.toolTip()
+        status = dialog.status.text()
+        assert status.startswith(result.message or result.code) and "wavelength=1.0" in status
+        assert all(detail in status for detail in result.diagnostics)
+        assert result.plan_fingerprint in dialog.status.toolTip()
         more = [_cif(tmp_path, f"phase{name}", 4.3 + .05 * index) for index, name in enumerate("cdefgh")]
         source.add_cif_paths(tuple(str(path) for path in more))
         assert len(source.selection) == 8
         source.add_cif_paths((str(_cif(tmp_path, "ninth", 4.9)),))
         assert len(source.selection) == 8 and "eight" in dialog.status.text().casefold()
     finally:
-        _close_page(page, qapp)
+        _close_showing(page, qapp)
 
 
 def test_p37b_context_fingerprints_and_dialog_generation_jointly_gate_adoption(
