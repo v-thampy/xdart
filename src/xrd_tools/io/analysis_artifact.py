@@ -3160,7 +3160,6 @@ class AnalysisArtifactOutput:
         self._writer_finished = False
         self._validated_candidate: TargetSnapshot | None = None
         self._candidate_inspection: AnalysisArtifactInspection | None = None
-        self._post_rename_attempted = False
         self._post_rename_observed: TargetSnapshot | None = None
         self._receipt: AnalysisArtifactReceipt | None = None
         self._completed = False
@@ -3308,7 +3307,7 @@ class AnalysisArtifactOutput:
         self._candidate_inspection = inspection
         self._writer_finished = True
 
-    def _terminal(self) -> tuple[StreamTerminal, AnalysisArtifactInspection]:
+    def _terminal(self, *, retry: bool) -> tuple[StreamTerminal, AnalysisArtifactInspection]:
         candidate, inspection = self._validated_candidate, self._candidate_inspection
         if (
             candidate is None or inspection is None or not candidate.exists or candidate.size is None
@@ -3322,14 +3321,13 @@ class AnalysisArtifactOutput:
             revision = _post_rename_revision(target)
             if target_revision_key(revision) != target_revision_key(self._post_rename_observed):
                 raise TargetChanged("analysis artifact changed after its post-rename check")
-        elif self._post_rename_attempted:
-            # A retry whose post-rename check never recorded a revision: the rename-kept tuple cannot prove the
-            # bytes, so hash the public file once against the candidate's digest (his "Hash once on that retry").
+        elif retry:
+            # Publication may fail to observe the public name before calling us at all. Without a recorded
+            # revision, the rename-kept tuple cannot prove the bytes on retry.
             revision = capture_target_snapshot(target)
             if revision.digest != candidate.digest:
                 raise TargetChanged("analysis artifact content changed after publication")
         else:
-            self._post_rename_attempted = True
             revision = _post_rename_revision(target)
         if (
             not revision.exists or revision.ctime_ns is None
@@ -3354,9 +3352,9 @@ class AnalysisArtifactOutput:
         # The candidate's inspection, rebound to the public name and revision: what a fresh inspection returns.
         return terminal, _rebind(inspection, path=target, storage_revision=_comparable_terminal_revision(terminal))
 
-    def _seal_receipt(self) -> AnalysisArtifactReceipt:
+    def _seal_receipt(self, *, retry: bool) -> AnalysisArtifactReceipt:
         if self._receipt is None:
-            terminal, inspection = self._terminal()
+            terminal, inspection = self._terminal(retry=retry)
             self._receipt = AnalysisArtifactReceipt(
                 self.request,
                 terminal,
@@ -3382,8 +3380,8 @@ class AnalysisArtifactOutput:
                 )
         return self._receipt
 
-    def _observe_published(self, _path: Path, _ordinal: int) -> StreamTerminal:
-        receipt = self._seal_receipt()
+    def _observe_published(self, _path: Path, _ordinal: int, *, retry: bool = False) -> StreamTerminal:
+        receipt = self._seal_receipt(retry=retry)
         if self._on_published is not None:
             self._on_published(receipt)
         self._completed = True
@@ -3448,7 +3446,7 @@ class AnalysisArtifactOutput:
         if not self._publication.published:
             return self.abort()
         try:
-            self._observe_published(Path(self.request.target), self._ordinal)
+            self._observe_published(Path(self.request.target), self._ordinal, retry=True)
         except BaseException as error:
             raise AnalysisArtifactCleanupPending(self.snapshot) from error
         return self.snapshot

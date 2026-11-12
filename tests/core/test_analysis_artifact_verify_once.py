@@ -140,10 +140,23 @@ def _edit_in_place_keeping_size_and_mtime(path: Path) -> None:
 
 @pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize("edited", (False, True))
-def test_a_retry_with_no_recorded_post_rename_revision_hashes_once(tmp_path, monkeypatch, kind, edited):
+@pytest.mark.parametrize("observation", ("revision", "namespace"))
+def test_a_retry_with_no_recorded_post_rename_revision_hashes_once(tmp_path, monkeypatch, kind, edited, observation):
     request = _request(tmp_path / f"retry-unrecorded-{edited}.nexus", kind)
     output = admit_analysis_artifact(request, coordinator=OutputTransactionCoordinator())
-    failed = _fail_first_post_rename_check(monkeypatch, request, "_post_rename_revision")
+    if observation == "revision":
+        failed = _fail_first_post_rename_check(monkeypatch, request, "_post_rename_revision")
+    else:
+        real_observe = finite_api._try_observe_at
+        failed = []
+
+        def miss_published_name_once(descriptor, name, path):
+            if Path(path) == Path(request.target) and not failed:
+                failed.append(path)
+                return None
+            return real_observe(descriptor, name, path)
+
+        monkeypatch.setattr(finite_api, "_try_observe_at", miss_published_name_once)
     writes = []
 
     def write_once(entry):
