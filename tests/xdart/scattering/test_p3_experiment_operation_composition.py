@@ -246,7 +246,8 @@ def test_one_and_many_candidates_show_same_nonblocking_dialog_then_accept_worker
         assert page._authored_asset_dialog is None
         dialog = _present_confirmation(page)
         assert any(row.editor is dialog.paths for row in dialog.findChildren(FormRow))
-        assert dialog.paths.toolTip().strip()
+        assert "adopt" in dialog.paths.toolTip().casefold()
+        assert newest.path in dialog.paths.toolTip()
         for button in (dialog.accept_button, dialog.choose_button, dialog.cancel_button):
             assert isinstance(button, ActionButton) and button.toolTip().strip()
         assert dialog.selected_path == newest.path

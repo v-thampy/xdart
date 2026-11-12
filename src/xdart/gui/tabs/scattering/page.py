@@ -567,7 +567,12 @@ class _AuthoredAssetDialog(QtWidgets.QDialog):
         self.cancel_button.setEnabled(enabled)
 
     def _show_selected_path(self, _index: int) -> None:
-        self.path_row.set_purpose_tooltip(self.selected_path or "No new valid authored file was found.")
+        selected = self.selected_path
+        if selected:
+            tip = f"Choose which authored file to adopt.\n{selected}"
+        else:
+            tip = "No new valid authored file was found. Choose another file to adopt."
+        self.path_row.set_purpose_tooltip(tip)
 
     def close_inert(self) -> None:
         self._inert = True

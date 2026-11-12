@@ -2923,7 +2923,9 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             return str(field.currentText() if data is None else data).strip()
         row = self._formrows.get(key)  # a file row shows its file's name: its value is the row's
         text = str(field.text() if row is None else row.current_value()).strip()
-        return str(Path(text).expanduser()) if key in self._HOME_PATH_KEYS and text.startswith('~') else text
+        # Unresolved ~user is normal while editing. Leave it for the path
+        # validator so the UI can report an unreadable file or folder.
+        return os.path.expanduser(text) if key in self._HOME_PATH_KEYS and text.startswith('~') else text
 
     def _reader(self):
         return {'detector_shape': tuple(int(v) for v in self._text('shape').split(',')),

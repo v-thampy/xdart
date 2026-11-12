@@ -88,3 +88,17 @@ def test_a_typed_home_geometry_file_starts_the_refinement(qapp, tmp_path, monkey
         _wait(dialog)
         dialog.deleteLater()
         qapp.processEvents()
+
+
+def test_a_geometry_path_with_an_unknown_home_shows_the_unreadable_note(qapp, tmp_path):
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+
+    dialog = CalibrationDialog(CalibrationContext("Stitch", tmp_path))
+    try:
+        dialog.refine_seed.setCurrentIndex(dialog.refine_seed.findData("file"))
+        dialog._fields["refine_seed_path"].setText("~xdart_no_such_user__/geometry.json")
+        assert dialog.refine_seed_note.text() == "This file cannot be read as a geometry JSON."
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qapp.processEvents()

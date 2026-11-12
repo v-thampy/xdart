@@ -205,15 +205,6 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
         )
         qapp.processEvents()
         elapsed = time.perf_counter() - started
-        heartbeat_timer.stop()
-        rss_timer.stop()
-        gc.collect()
-        qapp.processEvents()
-        run_terminal_rss = process.memory_info().rss
-        rss_samples.append(run_terminal_rss)
-        peak_rss = max(rss_samples)
-        peak_delta = peak_rss - baseline_rss
-        run_terminal_delta = run_terminal_rss - baseline_rss
 
         identity = controller.run_identity
         assert identity is not None
@@ -227,6 +218,17 @@ def test_j3_651_frame_os_rss_remains_bounded_at_public_mount(
             qapp.processEvents()
             time.sleep(0.01)
         assert run.display.hydration_thread is None
+        qapp.processEvents()
+        heartbeat_timer.stop()
+        rss_timer.stop()
+        sample_rss()
+        gc.collect()
+        qapp.processEvents()
+        run_terminal_rss = process.memory_info().rss
+        rss_samples.append(run_terminal_rss)
+        run_terminal_delta = run_terminal_rss - baseline_rss
+        peak_rss = max(rss_samples)
+        peak_delta = peak_rss - baseline_rss
         assert executor.delivered_labels == list(
             range(1, _J3_FRAME_COUNT + 1)
         )

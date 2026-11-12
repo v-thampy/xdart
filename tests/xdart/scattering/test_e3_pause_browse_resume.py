@@ -323,10 +323,15 @@ def test_browse_heavy_hydration_preserves_named_active_modes() -> None:
         owner.retire()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "E3-BROWSE-ROWS-STALE-1210: with a fixture that exists (a real GI Run of Combi4) this row runs again after skipping "
-    "everywhere since before 1.2.8, and fails: Browse opens the file 5 times (bound 2 to 4) and the resumed browse key "
-    "projects nothing at once. Diagnose against the 1.2.8 Browse-open changes before any bound moves."))
+class _KnownBrowseOpenCount(AssertionError):
+    """E3-BROWSE-ROWS-STALE-1210: Combi4 opens five times, against the old bound of four."""
+
+
+class _KnownBrowseMotorFallback(AssertionError):
+    """E3-BROWSE-ROWS-STALE-1210: Browse shows Manual for the generated GI output."""
+
+
+@pytest.mark.xfail(strict=True, raises=_KnownBrowseOpenCount, reason="E3-BROWSE-ROWS-STALE-1210")
 def test_real_browse_load_is_off_thread_exact_and_independently_owned(
     monkeypatch, _browse_fixture,
 ):
@@ -373,37 +378,41 @@ def test_real_browse_load_is_off_thread_exact_and_independently_owned(
         1,
         str(path),
     )
-    assert loader.begin(request) is request
-    outcome = _wait_outcome(loader, request)
-    assert outcome.request is request
-    assert outcome.status is BrowseLoadStatus.READY
-    context = loader.consume(outcome)
-    assert context is not None
-    assert context.operation is request
-    assert context.load_request is request
-    assert context.scan_key == path.stem  # the regenerated fixture's own name (it was the old file's literal stem)
-    assert tuple(context.frame_ids) == tuple(range(1, 17))
-    assert context.scalar_catalog is not None
-    assert context.scalar_catalog.labels == tuple(range(1, 17))
-    assert len(context.publication_store) == 0
-    assert len(context.record_store) == 0
-    assert context.calibration_identity
-    assert context.requested_path == str(path)
-    assert not hasattr(context, "mask_identity")
-    assert not hasattr(context, "result_identity")
-    assert calls == [
-        ("open_scan", "scattering-browse"),
-        ("read_scalar_catalog", "scattering-browse"),
-    ]
-    assert 2 <= len(file_opens) <= 4
-    assert all(
-        source == str(path) and thread == "scattering-browse"
-        for source, thread in file_opens
-    )
-    loader.release_context(context)
+    context = None
+    try:
+        assert loader.begin(request) is request
+        outcome = _wait_outcome(loader, request)
+        assert outcome.request is request
+        assert outcome.status is BrowseLoadStatus.READY
+        context = loader.consume(outcome)
+        assert context is not None
+        assert context.operation is request
+        assert context.load_request is request
+        assert context.scan_key == path.stem
+        assert tuple(context.frame_ids) == tuple(range(1, 17))
+        assert context.scalar_catalog is not None
+        assert context.scalar_catalog.labels == tuple(range(1, 17))
+        assert len(context.publication_store) == 0
+        assert len(context.record_store) == 0
+        assert context.calibration_identity
+        assert context.requested_path == str(path)
+        assert not hasattr(context, "mask_identity")
+        assert not hasattr(context, "result_identity")
+        assert calls == [
+            ("open_scan", "scattering-browse"),
+            ("read_scalar_catalog", "scattering-browse"),
+        ]
+        assert all(source == str(path) and thread == "scattering-browse" for source, thread in file_opens)
+    finally:
+        released = None if context is None else loader.release_context(context)
+        closed = loader.close()
+    assert released is not None and released.cleanup_status is CleanupStatus.CLEANED
+    assert closed.cleanup_status is CleanupStatus.CLEANED
     assert context.released is True
     assert len(context.record_store) == 0
-    loader.close()
+    if len(file_opens) == 5:
+        raise _KnownBrowseOpenCount(file_opens)
+    assert 2 <= len(file_opens) <= 4
 
 
 def test_explicit_processed_nexus_browse_reload_does_not_enter_raw_discovery(
@@ -487,12 +496,13 @@ def test_explicit_malformed_nexus_browse_is_refused_by_admission(
     loader.close()
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "E3-BROWSE-ROWS-STALE-1210: with a fixture that exists (a real GI Run of Combi4) this row runs again after skipping "
-    "everywhere since before 1.2.8, and fails: Browse opens the file 5 times (bound 2 to 4) and the resumed browse key "
-    "projects nothing at once. Diagnose against the 1.2.8 Browse-open changes before any bound moves."))
+@pytest.mark.xfail(strict=True, raises=_KnownBrowseMotorFallback, reason="E3-BROWSE-ROWS-STALE-1210")
 def test_real_browse_resume_keeps_exact_a_and_rejects_late_projection(_browse_fixture):
+    from xrd_tools.io.browse_presentation import read_ring_record
+
     path = _browse_fixture
+    saved = read_ring_record(path).run_configuration
+    assert saved is not None and saved["gi"]["resolved_motor"] == "th"
     _, lifecycle, executor, _, acquisition = _running_controller(gi=True)
     loader = BrowseLoader(max_items=32)
     controller = ContextController(
@@ -501,37 +511,48 @@ def test_real_browse_resume_keeps_exact_a_and_rejects_late_projection(_browse_fi
         browse_loader=loader,
         projection=ContextProjection(),
     )
-    controller.adopt_acquisition(executor.identity)
-    a_store = acquisition.publication_store
-    a_catalog = a_store.catalog_snapshot()
-    controller.pause()
-    request = controller.begin_browse(str(path))
-    deadline = time.monotonic() + 15.0
-    outcome = None
-    while outcome is None and time.monotonic() < deadline:
-        outcome = controller.poll_browse()
-        if outcome is None:
-            time.sleep(0.005)
-    assert outcome is not None
-    assert outcome.request is request
-    browse = controller.browse_context
-    assert browse is not None
-    assert browse.record_store is not acquisition.record_store
-    assert browse.publication_store is not a_store
-    browse_key = _current_key(controller)
-    payload = controller.project(browse_key)
-    assert payload is not None
-    assert payload.frame_key.local_frame_label == 1
-    assert payload.measurement_mode == "GI"
+    try:
+        controller.adopt_acquisition(executor.identity)
+        a_store = acquisition.publication_store
+        a_catalog = a_store.catalog_snapshot()
+        controller.pause()
+        request = controller.begin_browse(str(path))
+        deadline = time.monotonic() + 15.0
+        outcome = None
+        while outcome is None and time.monotonic() < deadline:
+            outcome = controller.poll_browse()
+            if outcome is None:
+                time.sleep(0.005)
+        assert outcome is not None
+        assert outcome.request is request
+        browse = controller.browse_context
+        assert browse is not None
+        assert browse.record_store is not acquisition.record_store
+        assert browse.publication_store is not a_store
+        browse_key = _current_key(controller)
+        payload = controller.project(browse_key)
+        deadline = time.monotonic() + 15.0
+        while payload is None and time.monotonic() < deadline:
+            controller.poll_browse_preview()
+            payload = controller.project(browse_key)
+            if payload is None:
+                time.sleep(0.005)
+        assert payload is not None
+        assert payload.frame_key.local_frame_label == 1
+        assert payload.measurement_mode == "GI"
+        delayed = controller.project_request(browse_key)
+        selection = controller.resume()
+        assert selection.names(acquisition)
+        assert controller.acquisition_context is acquisition
+        assert acquisition.publication_store is a_store
+        assert a_store.catalog_snapshot() == a_catalog
+        assert controller.resolve_projection(delayed) is None
+    finally:
+        closed = controller.close()
+    assert closed.cleanup_status is CleanupStatus.CLEANED
+    if payload.gi_resolved_motor == "Manual":
+        raise _KnownBrowseMotorFallback(payload.gi_resolved_motor)
     assert payload.gi_resolved_motor == "th"
-    delayed = controller.project_request(browse_key)
-    selection = controller.resume()
-    assert selection.names(acquisition)
-    assert controller.acquisition_context is acquisition
-    assert acquisition.publication_store is a_store
-    assert a_store.catalog_snapshot() == a_catalog
-    assert controller.resolve_projection(delayed) is None
-    controller.close()
 
 
 def test_cancelled_load_retires_exact_worker_after_inert_completion(

@@ -161,7 +161,7 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
             or configuration.processing_mode == "Int 1D (XYE)"
         ):
             return None
-        return _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
+        return DEFAULT_PIPELINE_V2
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
     if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
@@ -287,7 +287,7 @@ def _post_g2_output_diagnostics_choice(configuration, *, pipeline_v2):
         _MISSING,
     )
     if value is _MISSING:
-        return _PostG2OutputDiagnosticsChoice()
+        return DEFAULT_OUTPUT_DIAGNOSTICS
     if pipeline_v2 is None:
         raise ValueError("post-G2 output diagnostics require pipeline V2")
     if not isinstance(value, Mapping):

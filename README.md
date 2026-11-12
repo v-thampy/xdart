@@ -157,8 +157,9 @@ processing setup. Preserve raw data and calibration for processing replay.
 ### Fitting: Peak Fitter and Phase Analysis
 
 **Peak Fitting** opens the Peak Fitter: pseudo-Voigt, Gaussian, Lorentzian,
-Voigt, Pearson VII or split pseudo-Voigt peaks over a polynomial or Chebyshev
-background of any degree, a template background, or both. **Phase Analysis** fits
+Voigt, Pearson VII or split pseudo-Voigt peaks over a polynomial background
+(degree 0–7), a Chebyshev background (degree 0–15), a template, or a combination.
+**Phase Analysis** fits
 the checked phases from CIF files or typed lattices (calibrants are reference
 lines only) and draws their reference rings on Int's plots.
 Opened from Int, both read the trace Int shows or a **Source** of their own, and offer
@@ -198,11 +199,12 @@ a Live Run has caught up and is waiting for new images.
 
 - **Append** adds new frames to a compatible processed NeXus scan in place,
   skipping frames and scans already processed, and says how many frames are new.
-  An image that changed since it was processed is processed again; a refused
-  Append says what differs. **Replace/Overwrite** reprocesses it. Int 1D (XYE)
+  If an already-processed image changes during Live, that scan stops growing
+  for the current Run and is reprocessed on the next Run. A refused Append
+  says what differs. **Replace/Overwrite** reprocesses the scan. Int 1D (XYE)
   does not support Append. Stitch/RSM Append skips complete results, as
   described above.
-- A Folder or Live Run writes its outputs flat into the **Save Path**, never
+- A Folder or Live Run writes its NeXus outputs flat into the **Save Path**, never
   reads the Save Path as input, and goes on to the next scan when one cannot be
   processed, saying why.
 - **Single** follows the current selection; **Overlay** keeps patterns for
@@ -216,8 +218,8 @@ a Live Run has caught up and is waiting for new images.
   **Warnings** filters it. **Config → Debug → Debug Logging** writes detailed
   diagnostics to the log file, and **Performance Monitoring** adds a timing
   summary to each Run. **Config → Performance Diagnostics…** sets the Live plot
-  interval and, for a non-Live Overwrite Run with NeXus output only, benchmark
-  pipeline values; other Runs ignore those and say so in the log.
+  interval and sets benchmark pipeline values for non-Live, non-Batch Overwrite
+  Runs that write NeXus. Other Runs ignore those values and say so in the log.
 
 ### Data export and saving
 
@@ -291,8 +293,8 @@ pixi install --locked
 pixi run --locked xdart
 ```
 
-The default `main` branch contains the current source. To use the exact 1.2.9
-release, run `git switch --detach v1.2.9` before installing.
+The default `main` branch contains the current source. To use the release
+described here, run `git switch --detach v1.2.9` before installing.
 The lockfile covers Apple Silicon macOS, Linux x86-64, and Windows x86-64.
 Each machine installs its own environment; keep the shared lockfile unchanged
 when testing on another machine.

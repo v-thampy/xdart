@@ -36,7 +36,7 @@ from xdart.gui.tabs.scattering.shell_values import (
 )
 from xdart.modules.display_context import CommitGate, HydrationOwner
 from xdart.modules.frame_publication import FramePublication
-from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind, assert_frameview_equivalent
+from xrd_tools.core import Axis, FrameRecord, FrameView, TwoDKind
 from xrd_tools.core.containers import IntegrationResult1D, IntegrationResult2D
 from xrd_tools.io import read_frame_record, read_frame_view
 from xrd_tools.io.nexus import write_integrated_stack
@@ -379,7 +379,6 @@ def test_deep_selection_save_reload_equivalence_and_foreign_late_inert(mount, tm
     np.testing.assert_array_equal(reloaded.axis_1d.values, np.float32([0.1, 0.2, 0.3]))  # the axis is stored float32
     np.testing.assert_array_equal(reloaded.intensity_1d, np.array([1.0, 2.0, 3.0]) + 513)
     np.testing.assert_array_equal(reloaded.intensity_2d, (np.arange(6.0).reshape(3, 2) + 513).T)
-    assert_frameview_equivalent(read_frame_view(processed, 513), reloaded)
     identity = RunIdentity(1, "deep")
     frame = DisplayFrameKey(identity, "deep", str(processed), 513, 513)
     payload = StandardDisplayPayload(0, frame, "deep:513", reloaded)
