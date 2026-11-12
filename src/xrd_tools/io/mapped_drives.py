@@ -77,10 +77,10 @@ def _network_path(path: str) -> str | None:
 def as_mapped_drive(path: str, remotes: dict[str, str] | None = None) -> str:
     """``path`` spelled with the drive letter mapped to its share (the longest mapped folder wins), or ``path`` itself
     when it is no network path or no drive maps it."""
-    remotes = drive_remotes() if remotes is None else remotes
-    spelled = _network_path(path) if path and remotes else None
+    spelled = _network_path(path) if path else None
     if spelled is None:
         return path
+    remotes = drive_remotes() if remotes is None else remotes
     folded = ntpath.normcase(spelled)
     best: tuple[str, str] | None = None
     for drive, remote in remotes.items():

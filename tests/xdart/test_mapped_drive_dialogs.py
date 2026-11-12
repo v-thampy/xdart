@@ -43,6 +43,17 @@ def test_a_cancelled_dialog_still_returns_nothing(qapp, mapped, monkeypatch):  #
     assert file_dialogs.ask(None, "Choose folder", folder=True) == []
 
 
+def test_local_file_pick_does_not_query_the_network_drive_provider(qapp, monkeypatch):  # noqa: F811
+    queries = []
+    monkeypatch.setattr(mapped_drives, "_is_windows", lambda: True)
+    monkeypatch.setattr(mapped_drives, "_cache", None)
+    monkeypatch.setattr(mapped_drives, "_query_remotes", lambda: queries.append(True) or {"X:": SHARE})
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", staticmethod(
+        lambda *args, **kwargs: ("C:/local/profile.json", "")))
+    assert file_dialogs.ask(None, "Choose") == ["C:/local/profile.json"]
+    assert queries == []
+
+
 def test_the_save_path_check_takes_the_drive_and_the_share_as_one_folder(mapped, monkeypatch):
     monkeypatch.setattr(controls_editing, "os", types.SimpleNamespace(path=ntpath))  # Windows spelling rules
     assert controls_editing._same_folder(r"X:\bl11-3\test_Oct2026\xdart_processed_data",
