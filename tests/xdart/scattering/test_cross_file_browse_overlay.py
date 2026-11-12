@@ -21,6 +21,21 @@ from xrd_tools.session.intent_store import RunIntentStore
 from xrd_tools.session.run_configuration import RunIntent
 
 
+def _first_file_reads_settled(owner) -> bool:
+    """Whether releasing the shown Browse would be clean now, so the next open is not deferred: its preview gate
+    free, no 1-D or slice read in flight, and no repaint waiting (the conditions ``_BrowseHydrationOwner.release``
+    reports as a pending cleanup; ledger BROWSE-REOPEN-CLEANUP-PENDING)."""
+    if owner is None:
+        return True
+    one_d, slices = owner._one_d_lane, owner._slice_lane
+    return not (
+        owner.transport.retains_gate(owner._gate)
+        or one_d._active is not None or one_d._ready_pending
+        or (slices is not None and (slices._active is not None or slices._repaint))
+        or not owner._repaints.empty()
+    )
+
+
 @pytest.fixture
 def qapp():
     return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -109,7 +124,7 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
                         if lane._active is busy:
                             lane._active = None
                 threading.Timer(0.3, read_done).start()
-            _wait(lambda: True if owner is None or not owner.transport.retains_gate(owner._gate) else None)
+            _wait(lambda: True if _first_file_reads_settled(owner) else None)
         assert open_file(second) is waits
         _click_frame(qapp, shell, 0)
         _wait(lambda: settled(second, 1))
