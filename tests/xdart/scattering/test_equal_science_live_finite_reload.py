@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 
 from tests.xdart.scattering.test_live_owner_transitions import _intent
-from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _stop, _terminals
+from tests.xdart.scattering.test_live_qualify_refusal_run import _frame, _stop, _terminal, _terminals
 from tests.xdart.scattering.test_p1b_output_graph import _run_to_terminal, _start
 from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
@@ -58,19 +58,26 @@ def _reduce(tmp_path, raw, stem, count, poni, kind):
                      output="Overwrite" if kind == "overwrite" else "Append")
     if poni is not None:
         intent.poni_file = str(poni)
+    intent.bai_1d_args["error_model"] = "poisson"
+    intent.bai_2d_args["error_model"] = "poisson"
     intent.save_path = str(tmp_path / kind)
     if kind == "live":
         executor = StandardRunExecutor(join_timeout=5.0)
         identity, events = _start(executor, intent, request_value=11), []
         deadline = time.monotonic() + 180.0
-        while len(_ready(events, stem)) < count and time.monotonic() < deadline:
-            events.extend(executor.drain_events())
-            time.sleep(0.01)
-        terminals = _stop(executor, identity, events)
+        try:
+            while len(_ready(events, stem)) < count and not _terminal(events) and time.monotonic() < deadline:
+                events.extend(executor.drain_events())
+                time.sleep(0.01)
+            assert len(_ready(events, stem)) == count, _terminals(events)
+        finally:
+            terminals = _stop(executor, identity, events)
     else:
         executor, identity, events = _run_to_terminal(intent, request_value=11)
         executor.close(identity)
         terminals = _terminals(events)
+    expected_terminal = "STOPPED" if kind == "live" else "FINISHED"
+    assert [status for status, _detail in terminals] == [expected_terminal], (kind, terminals)
     outputs = sorted((tmp_path / kind).rglob("*.nexus"))
     assert len(outputs) == 1, (kind, outputs, terminals)
     return outputs[0], terminals
@@ -102,11 +109,12 @@ def test_finite_overwrite_fresh_append_and_live_save_equal_science(tmp_path, dat
     reference = saved["overwrite"][0]
     for label in expected:
         base = read_frame_view(reference, label)
-        assert base.intensity_1d is not None and base.intensity_2d is not None
+        for field in ("intensity_1d", "sigma_1d", "intensity_2d", "sigma_2d"):
+            assert getattr(base, field) is not None, (label, field)
         for kind in ("append", "live"):
             other = read_frame_view(saved[kind][0], label)
             where = f"{kind} frame {label}"
-            for field in ("intensity_1d", "sigma_1d", "intensity_2d"):
+            for field in ("intensity_1d", "sigma_1d", "intensity_2d", "sigma_2d"):
                 _exactly_equal(f"{where} {field}", getattr(base, field), getattr(other, field))
             for axis in ("axis_1d", "axis_2d_x", "axis_2d_y"):
                 a, b = getattr(base, axis), getattr(other, axis)
@@ -114,4 +122,4 @@ def test_finite_overwrite_fresh_append_and_live_save_equal_science(tmp_path, dat
                 _exactly_equal(f"{where} {axis}", a.values, b.values)
             assert dict(base.metadata_numeric) == dict(other.metadata_numeric), where
             assert dict(base.metadata_raw) == dict(other.metadata_raw), where
-            assert_frameview_equivalent(base, other)
+            assert_frameview_equivalent(base, other, rtol=0, atol=0)
