@@ -888,7 +888,8 @@ def test_nexus_record_batching_is_independent_and_drains_its_terminal_tail(
     assert tuple(item[0].label for item in sink._pending_record_writes) == (6,)
     sink.flush(force=True)
     perf = sink.perf_snapshot()
-    assert set(perf) == {"sink_nexus_write", "sink_nexus_flush"}
+    # The forced flush seals a checkpoint, whose readback is timed for the Run's summary (NEXT-1210-VERIFY-ONCE B-4).
+    assert set(perf) == {"sink_nexus_write", "sink_nexus_flush", "writer_finish_checkpoint_readback"}
     assert perf["sink_nexus_write"] >= 0.0
     assert perf["sink_nexus_flush"] >= 0.0
     sink.finish(result=None)

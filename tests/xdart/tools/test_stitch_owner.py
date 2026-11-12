@@ -273,16 +273,19 @@ def test_published_inspection_failure_reaches_owner_with_publication_truth(monke
         np.ones((195, 487), dtype=np.int32).tofile(path)
     preflight = prepare_stitch_tool(replace(preflight.form, detector_shape=(195, 487)))
     target = Path(preflight.request.module.output.target)
-    inspect = analysis_artifact.inspect_analysis_artifact
+    # The post-rename revision check fails once (NEXT-1210-VERIFY-ONCE B-1: the published file is no longer
+    # inspected a second time, so the injected failure moved from that inspection to the check replacing it).
+    from xrd_tools.io import output_transaction
+    revision = output_transaction.capture_target_revision
     failures = []
 
-    def inspect_once(path, **kwargs):
+    def inspect_once(path, *args, **kwargs):
         if Path(path) == target and not failures:
             failures.append(path)
             raise OSError("transient published inspection")
-        return inspect(path, **kwargs)
+        return revision(path, *args, **kwargs)
 
-    monkeypatch.setattr(analysis_artifact, "inspect_analysis_artifact", inspect_once)
+    monkeypatch.setattr(analysis_artifact, "_post_rename_revision", inspect_once, raising=False)
     owner = _prepare_owner(preflight)
     assert owner.begin_run() is not None
     pending = _poll_terminal(owner, timeout=10)
