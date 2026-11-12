@@ -2597,6 +2597,17 @@ def test_fast_terminal_science_accepts_allclose_axes_and_mixed_sigma(tmp_path):
         assert np.isnan(two_d["sigma"][[0, 2]]).all()
 
 
+def _abort_keeps_no_partial(target, abort):
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        abort()
+    assert not [w for w in caught if "preserved non-final data" in str(w.message)]
+    target = Path(target)
+    assert not target.exists() and not tuple(target.parent.glob(f".{target.name}.xdart-partial-*"))
+
+
 def test_fast_later_batch_rejects_divergent_axis_before_mutation(tmp_path):
     from xrd_tools.core.scan import ScanFrame
     from xrd_tools.reduction import FrameReduction, ReductionResult
@@ -2621,8 +2632,9 @@ def test_fast_later_batch_rejects_divergent_axis_before_mutation(tmp_path):
     writer = sink._writer
     assert writer._row_cursors["integrated_1d"] == {0: 0}
     assert writer._h5["entry/integrated_1d/intensity"].shape == (1, 8)
-    with pytest.warns(RuntimeWarning, match="preserved non-final data"):
-        sink.abort(ReductionResult("axis-authority", {}, 1, failed=True))
+    # The fast route keeps nothing it has not verified (his "Fix in packet B", NEXT-1210-VERIFY-ONCE B-2): the
+    # abort removes its own partial instead of preserving it with a warning.
+    _abort_keeps_no_partial(_target, lambda: sink.abort(ReductionResult("axis-authority", {}, 1, failed=True)))
 
 
 def test_fast_regenerable_rejects_accidental_repeat_before_mutation(tmp_path):
@@ -2652,8 +2664,7 @@ def test_fast_regenerable_rejects_accidental_repeat_before_mutation(tmp_path):
         writer._h5["entry/integrated_1d/intensity"][0], before,
     )
     assert writer._h5["entry/frames/frame_0000/timestamp"].asstr()[()] == "first"
-    with pytest.warns(RuntimeWarning, match="preserved non-final data"):
-        sink.abort(None)
+    _abort_keeps_no_partial(_target, lambda: sink.abort(None))  # as above (B-2)
 
 
 @pytest.mark.parametrize("corrupt", (False, True))
