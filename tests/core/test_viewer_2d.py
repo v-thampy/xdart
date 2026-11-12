@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import fabio
+import tifffile
 
 _EXPECTED_R = 11_546_624
 
@@ -53,7 +55,7 @@ def _npz(path: Path, members, *, compression=zipfile.ZIP_DEFLATED) -> None:
 
 
 def _write_hdf_stack(path, value, dataset="entry/data/data"):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     with h5py.File(path, "w") as handle:
         handle.create_dataset(dataset, data=value)
 
@@ -103,7 +105,7 @@ def _finalize_processed(handle):
 
 
 def _external_master(path, links):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     with h5py.File(path, "w") as handle:
         group = handle.create_group("entry/data")
         for name, segment in links:
@@ -443,8 +445,8 @@ def test_npz_central_metadata_counts_member_comments_at_exact_cap(tmp_path):
 
 
 def test_raw_tiff_and_hdf5_catalogs_read_only_one_selected_frame(tmp_path, monkeypatch):
-    tifffile = pytest.importorskip("tifffile")
-    h5py = pytest.importorskip("h5py")
+    import tifffile
+    import h5py
     admissions = []
     original_admit = api._admit
 
@@ -491,7 +493,7 @@ def test_raw_tiff_and_hdf5_catalogs_read_only_one_selected_frame(tmp_path, monke
     _assert_canonical(api.read_viewer_2d_frame(h5_catalog, 1), h5_data[1])
     assert all(value == 0 for value in admissions[4:])
 
-    fabio = pytest.importorskip("fabio")
+    import fabio
     edf_path = tmp_path / "image.edf"
     fabio.edfimage.EdfImage(data=raw_data).write(edf_path)
     edf_catalog = api.catalog_viewer_2d(edf_path)
@@ -574,7 +576,7 @@ def test_hdf_census_and_depth_caps_refuse_before_cap_plus_one_retention(tmp_path
                 **({} if axis == "candidate" else {"path": "x", "external": axis == "external"}))
         assert (walk.visits, walk.external, walk.path_bytes, walk.candidates) == before
         return
-    h5py = pytest.importorskip("h5py")
+    import h5py
     if axis == "name-plus-one":
         path = tmp_path / "name-retention.nxs"
         _write_hdf_stack(path, np.arange(6).reshape(2, 3), dataset="data")
@@ -619,7 +621,7 @@ def test_hdf_census_and_depth_caps_refuse_before_cap_plus_one_retention(tmp_path
     ids=lambda selected: f"r30-f05-selected-{selected}",
 )
 def test_selected_hdf_lookup_charges_before_materialization(tmp_path, monkeypatch, selected):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     if selected.startswith("path-"):
         path = tmp_path / f"selected-{selected}.nxs"
         _write_hdf_stack(path, np.arange(6).reshape(1, 2, 3))
@@ -702,7 +704,7 @@ def test_selected_hdf_lookup_charges_before_materialization(tmp_path, monkeypatc
 )
 def test_r30_hdf_attribute_storage_is_charged_before_value_read(tmp_path, monkeypatch,
                                                                count, entry_size, refused):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / "attributes.nxs"
     with h5py.File(path, "w") as handle:
         for index in range(count):
@@ -732,7 +734,7 @@ def test_r30_hdf_attribute_storage_is_charged_before_value_read(tmp_path, monkey
 @pytest.mark.parametrize("kind", ["non-scalar", "reference", "object-member"],
                          ids=lambda kind: f"r32-f05-attribute-{kind}")
 def test_r32_hdf_invalid_attribute_is_inspected_without_value_read(tmp_path, monkeypatch, kind):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / f"attribute-{kind}.nxs"
     with h5py.File(path, "w") as handle:
         group = handle.create_group("a_candidate")
@@ -751,7 +753,7 @@ def test_r32_hdf_invalid_attribute_is_inspected_without_value_read(tmp_path, mon
 
 
 def test_r30_hdf_selected_anchor_reread_charges_links_without_candidate_retain(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path, target = tmp_path / "links.nxs", tmp_path / "target.nxs"
     _write_hdf_stack(target, np.arange(6).reshape(1, 2, 3))
     with h5py.File(path, "w") as handle:
@@ -777,7 +779,7 @@ def test_r30_hdf_selected_anchor_reread_charges_links_without_candidate_retain(t
 
 
 def test_tiff_frame_limit_is_checked_before_page_iteration(tmp_path, monkeypatch):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     path = tmp_path / "many.tiff"
     path.write_bytes(b"placeholder")
 
@@ -795,7 +797,7 @@ def test_tiff_frame_limit_is_checked_before_page_iteration(tmp_path, monkeypatch
 
 
 def test_processed_gapped_labels_preserve_raw_or_explicit_thumbnail_provenance(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw_path = tmp_path / "raw.nxs"
     raw = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
     _write_hdf_stack(raw_path, raw)
@@ -840,7 +842,7 @@ def test_processed_gapped_labels_preserve_raw_or_explicit_thumbnail_provenance(t
 def test_historical_processed_markers_never_fall_through_to_raw_dataset(
     tmp_path, suffix,
 ):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / f"historical{suffix}"
     with h5py.File(path, "w") as handle:
         handle.create_dataset(
@@ -856,7 +858,7 @@ def test_historical_processed_markers_never_fall_through_to_raw_dataset(
 
 
 def test_wrong_suffix_current_bytes_are_not_processed_or_raw(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     current = tmp_path / "current.nexus"
     with h5py.File(current, "w") as handle:
         _processed_thumbnail(
@@ -875,7 +877,7 @@ def test_wrong_suffix_current_bytes_are_not_processed_or_raw(tmp_path):
 
 
 def test_current_integrated_only_record_never_becomes_raw_intensity(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / "integrated-only.nexus"
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
@@ -891,7 +893,7 @@ def test_current_integrated_only_record_never_becomes_raw_intensity(tmp_path):
 def test_current_thumbnail_catalog_uses_one_primary_hdf_open(
     tmp_path, monkeypatch,
 ):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / "thumbnail.nexus"
     with h5py.File(path, "w") as handle:
         _processed_thumbnail(
@@ -916,7 +918,7 @@ def test_current_thumbnail_catalog_uses_one_primary_hdf_open(
 
 @pytest.mark.parametrize("family", ["raw", "tiff", "edf", "cbf"])
 def test_processed_raw_keeps_non_hdf_detector_parity(tmp_path, family):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     value = np.arange(12, dtype=np.int32).reshape(3, 4)
     source = tmp_path / f"source.{family}"
     _write_selected_source(source, "fabio" if family == "edf" else family, value)
@@ -936,7 +938,7 @@ def test_processed_raw_keeps_non_hdf_detector_parity(tmp_path, family):
 
 @pytest.mark.parametrize("locality", ["provenance", "unselected-drift"])
 def test_eiger_external_segments_use_interval_local_identity_and_detect_drift(tmp_path, locality):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     base = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
     master, segments, arrays = _eiger_master(tmp_path, [
         (f"data_{number:06d}.h5", base + number * 100) for number in (1, 2)])
@@ -963,7 +965,7 @@ def test_eiger_external_segments_use_interval_local_identity_and_detect_drift(tm
 
 
 def test_one_hdf_census_spans_processed_recursion_and_pre_read_post(tmp_path, monkeypatch):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw = tmp_path / "raw.nxs"
     _write_hdf_stack(raw, np.arange(6).reshape(1, 2, 3))
     processed = tmp_path / "processed.nexus"
@@ -988,7 +990,7 @@ def test_one_hdf_census_spans_processed_recursion_and_pre_read_post(tmp_path, mo
 
 def test_processed_651_catalog_uses_owned_frame_bound_and_hashes_each_file_once(
         tmp_path, monkeypatch):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw = np.arange(651 * 2 * 3, dtype=np.uint16).reshape(651, 2, 3)
     master, segments, _ = _eiger_master(
         tmp_path / "raw", [("data_000001.h5", raw)])
@@ -1019,7 +1021,7 @@ def test_processed_651_catalog_uses_owned_frame_bound_and_hashes_each_file_once(
 
 
 def test_processed_651_pure_thumbnail_catalog_uses_owned_field_budget(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     processed = tmp_path / "processed.nexus"
     thumbnail = np.arange(6, dtype=np.uint8).reshape(2, 3)
     with h5py.File(processed, "w") as handle:
@@ -1037,7 +1039,7 @@ def test_processed_651_pure_thumbnail_catalog_uses_owned_field_budget(tmp_path):
 
 
 def test_processed_651_missing_source_falls_back_to_all_thumbnails(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     processed = tmp_path / "processed.nexus"
     missing = tmp_path / "missing-master.h5"
     thumbnail = np.arange(6, dtype=np.uint16).reshape(2, 3)
@@ -1060,7 +1062,7 @@ def test_processed_651_missing_source_falls_back_to_all_thumbnails(tmp_path):
 
 def test_processed_fixed_name_misses_do_not_consume_frame_catalog_cap(
         tmp_path, monkeypatch):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw = tmp_path / "raw.h5"
     value = np.arange(6, dtype=np.uint16).reshape(1, 2, 3)
     _write_hdf_stack(raw, value)
@@ -1085,7 +1087,7 @@ def test_processed_fixed_name_misses_do_not_consume_frame_catalog_cap(
 
 def test_explicit_hdf_dataset_hint_bypasses_generic_foreign_census(
         tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / "selected.nxs"
     value = np.arange(6).reshape(1, 2, 3)
     with h5py.File(path, "w") as handle:
@@ -1102,7 +1104,7 @@ def test_explicit_hdf_dataset_hint_bypasses_generic_foreign_census(
 
 
 def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_path):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
     segment = tmp_path / "segment.h5"
     _write_hdf_stack(segment, value)
@@ -1132,7 +1134,7 @@ def test_processed_external_preferred_path_bypasses_foreign_master_census(tmp_pa
 @pytest.mark.parametrize("drift", ["before", "during"])
 def test_eiger_frame_read_refuses_metadata_drift_without_rehashing(
         tmp_path, monkeypatch, drift):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     value = np.arange(2 * 2 * 3, dtype=np.uint16).reshape(2, 2, 3)
     master, segments, _ = _eiger_master(
         tmp_path, [("data_000001.h5", value)])
@@ -1191,12 +1193,12 @@ def _non_hdf_stat_case(tmp_path, family):
         )
     elif family == "tiff":
         path, expected, label = tmp_path / "selected.tiff", values[1], 1
-        pytest.importorskip("tifffile").imwrite(
+        tifffile.imwrite(
             path, values, photometric="minisblack",
         )
     else:
         path, expected, label = tmp_path / "selected.edf", values[0], 0
-        pytest.importorskip("fabio").edfimage.EdfImage(data=expected).write(path)
+        fabio.edfimage.EdfImage(data=expected).write(path)
     return path, api.catalog_viewer_2d(path, policy=policy), label, expected, policy
 
 
@@ -1223,7 +1225,7 @@ def test_non_hdf_frame_read_uses_metadata_revision_and_selected_pixel_hash(
 
 def test_tiff_parent_swap_and_restore_reads_certified_descriptor(
         tmp_path, monkeypatch):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     admitted = np.arange(2 * 3 * 5, dtype=np.uint16).reshape(2, 3, 5)
     foreign = admitted + 1000
     active_dir, foreign_dir = tmp_path / "active", tmp_path / "foreign"
@@ -1438,13 +1440,13 @@ def _write_selected_source(path, family, value):
     elif family == "raw":
         path.write_bytes(value.tobytes())
     elif family == "tiff":
-        pytest.importorskip("tifffile").imwrite(path, value)
+        tifffile.imwrite(path, value)
     elif family == "fabio":
-        pytest.importorskip("fabio").edfimage.EdfImage(data=value).write(path)
+        fabio.edfimage.EdfImage(data=value).write(path)
     elif family == "cbf":
-        pytest.importorskip("fabio").cbfimage.CbfImage(data=value).write(path)
+        fabio.cbfimage.CbfImage(data=value).write(path)
     else:
-        h5py = pytest.importorskip("h5py")
+        import h5py
         with h5py.File(path, "w") as handle:
             _processed_thumbnail(
                 handle, 0, value, vmin=0.0, vmax=float(value.max()))
@@ -1453,10 +1455,10 @@ def _write_selected_source(path, family, value):
 
 def _block_selected_materialization(monkeypatch, family, target, materialized):
     if family in {"hdf", "thumbnail"}:
-        h5py = pytest.importorskip("h5py")
+        import h5py
         _block_hdf_materialization(monkeypatch, h5py, target, materialized)
     elif family == "tiff":
-        tifffile = pytest.importorskip("tifffile")
+        import tifffile
         original = tifffile.TiffPage.asarray
 
         def materialize(page, *args, **kwargs):
@@ -1465,7 +1467,7 @@ def _block_selected_materialization(monkeypatch, family, target, materialized):
 
         monkeypatch.setattr(tifffile.TiffPage, "asarray", materialize)
     else:
-        fabio = pytest.importorskip("fabio")
+        import fabio
         original = fabio.open
 
         def materialize(*args, **kwargs):
@@ -1482,7 +1484,7 @@ def _block_selected_materialization(monkeypatch, family, target, materialized):
     ids=lambda axis: f"r30-f01-{axis}",
 )
 def test_r30_hdf_dependency_grammar_is_locator_local(tmp_path, axis):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     shape = (2, 2, 3)
     if axis == "generic-foreign":
         primary, foreign = tmp_path / "primary.nxs", tmp_path / "foreign.nxs"
@@ -1603,7 +1605,7 @@ def test_r30_decoder_matrix_refuses_forgery_before_decode(tmp_path, monkeypatch,
             _assert_refusal(api.Viewer2DRefusalCode.FORMAT_INVALID,
                 api.read_viewer_2d_frame, forged, 0, policy=forged_policy)
         return
-    fabio = pytest.importorskip("fabio")
+    import fabio
     path, replacement = tmp_path / "small.edf", tmp_path / "large.edf"
     fabio.edfimage.EdfImage(data=value).write(path)
     catalog = api.catalog_viewer_2d(path)
@@ -1644,7 +1646,7 @@ def test_r30_selected_metadata_mismatch_refuses_before_materialization(tmp_path,
         catalog = _rehashed_catalog(catalog, source_dtype=fact.dtype, frame_facts=(fact,))
     _write_selected_source(path, family, replacement)
     if family == "thumbnail" and drift.endswith("dtype"):
-        h5py = pytest.importorskip("h5py")
+        import h5py
         with h5py.File(path, "r+") as handle:
             thumbnail = handle["/entry/frames/frame_0000/thumbnail"]
             thumbnail.attrs["dtype"] = ("uint16" if drift == "lut-dtype" else "uint8")
@@ -1683,7 +1685,7 @@ def test_r30_catalog_revision_brackets_valid_metadata(tmp_path, monkeypatch, axi
         suffix = "tiff" if axis == "detector" else "nxs"
         path, replacement = tmp_path / f"a.{suffix}", tmp_path / f"b.{suffix}"
         if axis == "detector":
-            tifffile = pytest.importorskip("tifffile")
+            import tifffile
             tifffile.imwrite(path, np.arange(6).reshape(2, 3))
             tifffile.imwrite(replacement, np.arange(9).reshape(3, 3))
             original = tifffile.TiffPages.__iter__
@@ -1691,13 +1693,13 @@ def test_r30_catalog_revision_brackets_valid_metadata(tmp_path, monkeypatch, axi
                 lambda pages: list(original(pages)),
                 lambda: os.replace(replacement, path), entered, transform=iter))
         else:
-            h5py = pytest.importorskip("h5py")
+            import h5py
             _write_hdf_stack(path, np.arange(6).reshape(1, 2, 3))
             _write_hdf_stack(replacement, np.arange(9).reshape(1, 3, 3))
             monkeypatch.setattr(api, "_hdf_dataset", _after_call(
                 api._hdf_dataset, lambda: os.replace(replacement, path), entered))
     elif axis == "hdf-dependency":
-        h5py = pytest.importorskip("h5py")
+        import h5py
         segment, replacement = tmp_path / "segment.h5", tmp_path / "replacement.h5"
         path = tmp_path / "master.nxs"
         _write_hdf_stack(segment, np.arange(6).reshape(1, 2, 3))
@@ -1706,7 +1708,7 @@ def test_r30_catalog_revision_brackets_valid_metadata(tmp_path, monkeypatch, axi
         monkeypatch.setattr(api, "_dependency", _after_call(
             api._dependency, lambda: os.replace(replacement, segment), entered))
     else:
-        h5py = pytest.importorskip("h5py")
+        import h5py
         root = tmp_path / "base-race"
         master, _, _ = _eiger_master(
             root, [("data_000001", np.arange(6).reshape(1, 2, 3))])
@@ -1828,7 +1830,7 @@ def test_memory_ledger_rejects_each_isolated_invariant(canonical, reservation, s
 )
 def test_rehashed_catalog_rejects_each_isolated_cross_field(tmp_path, axis):
     if axis == "fact-summary":
-        h5py = pytest.importorskip("h5py")
+        import h5py
         path = tmp_path / "processed.nexus"
         with h5py.File(path, "w") as handle:
             _processed_thumbnail(
@@ -1858,7 +1860,7 @@ _FIRST_SEGMENT_HINT = "/entry/data/data_000001"
 @pytest.mark.parametrize("axis", ["baseline", "unselected-drift", "selected-drift"],
                          ids=lambda axis: f"r45-v1-{axis}")
 def test_processed_eiger_selection_is_interval_local(tmp_path, monkeypatch, axis, hint):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw = np.arange(2 * 3, dtype=np.uint16).reshape(1, 2, 3)
     master, segments, arrays = _eiger_master(tmp_path / axis, [
         (f"data_{number:06d}.h5", raw + number * 100) for number in (1, 2)])
@@ -1908,7 +1910,7 @@ def _hinted_eiger_record(tmp_path, hint, *, frames=2, segments=2, thumbnails=Tru
     index and the dataset *hint*; a thumbnail beside every label when
     *thumbnails*, so a frame the raw resolution cannot reach shows up as
     the thumbnail fallback rather than as an absent label."""
-    h5py = pytest.importorskip("h5py")
+    import h5py
     raw = np.arange(frames * 2 * 3, dtype=np.uint16).reshape(frames, 2, 3)
     master, segment_paths, arrays = _eiger_master(tmp_path / "raw", [
         (f"data_{number:06d}.h5", raw + number * 100)
@@ -2031,7 +2033,7 @@ def test_catalog_validation_hashes_a_chain_identity_once_per_shape(tmp_path, mon
 
 
 def test_hdf_catalog_and_selected_read_use_no_python_payload_streams(tmp_path, monkeypatch):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     processed, _, _, arrays = _hinted_eiger_record(tmp_path, _FIRST_SEGMENT_HINT)
     before = h5py.h5f.get_obj_count(types=h5py.h5f.OBJ_FILE)
 
@@ -2060,7 +2062,7 @@ def test_win32_metadata_revision_refuses_an_ordinary_write(
     if family == "npy":
         np.save(path, value + 1)
     else:
-        h5py = pytest.importorskip("h5py")
+        import h5py
         with h5py.File(path, "r+") as handle:
             handle["entry/data/data"][0, 0, 0] += 1
     assert path.stat().st_mtime_ns != catalog.primary_revision.mtime_ns
@@ -2077,8 +2079,8 @@ _REAL_EIGER_RECORDS = (
 
 @pytest.mark.parametrize("record,labels", _REAL_EIGER_RECORDS)
 def test_processed_real_eiger_record_reaches_every_segment(record, labels, monkeypatch):
-    h5py = pytest.importorskip("h5py")
-    pytest.importorskip("hdf5plugin")
+    import h5py
+    import hdf5plugin  # noqa: F401
     configured = os.environ.get("XDART_TEST_DATA")
     if not configured:
         pytest.skip("XDART_TEST_DATA is not configured")
@@ -2137,7 +2139,7 @@ def test_processed_real_eiger_record_reaches_every_segment(record, labels, monke
     ("utf8", 4097), ("bytes", 4097)], ids=("r45-v2-utf8-4096",
     "r45-v2-bytes-4096", "r45-v2-utf8-4097", "r45-v2-bytes-4097"))
 def test_selected_direct_vlen_strings_use_one_fixed_bounded_read(tmp_path, monkeypatch, kind, size):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / f"{kind}-{size}.nxs"
     payload = ("é" * (size // 2) + "x" * (size % 2)
                if kind == "utf8" else b"x" * size)
@@ -2164,7 +2166,7 @@ def test_selected_direct_vlen_strings_use_one_fixed_bounded_read(tmp_path, monke
     "subarray-vlen", "compound-ref", "subarray-ref"],
     ids=lambda axis: f"r45-v2-{axis}")
 def test_selected_nested_or_nonstring_object_attributes_refuse_without_read(tmp_path, monkeypatch, axis):
-    h5py = pytest.importorskip("h5py")
+    import h5py
     path = tmp_path / f"{axis}.nxs"
     with h5py.File(path, "w") as handle:
         group = handle.create_group("entry")
@@ -2209,7 +2211,7 @@ def test_selected_nested_or_nonstring_object_attributes_refuse_without_read(tmp_
 @pytest.mark.parametrize("drift", ["shape", "dtype"],
                          ids=lambda drift: f"r45-v3-fabio-{drift}")
 def test_later_fabio_frame_metadata_refuses_before_global_data_decode(tmp_path, monkeypatch, drift):
-    fabio = pytest.importorskip("fabio")
+    import fabio
     path = tmp_path / f"later-{drift}.edf"
     first = np.arange(6, dtype=np.int16).reshape(2, 3)
     later = (np.arange(8, dtype=np.int16).reshape(2, 4) if drift == "shape"
@@ -2359,7 +2361,7 @@ def test_a_frame_just_over_the_budget_is_refused(monkeypatch):
 
 
 def test_windows_pc_reads_a_4096_square_16_bit_tiff(tmp_path, monkeypatch):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     path = tmp_path / "frame_4096.tif"
     tifffile.imwrite(path, (np.arange(4096 * 4096, dtype=np.uint32) % 65521).astype(np.uint16).reshape(4096, 4096))
     assert 32 * 1024**2 <= path.stat().st_size < 34 * 1024**2, "about 32 MB on disk, as at the beamline"

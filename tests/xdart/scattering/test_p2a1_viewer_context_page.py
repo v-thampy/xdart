@@ -96,7 +96,7 @@ def _mount_source(tmp_path, family):
     elif family == "eiger":
         path, _, _ = a0._eiger_master(tmp_path / "eiger", [("data_000001.h5", base[np.newaxis])])
     elif family == "processed":
-        h5py = pytest.importorskip("h5py")
+        import h5py
         raw = tmp_path / "source.nxs"
         a0._write_hdf_stack(raw, base[np.newaxis])
         thumb = base.astype(np.uint8)

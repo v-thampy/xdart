@@ -350,7 +350,7 @@ def test_public_observe_probe_and_read_real_extendible_nexus(tmp_path):
 
 
 def test_public_probe_rejects_real_truncated_tiff_then_reads_complete(tmp_path):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     complete = tmp_path / "complete.tif"
     image = np.arange(12, dtype=np.uint16).reshape(3, 4)
     tifffile.imwrite(complete, image)

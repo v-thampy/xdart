@@ -453,7 +453,7 @@ def test_a_tight_budget_shows_each_frame_after_the_previous_is_released(tmp_path
 
 @pytest.mark.skipif(os.environ.get("XDART_F4_TIMING") != "1", reason="diagnostic timing: XDART_F4_TIMING=1")
 def test_f4_read_and_draw_timing_of_a_4096_square_frame(tmp_path):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     import gc
     native = (np.arange(4096 * 4096, dtype=np.uint32) % 65521).astype(np.uint16).reshape(4096, 4096)
     path = tmp_path / "frame_4096.tif"

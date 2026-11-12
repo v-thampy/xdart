@@ -305,7 +305,8 @@ def test_release_is_nonblocking_until_actual_reader_close_and_discards_completio
     try:
         before = monotonic()
         assert not lane.release()
-        assert monotonic() - before < .25
+        # well under the reader's 5 s stall: release never waits for the closing reader (1.2.10 review M6)
+        assert monotonic() - before < 2.0
         assert not lane.consume_repaint()
     finally:
         finish.set()

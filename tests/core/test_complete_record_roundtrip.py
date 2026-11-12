@@ -32,7 +32,7 @@ _SHAPE = (64, 60)
 @pytest.fixture()
 def project(tmp_path):
     """A project root holding real single-frame TIFF sources."""
-    fabio = pytest.importorskip("fabio")
+    import fabio
     root = tmp_path / "proj"
     (root / "raw").mkdir(parents=True)
     rng = np.random.default_rng(11)

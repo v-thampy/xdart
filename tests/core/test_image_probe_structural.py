@@ -39,7 +39,7 @@ def _probe(path: Path):
 
 def _tiff_payload(tmp_path: Path) -> tuple[bytes, int]:
     """Return a complete TIFF and its first declared pixel-data offset."""
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     complete = tmp_path / "complete-fixture.tif"
     tifffile.imwrite(
         complete,
@@ -178,7 +178,7 @@ def test_tiff_header_variants_reject_truncated_payload_before_fabio(
 ) -> None:
     import fabio
 
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     complete = tmp_path / "variant-complete.tif"
     tifffile.imwrite(
         complete,
@@ -224,7 +224,7 @@ def test_complete_strip_and_tile_tiffs_remain_ready(
 ) -> None:
     import fabio
 
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     source = tmp_path / "complete.tif"
     tifffile.imwrite(
         source,
@@ -263,7 +263,7 @@ def test_complete_strip_and_tile_tiffs_remain_ready(
 def test_complete_tiff_probe_uses_only_header_reads(tmp_path, monkeypatch):
     import fabio
 
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     source = tmp_path / "large-complete.tif"
     tifffile.imwrite(
         source,

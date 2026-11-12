@@ -57,7 +57,7 @@ def test_nexus_stack_source_loads_chunks(tmp_path):
 
 
 def test_image_file_source_uses_existing_reader(tmp_path):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     from xrd_tools.sources import ImageFileSource, open_source
 
     path = tmp_path / "frame.tif"
@@ -71,7 +71,7 @@ def test_image_file_source_uses_existing_reader(tmp_path):
 
 
 def test_image_sources_preserve_native_dtype_for_saturation(tmp_path):
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     from xrd_tools.core.invalid import detector_value_mask
     from xrd_tools.sources import ImageFileSource, TiffSeriesSource
 

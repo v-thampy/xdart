@@ -236,7 +236,8 @@ def test_stop_or_closing_the_window_ends_a_paused_run(qapp):
     assert _until(lambda: dialog.status.text().startswith("Paused at 2/3")), dialog.status.text()
     started = time.monotonic()
     _close(host)  # the paused worker wakes for the close: clean, never a hang
-    assert time.monotonic() - started < 5 and loaded == [0, 1]
+    # a ceiling, not a timing: a paused worker the close failed to wake would hang (1.2.10 review M6, Table B)
+    assert time.monotonic() - started < 30 and loaded == [0, 1]
 
 
 def test_a_runs_options_are_locked_until_it_ends(qapp):

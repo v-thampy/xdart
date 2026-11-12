@@ -1154,7 +1154,7 @@ def test_metadata_key_domains_refuse_duplicate_and_overlap_before_effects(tmp_pa
 
 
 def test_average_static_mask_loads_authenticated_edf(tmp_path) -> None:
-    fabio = pytest.importorskip("fabio")
+    import fabio
     expected = np.array([[False, True], [True, False]], dtype=bool)
     mask_path = tmp_path / "mask.edf"
     fabio.edfimage.EdfImage(data=expected.astype("u1")).write(
@@ -1195,7 +1195,7 @@ def test_average_static_mask_decode_is_bound_to_authenticated_bytes(
         if suffix == ".npy":
             np.save(mask_path, value)
         else:
-            fabio = pytest.importorskip("fabio")
+            import fabio
             fabio.edfimage.EdfImage(data=value.astype("u1")).write(
                 str(mask_path)
             )

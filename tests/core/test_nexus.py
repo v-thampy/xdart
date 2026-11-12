@@ -812,7 +812,7 @@ class TestWriteNexus:
     def test_comp_kwargs_lz4_returns_hdf5plugin_codec_when_safe(self, monkeypatch):
         # On a machine where the lz4 plugin is available, "lz4" emits hdf5plugin's
         # LZ4 (filter 32004) + the HDF5 shuffle filter -- the reader needs hdf5plugin.
-        hdf5plugin = pytest.importorskip("hdf5plugin")
+        import hdf5plugin
         monkeypatch.setattr(_nexus_io, "_native_filter_unsafe", lambda: False)
         kw = _comp_kwargs("lz4")
         assert kw == dict(shuffle=True, **hdf5plugin.LZ4())
@@ -898,7 +898,7 @@ class TestResolveStackCompression:
     def test_lz4_round_trips_when_natively_supported(self, tmp_path, result_1d):
         # Real write+read of an lz4 stack -- runs wherever hdf5plugin is importable
         # (incl. arm64-macOS: the old bus error was h5py's bundled LZF, not LZ4).
-        pytest.importorskip("hdf5plugin")
+        import hdf5plugin  # noqa: F401
         if _nexus_io._native_filter_unsafe():
             pytest.skip("hdf5plugin not importable here")
         p = write_nexus(tmp_path / "lz4.nexus", results_1d={0: result_1d}, compression="lz4")

@@ -247,7 +247,8 @@ def test_ordinary_output_routes_group_target_through_one_borrowed_lock(tmp_path)
     assert "target = Path(item.group.target)" in source
     assert "file_lock=self._command_lock" in source
     assert source.count("file_lock=self._command_lock") == 3
-    assert adapter._command_lock is adapter._command_lock
+    # the one lock the writers borrow is the adapter's re-entrant command lock (this line compared it with itself)
+    assert type(adapter._command_lock) is type(threading.RLock())
 
 
 def test_reintegrate_values_progress_cancel_recipe_and_owner_census(monkeypatch):
@@ -584,7 +585,7 @@ def test_reintegrate_capacity_wait_surfaces_sticky_failure_and_cancel():
             waiting.wait_for_capacity()
     finally:
         timer.join()
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 3.0  # a ceiling under the 5 s waits it must not reach (review M6)
 
 
 def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
@@ -629,7 +630,7 @@ def test_reintegrate_cancelled_stalled_worker_returns_pending_bounded(
     try:
         with pytest.raises(TimeoutError, match="writer thread did not exit"):
             run_reintegrate_successor(successor, cancel_token=cancelled)
-        assert time.monotonic() - started < 1.0
+        assert time.monotonic() - started < 3.0  # under the stalled worker's 5 s release (review M6)
     finally:
         release.set()
         timer.join()

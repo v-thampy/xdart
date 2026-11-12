@@ -1027,7 +1027,7 @@ def test_pending_processed_browser_mutation_dominates_active_background(
 def test_raw_tiff_viewer_metadata_click_uses_auto_sidecar_plan(
     monkeypatch, qapp, tmp_path,
 ) -> None:
-    tifffile = pytest.importorskip("tifffile")
+    import tifffile
     image = tmp_path / "scan_0001.TIFF"
     tifffile.imwrite(image, np.ones((3, 4), dtype=np.uint16))
     image.with_suffix(".txt").write_text(

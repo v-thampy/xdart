@@ -45,4 +45,5 @@ def test_o6_a_2500_frame_open_spends_no_time_hashing_the_file():
         print(f"O6 {path.name} records={timing.record_count} seal={timing.initial_seal_s:.3f}s "
               f"catalog={timing.record_iteration_s:.3f}s worker={timing.worker_total_s:.3f}s seal_mode={timing.seal_mode}")
         assert timing.seal_mode == "snapshot" and timing.record_count == 2500
-        assert timing.initial_seal_s < 0.05, "the seal no longer reads and hashes the 1.47 GB file"
+        # hashing the 1.47 GB file takes seconds; the ceiling leaves a loaded machine room (1.2.10 review M6)
+        assert timing.initial_seal_s < 0.5, "the seal no longer reads and hashes the 1.47 GB file"

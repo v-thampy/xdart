@@ -28,7 +28,7 @@ jobs:
     name: xdart-offscreen (${{ matrix.group }})
     strategy:
       fail-fast: false
-      # Same six bounded groups as pr.yml: windows that tests close without
+      # Same seven bounded groups as pr.yml: windows that tests close without
       # deleting stay alive, and one process over the whole tests/xdart tree
       # grows that graph until theme repolishes time out. The files that
       # change the application's theme or font restyle every live widget, so
@@ -43,7 +43,11 @@ jobs:
           - group: viewers-analysis
             tests: tests/xdart/scattering/test_p*.py
           - group: scattering-other
-            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py
+            tests: tests/xdart/scattering --ignore-glob=tests/xdart/scattering/test_e[12346]*.py --ignore-glob=tests/xdart/scattering/test_p*.py --ignore=tests/xdart/scattering/test_live_revalidation_cost_run.py
+          # As in pr.yml: about 19 minutes on hosted CI by itself (2026-10-31); inside scattering-other the group
+          # reached its 75-minute limit (nightly #185 and #188 were cancelled there, 1.2.10 review M6).
+          - group: live-revalidation
+            tests: tests/xdart/scattering/test_live_revalidation_cost_run.py
           - group: application
             tests: >-
               tests/xdart --ignore=tests/xdart/scattering

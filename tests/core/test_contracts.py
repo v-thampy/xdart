@@ -136,7 +136,7 @@ def test_processed_scan_source_contract(tmp_path, monkeypatch):
     """The reader handle satisfies the full FrameSource contract — including
     the capabilities property (previously missing; the rsm boundary
     docstring claimed conformance)."""
-    fabio = pytest.importorskip("fabio")
+    import fabio
     root = tmp_path / "proj"
     (root / "raw").mkdir(parents=True)
     frames = []

@@ -373,9 +373,13 @@ def test_slice_pin_shared_axis_and_metadata_survive_replacement():
 
 def test_deep_selection_save_reload_equivalence_and_foreign_late_inert(mount, tmp_path):
     processed, _ = _write_result(tmp_path / "deep", list(range(1, 514)))
-    saved = read_frame_view(processed, 513)
     reloaded = read_frame_view(processed, 513)
-    assert_frameview_equivalent(saved, reloaded)
+    # the science _write_result saved for label 513, known independently of the read (Codex's A9: this row compared
+    # one read with another of the same row); the saved 2-D stack is (chi, q), the transpose of pyFAI's result
+    np.testing.assert_array_equal(reloaded.axis_1d.values, [0.1, 0.2, 0.3])
+    np.testing.assert_array_equal(reloaded.intensity_1d, np.array([1.0, 2.0, 3.0]) + 513)
+    np.testing.assert_array_equal(reloaded.intensity_2d, (np.arange(6.0).reshape(3, 2) + 513).T)
+    assert_frameview_equivalent(read_frame_view(processed, 513), reloaded)
     identity = RunIdentity(1, "deep")
     frame = DisplayFrameKey(identity, "deep", str(processed), 513, 513)
     payload = StandardDisplayPayload(0, frame, "deep:513", reloaded)

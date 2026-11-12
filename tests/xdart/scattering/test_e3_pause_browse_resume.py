@@ -58,9 +58,11 @@ from tests.xdart.scattering.test_e3_context_contract import (
 )
 
 
-_B_SHA256 = (
-    "6110bedb3bb14c1c30978f84b43716339ff099856ab55f96e4ca7f2d9c56a3c6"
-)
+#: The 16-frame grazing-incidence Combi4 scan in the real test data (XDART_TEST_DATA), reduced once per module by the
+#: real executor. Until 1.2.10 the fixture defaulted to a personal scratch file that no longer exists, so both rows
+#: that use it skipped everywhere (review M6).
+_B_RAW = Path("Tiff/Combi4_Angledependence_samz_4p9_03271005_0001.tif")
+_B_PONI = Path("Tiff/LaB6_detz190_dety72_th5_03261554_0001.poni")
 _EXPLICIT_NEXUS_RELATIVE = Path(
     "eiger/xdart_processed_data/"
     "Combi4_Angledependence_samz_4p9_03271005.nexus"
@@ -71,26 +73,40 @@ _EXPLICIT_NEXUS_SHA256 = (
 )
 
 
-def _browse_fixture() -> Path:
-    configured = os.environ.get("XDART_E3_BROWSE_FIXTURE")
-    candidates = (
-        Path(configured) if configured else None,
-        Path(
-            "/Users/vthampy/repos/tmp/codex-c3d-testdata-final/"
-            "xdart_processed_data/"
-            "Combi4_Angledependence_samz_4p9_03271005.nxs"
-        ),
+@pytest.fixture(scope="module")
+def _browse_fixture(tmp_path_factory) -> Path:
+    """The Combi4 scan reduced with GI (incidence motor th) into ``Combi4_..._03271005.nexus``, through the same
+    StartPipeline and StandardRunExecutor a Run uses."""
+    data_root = os.environ.get("XDART_TEST_DATA")
+    if not data_root:
+        pytest.skip(f"XDART_TEST_DATA is unset; expected {_B_RAW}")
+    raw, poni = Path(data_root) / _B_RAW, Path(data_root) / _B_PONI
+    if not (raw.is_file() and poni.is_file()):
+        pytest.skip(f"{_B_RAW} or {_B_PONI} is missing from XDART_TEST_DATA")
+    target = tmp_path_factory.mktemp("e3-browse") / "Combi4_Angledependence_samz_4p9_03271005.nexus"
+    intent = RunIntent(
+        source_spec=image_series_spec(raw), processing_mode="Int 2D", poni_file=str(poni),
+        project_root=str(raw.parent.parent), save_path=str(target), output_mode="Overwrite", max_cores=4,
+        bai_1d_args={"npt": 500, "method": "csr"}, bai_2d_args={"npt_rad": 200, "npt_azim": 200, "method": "csr"},
     )
-    path = next(
-        (item for item in candidates if item is not None and item.is_file()),
-        None,
-    )
-    if path is None:
-        pytest.skip("the accepted private E3 browse fixture is unavailable")
-    with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    assert digest == _B_SHA256
-    return path
+    intent.gi.enabled = True
+    intent.gi.incidence_motor = "th"
+    executor = StandardRunExecutor(join_timeout=5.0)
+    pipeline = StartPipeline(intents=RunIntentStore(intent), lifecycle=ScatteringCoordinator(),
+                             sources=FilesystemSourceAdapter(), executor=executor)
+    launched = pipeline.start(await_admission(executor, pipeline.begin()))
+    assert isinstance(launched, StartLaunched)
+    deadline, events = time.monotonic() + 180.0, []
+    try:
+        while not any(event.kind is StandardEventKind.FINISHED for event in events):
+            assert time.monotonic() < deadline, [event.kind for event in events][-5:]
+            assert not any(event.kind is StandardEventKind.FAILED for event in events), events[-1]
+            events.extend(executor.drain_events())
+            time.sleep(0.02)
+    finally:
+        executor.close(launched.run_identity)
+    assert target.is_file()
+    return target
 
 
 def _wait_outcome(
@@ -306,9 +322,9 @@ def test_browse_heavy_hydration_preserves_named_active_modes() -> None:
 
 
 def test_real_browse_load_is_off_thread_exact_and_independently_owned(
-    monkeypatch,
+    monkeypatch, _browse_fixture,
 ):
-    path = _browse_fixture()
+    path = _browse_fixture
     calls: list[tuple[str, str]] = []
     file_opens: list[tuple[str, str]] = []
     import h5py
@@ -465,8 +481,8 @@ def test_explicit_malformed_nexus_browse_is_refused_by_admission(
     loader.close()
 
 
-def test_real_browse_resume_keeps_exact_a_and_rejects_late_projection():
-    path = _browse_fixture()
+def test_real_browse_resume_keeps_exact_a_and_rejects_late_projection(_browse_fixture):
+    path = _browse_fixture
     _, lifecycle, executor, _, acquisition = _running_controller(gi=True)
     loader = BrowseLoader(max_items=32)
     controller = ContextController(
