@@ -172,6 +172,12 @@ class CalibrationFitWindow(FitWindow):
     def set_save_enabled(self, enabled, reason=''):
         self.save_button.apply_spec(replace(self.save_button.spec, enabled=enabled, reason=reason))
 
+    def show_save_refusal(self, message):
+        """Why a "Save geometry and use" did not save, on this window's own status line (the Stitched calibrant
+        panel's, shown); the next preview's summary replaces it (C-7)."""
+        self.panels.setCurrentWidget(self.pattern_view)
+        self.pattern_view.status.setText(f'Not saved: {message}')
+
     def _panel_changed(self, index):
         if (self.panels.widget(index) is self.pattern_view
                 and self.pattern_view.keyed_projection is None and not self._preview_busy):

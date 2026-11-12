@@ -2991,11 +2991,20 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         else:
             self.status.setText(detail)
 
-    def _guard(self, operation):
+    def _guard(self, operation, *, refused=None):
         try:
             operation()
         except Exception as error:
             self.status.setText(str(error))
+            if refused is not None:
+                refused(str(error))
+
+    def _save_refused(self, message):
+        """A "Save geometry and use" that was refused or failed, said on the fit window its click came from as well
+        as on this window's status line beneath it, so the click never ends silently (C-7)."""
+        window = self._calibration_fit_window
+        if window is not None and window.isVisible():
+            window.show_save_refusal(message)
 
     def _enumerate(self):
         def go():
@@ -3352,11 +3361,13 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 self._saving = self.fit
                 self._start('save', (self.fit, selected, pair_validation_angles(
                     self.fit, scan_angles=self._scan_angles(self.fit))))
-        self._guard(go)
+        self._guard(go, refused=self._save_refused if self._finish_after_save else None)
 
     def _save_and_close(self):
         """Finish through the existing pair writer; only a successful session and handoff close the windows."""
-        if self.active():
+        if self.active():  # said, never silent (C-7)
+            self.status.setText(self._BUSY_WAIT)
+            self._save_refused(self._BUSY_WAIT)
             return
         self._finish_after_save = True
         self._save()
@@ -3372,7 +3383,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if self.fit is not None and self._fit_setup is not None and self._setup_state() != self._fit_setup:
             self._invalidate_fit()
 
-    def _default_name(self, beam):
+    def _default_name(self, beam, folder=None):
         """The calibration's default file name, as Stitch names its results (maintainer, 2026-09-29:
         "spec_name_scan_no.json"): the calibrant scan's (the direct-beam scan's for a direct-beam
         geometry) SPEC file and scan, or its NeXus file; the first free name, since a saved calibration
@@ -3383,8 +3394,9 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         scan = re.match(r'\d+', self._text(prefix + 'scan') or '')
         stem = (f'{source.stem}_scan{scan[0]}' if scan and not (beam and self.beam_source_kind.currentData() == 'nexus')
                 else source.stem)
-        folder = ((source if source.is_absolute() else self.project_root / source).parent
-                  if source_text else self.project_root)
+        if folder is None:
+            folder = ((source if source.is_absolute() else self.project_root / source).parent
+                      if source_text else self.project_root)
         for count in range(1, 1000):
             name = folder / (f'{stem}.json' if count == 1 else f'{stem}_{count}.json')
             if not name.exists() and not xu_partner_path(name).exists():
@@ -3394,11 +3406,19 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def _save_path(self, *, beam=False, new_only=False):
         """The new calibration file the person chooses inside the project, or None."""
         from xdart.gui.widgets import file_dialogs
+        from xdart.utils.browse import browse_start_dir
         # The shared last-folder rule precedes the source folder; checks keep it inside the Project and new.
         suggested = self._default_name(beam)
+        offered = suggested.name
+        start = browse_start_dir(str(suggested), fallback=str(self.project_root))
+        if not (start and Path(start).resolve().is_relative_to(self.project_root)):
+            # His pick, 2026-11-12 ("<Project>/calibration (Recommended)"): a start the check below would refuse,
+            # outside the Project, offers the Project's calibration folder instead, as an absolute name (C-7).
+            suggested = self._default_name(beam, folder=self.project_root / 'calibration')
+            offered = str(suggested)
         picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
                                     current=str(suggested), fallback=str(self.project_root),
-                                    default_name=suggested.name)
+                                    default_name=offered)
         path = picks[0] if picks else ''
         if not path:
             return None
@@ -4145,6 +4165,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._job_status(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
+        finishing = kind == 'save' and self._finish_after_save  # a "Save geometry and use" (C-7)
         if os.environ.get('XDART_DEBUG_ORIENTATION'):
             _LOG.warning('calibration terminal kind=%s status=%s pending_metadata=%r orientation_generation=%s',
                          kind, terminal.status, self._pending_source_details, self._orientation_generation)
@@ -4346,6 +4367,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 self._close_after_save = False
                 self._finish_after_save = False
                 self._job_status(str(error))
+                if finishing:
+                    self._save_refused(str(error))
         elif terminal.status is OperationTerminalStatus.CANCELLED:
             self._close_after_save = False
             self._finish_after_save = False
@@ -4354,6 +4377,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._close_after_save = False
             self._finish_after_save = False
             self._job_status(terminal.failure_message)
+            if finishing:
+                self._save_refused(terminal.failure_message)
         if kind == 'orientation' and self.orientation_panel is not None:
             if terminal.status is OperationTerminalStatus.CANCELLED:
                 self.orientation_panel.finding_pane.set_text('Cancelled. No finding was adopted.')
