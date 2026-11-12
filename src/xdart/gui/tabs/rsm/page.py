@@ -47,7 +47,7 @@ from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindo
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
 from xdart.gui.tabs.scattering.context_projection import apply_keyed_presentation_background
-from xdart.gui.tabs.scattering.controls_editing import _same_output_path
+from xdart.gui.tabs.scattering.controls_editing import processed_data_folder, save_path_follows_project
 from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
 from xdart.gui.tabs.scattering.presentation_background import PresentationBackgroundOwner
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
@@ -323,14 +323,6 @@ def suggested_family(project_root, members):
     return family if is_artifact_family(family) else "rsm"
 
 
-def suggested_output(project_root, members):
-    """The output a page suggests for its ordered members: the stable slot ``<Project>/xdart_processed_data/
-    <family>_rsm.nexus`` of ``suggested_family``."""
-    from xrd_tools.io.output_path import resolve_finite_output_target
-    return str(resolve_finite_output_target(Path(project_root) / "xdart_processed_data",
-                                            suggested_family(project_root, members), operation_token="rsm"))
-
-
 class RSMPage(QtWidgets.QWidget):
     """The native RSM workspace."""
 
@@ -365,7 +357,7 @@ class RSMPage(QtWidgets.QWidget):
         self._format_choice = ""
         #: The source kind the Source rows and files last showed (a format edit swaps files only when it changes)
         self._source_kind_shown = None
-        self._output_suggested = True  # the output follows the Source until the user names one
+        self._output_suggested = True  # the Save Path follows the Project until the user chooses a folder (C-6)
         self._run_requested = False
         # Several RSMs per run (Stitch's Selection: 42,43 two RSMs), queued through the one owner one form at a
         # time as Stitch queues its outputs: the forms still to prepare (Preview) or prepare and grid (Run)
@@ -1092,8 +1084,9 @@ class RSMPage(QtWidgets.QWidget):
             self._source_changed(key)
         if key in {"data_format", "nexus_entry"}:
             self._project_data_format()
-        if key == "output_path":
-            self._output_suggested = not str(self._value("output_path")).strip()
+        if key == "output_path":  # the rule every tool shares (C-6): blank or the Project's default follows it
+            self._output_suggested = save_path_follows_project(
+                str(self._value("output_path")), str(self._value("project_root")))
         if key == "geometry_path":
             self._sync_calibration_window()
         if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
@@ -1241,10 +1234,10 @@ class RSMPage(QtWidgets.QWidget):
         return selection, options, self._queue_target(root) if outputs else None
 
     def _queue_target(self, project):
-        """(Project, the Save Path's folder): where several RSMs' outputs go, for their check while the scans are
+        """(Project, the Save Path folder): where several RSMs' outputs go, for their check while the scans are
         found (``_queue_refusals``, G11); None while the Save Path is blank (``build_forms`` refuses it)."""
         try:
-            return project, self._inside(project, str(self._value("output_path")).strip(), "output path").parent
+            return project, self._inside(project, str(self._value("output_path")).strip(), "Save Path")
         except (TypeError, ValueError, OSError):
             return None
 
@@ -1297,34 +1290,16 @@ class RSMPage(QtWidgets.QWidget):
             raise ValueError(f"{len(groups)} RSMs in the Source: Preview and Run queue them (build_forms)")
         return groups[0]
 
-    def _suggestion_members(self, root):
-        """The (path, scan) pairs the suggested output's family is named from: the found group's members when
-        the Source was found as it stands, else the rows' own without reading (one SPEC file's selected group,
-        or the NeXus files); none (the family ``rsm``) until then."""
-        from xrd_tools.sources.grouping import parse_stitch_scan_groups
-        found = self._groups
-        if found is not None and found[0] == self._group_key():
-            return found[1][0] if len(found[1]) == 1 else ()
-        kind = self._value("source_kind")
-        try:
-            files = self._source_files(root)
-            if kind == "NeXus":
-                return tuple((path, None) for path in files)
-            if kind == "Spec" and len(files) == 1 and self._value("scan_mode") == "Select Scans":
-                groups = parse_stitch_scan_groups(str(self._value("scan")))
-                return tuple((files[0], token) for token in groups[0]) if len(groups) == 1 else ()
-        except ValueError:
-            pass
-        return ()
-
     def _apply_suggestion(self):
-        """The suggested output while the user has named none; True when it changed."""
+        """The Save Path while it follows the Project: the Project's processed-data folder, the rule Int and Stitch
+        share (C-6); True when it changed. The result is named inside it from the scans (``build_form``)."""
         project = str(self._value("project_root")).strip()
         if not (self._output_suggested and project):
             return False
-        suggestion = suggested_output(project, self._suggestion_members(Path(project).expanduser()))
-        if _same_output_path(str(self._value("output_path")), suggestion, root=project):
+        current = str(self._value("output_path")).strip()
+        if current and save_path_follows_project(current, project):
             return False
+        suggestion = processed_data_folder(project)
         self._fields["output_path"] = replace(self._fields["output_path"], value=suggestion)
         self._rows["output_path"].apply_field(self._fields["output_path"])
         return True
@@ -1394,10 +1369,11 @@ class RSMPage(QtWidgets.QWidget):
         File (C4). A Source of several RSMs is ``build_forms``'s."""
         project = self._form_project()
         members = self._group_members()
-        output = self._inside(project, str(self._value("output_path")).strip(), "output path")
-        # the suggested output is its family's stable slot, and the result records that family
-        family = (suggested_family(project, members)
-                  if _same_output_path(str(output), suggested_output(project, members), root=str(project)) else None)
+        # the Save Path is a folder (C-6): the result is its family's stable slot in it, and records that family
+        folder = self._inside(project, str(self._value("output_path")).strip(), "Save Path")
+        family = suggested_family(project, members)
+        from xrd_tools.io.output_path import resolve_finite_output_target
+        output = resolve_finite_output_target(folder, family, operation_token="rsm")
         return self._form_for(project, members, output, family)
 
     def build_forms(self):
@@ -1409,7 +1385,7 @@ class RSMPage(QtWidgets.QWidget):
         groups = self._groups_members()
         if len(groups) == 1:
             return (self.build_form(),)
-        folder = self._inside(project, str(self._value("output_path")).strip(), "output path").parent
+        folder = self._inside(project, str(self._value("output_path")).strip(), "Save Path")
         forms, slots = [], {}
         for index, (members, (family, output)) in enumerate(
                 zip(groups, queue_output_slots(project, folder, groups), strict=True), 1):
@@ -1516,9 +1492,11 @@ class RSMPage(QtWidgets.QWidget):
                 need("experiment", f"the Mask File ({Path(mask).name} not found)")
             for text in self._source_needs(root):
                 need("source", text)
-            output = str(self._value("output_path")).strip()
-            if not output.endswith(".nexus"):
-                need("project", "an Output ending in .nexus")
+            output = str(self._value("output_path")).strip()  # a folder, as every tool's (C-6)
+            if not output:
+                need("project", "a Save Path folder")
+            elif output.lower().endswith(".nexus"):
+                need("project", "a Save Path folder, not a .nexus file")
             try:  # a UB given for an HKL map: its rows, or its SPEC file and scan
                 given = self._ub_override(root)
             except ValueError as error:
@@ -2723,8 +2701,9 @@ class RSMPage(QtWidgets.QWidget):
         kind = self._value("source_kind")
         current = self._source_paths[0] if key == "spec_path" and self._source_paths else self._value(key)
         common = dict(current=str(current or ""), fallback=str(self._value("project_root") or ""))
-        if key in {"project_root", "image_dir"} or key == "spec_path" and kind == "Directory":
-            picks = dialogs.browse(self, {"image_dir": "Choose images folder"}.get(key, "Choose folder"),
+        if key in {"project_root", "image_dir", "output_path"} or key == "spec_path" and kind == "Directory":
+            picks = dialogs.browse(self, {"image_dir": "Choose images folder",
+                                          "output_path": "Choose processed-data folder"}.get(key, "Choose folder"),
                                    folder=True, **common)
             if picks and key == "spec_path":
                 self.set_sources(picks[:1])
@@ -2747,10 +2726,6 @@ class RSMPage(QtWidgets.QWidget):
         elif key in {"dark_path", "flat_path"}:  # Int's file types for the correction images
             picks = dialogs.browse(self, {"dark_path": "Choose dark", "flat_path": "Choose flat field"}[key],
                                    file_filter=dialogs.CORRECTION_FILTER, **common)
-        elif key == "output_path":  # the shared save: the last folder, the current output's name
-            picks = dialogs.browse(self, "Choose RSM output", save=True, file_filter="NeXus result (*.nexus)",
-                                   default_name=Path(common["current"]).name if common["current"] else "",
-                                   **common)
         else:
             picks = dialogs.browse(self, "Choose " + self._fields[key].label, **common)
         if picks:
@@ -2883,7 +2858,7 @@ def build_rsm_page(services, parent):
     from xdart.gui.pages.project_defaults import ProjectDefaults
     page = RSMPage(services, parent)
     page.restore_last_settings()
-    project = ProjectDefaults(page._value, page.set_field, output_file=True)
+    project = ProjectDefaults(page._value, page.set_field)
     root, directory = project.location()
     if root and directory:
         page._result_browser.set_directory(directory, explicit=False)
@@ -2894,4 +2869,4 @@ def build_rsm_page(services, parent):
                       processing_mode=_RSMProcessingMode(page), write_mode=RunBarWriteMode(page.run_bar))
 
 
-__all__ = ["RSMPage", "build_rsm_page", "no_ub_warning", "suggested_output"]
+__all__ = ["RSMPage", "build_rsm_page", "no_ub_warning", "suggested_family"]

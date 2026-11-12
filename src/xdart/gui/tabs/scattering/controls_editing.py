@@ -574,29 +574,44 @@ def reduce_control_edit(
         return EditNoChange()
     candidate = snapshot.thaw()
     _install_value(candidate, path, parsed)
-    prior_default_save_path = (
-        str(Path(str(intent.project_root)).expanduser() / "xdart_processed_data")
-        if str(intent.project_root or "").strip()
-        else ""
-    )
     if (
         path == PROJECT_ROOT
         and str(parsed).strip()
-        and (
-            not str(intent.save_path or "").strip()
-            or bool(prior_default_save_path)
-            and _same_folder(str(intent.save_path), prior_default_save_path)
-        )
+        and save_path_follows_project(str(intent.save_path or ""), str(intent.project_root or ""))
     ):
-        candidate.save_path = str(
-            Path(str(parsed)).expanduser() / "xdart_processed_data"
-        )
+        candidate.save_path = processed_data_folder(str(parsed))
     if path == GI_ENABLED:
         _normalize_gi_units(
             candidate,
             was_enabled=intent.gi.enabled,
         )
     return candidate
+
+
+#: Every tool's default Save Path is this folder inside the Project: Int 1D/2D, Stitch and RSM (NEXT-1210 C-6).
+PROCESSED_DATA_FOLDER = "xdart_processed_data"
+
+
+def processed_data_folder(project_root: str) -> str:
+    """The default Save Path of every tool (Int 1D/2D, Stitch, RSM): ``<Project>/xdart_processed_data``. The
+    maintainer, 2026-11-12: "the save path should be the same and derived from the project folder in all cases"."""
+    return str(Path(str(project_root)).expanduser() / PROCESSED_DATA_FOLDER)
+
+
+def save_path_follows_project(save_path: str, project_root: str) -> bool:
+    """Whether a Project change moves this Save Path, in every tool: it is blank, or it is that Project's default
+    folder however it is spelled (a relative Save Path is inside the Project). A folder the user chose is kept."""
+    text = str(save_path or "").strip()
+    if not text:
+        return True
+    project = str(project_root or "").strip()
+    if not project:
+        return False
+    default = processed_data_folder(project)
+    if _same_folder(text, default):
+        return True
+    spelled = os.path.expanduser(text)
+    return not os.path.isabs(spelled) and _same_folder(os.path.join(os.path.expanduser(project), spelled), default)
 
 
 def _same_folder(left: str, right: str) -> bool:

@@ -44,7 +44,7 @@ from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
-from xdart.gui.tabs.scattering.controls_editing import _same_output_path
+from xdart.gui.tabs.scattering.controls_editing import processed_data_folder, save_path_follows_project
 from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
 from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
 from xdart.gui.tabs.scattering.shell_widgets import foldable
@@ -1435,14 +1435,8 @@ class StitchPage(QtWidgets.QWidget):
     def set_field(self, key, value):
         prior_project = str(self._value("project_root") or "") if key == "project_root" else ""
         prior_output = str(self._value("output_path") or "") if key == "project_root" else ""
-        output_follows_project = key == "project_root" and (
-            not prior_output.strip()
-            or _same_output_path(
-                prior_output,
-                str(Path(prior_project) / "xdart_processed_data"),
-                root=prior_project,
-            )
-        )
+        # the Save Path rule every tool shares (C-6): it moves with the Project while it is that Project's default
+        output_follows_project = key == "project_root" and save_path_follows_project(prior_output, prior_project)
         if key in self._range_keys:
             self._range_edited(self._fields[key].path, value)
             return
@@ -1491,7 +1485,7 @@ class StitchPage(QtWidgets.QWidget):
         elif key in {"unit", "map_axis"}:
             self._processing_axis_changed()
         elif key == "project_root" and output_follows_project:
-            self.set_field("output_path", str(Path(value) / "xdart_processed_data"))
+            self.set_field("output_path", processed_data_folder(value))
         if key in {"geometry_path", "project_root"}:
             self._refresh_xu_geometry()
         if key == "geometry_path":
@@ -2143,7 +2137,7 @@ class StitchPage(QtWidgets.QWidget):
                 output_families=tuple(part.strip() for part in str(value("output_family")).split(";")))
         output = str(value("output_path"))
         if not output:
-            output = str(Path(value("project_root")) / "xdart_processed_data")
+            output = processed_data_folder(value("project_root"))
         directory = Path(output)
         if not directory.is_absolute():
             directory = Path(value("project_root")) / directory

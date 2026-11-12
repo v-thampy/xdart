@@ -9,7 +9,6 @@ from typing import Callable
 class ProjectDefaults:
     read: Callable[[str], str]
     write: Callable[[str, str], None]
-    output_file: bool = False
 
     def location(self) -> tuple[str, str]:
         project = str(self.read("project_root") or "").strip()
@@ -18,15 +17,12 @@ class ProjectDefaults:
             path = Path(output).expanduser()
             if not path.is_absolute():
                 path = Path(project) / path
-            output = str(path.parent if self.output_file else path)
+            output = str(path)
         return project, output
 
     def inherit(self, location: tuple[str, str]) -> None:
         if str(self.read("project_root") or "").strip() or not location[0]:
             return
         self.write("project_root", location[0])
-        if location[1]:
-            output = location[1]
-            if self.output_file:
-                output = str(Path(output) / Path(self.read("output_path")).name)
-            self.write("output_path", output)
+        if location[1]:  # every tool's Save Path is a folder (C-6)
+            self.write("output_path", location[1])

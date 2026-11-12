@@ -19,7 +19,7 @@ from xdart.gui.pages.operation_owner import SingleWorkerOwner
 from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.rsm import page as page_module
-from xdart.gui.tabs.rsm.page import RSMPage, suggested_output
+from xdart.gui.tabs.rsm.page import RSMPage
 from xdart.gui.tabs.rsm.display import rsm_keyed_projection
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_ENABLED, THRESHOLD_MAX, THRESHOLD_MIN
@@ -190,11 +190,11 @@ def test_the_page_builds_the_retired_dialogs_exact_scan43_form(qapp, tmp_path):
                         corrections=replaced(form.corrections, threshold=StitchConditioning("auto")), **fields)
     page = _page(qapp, owner=_Owner())
     try:
-        output = tmp_path / "rsm.nexus"
+        output = tmp_path / "STO_align-43_rsm.nexus"  # the scan's slot in the Save Path folder (C-6)
         _sto_align(tmp_path)  # the preset's scan on disk: the page finds its member through Stitch's Source
         page.set_field("project_root", str(tmp_path))
         page.set_field("geometry_path", _canonical_partner(tmp_path))
-        page.set_field("output_path", str(output))
+        page.set_field("output_path", str(tmp_path))
         page.set_sources(["STO_align"])  # Project relative, as the preset names it
         for key, value in (("scan", "43"), ("image_dir", "images"), ("image_stem", "b_thampy_STO_align_scan43_"),
                            ("frame_last", "60")):
@@ -203,14 +203,15 @@ def test_the_page_builds_the_retired_dialogs_exact_scan43_form(qapp, tmp_path):
         geometry = page.build_form().geometry_asset
         assert page.build_form().fingerprint == _as_page(
             _scan43_dialog_form(tmp_path, output), overwrite=AnalysisArtifactOverwrite.REPLACE,
-            geometry_asset=geometry, max_chunk_bytes=None).fingerprint
+            geometry_asset=geometry, max_chunk_bytes=None, output_family="STO_align-43").fingerprint
         page.set_field("coordinates", RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name)
         page.set_field("grid", "Full 200×200×200")
         page.set_field("normalization", "None")
         assert page.build_form().fingerprint == _as_page(
             _scan43_dialog_form(tmp_path, output, frame=RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU,
                                 bins=rsm_tool_preset().full_bins, normalization=RSMNormalizationPolicy.identity()),
-            overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry, max_chunk_bytes=None).fingerprint
+            overwrite=AnalysisArtifactOverwrite.REPLACE, geometry_asset=geometry, max_chunk_bytes=None,
+            output_family="STO_align-43").fingerprint
     finally:
         _close(page, qapp)
 
@@ -289,15 +290,17 @@ def test_rsm_source_counts_match_stitch_and_follow_the_selected_scan(qapp, tmp_p
         _close(page, qapp)
 
 
-def test_suggested_output_comparison_normalizes_folder_spelling_and_keeps_custom_name(qapp, tmp_path):
+def test_save_path_folder_spelling_still_follows_and_a_chosen_folder_is_kept(qapp, tmp_path):
+    """The Save Path is a folder (C-6): the Project's default however it is spelled still follows the Project, and a
+    folder the user chooses is kept; either way the result is named in it from the scans and records its family."""
     from xdart.gui.tabs.rsm.page import suggested_family
 
     page = _page(qapp)
     try:
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
-        suggested = Path(page._value("output_path"))
-        alias = str(suggested.parent / "temporary" / ".." / suggested.name)
+        folder = Path(page._value("output_path"))
+        alias = str(folder.parent / "temporary" / ".." / folder.name)
         page._fields["output_path"] = replace(page._fields["output_path"], value=alias)
         page._rows["output_path"].apply_field(page._fields["output_path"])
         page._output_suggested = True
@@ -306,11 +309,11 @@ def test_suggested_output_comparison_normalizes_folder_spelling_and_keeps_custom
         expected_family = suggested_family(tmp_path, page._group_members())
         assert page.build_form().output_family == expected_family
 
-        custom = str(suggested.with_name("custom_rsm.nexus"))
-        page.set_field("output_path", custom)
+        chosen = str(tmp_path / "custom")
+        page.set_field("output_path", chosen)
         assert not page._output_suggested
-        assert page.build_form().output_family is None
-        assert page._value("output_path") == custom
+        assert page.build_form().output_family == expected_family
+        assert page._value("output_path") == chosen
     finally:
         _close(page, qapp)
 
@@ -416,8 +419,8 @@ def test_preview_lists_every_identity_and_run_paints_the_committed_six(qapp, tmp
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
         assert page._readiness[1], page._readiness
-        output = Path(page._value("output_path"))
-        assert str(output) == suggested_output(tmp_path, page.build_form().members)
+        output = Path(page.build_form().output_path)
+        assert output.parent == Path(page._value("output_path"))  # the result is named in the Save Path folder
         page.begin_preview()
         _wait(page, qapp, lambda: "Preview ready" in page.run_bar.readinessLabel.full_text())
         assert not output.parent.exists()  # Preview creates nothing (stage 2)
@@ -628,7 +631,7 @@ def test_scan43_through_the_page_commits_and_reopens_the_reference_result(qapp, 
         assert expected != off.payload.result_fingerprint
         page.begin_run()
         _wait(page, qapp, lambda: not page.active(), seconds=600)
-        output = page._value("output_path")
+        output = str(page.build_form().output_path)
         assert page.run_bar.readinessLabel.full_text() == f"Saved {Path(output).name}"
         committed = page._results[output]
         assert committed.result_fingerprint == expected
@@ -705,7 +708,7 @@ def test_scan43_from_a_rough_calibration_authored_in_the_window_runs_and_reopens
                 in page.preview_text.toPlainText().splitlines())
         page.begin_run()
         _wait(page, qapp, lambda: not page.active(), seconds=600)
-        output = page._value("output_path")
+        output = str(page.build_form().output_path)
         assert page.run_bar.readinessLabel.full_text() == f"Saved {Path(output).name}"
         committed = page._results[output]
         assert page.reopen(output)
@@ -846,7 +849,7 @@ def test_a_pending_verification_keeps_a_clickable_retry(qapp, tmp_path, monkeypa
         monkeypatch.setattr(operation, "read_analysis_artifact", fail_once)
         page.begin_run()
         _wait(page, qapp, lambda: page._owner.finalization is rsm_owner.RSMOwnerFinalization.VERIFICATION_PENDING)
-        assert Path(page._value("output_path")).is_file()
+        assert Path(page.build_form().output_path).is_file()
         assert not page._rows["output_path"].isEnabled() and page.retry_button.isEnabled()
         page.retry_button.click()
         qapp.processEvents()
@@ -1098,7 +1101,7 @@ def test_append_skips_an_up_to_date_output_and_replace_grids_it_again(qapp, tmp_
     try:
         _synthetic_source(tmp_path, full=True)
         _with_source(page, tmp_path, scans="1")
-        output = Path(page._value("output_path"))
+        output = Path(page.build_form().output_path)  # named in the Save Path folder (C-6)
         toggle = page.run_bar.writeModeButton
         assert toggle.isEnabled() and page.run_bar.write_mode() == "Append"
         assert toggle.toolTip().startswith("Append: skip the output")
@@ -1143,7 +1146,7 @@ def test_a_replace_repaints_the_new_result_under_the_same_name(qapp, tmp_path, m
         page.begin_run()
         _wait(page, qapp, lambda: page.shown is not None)
         assert page.shown[0] is first
-        assert Path(page._value("output_path")).is_file()
+        assert Path(page.build_form().output_path).is_file()
         monkeypatch.setattr(page_module, "make_rsm_viewer_values", {"payload": second}.__getitem__)
         page.begin_run()
         _wait(page, qapp, lambda: page.shown[0] is second and not page.active())
@@ -1168,7 +1171,7 @@ def test_a_refused_or_stopped_replace_keeps_the_prior_result_shown(qapp, tmp_pat
         page.begin_run()
         _wait(page, qapp, lambda: page.shown is not None and not page.active())
         prior = page.shown
-        assert Path(page._value("output_path")).is_file()
+        assert Path(page.build_form().output_path).is_file()
         _terminal_instead_of_gridding(monkeypatch, ModuleDisposition.REFUSED, "OUTPUT_NOT_PREVIOUS_ANALYSIS")
         page.begin_run()
         _wait(page, qapp, lambda: "refused" in label.full_text() and not page.active())
@@ -1539,7 +1542,7 @@ def test_a_bracket_selection_is_one_rsm_and_a_comma_selection_is_queued(qapp, tm
         assert all(form.output_family and Path(form.output_path).name == f"{form.output_family}_rsm.nexus"
                    for form in forms)
         assert len({form.output_path for form in forms}) == 2
-        assert {Path(form.output_path).parent for form in forms} == {Path(page._value("output_path")).parent}
+        assert {Path(form.output_path).parent for form in forms} == {Path(page._value("output_path"))}
         page.set_field("scan", "[1-2]")
         assert page._readiness[1], page._readiness
         page.resolve_source()
@@ -1892,7 +1895,7 @@ def test_a_save_path_changed_while_the_scans_were_found_asks_for_another_run(qap
         monkeypatch.setattr(rsm_values, "rsm_member_groups", held)
         page.begin_run()
         elsewhere = tmp_path / "elsewhere"
-        page.set_field("output_path", str(elsewhere / "named.nexus"))
+        page.set_field("output_path", str(elsewhere))
         release.set()
         _wait(page, qapp, lambda: not page.active() and "Run again" in label.full_text())
         assert label.full_text() == "The output changed while the scans were found: Run again"
@@ -2113,7 +2116,7 @@ def test_a_raw_nexus_source_is_one_rsm_named_by_its_entry(qapp, tmp_path):
         page.begin_run()  # gridded for real: five frames
         _wait(page, qapp, lambda: page.shown is not None and not page.active(), seconds=300)
         assert page.shown[0].shape == (12, 16, 20)
-        output = Path(page._value("output_path"))
+        output = Path(page.build_form().output_path)  # named in the Save Path folder (C-6)
         assert page.run_bar.readinessLabel.full_text() == f"Saved {output.name}" and output.is_file()
         page.begin_run()  # Append: the output already holds this RSM
         _wait(page, qapp, lambda: "Up to date" in page.run_bar.readinessLabel.full_text() and not page.active())

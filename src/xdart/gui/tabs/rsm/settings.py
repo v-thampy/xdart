@@ -17,6 +17,7 @@ partial document restores what it holds: the scan-43 one the tests ship names no
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from xdart.gui.tools.page_settings import (
@@ -41,7 +42,7 @@ def page_settings(page) -> dict[str, Any]:
         write_mode=page.run_bar.write_mode(),
         point_images=page.point_images.document(),
     )
-    if page._output_suggested:  # the Output follows the Source until a name is chosen, and so it does restored
+    if page._output_suggested:  # the Save Path follows the Project until a folder is chosen, and so it does restored
         document["fields"]["output_path"] = ""
     from .page import _UB_TYPED
     if page._value("ub_from") != _UB_TYPED:
@@ -58,6 +59,10 @@ def apply_page_settings(page, document: Any) -> None:
         page.point_images.restore(document["point_images"])
     fields = saved_fields(page, document, _NOT_FIELDS)
     fields.update(formats)
+    output = fields.get("output_path")
+    if isinstance(output, str) and output.strip().lower().endswith(".nexus"):
+        # 1.2.9 kept an output file here; the Save Path is its folder now (C-6), the result named in it from the scans
+        fields["output_path"] = str(Path(output.strip()).expanduser().parent)
     legacy = document.get("fields", {}).get("grid")
     if legacy is not None:
         from xdart.gui.tabs.rsm.page import _GRID_FIELDS, _GRIDS

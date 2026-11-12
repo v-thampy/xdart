@@ -55,7 +55,7 @@ def _every_input(root):
         "image_stem": "{spec}_scan{scan}_", "scan_mode": "All Scans", "scan": "[1-2]",
         "ub_from": "Typed", "ub_row1": "1 0 0", "ub_row2": "0 1 0", "ub_row3": "0 0 1",
         "ub_spec_path": "ub.spec", "ub_scan": "7",
-        "project_root": str(root), "output_path": str(root / "named_rsm.nexus"),
+        "project_root": str(root), "output_path": str(root / "named"),  # a chosen folder (C-6)
         "coordinates": RSMCoordinateFrame.Q_SAMPLE_CARTESIAN_XU.display_name,
         "grid_h": "60", "grid_k": "70", "grid_l": "80",
         "offset": "0.5", "static_hot": "", "normalization": "Monitor", "monitor": "I0",
@@ -111,20 +111,20 @@ def test_settings_round_trip_every_rsm_input(qapp, tmp_path):
         _close(restored, qapp)
 
 
-def test_a_suggested_output_is_saved_as_following_the_source(qapp, tmp_path):
-    """The Output follows the Source until a name is chosen (stage 2); a document keeps that, not the path it
-    suggested then, so a restored page (or another Project) suggests its own. A chosen name is kept."""
+def test_a_following_save_path_is_saved_as_following_the_project(qapp, tmp_path):
+    """The Save Path follows the Project until a folder is chosen (C-6); a document keeps that, not the folder it
+    showed then, so a restored page (or another Project) shows its own. A chosen folder is kept."""
     page, restored = _page(qapp, owner=_Owner()), _page(qapp, owner=_Owner())
     try:
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
-        assert page._output_suggested and page._value("output_path").endswith("_rsm.nexus")
+        assert page._output_suggested and page._value("output_path") == str(tmp_path / "xdart_processed_data")
         assert page.settings()["fields"]["output_path"] == ""
         restored.apply_settings(page.settings())
         restored.resolve_source()
         assert restored._output_suggested and restored._value("output_path") == page._value("output_path")
         assert restored.build_form().fingerprint == page.build_form().fingerprint
-        named = str(tmp_path / "mine_rsm.nexus")
+        named = str(tmp_path / "mine")
         page.set_field("output_path", named)
         restored.apply_settings(page.settings())
         assert not restored._output_suggested and restored._value("output_path") == named
