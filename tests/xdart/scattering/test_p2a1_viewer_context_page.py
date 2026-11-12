@@ -338,12 +338,12 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced(tmp_path, monkeypat
 
     Runs on the real page (1.2.10 review M6, Table A row 2), no longer on a SimpleNamespace page, controller, shell
     and executor. A real Int 2D Run leaves its retained acquisition; the delayed CONTEXT_READY carries that Run's
-    identity on the real executor's queue and the page's real drain takes it. The 2D Viewer is opened over the
-    retained acquisition through the page's own open while Int 2D stays the mode: no gesture reaches that state (the
-    mode switch clears the viewer before it commits), and it is the state this fence guards. Injected only at the
-    view boundary: the view's two refused clear receipts, and the shell's failing render.
+    identity on the real executor's queue and the page's real drain takes it. The 2D Viewer comes to own the display
+    in Int 2D by a real route: a profile saved in Int 2D is loaded while the 2D Viewer shows the result (Config:Load
+    commits its mode without the viewer clear the mode switch does), the state this fence guards. Injected only at
+    the view boundary: the view's two refused clear receipts, and the shell's failing render; the profile chooser
+    is answered.
     """
-    import h5py
     from pyqtgraph.Qt import QtWidgets
     from tests.xdart.scattering.test_gi_motorless_source import _close, _wait
     from tests.xdart.scattering.test_int_prerun_checks import _page as run_page, _run
@@ -369,12 +369,15 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced(tmp_path, monkeypat
 
         # the Run's end shows its result in Browse, and Run is offered again (its finalized Browse has settled)
         _wait(app, lambda: result_shown() and page._start_permitted() == (True, ""))
-        stack = tmp_path / "viewer.h5"
-        with h5py.File(stack, "w") as handle:
-            handle.create_dataset("entry/data/data", data=np.arange(3 * 12 * 16, dtype=np.uint16).reshape(3, 12, 16))
-        page._open_viewer_2d_path(str(stack))
+        profile = tmp_path / "int2d.json"
+        monkeypatch.setattr(page, "_profile_path_chooser", lambda _action, _start: str(profile))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.MENU, "Config:Save"))
+        assert profile.is_file(), page._notice_text
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PROCESSING_MODE, "2D Viewer"))
+        assert controller.viewer_2d_context is not None, page._notice_text  # the viewer's open was admitted
         _wait(app, viewer_shown)
-        assert page._intents.snapshot().thaw().processing_mode == "Int 2D"
+        page._handle_shell_command(ShellCommand(ShellCommandKind.MENU, "Config:Load"))
+        assert page._intents.snapshot().thaw().processing_mode == "Int 2D", page._notice_text
         assert controller.viewer_2d_owned and controller.selection.kind is ContextKind.VIEWER_2D
 
         calls, adopted, refusals = [], [], []
@@ -417,11 +420,13 @@ def test_page_clear_select_scan_and_delayed_event_are_fenced(tmp_path, monkeypat
         # no viewer projection survives: the real selection draws the result's own at once
         assert not controller.viewer_2d_owned and page._last_scientific_projection is not viewer_projection
         _wait(app, result_shown)  # the retained Run's own result: its acquisition shows it again
+        assert adopted == []
         executor._events.put(event)
         page._drain_executor()
         assert adopted == [identity], "with the viewer closed, the same event reaches the acquisition owner"
 
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PROCESSING_MODE, "2D Viewer"))
+        assert controller.viewer_2d_context is not None, page._notice_text
         _wait(app, viewer_shown)
         events = []
         drop, set_mode, apply_state = (view.drop_viewer_loading_snapshot, page._shell.browser.set_filename_mode,
@@ -509,7 +514,7 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
     page.show()
     try:
         controller, view, button = page._context_controller, page._shell.scientific, page._shell.run_controls.startButton
-        _wait(app, button.isEnabled)
+        _wait(app, lambda: button.isEnabled() and page._source_selection.observation is not None)
 
         def entering(name, call):
             def recorded(*args, **kwargs):
@@ -565,10 +570,10 @@ def test_real_viewer_chooser_preserves_opaque_identity_and_acquisition_isolation
                     "abspath", "expanduser", "exists", "isfile", "realpath", "splitext", "stat", "open"}, filesystem))
                 button.click()
             assert calls == expected, calls
+            assert entered == [] and filesystem == [], (entered, filesystem)
             _wait(app, shown)
             assert controller.viewer_2d_context.original_path == selected
         assert chosen == [""], "the second Run reloads the shown file without the chooser"
-        assert entered == [] and filesystem == [], (entered, filesystem)
         assert (source.mode, source.history, source.live_source) == source_state
     finally:
         _close(page, app)
