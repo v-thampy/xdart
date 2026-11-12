@@ -10,7 +10,6 @@ import json
 
 # Other imports
 import numpy as np
-import pandas as pd
 from pyFAI.units import Unit
 
 # Qt imports
@@ -192,95 +191,6 @@ class GridAxisItem(pg.AxisItem):
             self.grid_rows = tuple(spec for spec in tickSpecs if _is_grid_row(*spec))
             tickSpecs = [spec for spec in tickSpecs if not _is_grid_row(*spec)]
         pg.AxisItem.drawPicture(self, p, axisSpec, tickSpecs, textSpecs)
-
-
-class DFTableModel(QtCore.QAbstractTableModel):
-    """TableModel for handling pandas DataFrame. Used with a QTableView.
-    See QAbstractTableModel for details on implemented methods.
-    
-    attributes:
-        dataFrame: pandas DataFrame, where data is stored.
-    """
-    def __init__(self, data=None, parent=None):
-        super().__init__(parent)
-        if data is None:
-            data = pd.DataFrame()
-        self.dataFrame = data
-    
-    def data(self, index, role=QtCore.Qt.DisplayRole):
-        if index.isValid():
-            if role == QtCore.Qt.DisplayRole:
-                return str(self.dataFrame.iloc[index.row(), index.column()])
-        return None
-
-    def rowCount(self, parent):
-        return self.dataFrame.shape[0]
-    
-    def columnCount(self, parent):
-        return self.dataFrame.shape[1]
-    
-    def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):
-        if role == QtCore.Qt.DisplayRole:
-            if orientation == QtCore.Qt.Horizontal:
-                try:
-                    return str(self.dataFrame.columns.values[section])
-                except IndexError:
-                    return ' '
-            elif orientation == QtCore.Qt.Vertical:
-                try:
-                    return str(self.dataFrame.index[section])
-                except IndexError:
-                    return ' '
-        return QtCore.QAbstractTableModel.headerData(self, section, orientation, role)
-    
-    
-class NamedActionParameterItem(ParameterItem):
-    """pyqtgraph ActionParameterItem which can display a title.
-    """
-    def __init__(self, param, depth):
-        ParameterItem.__init__(self, param, depth)
-        # self.layoutWidget = QtGui.QWidget()
-        self.layoutWidget = QtWidgets.QWidget()
-        # self.layout = QtGui.QHBoxLayout()
-        self.layout = QtWidgets.QHBoxLayout()
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        self.layoutWidget.setLayout(self.layout)
-        title = param.opts.get('title', None)
-        if title is None:
-            title = param.name()
-        # self.button = QtGui.QPushButton(title)
-        self.button = QtWidgets.QPushButton(title)
-        #self.layout.addSpacing(100)
-        self.layout.addWidget(self.button)
-        self.layout.addStretch()
-        self.button.clicked.connect(self.buttonClicked)
-        param.sigNameChanged.connect(self.paramRenamed)
-        self.setText(0, '')
-        
-    def treeWidgetChanged(self):
-        ParameterItem.treeWidgetChanged(self)
-        tree = self.treeWidget()
-        if tree is None:
-            return
-        
-        self.setFirstColumnSpanned(True)
-        tree.setItemWidget(self, 0, self.layoutWidget)
-        
-    def paramRenamed(self, param, name):
-        self.button.setText(name)
-        
-    def buttonClicked(self):
-        self.param.activate()
-
-        
-class NamedActionParameter(Parameter):
-    """Used for displaying a button within the tree."""
-    itemClass = NamedActionParameterItem
-    sigActivated = QtCore.Signal(object)
-
-    def activate(self):
-        self.sigActivated.emit(self)
-        self.emitStateChanged('activated', None)
 
 
 from pyqtgraph.parametertree import registerParameterType
