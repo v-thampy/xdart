@@ -221,3 +221,47 @@ def test_a_target_created_before_the_stream_reservation_is_never_clobbered(tmp_p
     assert [status for status, _ in first] == ["FAILED"], first
     assert target.read_bytes() == foreign
     assert _files(save) == ["scan_int1d.nexus"], _files(save)
+
+
+def test_a_fresh_live_append_keeps_the_resumable_writer(tmp_path, monkeypatch):
+    """Live is excluded from B-2: a Live Run keeps one scan's session open across epochs, so its first epoch on a
+    new output must stay resumable (not the fast writer, its empty seed or its no-partial rule). A Stop keeps the
+    stopped epoch's frames."""
+    from tests.xdart.scattering.test_live_qualify_refusal_run import _stop
+
+    seen = {"admitted_fast": [], "writer_fast": []}
+    real_admit = transaction_api.OutputTransactionCoordinator.admit
+
+    def admit(self, *args, **kwargs):
+        transaction = real_admit(self, *args, **kwargs)
+        seen["admitted_fast"].append(transaction.fast_regenerable)
+        return transaction
+
+    real_readback = record_writer.NexusRecordWriter._verify_dirty_evidence
+
+    def readback(self, *args, **kwargs):
+        seen["writer_fast"].append(self._fast_regenerable)
+        return real_readback(self, *args, **kwargs)
+
+    monkeypatch.setattr(transaction_api.OutputTransactionCoordinator, "admit", admit)
+    monkeypatch.setattr(record_writer.NexusRecordWriter, "_verify_dirty_evidence", readback)
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for index in range(1, 4):
+        _frame(raw, "scan", index, "txt", float(index))
+    intent = _intent(tmp_path, raw, live=True)
+    intent.save_path = str(tmp_path / "live")
+    executor = StandardRunExecutor(join_timeout=5.0)
+    identity, events, deadline = _start(executor, intent, request_value=13), [], time.monotonic() + 120
+    while len({event.frame_key.local_frame_label for event in events
+               if event.kind is StandardEventKind.FRAME_READY}) < 3 and not any(
+            event.kind in _TERMINAL for event in events):
+        assert time.monotonic() < deadline, "frames never ready"
+        events.extend(executor.drain_events())
+        time.sleep(0.01)
+    terminals = _stop(executor, identity, events)
+    assert [status for status, _ in terminals] == ["STOPPED"], terminals
+    assert seen["admitted_fast"] and not any(seen["admitted_fast"]), seen
+    assert seen["writer_fast"] and not any(seen["writer_fast"]), seen
+    (output,) = sorted((tmp_path / "live").rglob("*.nexus"))
+    assert _labels(output) == [1, 2, 3]
