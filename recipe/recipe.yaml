@@ -97,6 +97,7 @@ requirements:
     - nexpy ==2.0.3               # external NeXus browser; silx view is already included
     - imagecodecs
     - imageio
+    - pillow                      # the experiment-authoring editor imports PIL directly
     - packaging
     - menuinst                    # creates the Start-menu/Applications shortcut
     # GUI analysis tools the Tools menu + the Grazing/GI workflow surface -- ship
@@ -124,6 +125,7 @@ tests:
         - xrd_tools               # headless core (import-light)
         - xdart                   # GUI package imports without a display
         - tifffile                # read at Run admission for every TIFF scan
+        - PIL                     # the experiment-authoring editor's image reader
         - ipykernel               # the notebook stack is part of the package
         - ipympl
         - ipywidgets

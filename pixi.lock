@@ -10997,6 +10997,7 @@ packages:
   - nexpy==2.0.3 ; extra == 'gui'
   - imagecodecs ; extra == 'gui'
   - imageio ; extra == 'gui'
+  - pillow ; extra == 'gui'
   - packaging ; extra == 'gui'
   - xdart[fitting,rsm,notebook] ; extra == 'gui'
   - ipywidgets ; extra == 'notebook'
