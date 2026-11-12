@@ -82,16 +82,7 @@ _STRINGS: dict[str, str] = dict.fromkeys(
     ("DATA BROWSER", "fileMenuButton", "configMenuButton", "helpMenuButton"), _BROWSER_OWNER,
 )
 
-_DEBT: dict[str, dict[str, int]] = {
-    # Int's page's own Open/Save choosers, found when tabs/scattering was fenced (1.2.10, NEXT-1210-SMALL-FIXES D-2);
-    # they bypass file_dialogs' one Browse rule (live_findings_ledger INT-PAGE-FILE-DIALOGS-1210).
-    "tabs/scattering/page.py": {
-        "QFileDialog.getExistingDirectory": 1,
-        "QFileDialog.getOpenFileName": 4,
-        "QFileDialog.getOpenFileNames": 1,
-        "QFileDialog.getSaveFileName": 2,
-    },
-}
+_DEBT: dict[str, dict[str, int]] = {}  # Int's page's eight file choosers moved onto file_dialogs.ask (1.2.10)
 
 
 def _fenced_modules() -> list[Path]:
