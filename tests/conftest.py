@@ -16,9 +16,13 @@ xdart tests are collected first.  ``setdefault`` so an explicit ``QT_API`` in
 the environment still wins.
 """
 import os
+import tempfile
 
 os.environ.setdefault("QT_API", "PySide6")
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
+# The user's phase library (~/.xdart/phases) is never a test's: a test that adds a CIF without choosing a library of its
+# own writes into this per-process folder (1.2.10 terminal battery: one such test wrote TiN into a real library).
+os.environ.setdefault("XDART_PHASE_LIBRARY", os.path.join(tempfile.mkdtemp(prefix="xdart_test_phases_"), "phases"))
 
 
 # ---------------------------------------------------------------------------
