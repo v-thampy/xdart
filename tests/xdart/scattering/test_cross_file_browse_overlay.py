@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -13,6 +12,7 @@ from tests.xdart.scattering.test_e4_accumulation_selection_parity import _click_
 from tests.xdart.scattering.test_e4_preview_transport import _write_processed
 from tests.xdart.scattering.test_p3_experiment_operation_composition import _page
 from tests.xdart.scattering.test_p34_reintegrate_operation import _wait
+from xdart.gui.tabs.scattering.browse_1d_hydration import Browse1DHydrationLane
 from xdart.gui.tabs.scattering.events import CleanupStatus
 from xdart.gui.tabs.scattering.hydration_transport import HydrationTransport
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
@@ -27,12 +27,10 @@ def _first_file_reads_settled(owner) -> bool:
     reports as a pending cleanup; ledger BROWSE-REOPEN-CLEANUP-PENDING)."""
     if owner is None:
         return True
-    one_d, slices = owner._one_d_lane, owner._slice_lane
     return not (
-        owner.transport.retains_gate(owner._gate)
-        or one_d._active is not None or one_d._ready_pending
-        or (slices is not None and (slices._active is not None or slices._repaint))
-        or not owner._repaints.empty()
+        owner.polling_needed()
+        or owner.transport.retains_gate(owner._gate)
+        or (owner._owns_transport and owner.transport.worker is not None)
     )
 
 
@@ -47,7 +45,8 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
     tmp_path, monkeypatch, qapp, mode, case,
 ):
     waits = case == "waits"
-    first, _ = _write_processed(tmp_path / "first", labels=(1, 2))
+    late_read = case == "opens-after-late-read"
+    first, _ = _write_processed(tmp_path / "first", labels=(1, 2, 3) if late_read else (1, 2))
     second, _ = _write_processed(tmp_path / "second", labels=(1, 2))
     persisted = (get_1d(first, 2), get_1d(second, 1))
     store = RunIntentStore(RunIntent(
@@ -56,6 +55,7 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
     page, _ = _page(tmp_path, monkeypatch, store=store)
     controller, shell = page._context_controller, page._shell
     view = shell.scientific
+    release_read = threading.Event()
 
     def settled(path, label):
         frame = controller.navigation.current
@@ -111,19 +111,26 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
             # CI-FLAKE-OVERLAY-OPENS (hosted run 40636668726): on a slow runner the first file's preview reads can
             # still hold its gate here, so the open defers as in the "waits" case; this case opens once they are done
             owner = controller._browse_hydration_owner
-            if case == "opens-after-late-read" and owner is not None:
-                # A 1-D read of the first file still in flight, done 0.3 s later (PR #8 run 43267789395: the open
-                # deferred on a pending Browse cleanup, not on the preview gate).
-                lane, busy = owner._one_d_lane, SimpleNamespace(
-                    cancelled=threading.Event(), cleanup_pending=False, running=True)
-                with lane._lock:
-                    lane._active = busy
+            if late_read:
+                assert owner is not None
+                _wait(lambda: True if _first_file_reads_settled(owner) else None)
+                entered_read = threading.Event()
+                real_read = Browse1DHydrationLane._open_and_read
 
-                def read_done():
-                    with lane._lock:
-                        if lane._active is busy:
-                            lane._active = None
-                threading.Timer(0.3, read_done).start()
+                def held_read(lane, task, labels, fact_labels):
+                    if lane is owner._one_d_lane:
+                        entered_read.set()
+                        assert release_read.wait(10)
+                    return real_read(lane, task, labels, fact_labels)
+
+                monkeypatch.setattr(Browse1DHydrationLane, "_open_and_read", held_read)
+                unread = controller.navigation.frames[2]
+                assert owner.submit_1d(owner._one_d_lane.context, controller.selection, (unread,)) is not None
+                assert entered_read.wait(5), "the first file never began reading frame 3"
+                assert not _first_file_reads_settled(owner)
+                page._ensure_timer()  # The direct lane submission bypassed the page's normal timer wake.
+                # Release only after the GUI event loop runs, so a synchronous open here would defer.
+                QtCore.QTimer.singleShot(0, release_read.set)
             _wait(lambda: True if _first_file_reads_settled(owner) else None)
         assert open_file(second) is waits
         _click_frame(qapp, shell, 0)
@@ -139,6 +146,7 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
             np.testing.assert_array_equal(item.xData, expected.q)
             np.testing.assert_array_equal(item.yData, expected.intensity)
     finally:
+        release_read.set()
         _wait(lambda: True if page.close_workspace().cleanup_status is CleanupStatus.CLEANED else None)
         page.deleteLater()
         qapp.processEvents()
