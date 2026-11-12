@@ -30,6 +30,7 @@ def test_finish_timings_are_opt_in_and_preserve_records(tmp_path, monkeypatch, t
                 "writer_finish_" + name for name in (
                     "metadata", "flush", "admission", "checkpoint", "close",
                     "replace", "resume", "receipt", "publication_drop",
+                    "checkpoint_readback",  # the checkpoint's own readback, named for the Run's summary (B-4)
                 )
             }
             assert all(value >= 0 for value in measured.values())
