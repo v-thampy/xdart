@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 import heapq
-import os
 from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Mapping
@@ -56,18 +55,12 @@ def browse_1d_row_name(mode: str, component: str) -> str:
 
 
 def _detect_physical_ram_bytes() -> int | None:
-    """Return installed RAM without adding an optional runtime dependency."""
+    """Installed RAM from the one detector (``os.sysconf``, then Windows; 1.2.10 review M5)."""
 
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
-    if type(pages) is not int or type(page_size) is not int:
-        return None
-    if pages <= 0 or page_size <= 0:
-        return None
-    return pages * page_size
+    from xrd_tools.core.staging import total_physical_ram_bytes
+
+    detected = total_physical_ram_bytes()
+    return detected if type(detected) is int and detected > 0 else None
 
 
 def default_browse_1d_cache_budget(

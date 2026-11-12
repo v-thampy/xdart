@@ -54,8 +54,9 @@ def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(value)))
 
 
-def total_physical_ram_bytes() -> int | None:
-    """Total physical RAM in bytes, or ``None`` if it can't be detected."""
+def posix_physical_ram_bytes() -> int | None:
+    """Total physical RAM from ``os.sysconf`` (macOS, Linux), or ``None`` where it has none (Windows) or fails. Only a
+    caller with its own Windows policy reads this directly (Viewer 2D's floor, the private staging guard)."""
     try:
         pages = os.sysconf("SC_PHYS_PAGES")
         page_size = os.sysconf("SC_PAGE_SIZE")
@@ -66,10 +67,18 @@ def total_physical_ram_bytes() -> int | None:
     return pages * page_size
 
 
+def total_physical_ram_bytes() -> int | None:
+    """Total physical RAM in bytes, or ``None`` if it can't be detected: ``os.sysconf``, then Windows'
+    ``GlobalMemoryStatusEx``. The one detector for the RAM-aware defaults (worker cap, heavy window, the Live record and
+    Browse publication caps, the Browse 1D cache); each caller keeps its own policy and fallback. Before 1.2.10 it read
+    ``os.sysconf`` only, so every Windows PC took those fallbacks (review M5; the maintainer's "Move them")."""
+    return posix_physical_ram_bytes() or windows_physical_ram_bytes()
+
+
 def windows_physical_ram_bytes() -> int | None:
     """Total physical RAM on Windows, where ``os.sysconf`` has none (``GlobalMemoryStatusEx``); ``None`` elsewhere or
     if it can't be read. Callers choose their own memory policy and fallback; this does not change the separate
-    POSIX-only ``total_physical_ram_bytes`` detector."""
+    POSIX ``posix_physical_ram_bytes`` reading."""
     if sys.platform != "win32":
         return None
     import ctypes

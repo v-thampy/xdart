@@ -193,11 +193,9 @@ class EnvProvenance:
             import psutil  # noqa: WPS433
             ram_gb = round(psutil.virtual_memory().total / 1e9, 1)
         except Exception:
-            try:
-                ram_gb = round(
-                    os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9, 1)
-            except (ValueError, OSError, AttributeError):
-                ram_gb = None
+            from xrd_tools.core.staging import total_physical_ram_bytes
+            total = total_physical_ram_bytes()  # os.sysconf, then Windows (1.2.10 review M5)
+            ram_gb = round(total / 1e9, 1) if total else None
 
         return cls(
             git_sha=git_sha,

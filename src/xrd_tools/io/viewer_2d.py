@@ -18,7 +18,8 @@ from pathlib import Path
 
 import numpy as np
 from xrd_tools.core import staging as _staging
-from xrd_tools.core.staging import total_physical_ram_bytes as _physical_ram_bytes
+# The POSIX reading: this budget has its own Windows policy below (never lower a small PC below the fallback)
+from xrd_tools.core.staging import posix_physical_ram_bytes as _physical_ram_bytes
 from xrd_tools.io.stat_identity import identity_ctime_ns
 
 SUPPORTED_VIEWER_SUFFIXES = frozenset({

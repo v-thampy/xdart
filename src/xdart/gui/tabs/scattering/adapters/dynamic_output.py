@@ -57,6 +57,7 @@ from xrd_tools.core.scan import SourceKind
 from xrd_tools.core.staging import (
     browse_publication_max_items,
     heavy_window,
+    posix_physical_ram_bytes,
     total_physical_ram_bytes,
     windows_physical_ram_bytes,
 )
@@ -132,9 +133,11 @@ DEFAULT_OUTPUT_DIAGNOSTICS = _PostG2OutputDiagnosticsChoice()
 PERFORMANCE_DIAGNOSTICS_KEYS = PROCESS_PRIVATE_RUN_OPTIONS
 
 
-def pipeline_incompatibility(configuration, *, coordinated=True) -> str:
-    """Why this Run cannot take a pipeline choice ("" when it can): only a non-Live, non-Batch, coordinated Overwrite Run
-    with NeXus output takes one."""
+def pipeline_incompatibility(configuration) -> str:
+    """Why this Run cannot take a pipeline choice ("" when it can): only a non-Live, non-Batch Overwrite Run with NeXus
+    output takes one. ``prepare_admission`` drops the stored private options of any other Run before they are parsed
+    (1.2.10 review H3: such a Run used to refuse them and skip every scan); the parsers below stay strict for a Run that
+    takes them."""
     if configuration.live_mode:
         return "a Live Run"
     if configuration.batch_mode:
@@ -142,22 +145,23 @@ def pipeline_incompatibility(configuration, *, coordinated=True) -> str:
     if configuration.output_mode != "Overwrite":
         mode = str(configuration.output_mode)
         return f"{'an' if mode[:1] in 'AEIOU' else 'a'} {mode} Run"
-    if not coordinated:
-        return "an uncoordinated Run"
     if configuration.processing_mode == "Int 1D (XYE)":
         return "an XYE-only Run"
     return ""
 
 
 def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
-    """The Run's pipeline choice, or None for a Run that cannot take one. A stored choice is checked strictly only for a
-    Run that can take it; any other Run ignores it, whatever it holds (1.2.10 review H3: a Live, Batch or Append Run used
-    to refuse it and skip every scan), and its adapter says so once (``_note_ignored_diagnostics``)."""
     value = configuration.run_options.get("_post_g2_pipeline_v2", _MISSING)
-    if pipeline_incompatibility(configuration, coordinated=coordinated):
-        return None
     if value is _MISSING:
-        return DEFAULT_PIPELINE_V2
+        if (
+            configuration.live_mode
+            or configuration.batch_mode
+            or configuration.output_mode != "Overwrite"
+            or not coordinated
+            or configuration.processing_mode == "Int 1D (XYE)"
+        ):
+            return None
+        return _PostG2PipelineV2Choice(1, 8, 8, 16, 64)
     if not isinstance(value, Mapping):
         raise TypeError("post-G2 pipeline V2 choice must be one exact mapping")
     if set(value) != _POST_G2_PIPELINE_V2_FIELDS:
@@ -182,6 +186,16 @@ def _post_g2_pipeline_v2_choice(configuration, *, coordinated):
             "post-G2 pipeline V2 semantic checkpoint exceeds the staging "
             "cap minus its 8-frame safety margin"
         )
+    if configuration.live_mode:
+        raise ValueError("post-G2 pipeline V2 requires a non-Live run")
+    if configuration.batch_mode:
+        raise ValueError("post-G2 pipeline V2 requires a non-batch run")
+    if configuration.output_mode != "Overwrite":
+        raise ValueError("post-G2 pipeline V2 requires Overwrite output")
+    if not coordinated:
+        raise ValueError("post-G2 pipeline V2 requires a coordinated run")
+    if configuration.processing_mode == "Int 1D (XYE)":
+        raise ValueError("post-G2 pipeline V2 requires Nexus output")
     return _PostG2PipelineV2Choice(*row)
 
 
@@ -194,7 +208,7 @@ def _unsafe_unfunded_staging_requested(
 ) -> bool:
     raw = env.get(_UNSAFE_UNFUNDED_STAGING_ENV)
     marker = run_options.get(_UNSAFE_UNFUNDED_STAGING_KEY, _MISSING)
-    if marker is _MISSING or pipeline_v2 is None:  # a Run that takes no pipeline choice ignores the marker too
+    if marker is _MISSING:
         return False
     if raw is None or not str(raw).strip():
         raise ValueError(
@@ -272,8 +286,10 @@ def _post_g2_output_diagnostics_choice(configuration, *, pipeline_v2):
         "_post_g2_output_diagnostics_v1",
         _MISSING,
     )
-    if value is _MISSING or pipeline_v2 is None:  # None: a Run that takes no pipeline choice ignores these too
-        return DEFAULT_OUTPUT_DIAGNOSTICS
+    if value is _MISSING:
+        return _PostG2OutputDiagnosticsChoice()
+    if pipeline_v2 is None:
+        raise ValueError("post-G2 output diagnostics require pipeline V2")
     if not isinstance(value, Mapping):
         raise TypeError(
             "post-G2 output diagnostics must be one exact mapping"
@@ -472,7 +488,8 @@ def _light_policy_layout(
                 checkpoint=staging_frame_cap - 8,
             )
         )
-        total = max(0, int(total_physical_ram_bytes() or 0))
+        # the private benchmark keeps its pre-1.2.10 eligibility: the POSIX reading, so Windows stays refused here
+        total = max(0, int(posix_physical_ram_bytes() or 0))
         limit = min(
             total // 2,
             max(0, total - _UNSAFE_UNFUNDED_STAGING_RESIDUAL_BYTES),
@@ -1028,12 +1045,17 @@ class DynamicOutputAdapter:
             raise TypeError("dynamic admission preparation inputs are not exact")
         if stop_signal.is_set(): raise RuntimeError("admission cancelled")
         env = dict(os.environ); frame_count = _supported_lineage_frame_count(item.source_stamp)
-        self._note_ignored_diagnostics()
-        pipeline_v2 = _post_g2_pipeline_v2_choice(self.configuration, coordinated=True)
-        diagnostics = _post_g2_output_diagnostics_choice(self.configuration, pipeline_v2=pipeline_v2)
-        unsafe = _unsafe_unfunded_staging_requested(
-            pipeline_v2, run_options=self.configuration.run_options, env=env,
-            frame_count=frame_count)
+        if pipeline_incompatibility(self.configuration):
+            # a Run that cannot take the private Performance Diagnostics options ignores all three, unparsed, and
+            # says so once; it uses the defaults a Run without them uses
+            self._note_ignored_diagnostics()
+            pipeline_v2, diagnostics, unsafe = None, DEFAULT_OUTPUT_DIAGNOSTICS, False
+        else:
+            pipeline_v2 = _post_g2_pipeline_v2_choice(self.configuration, coordinated=True)
+            diagnostics = _post_g2_output_diagnostics_choice(self.configuration, pipeline_v2=pipeline_v2)
+            unsafe = _unsafe_unfunded_staging_requested(
+                pipeline_v2, run_options=self.configuration.run_options, env=env,
+                frame_count=frame_count)
         if unsafe and not (getattr(item.descriptor, "kind", None) is SourceKind.EIGER_MASTER
                            and item.descriptor.finalized and item.descriptor.frame_shape is not None
                            and item.descriptor.dtype is not None):
