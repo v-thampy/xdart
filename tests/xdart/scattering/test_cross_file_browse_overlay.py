@@ -88,6 +88,11 @@ def test_int_overlay_retains_selected_point_when_browsing_another_file(
                 asked.append(gate)
                 return len(asked) == 1 or real(self, gate)
             monkeypatch.setattr(HydrationTransport, "retains_gate", retains_gate)
+        else:
+            # CI-FLAKE-OVERLAY-OPENS (hosted run 40636668726): on a slow runner the first file's preview reads can
+            # still hold its gate here, so the open defers as in the "waits" case; this case opens once they are done
+            owner = controller._browse_hydration_owner
+            _wait(lambda: True if owner is None or not owner.transport.retains_gate(owner._gate) else None)
         assert open_file(second) is waits
         _click_frame(qapp, shell, 0)
         _wait(lambda: settled(second, 1))
