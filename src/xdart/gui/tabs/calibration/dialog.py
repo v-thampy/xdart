@@ -553,6 +553,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self._job = None
         self._row_identity = None
         self._close_pending = False
+        self._session_open_request = None
         self.orientation_panel = None
         self.instrument_schematic = None
         self._orientation_generation = 0
@@ -2971,6 +2972,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                          kind, self._owner.busy, self._pending_source_details, self._orientation_generation)
         if self._owner.busy:
             return
+        if kind not in ('open', 'source_details', 'beam_detect'):
+            self._session_open_request = None
         self._job = kind
         self._point_request = (kind, arguments)
         if self._calibration_fit_window is not None:
@@ -3900,6 +3903,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def _new_session(self):
         if self._owner.busy:
             return
+        self._session_open_request = None
+        self._pending_session_resume = None
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
         self.frames = ()
         self._prediction = None
@@ -3910,19 +3915,32 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _resume(self):
         if self.active():
+            self.status.setText(self._BUSY_WAIT)
             return
+        request = self._session_open_request = object()
         def go():
             from xdart.gui.widgets.file_dialogs import browse
             picks = browse(self, 'Open calibration session', file_filter='Calibration session (*.json)',
                            fallback=str(self.project_root))
             path = picks[0] if picks else ''
-            if path:
+            if path and self._session_open_request is request:
                 # NEXT-1210-RESPONSIVENESS C-5: the session's hashes and staged images are checked on the window's
                 # worker (its busy state and Cancel); a job that started while the picker was open refuses it, said.
-                if self._owner.busy:
+                if self.active():
                     raise ValueError(self._BUSY_WAIT)
                 self._start('open', (path,))
-        self._guard(go)
+                return self._identity is not None
+        if not self._guard(go) and self._session_open_request is request:
+            self._session_open_request = None
+
+    def _apply_opened_session(self, request, opened):
+        if self._session_open_request is not request:
+            return
+        if self._owner.busy:  # any background read queued by the terminal settles first
+            QtCore.QTimer.singleShot(20, self, lambda: self._apply_opened_session(request, opened))
+            return
+        self._session_open_request = None
+        self._guard(lambda: self._session_opened(*opened))
 
     def _session_opened(self, path, loaded):
         """A session the worker read and checked (C-5): its frames, arm, fit policy and resume, into the window."""
@@ -4177,6 +4195,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._quick_cancelled = True
         self.point_images.finish_run()
         if self._identity is not None:
+            if self._job == 'open':
+                self._session_open_request = None
             self._owner.cancel(self._identity)
             self._job_status('Cancelling; completed rows and saved files are retained.')
 
@@ -4188,6 +4208,9 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._job_status(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
+        open_request = self._session_open_request if kind == 'open' else None
+        if kind == 'open' and terminal.status is not OperationTerminalStatus.RETURNED:
+            self._session_open_request = None
         finishing = kind == 'save' and self._finish_after_save  # a "Save geometry and use" (C-7)
         if os.environ.get('XDART_DEBUG_ORIENTATION'):
             _LOG.warning('calibration terminal kind=%s status=%s pending_metadata=%r orientation_generation=%s',
@@ -4298,11 +4321,11 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 elif kind == 'predict':
                     self._prediction = result
                     self._render_frames()
-                elif kind == 'open' and not self._close_pending:  # a window closing applies no session
+                elif kind == 'open' and open_request is not None and not self._close_pending:
                     # On the next turn, as Open saved session applied it before (C-5): the reads its settings queue
                     # then wait for their own turn rather than starting with this terminal; its refusals say why.
                     opened = result
-                    QtCore.QTimer.singleShot(0, self, lambda: self._guard(lambda: self._session_opened(*opened)))
+                    QtCore.QTimer.singleShot(0, self, lambda: self._apply_opened_session(open_request, opened))
                 elif kind in ('fit', 'refine'):
                     if self._job_policy and 'conditioning' in self._job_policy:
                         result.asset['provenance']['calibration_conditioning'] = self._job_policy['conditioning']
@@ -4384,7 +4407,10 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
                 elif kind == 'open':
-                    self.status.setText('Calibration session opened.')  # its own messages follow (_session_opened)
+                    if open_request is None:
+                        self.status.setText('Cancelled. The current calibration session is unchanged.')
+                    elif self._session_open_request is open_request:
+                        self.status.setText('Applying calibration session…')
                 elif kind == 'stitch_preview':
                     # An adopted preview keeps the summary show_preview wrote (busy ended above); one stitched for
                     # a fit or inputs that changed meanwhile was discarded, and never says it is complete.
@@ -4485,6 +4511,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._cancel()
             event.ignore()
         else:
+            self._session_open_request = None
             self._timer.stop()
             self._save_session_quietly()
             self._help_owner.shutdown()
@@ -4522,6 +4549,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def shutdown(self):
         """Host Exit: cancel and return the existing retryable close receipt."""
         from xdart.gui.pages.values import PageCleanup
+        self._session_open_request = None
         self._pending_session_resume = None
         self._quick_stage = self._quick_kind = None
         self._beam_probe_timer.stop()

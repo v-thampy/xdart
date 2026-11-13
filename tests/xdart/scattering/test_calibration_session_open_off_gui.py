@@ -139,3 +139,44 @@ def test_a_cancelled_or_closed_open_applies_nothing(qapp, tmp_path, monkeypatch,
     finally:
         release.set()
         _dispose(page)
+
+
+@pytest.mark.parametrize('action', ['close', 'new', 'late cancel'])
+def test_a_new_intent_discards_the_unapplied_session(qapp, tmp_path, monkeypatch, action):
+    from pyqtgraph.Qt import QtWidgets
+    from xrd_tools.integrate.stitch_calibration import save_calibration_session
+
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        session = tmp_path / 'session-a'
+        session.mkdir()
+        path = save_calibration_session(session, frames, arm=('del', 'nu'), fit_policy=dialog._fit_policy())
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getOpenFileName', staticmethod(
+            lambda parent, title, start, filt: (str(path), filt)))
+        before = dialog.session_dir, dialog.frames
+        dialog._resume()
+        if action == 'late cancel':
+            worker = dialog._owner._worker
+            assert worker is not None
+            worker.join(10)
+            assert not worker.is_alive()
+            dialog.cancel_button.click()  # the result is available, but the window has not polled it
+        deadline = time.monotonic() + 10
+        while dialog._identity is not None and time.monotonic() < deadline:
+            dialog._poll()  # consume the real worker terminal, without delivering the next-turn callback
+            time.sleep(.005)
+        assert dialog._identity is None
+        assert (dialog.session_dir, dialog.frames) == before
+        if action == 'close':
+            assert dialog.close()
+        elif action == 'new':
+            dialog.new_session_button.click()
+            before = dialog.session_dir, dialog.frames
+            assert before[0] != session
+        qapp.processEvents()
+        assert dialog.isVisible() == (action != 'close')
+        assert (dialog.session_dir, dialog.frames) == before
+    finally:
+        _dispose(page)
