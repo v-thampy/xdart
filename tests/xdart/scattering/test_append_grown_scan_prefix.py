@@ -92,7 +92,9 @@ def test_a_grown_scans_processed_frames_are_not_probed_captured_or_qualified_aga
     assert execution["member_stamps"] == [SourceFileState.capture(path).as_dict() for path in images]
     assert [source["metadata_file"] for source in execution["metadata_sources"]] == [
         SourceFileState.capture(path.with_suffix(".txt")).as_dict() for path in images]
-    assert [(member["path"], member["size"], member["mtime_ns"]) for member in lineage["epochs"][-1]["source"][
+    # The history's final complete source (a version-2 epoch stores only the images it added, C-12).
+    from xrd_tools.io.append import _lineage_final_source
+    assert [(member["path"], member["size"], member["mtime_ns"]) for member in _lineage_final_source(lineage)[
         "image_members"]] == [(str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in images]
     # The next Run finds the whole scan processed (1.2.5's skip, from the record this one wrote).
     terminals = _run(tmp_path, raw, 9803)

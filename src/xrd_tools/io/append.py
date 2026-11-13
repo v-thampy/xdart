@@ -21,6 +21,12 @@ from .schema import (
 )
 LINEAGE_DATASET = "append_lineage"
 LINEAGE_VERSION = 1
+#: A history of two or more epochs (NEXT-1210-RESPONSIVENESS C-12; the maintainer, 2026-11-12: "Save only each epoch's
+#: new images (Recommended)"): each epoch keeps its source's scalars and only the members and dataset paths it added or
+#: grew, with counts of what it inherits from the epoch before. Version 1 stored every epoch's complete source, so a
+#: Live scan of n single-frame epochs stored n(n+1)/2 members and every epoch re-validated them all. One epoch stays
+#: version 1, byte for byte.
+COMPACT_LINEAGE_VERSION = 2
 _MAX_REPLACEMENT_CONFIG_UTF8_BYTES = 262_144
 _MAX_REPLACEMENT_LINEAGE_UTF8_BYTES = 64 << 20
 _MAX_REPLACEMENT_PATH_UTF8_BYTES = 4096
@@ -255,7 +261,8 @@ class AppendCommittedPrefix:
         lineage = json.loads(str(self.lineage_json))
         if not isinstance(lineage, dict):
             raise ValueError("committed Append prefix lineage is not an object")
-        if (type(lineage.get("version")) is not int or lineage.get("version") != LINEAGE_VERSION
+        if (type(lineage.get("version")) is not int
+                or lineage.get("version") not in (LINEAGE_VERSION, COMPACT_LINEAGE_VERSION)
                 or lineage.get("state") != "committed"):
             raise ValueError("committed Append prefix lineage is not committed")
         labels = _lineage_labels(lineage); epochs = lineage.get("epochs") or ()
@@ -266,7 +273,7 @@ class AppendCommittedPrefix:
                             tuple(lineage.get("modes") or ()))
         if lineage_identity != _intent_identity(self.intent):
             raise ValueError("committed Append prefix identity is inconsistent")
-        if _source_dict(_source_from_dict(epochs[-1]["source"])) != _source_dict(self.intent.source):
+        if _source_dict(_source_from_dict(_lineage_final_source(lineage))) != _source_dict(self.intent.source):
             raise ValueError("committed Append prefix source is inconsistent")
         object.__setattr__(self, "target", _normalize(self.target)); object.__setattr__(self, "lineage_json", _json(lineage))
     @property
@@ -726,7 +733,8 @@ def decode_replacement_lineage(handle: h5py.File, *, entry: str = "entry") -> tu
         raise ValueError("replacement Append lineage is not an object")
     expected = {"version", "state", "entry", "source_base", "source_identity",
                 "science_fingerprint", "modes", "epochs"}
-    if (raw != _json(value) or set(value) != expected or value.get("version") != LINEAGE_VERSION
+    if (raw != _json(value) or set(value) != expected
+            or value.get("version") not in (LINEAGE_VERSION, COMPACT_LINEAGE_VERSION)
             or value.get("state") != "committed" or type(value.get("entry")) is not str or value["entry"] != entry or (lineage_group := _replacement_hard_group(handle, value["entry"])) is None or lineage_group.name != group.name
             or value.get("source_base") != _normalize_base(source_base)
             or any(type(value.get(key)) is not str for key in
@@ -948,16 +956,13 @@ def _extend_pending_decision(
         write = new_labels[len(committed):]
         lineage = dict(prior_decision.lineage or {})
         epochs = list(lineage.get("epochs") or ())
-        pending = {
+        if epochs and lineage.get("state") == "pending":
+            epochs = epochs[:-1]
+        lineage["state"] = "pending"
+        lineage = _with_epoch(lineage, epochs, {
             "source": _source_dict(current_intent.source),
             "labels": list(write),
-        }
-        if epochs and lineage.get("state") == "pending":
-            epochs[-1] = pending
-        else:
-            epochs.append(pending)
-        lineage["state"] = "pending"
-        lineage["epochs"] = epochs
+        })
         return _decision(
             AppendDisposition.WRITE,
             write,
@@ -1020,8 +1025,8 @@ def truncate_append_epoch(
     epochs = list(lineage.get("epochs") or ())
     if not epochs:
         raise ValueError("pending Append lineage has no epoch to truncate")
-    epochs[-1] = {"source": _source_dict(source), "labels": list(labels)}
-    lineage.update(state="pending", epochs=epochs)
+    lineage["state"] = "pending"
+    lineage = _with_epoch(lineage, epochs[:-1], {"source": _source_dict(source), "labels": list(labels)})
     truncated = _decision(
         AppendDisposition.WRITE, labels, committed, lineage=lineage,
         source_generation=source.generation,
@@ -1045,7 +1050,249 @@ def seal_append_epoch(decision: AppendDecision) -> AppendDecision:
         lineage=lineage,
         source_generation=decision.source_generation,
     )
+_MEMBER_KEYS = ("image_members", "external_members")
+_COMPACT_EPOCH_KEYS = frozenset({"source", "labels", "inherited_members", "inherited_dataset_paths"})
+_SOURCE_KEYS = frozenset({"path", "adapter_id", "size", "mtime_ns", "extent", "digest", "dataset_paths",
+                          "image_members", "external_members", "generation"})
+_IMAGE_MEMBER_TYPES = {"path": str, "size": int, "mtime_ns": int, "source_start": int, "source_stop": int,
+                       "ordinal": int}
+_EXTERNAL_MEMBER_TYPES = {**_IMAGE_MEMBER_TYPES, "dataset_path": str}
+
+
+def _shared_prefix(old, new) -> int:
+    count = 0
+    for before, after in zip(old, new):
+        if before != after:
+            break
+        count += 1
+    return count
+
+
+def _compact_epoch(source: Mapping[str, Any], labels, prior: Mapping[str, Any] | None) -> dict[str, Any]:
+    """One version-2 epoch: ``source`` (complete) keeps its scalars and only the members and dataset paths it added or
+    grew since ``prior`` (the epoch before, complete; None for the first), the longest shared prefix inherited."""
+    compact = {**source, **{key: list(source.get(key) or ()) for key in (*_MEMBER_KEYS, "dataset_paths")}}
+    inherited = inherited_paths = 0
+    if prior is not None:
+        for key in _MEMBER_KEYS:
+            shared = _shared_prefix(prior.get(key) or (), compact[key])
+            compact[key] = compact[key][shared:]
+            inherited = max(inherited, shared)  # one member kind is empty on both sides
+        inherited_paths = _shared_prefix(prior.get("dataset_paths") or (), compact["dataset_paths"])
+        compact["dataset_paths"] = compact["dataset_paths"][inherited_paths:]
+    return {"source": compact, "labels": list(labels), "inherited_members": inherited,
+            "inherited_dataset_paths": inherited_paths}
+
+
+def _compact_epochs_of(lineage: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The history's epochs as version 2 stores them (a version-1 history compacted; once, linear in what it
+    stores)."""
+    epochs = list(lineage.get("epochs") or ())
+    if lineage.get("version") == COMPACT_LINEAGE_VERSION:
+        return epochs
+    compact, prior = [], None
+    for epoch in epochs:
+        compact.append(_compact_epoch(epoch["source"], epoch["labels"], prior))
+        prior = epoch["source"]
+    return compact
+
+
+def _compact_lineage(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    """A history as it is written: version 2 with two or more epochs, version 1 (unchanged) with one."""
+    value = dict(lineage)
+    if len(lineage.get("epochs") or ()) < 2:
+        return value
+    value.update(version=COMPACT_LINEAGE_VERSION, epochs=_compact_epochs_of(lineage))
+    return value
+
+
+def _source_at(epochs: list[Mapping[str, Any]], count: int) -> dict[str, Any] | None:
+    """The complete source after the first ``count`` version-2 epochs (None for none); linear in what they store."""
+    if count == 0:
+        return None
+    members: dict[str, list[Any]] = {key: [] for key in _MEMBER_KEYS}
+    paths: list[Any] = []
+    for epoch in epochs[:count]:
+        for key in _MEMBER_KEYS:
+            del members[key][epoch["inherited_members"]:]
+            members[key].extend(epoch["source"][key])
+        del paths[epoch["inherited_dataset_paths"]:]
+        paths.extend(epoch["source"]["dataset_paths"])
+    return {**epochs[count - 1]["source"], "dataset_paths": paths, **members}
+
+
+def _lineage_final_source(lineage: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The history's final complete source (its last epoch's, either version)."""
+    epochs = lineage["epochs"]
+    if lineage.get("version") != COMPACT_LINEAGE_VERSION:
+        return epochs[-1]["source"]
+    return _source_at(epochs, len(epochs))
+
+
+def _expand_lineage(lineage: Mapping[str, Any]) -> dict[str, Any]:
+    """A version-2 history as version 1 (each epoch's complete source): the oracle's form, quadratic in size."""
+    if lineage.get("version") != COMPACT_LINEAGE_VERSION:
+        return dict(lineage)
+    epochs = lineage["epochs"]
+    value = dict(lineage)
+    value.update(version=LINEAGE_VERSION, epochs=[
+        {"source": _source_at(epochs, index + 1), "labels": list(epoch["labels"])}
+        for index, epoch in enumerate(epochs)])
+    return value
+
+
+def lineage_epoch_states(lineage: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Each epoch's source scalars and how many members its complete source holds (``member_count``), either
+    version, without building every epoch's member list (Reintegrate's per-label facts; an image member, once
+    recorded, never changes, so its stamp is the final source's)."""
+    states, count = [], 0
+    compact = lineage.get("version") == COMPACT_LINEAGE_VERSION
+    for epoch in lineage["epochs"]:
+        source = epoch["source"]
+        stored = sum(len(source[key]) for key in _MEMBER_KEYS)
+        count = epoch["inherited_members"] + stored if compact else stored
+        states.append({**{key: value for key, value in source.items()
+                          if key not in (*_MEMBER_KEYS, "dataset_paths")}, "member_count": count})
+    return tuple(states)
+
+
+def lineage_epoch_source(lineage: Mapping[str, Any], index: int) -> Mapping[str, Any]:
+    """Epoch ``index``'s complete source, either version (version 1's as stored; version 2's rebuilt, linear in what
+    the history stores up to it)."""
+    epochs = lineage["epochs"]
+    if lineage.get("version") != COMPACT_LINEAGE_VERSION:
+        return epochs[index]["source"]
+    return _source_at(epochs, index + 1)
+
+
+def _with_epoch(lineage: Mapping[str, Any], epochs: list[Mapping[str, Any]],
+                epoch: Mapping[str, Any]) -> dict[str, Any]:
+    """``lineage`` with its stored ``epochs`` and then ``epoch`` (its source complete): version 1 for one epoch,
+    version 2 for more (a version-1 history of several epochs is compacted once). Linear in what it stores."""
+    value = dict(lineage)
+    if not epochs:
+        value.update(version=LINEAGE_VERSION, epochs=[{"source": epoch["source"], "labels": list(epoch["labels"])}])
+        return value
+    if lineage.get("version") == COMPACT_LINEAGE_VERSION:
+        stored, prior = list(epochs), _source_at(epochs, len(epochs))
+    else:
+        stored, prior = _compact_epochs_of({**lineage, "epochs": epochs}), epochs[-1]["source"]
+    value.update(version=COMPACT_LINEAGE_VERSION,
+                 epochs=[*stored, _compact_epoch(epoch["source"], epoch["labels"], prior)])
+    return value
+
+
+def _canonical_member(raw: Any, key: str) -> dict[str, Any]:
+    types = _EXTERNAL_MEMBER_TYPES if key == "external_members" else _IMAGE_MEMBER_TYPES
+    if type(raw) is not dict or set(raw) != set(types) or any(type(raw[name]) is not kind
+                                                             for name, kind in types.items()):
+        raise ValueError("Append source/member values require exact JSON types")
+    member = (AppendExternalMember if key == "external_members" else AppendImageMember)(**raw)
+    if asdict(member) != raw:
+        raise ValueError("Append epoch source is not canonical")
+    return raw
+
+
+def _compact_lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
+    """Version 1's rules (canonical sources, member partition, each source extending the one before, contiguous
+    labels) checked incrementally on a version-2 history: linear in what it stores. Its expansion to version 1 passes
+    the version-1 validator and recompacts to it (tests/core/test_append_lineage_compact.py)."""
+    epochs = lineage.get("epochs")
+    if not isinstance(epochs, list) or len(epochs) < 2:
+        raise ValueError("a version-2 Append history requires two or more epochs")
+    members: dict[str, list[dict[str, Any]]] = {key: [] for key in _MEMBER_KEYS}
+    paths: list[str] = []
+    prior: Mapping[str, Any] | None = None
+    flattened: list[int] = []
+    for index, epoch in enumerate(epochs):
+        if not isinstance(epoch, dict) or set(epoch) != _COMPACT_EPOCH_KEYS or not isinstance(epoch["source"], dict):
+            raise ValueError("Append epoch is malformed")
+        inherited, inherited_paths = epoch["inherited_members"], epoch["inherited_dataset_paths"]
+        if type(inherited) is not int or type(inherited_paths) is not int:
+            raise ValueError("Append epoch inherited counts require exact JSON integers")
+        raw = epoch["source"]
+        if set(raw) != _SOURCE_KEYS or any(type(raw[key]) is not list for key in (*_MEMBER_KEYS, "dataset_paths")):
+            raise ValueError("Append epoch source is not canonical")
+        scalars = {**raw, "image_members": [], "external_members": []}
+        if _json(_source_dict(_source_from_dict(scalars))) != _json(scalars):  # types, normal form, non-negative
+            raise ValueError("Append epoch source is not canonical")
+        delta = {key: [_canonical_member(item, key) for item in raw[key]] for key in _MEMBER_KEYS}
+        active = [key for key in _MEMBER_KEYS if members[key] or delta[key]]
+        if len(active) > 1:
+            raise ValueError("image-series and external members are distinct owners")
+        key = active[0] if active else None
+        before = members[key] if key else []
+        added = delta[key] if key else []
+        if index == 0 and (inherited or inherited_paths):
+            raise ValueError("the first Append epoch inherits nothing")
+        if not 0 <= inherited <= len(before) or not 0 <= inherited_paths <= len(paths):
+            raise ValueError("Append epoch inherited counts are out of range")
+        if (inherited < len(before) and added and added[0] == before[inherited]
+                or inherited_paths < len(paths) and raw["dataset_paths"]
+                and raw["dataset_paths"][0] == paths[inherited_paths]):
+            raise ValueError("Append epoch source is not canonical")  # the shared prefix is inherited whole
+        if before:  # version 1's member history: earlier members exact, an external source's last may grow
+            if inherited < len(before) - 1 or key == "image_members" and inherited != len(before):
+                raise ValueError(f"source does not extend exact {'image' if key == 'image_members' else 'external'}"
+                                 "-member history")
+            if inherited == len(before) - 1:
+                old = before[-1]
+                new = added[0] if added else None
+                if (new is None or any(new[name] != old[name] for name in
+                                       ("path", "dataset_path", "source_start", "ordinal"))
+                        or any(new[name] < old[name] for name in ("size", "mtime_ns", "source_stop"))):
+                    raise ValueError("source does not extend exact external-member history")
+        cursor = before[inherited - 1]["source_stop"] if inherited else 0
+        for offset, member in enumerate(added):
+            if member["ordinal"] != inherited + offset:
+                raise ValueError("source members require exact ordered ordinals")
+            if member["source_start"] != cursor:
+                raise ValueError("source member ranges must be contiguous from zero")
+            cursor = member["source_stop"]
+        if inherited + len(added) and cursor != raw["extent"]:
+            raise ValueError("source member ranges must end at the declared extent")
+        count_paths = inherited_paths + len(raw["dataset_paths"])
+        if key == "external_members" and count_paths and count_paths != inherited + len(added):
+            raise ValueError("external source dataset paths must cover every member")
+        if prior is not None:  # version 1's _source_extends
+            if not paths and raw["dataset_paths"]:
+                raise ValueError("persisted source has no exact dataset selectors")
+            if inherited_paths != len(paths):
+                raise ValueError("source does not extend exact dataset paths")
+            for name in ("path", "adapter_id"):
+                if raw[name] != prior[name]:
+                    raise ValueError(f"source does not extend exact {name}")
+            for name in ("size", "mtime_ns", "extent"):
+                if raw[name] < prior[name]:
+                    raise ValueError(f"source {name} regressed")
+            if prior["digest"] is not None and raw["digest"] is None:
+                raise ValueError("source digest evidence was downgraded")
+            if raw["extent"] == prior["extent"] and (
+                    any(raw[name] != prior[name] for name in ("size", "mtime_ns", "digest"))
+                    or added or raw["dataset_paths"] or inherited != len(before)):
+                raise ValueError("same-extent source identity changed")
+        raw_labels = epoch.get("labels")
+        if not isinstance(raw_labels, list) or any(type(label) is not int for label in raw_labels):
+            raise ValueError("Append epoch labels require exact JSON integers")
+        labels = tuple(raw_labels)
+        _require_contiguous(labels, "Append epoch labels")
+        if flattened and labels and labels[0] != flattened[-1] + 1:
+            raise ValueError("Append epochs are gapped or overlapping")
+        flattened.extend(labels)
+        if key:
+            del members[key][inherited:]
+            members[key].extend(added)
+        del paths[inherited_paths:]
+        paths.extend(raw["dataset_paths"])
+        prior = raw
+    values = tuple(flattened)
+    _require_contiguous(values, "Append lineage labels")
+    return values
+
+
 def _lineage_labels(lineage: Mapping[str, Any]) -> tuple[int, ...]:
+    if lineage.get("version") == COMPACT_LINEAGE_VERSION:
+        return _compact_lineage_labels(lineage)
     epochs = lineage.get("epochs")
     if not isinstance(epochs, list):
         raise ValueError("Append lineage epochs are malformed")
@@ -1099,7 +1346,7 @@ def decode_committed_append_prefix(handle: h5py.File, *, entry: str = "entry") -
     labels = _lineage_labels(lineage)
     if _disk_labels(processed, tuple(modes)) != labels:
         raise ValueError("disk rows do not match exact committed lineage")
-    source = _source_from_dict(epochs[-1]["source"])
+    source = _source_from_dict(_lineage_final_source(lineage))
     intent = AppendIntent(
         entry, stored_base, lineage.get("source_identity", ""),
         lineage.get("science_fingerprint", ""), tuple(modes), source, labels,
@@ -1286,11 +1533,8 @@ def _extension(
         raise ValueError("new labels overlap or gap committed rows")
     if int(intent.source.extent) - prior_extent != len(suffix):
         raise ValueError("source extent growth does not match selected labels")
-    pending = dict(lineage)
-    pending["state"] = "pending"
-    pending["epochs"] = list(lineage["epochs"]) + [
-        {"source": dict(recorded_source), "labels": list(suffix)}
-    ]
+    pending = _with_epoch({**lineage, "state": "pending"}, list(lineage["epochs"]),
+                          {"source": dict(recorded_source), "labels": list(suffix)})
     return _decision(
         AppendDisposition.WRITE,
         suffix,
@@ -1351,8 +1595,8 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             if current.committed_labels[:len(committed_prefix.committed_labels)] \
                     != committed_prefix.committed_labels:
                 raise ValueError("committed Append labels no longer retain observed prefix")
-            if _json({"epochs": current_lineage["epochs"][:len(observed_epochs)]}) \
-                    != _json({"epochs": observed_epochs}):
+            if _json({"epochs": _compact_epochs_of(current_lineage)[:len(observed_epochs)]}) \
+                    != _json({"epochs": _compact_epochs_of(observed_lineage)}):
                 raise ValueError("committed Append epochs diverged from observed prefix")
         if _intent_identity(current.intent) != _intent_identity(intent):
             raise ValueError(f"foreign Append identity: {_identity_difference(current.intent, intent)}")
@@ -1613,6 +1857,7 @@ __all__ = [
     "AppendSourceGraphRefused",
     "CommittedAppendCoverage",
     "LINEAGE_DATASET",
+    "COMPACT_LINEAGE_VERSION",
     "LINEAGE_VERSION",
     "begin_same_run_lineage",
     "commit_append_lineage",

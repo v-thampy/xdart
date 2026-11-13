@@ -795,7 +795,9 @@ def _point_native_facts(fact):
 
 def _admit_source_topology(fact, *, full_inventory, token=None,
                            selected_labels=None):
-    from xrd_tools.io.append import _lineage_labels
+    from xrd_tools.io.append import (
+        _lineage_final_source, _lineage_labels, lineage_epoch_source, lineage_epoch_states,
+    )
     from xrd_tools.io.record_writer import (
         WriterStateError, _validate_replacement_execution,
     )
@@ -822,14 +824,16 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             or any(type(label) is not int for label in selected_labels)
             or selected_labels != tuple(sorted(set(selected_labels))),
             "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-    epoch_sources = {}
+    epoch_sources, epoch_indices, complete_sources = {}, {}, {}
     if lineage is not None:
         try:
             _lineage_labels(lineage)
             epochs = lineage["epochs"]
             _reject(type(epochs) is not list or not epochs,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-            for epoch in epochs:
+            # Each epoch's source scalars and member count, either history version (C-12): a version-2 epoch stores
+            # only the members it added, and an image member, once recorded, never changes.
+            for index, (epoch, state) in enumerate(zip(epochs, lineage_epoch_states(lineage))):
                 labels = epoch["labels"]
                 _reject(
                     type(epoch) is not dict or type(epoch["source"]) is not dict
@@ -845,13 +849,14 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
                     for raw_label in raw_labels:
                         _reject(raw_label in epoch_sources,
                                 "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
-                        epoch_sources[raw_label] = epoch["source"]
+                        epoch_sources[raw_label] = state
+                        epoch_indices[raw_label] = index
         except (TypeError, ValueError, KeyError) as error:
             if (type(error) is ValueError
                     and str(error).startswith("REPLACEMENT_")):
                 raise
             raise ValueError("REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED") from error
-    final = None if lineage is None else lineage["epochs"][-1]["source"]
+    final = None if lineage is None else _lineage_final_source(lineage)
     _reject(lineage is not None
             and any(label not in epoch_sources for label in selected_labels),
             "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
@@ -960,6 +965,11 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
         hdf_routes = hdf_ranges
     frame_routes = {}
     total = execution["frame_count"] if final is None else final["extent"]
+
+    def _complete(index):  # an epoch's complete source, built once per epoch (C-12: version 2 stores deltas)
+        if index not in complete_sources:
+            complete_sources[index] = lineage_epoch_source(lineage, index)
+        return complete_sources[index]
     for label in selected_labels:
         ordinal = label - execution["first_label"]
         _reject(not 0 <= ordinal < total,
@@ -986,10 +996,10 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             if epoch_source is not None:
                 _reject(
                     ordinal >= epoch_source["extent"]
-                    or ordinal >= len(epoch_source["image_members"]),
+                    or ordinal >= epoch_source["member_count"],
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED",
                 )
-                source_state = epoch_source["image_members"][ordinal]
+                source_state = final["image_members"][ordinal]
                 _reject(
                     source_state["source_start"] != ordinal
                     or source_state["source_stop"] != ordinal + 1
@@ -1014,7 +1024,7 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             _reject(total != 1 or ordinal != 0,
                     "REPLACEMENT_SOURCE_LINEAGE_UNQUALIFIED")
             source_state = (execution if epoch_source is None
-                            else epoch_source)
+                            else _complete(epoch_indices[label]))
             current = execution if final is None else final
             _reject(
                 os.path.normcase(os.path.normpath(source_state["path"]))
@@ -1032,7 +1042,7 @@ def _admit_source_topology(fact, *, full_inventory, token=None,
             route = _prebound_hdf_frame(
                 _admitted_hdf_route(hdf_routes, hdf_stops, ordinal), ordinal)
             source_state = (execution if epoch_source is None
-                            else epoch_source)
+                            else _complete(epoch_indices[label]))
             selected_execution = (
                 None if ordinal >= execution["frame_count"] else
                 _external_member(
