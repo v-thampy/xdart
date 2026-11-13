@@ -32,6 +32,11 @@ def test_ints_browser_follows_a_save_path_change_over_an_opened_folder(tmp_path)
         owner.reconcile_intent(RunIntentStore(RunIntent(save_path=first)).snapshot(),
                                RunIntentStore(RunIntent(save_path=second)).snapshot())
         assert owner.directory == second and not owner.explicit_directory
+        project = str(tmp_path / "C")  # a relative Save Path is inside the Project, not the working directory
+        owner.reconcile_intent(RunIntentStore(RunIntent(save_path=second)).snapshot(),
+                               RunIntentStore(RunIntent(project_root=project,
+                                                        save_path="xdart_processed_data")).snapshot())
+        assert owner.directory == str(Path(project) / "xdart_processed_data")
     finally:
         owner.begin_close()
         until = time.monotonic() + 10
