@@ -161,7 +161,7 @@ def test_file_save_and_load_through_the_settings_port_and_what_is_refused(qapp, 
     document, a choice this version lacks, or a value its row cannot hold is refused with its reason, the inputs
     left as they were; a load while the page works is refused before any chooser. No confirmation is asked."""
     assert PageCapability.SETTINGS_PERSISTENCE in RSM_PAGE.capabilities
-    assert RSM_SETTINGS == SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM",
+    assert RSM_SETTINGS == SettingsKind("xdart-rsm-settings", 2, "rsm_settings", "RSM",
                                         sections=("point_images",))
     page = _page(qapp, owner=_Owner())
     handle = build_rsm_page(empty_host_services(_Status()), None)
@@ -191,7 +191,7 @@ def test_file_save_and_load_through_the_settings_port_and_what_is_refused(qapp, 
         for document, reason in (
                 ({"kind": "xdart-run-intent-profile"}, "not an xdart RSM settings file"),
                 ({**good, "kind": "xdart-stitch-settings"}, "not an xdart RSM settings file"),
-                ({**good, "version": 2}, "these RSM settings come from a newer xdart"),
+                ({**good, "version": RSM_SETTINGS.version + 1}, "these RSM settings come from a newer xdart"),
                 ({**good, "fields": ["grid"]}, "RSM settings fields are malformed"),
                 ({**good, "calibration": {"fields": ["rms"], "choices": {}}}, "RSM settings calibration is malformed"),
                 ({**good, "fields": {**good["fields"], "coordinates": "Q (lab)"}},

@@ -26,7 +26,7 @@ from xdart.gui.tools.page_settings import (
 )
 
 #: The document's kind and version, and its key in the session file.
-RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 1, "rsm_settings", "RSM", sections=("point_images",))
+RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 2, "rsm_settings", "RSM", sections=("point_images",))
 SESSION_KEY = RSM_SETTINGS.session_key
 #: Not saved field by field: the SPEC files row shows the source selection, and the Threshold is one policy.
 _NOT_FIELDS = frozenset({"spec_path", "threshold_enabled", "threshold_min", "threshold"})
@@ -60,9 +60,12 @@ def apply_page_settings(page, document: Any) -> None:
     fields = saved_fields(page, document, _NOT_FIELDS)
     fields.update(formats)
     output = fields.get("output_path")
-    if isinstance(output, str) and output.strip().lower().endswith(".nexus"):
-        # 1.2.9 kept an output file here; the Save Path is its folder now (C-6), the result named in it from the scans
-        fields["output_path"] = str(Path(output.strip()).expanduser().parent)
+    if document["version"] < 2 and isinstance(output, str) and output.strip().lower().endswith(".nexus"):
+        # Version 1 stored a result filename. A folder written by a 1.2.10 development build can already exist.
+        path = Path(output.strip()).expanduser()
+        root = Path(str(fields.get("project_root", page._value("project_root")) or "")).expanduser()
+        if not (root / path).is_dir():
+            fields["output_path"] = str(path.parent)
     legacy = document.get("fields", {}).get("grid")
     if legacy is not None:
         from xdart.gui.tabs.rsm.page import _GRID_FIELDS, _GRIDS

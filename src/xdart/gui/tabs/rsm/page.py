@@ -1499,8 +1499,8 @@ class RSMPage(QtWidgets.QWidget):
             output = str(self._value("output_path")).strip()  # a folder, as every tool's (C-6)
             if not output:
                 need("project", "a Save Path folder")
-            elif output.lower().endswith(".nexus"):
-                need("project", "a Save Path folder, not a .nexus file")
+            elif output.lower().endswith(".nexus") and self._inside(root, output, "Save Path").is_file():
+                need("project", "a Save Path folder, not a file")
             try:  # a UB given for an HKL map: its rows, or its SPEC file and scan
                 given = self._ub_override(root)
             except ValueError as error:

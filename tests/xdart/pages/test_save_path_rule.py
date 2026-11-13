@@ -159,9 +159,11 @@ def test_rsm_readiness_asks_for_a_save_path_folder_not_a_nexus_file(qapp, tmp_pa
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
         assert page._readiness[1], page._readiness
-        page.set_field("output_path", str(tmp_path / "named_rsm.nexus"))
+        file = tmp_path / "named_rsm.nexus"
+        file.touch()
+        page.set_field("output_path", str(file))
         assert not page._readiness[1]
-        assert "a Save Path folder, not a .nexus file" in page.run_bar.readinessLabel.full_text()
+        assert "a Save Path folder, not a file" in page.run_bar.readinessLabel.full_text()
     finally:
         _close(page, qapp)
 
@@ -174,6 +176,7 @@ def test_a_saved_rsm_output_file_loads_as_its_folder(qapp, tmp_path):
         _synthetic_source(tmp_path)
         _with_source(page, tmp_path)
         document = page.settings()
+        document["version"] = 1
         legacy = tmp_path / "older"
         document["fields"]["output_path"] = str(legacy / "named_rsm.nexus")
         restored.apply_settings(document)
@@ -181,6 +184,26 @@ def test_a_saved_rsm_output_file_loads_as_its_folder(qapp, tmp_path):
         assert restored._value("output_path") == str(legacy)
         form = restored.build_form()
         assert Path(form.output_path).parent == legacy and form.output_family
+    finally:
+        _close(page, qapp)
+        _close(restored, qapp)
+
+
+def test_rsm_a_folder_named_nexus_stays_a_folder_on_save_and_restore(qapp, tmp_path):
+    from xdart.gui.tabs.rsm.settings import RSM_SETTINGS
+
+    page, restored = _page(qapp, owner=_Owner()), _page(qapp, owner=_Owner())
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        folder = tmp_path / "new-output.nexus"  # a valid folder to create when Run saves
+        page.set_field("output_path", str(folder))
+        restored.apply_settings(RSM_SETTINGS.load(RSM_SETTINGS.dump(page.settings())))
+        assert restored._value("output_path") == str(folder)
+        assert page._readiness[1], page._readiness
+        restored.resolve_source()
+        assert restored._readiness[1], restored._readiness
+        assert Path(restored.build_form().output_path).parent == folder
     finally:
         _close(page, qapp)
         _close(restored, qapp)
