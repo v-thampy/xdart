@@ -319,3 +319,76 @@ def test_ints_run_drops_a_stored_grouping_its_finished_scan_no_longer_shows(qapp
     finally:
         _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
         page.close()
+
+
+def _int_page(tmp_path, *, points, images, policy):
+    """Int on a SPEC-backed image series of ``points`` rows and ``images`` files with a stored grouping."""
+    from dataclasses import replace
+    from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.sources.selection import image_series_spec
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff
+    rows = ''.join(f'{10 + point} 0 {100 * (point + 1)}\n' for point in range(points))
+    (tmp_path / 'calibrant').write_text('#F calibrant\n#E 1\n#O0 del  nu\n\n#S 1 ascan del 10 12 2 1\n#P0 10 0\n#N 3\n'
+                                        '#L del  nu  i0\n' + rows)
+    paths = [tmp_path / f'calibrant_scan001_{index:04}.tif' for index in range(images)]
+    for index, path in enumerate(paths):
+        _write_tiff(path, 10 + index)
+    poni, output = tmp_path / 'cal.poni', tmp_path / 'processed'
+    write_poni(poni)
+    intent = _intent(paths[0], output, poni)
+    series = image_series_spec(paths[0], metadata_format='spec')
+    intent.source_spec = replace(series, options={**series.options, 'point_images': policy.to_dict()})
+    lifecycle = ScatteringCoordinator()
+    store = RunIntentStore(intent)
+    page = ScatteringWorkspace(intents=store, lifecycle=lifecycle,
+                               sources=FilesystemSourceAdapter(), executor=StandardRunExecutor())
+    page.show()
+    return page, store, lifecycle, output
+
+
+@pytest.mark.parametrize('case', ['counts in flux', 'SPEC file not found'])
+def test_ints_run_keeps_a_stored_grouping_it_cannot_show_is_stale(qapp, tmp_path, case):
+    """The rule forgets a stored grouping only on positive evidence that the scan reads one image per point: counts
+    that are not yet a whole multiple (three points, four images), or a scan whose SPEC file cannot be found, refuse
+    the Run as before, keep the grouping (a Difference here, which a later question would offer as Average) and ask
+    nothing."""
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from tests.xdart.scattering.test_e3_join_oracle import _wait
+    policy = PointImagePolicy(2, 'difference', 1, False)
+    page, store, lifecycle, output = _int_page(tmp_path, points=3, images=4, policy=policy)
+    asked = []
+    probe = QtCore.QTimer()
+
+    def watch():
+        dialog = qapp.activeModalWidget()
+        if isinstance(dialog, PointImagesDialog):
+            asked.append(dialog)
+            dialog.reject()
+    probe.timeout.connect(watch)
+    probe.start(5)
+    try:
+        if case == 'SPEC file not found':
+            (tmp_path / 'calibrant').rename(tmp_path / 'calibrant.moved')
+        notices = []
+        page.noticeChanged.connect(notices.append)
+        _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
+        page._shell.run_controls.startButton.click()
+        _wait(qapp, lambda: (any('admission failed' in notice.lower() for notice in notices)
+                             or list(output.glob('*.nexus')))
+              and lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED} and page._admission is None, timeout=30,
+              diagnostic=lambda: f'{lifecycle.phase.value}: {notices}')
+        assert not list(output.glob('*.nexus')) and not asked, notices
+        assert not any('no longer fits' in notice for notice in notices), notices
+        assert store.snapshot().thaw().source_spec.options['point_images'] == policy.to_dict()
+        assert [stored.operation for _uri, _scan, stored in page.point_images.choices] == ['difference']
+    finally:
+        probe.stop()
+        _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
+        page.close()
