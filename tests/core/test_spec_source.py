@@ -455,3 +455,32 @@ def test_spec_padded_eiger_master_owns_external_frames_and_stitch_name(tmp_path)
         assert source.raw_locator_for(index) == (master, index)
         np.testing.assert_array_equal(source.load_frame(index), images[index])
     assert spec_scan_name(path, "5.1", tmp_path, "") == int_scan_name(master)
+def test_a_missing_scan_key_is_unused_in_an_empty_image_listing(tmp_path):
+    from xrd_tools.sources.spec import find_spec_image_files
+    assert find_spec_image_files(tmp_path, "sample", None) == []
+
+
+def test_shared_spec_listings_keep_distinct_symlink_parent_paths(tmp_path):
+    from xrd_tools.io.image import shared_image_listings
+    from xrd_tools.sources.spec import find_spec_image_files
+
+    local, other = tmp_path / "local", tmp_path / "other"
+    local.mkdir()
+    (other / "child").mkdir(parents=True)
+    link = local / "link"
+    try:
+        link.symlink_to(other / "child", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    (local / "sample_scan1_0000.tif").touch()
+    (other / "sample_scan001_0001.tif").touch()
+    (other / "sample_scan001_sample_scan2_0002.tif").touch()
+    through_link = link / ".."
+    with shared_image_listings():
+        assert [path.name for path in find_spec_image_files(local, "sample", "1.1")] == [
+            "sample_scan1_0000.tif"]
+        for scan in ("1.1", "2.1"):
+            expected = ["sample_scan001_sample_scan2_0002.tif"]
+            if scan == "1.1":
+                expected.insert(0, "sample_scan001_0001.tif")
+            assert [path.name for path in find_spec_image_files(through_link, "sample", scan)] == expected

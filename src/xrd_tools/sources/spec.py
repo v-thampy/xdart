@@ -45,12 +45,12 @@ def find_spec_image_files(directory: str | Path, spec_stem: str, scan: Any,
     from xrd_tools.io.image import find_image_files
 
     files = find_image_files(directory, stem=image_stem or None)
-    if not image_stem:
+    if not image_stem and files:
         # C-16: the listing indexed by scan number once per search (a scan's own pattern over every name of a
         # 20,700-image folder, twice per scan, was most of a search's time); outside a search, as before.
         from xrd_tools.io.image import shared_listing
         listing = files
-        index = shared_listing(("spec-scan-index", os.path.normcase(os.path.abspath(str(directory))), spec_stem),
+        index = shared_listing(("spec-scan-index", os.fspath(Path(directory)), spec_stem),
                                lambda: _index_by_scan(listing, spec_stem))
         files = list(index.get(int(str(scan).split(".")[0]), ()))
     files = [path for path in files if path.is_file()]

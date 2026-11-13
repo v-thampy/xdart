@@ -35,20 +35,28 @@ from xrd_tools.core.scan import SourceKind, SourceSpec, coerce_source_kind
 _NEXUS_EXTS = {".nxs", ".h5", ".hdf5", ".nexus", ".cxi"}
 
 
-def _walk_files(directory: Path, recursive: bool) -> list[Path]:
-    return list(os_sorted(_iter_files_unordered(directory, recursive)))
+def _walk_files(directory: Path, recursive: bool, *, check=None) -> list[Path]:
+    return list(os_sorted(_iter_files_unordered(directory, recursive, check=check)))
 
 
-def _iter_file_entries_unordered(directory: Path, recursive: bool, skip: frozenset[str] = frozenset()):
+def _iter_file_entries_unordered(directory: Path, recursive: bool, skip: frozenset[str] = frozenset(), *, check=None):
     """Yield regular-file ``DirEntry`` objects in filesystem DFS order. ``skip``: folders (case-folded as
     ``os.path.normcase`` folds them, spelled from *directory*) a recursive walk does not enter, a Run's Save Path
     (``output_safety.scan_skip_dirs``)."""
     def read_entries(path: Path):
         with os.scandir(path) as entries:
-            return list(entries)
+            if check is None:
+                return list(entries)
+            result = []
+            for entry in entries:
+                check()
+                result.append(entry)
+            return result
 
     pending = [iter(read_entries(directory))]
     while pending:
+        if check is not None:
+            check()
         try:
             entry = next(pending[-1])
         except StopIteration:
@@ -71,16 +79,16 @@ def _iter_file_entries_unordered(directory: Path, recursive: bool, skip: frozens
                 raise
 
 
-def _iter_files_unordered(directory: Path, recursive: bool) -> list[Path]:
+def _iter_files_unordered(directory: Path, recursive: bool, *, check=None) -> list[Path]:
     """Regular files under *directory* in raw filesystem-enumeration order —
     no natural sort.  The sort is the expensive part of a poll; splitting it
     out lets :class:`~xrd_tools.sources.directory_index.DirectoryIndex` detect
     an unchanged directory (order-independent map comparison) and skip the
     sort entirely (R1-R5)."""
-    return [Path(entry.path) for entry in _iter_file_entries_unordered(directory, recursive)]
+    return [Path(entry.path) for entry in _iter_file_entries_unordered(directory, recursive, check=check)]
 
 
-def discover_scans(directory, kind, *, recursive: bool = False,
+def discover_scans(directory, kind, *, recursive: bool = False, check=None,
                    **options) -> list[SourceSpec]:
     """Return one :class:`SourceSpec` per scan found in ``directory`` for ``kind``.
 
@@ -98,12 +106,14 @@ def discover_scans(directory, kind, *, recursive: bool = False,
     kind = coerce_source_kind(kind)
     if not directory.is_dir():
         return []
-    files = _walk_files(directory, recursive)
+    files = _walk_files(directory, recursive, check=check)
 
     if kind is SourceKind.SPEC:
         from xrd_tools.io.spec import is_spec_file, list_spec_scans
         out: list[SourceSpec] = []
         for f in files:
+            if check is not None:
+                check()
             if not is_spec_file(f):
                 continue
             for scan in list_spec_scans(f):
@@ -118,6 +128,8 @@ def discover_scans(directory, kind, *, recursive: bool = False,
                                                 guess_source_kind)
         out = []
         for f in files:
+            if check is not None:
+                check()
             if f.suffix.lower() not in _NEXUS_EXTS:
                 continue
             if kind is SourceKind.EIGER_MASTER:

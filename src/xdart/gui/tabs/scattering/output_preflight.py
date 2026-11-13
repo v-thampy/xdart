@@ -74,6 +74,7 @@ from .contracts import (
     ExternalSourceState, OutputDisposition, OutputFact, PlannedOutput,
     SourceExecutionStamp, SourceFileState, StartCapture,
 )
+from .controls_editing import project_output_request
 from .source_metadata import ordered_motor_intersection
 
 load_poni = load_detector_calibration
@@ -118,6 +119,11 @@ class OutputCandidate:
     _configuration: FrozenRunConfiguration | None = field(
         default=None, repr=False, compare=False,
     )
+
+    @property
+    def project_root(self) -> str:
+        return "" if self._configuration is None else self._configuration.project_root
+
     def __post_init__(self) -> None:
         texts = (
             self.poni_file, self.mask_file, self.save_path,
@@ -509,7 +515,7 @@ def _run_scan_skip(source: object, configuration: object) -> tuple[str, ...]:
     """The Save Path's folder a Folder Run's recursive scans leave out (``output_safety.scan_skip_dirs``)."""
     if type(source) is not DirectorySourceSpec or not source.recursive:
         return ()
-    save_path = configuration.save_path
+    save_path = project_output_request(configuration.save_path, getattr(configuration, "project_root", ""))
     return scan_skip_dirs(source.root, None if save_path in (None, "") else str(save_path))
 
 
@@ -821,7 +827,7 @@ def _directory_target(
     candidate: Candidate,
     name: str,
 ) -> Path:
-    output_root = Path(configuration.save_path)
+    output_root = Path(project_output_request(configuration.save_path, configuration.project_root))
     # Flat in the Save Path, as the eager branch of _directory_items places it.
     output_directory = output_root if _save_path_is_directory(output_root) else None
     # Hand the directory DOWN as a directory (F1).  Passing it as a request
@@ -2178,7 +2184,7 @@ def _run_output_naming(
     selected root).  It is used as a DIRECTORY and never re-inspected for a
     suffix, which is what makes the dotted sub-folder safe.
     """
-    requested = Path(configuration.save_path)
+    requested = Path(project_output_request(configuration.save_path, configuration.project_root))
     if not _save_path_is_directory(requested):
         # An explicit FILE request: its parent is the directory and its stem is
         # the family.  A per-candidate directory does not apply.
@@ -2381,7 +2387,8 @@ def _directory_items(
     spec_cache: dict | None = None,
     metadata_format=_CONFIG_METADATA_FORMAT,
 ) -> tuple[PlannedOutput, ...]:
-    output_root, items, consumed = Path(configuration.save_path), [], set()
+    output_root = Path(project_output_request(configuration.save_path, configuration.project_root))
+    items, consumed = [], set()
     if _save_path_is_directory(output_root):
         try:
             output_root.resolve(strict=False)

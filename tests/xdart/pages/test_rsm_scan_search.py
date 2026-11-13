@@ -117,3 +117,78 @@ def test_stop_during_the_scan_search_returns_promptly(qapp, tmp_path, monkeypatc
             page.build_forms()
     finally:
         _close(page, qapp)
+
+
+def test_stop_after_preflight_returns_does_not_start_gridding(qapp, tmp_path):
+    from xdart.gui.pages.operation_owner import OperationTerminalStatus
+
+    page = _page(qapp)
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path, scans="1")
+        page._begin_preflight(run=True)
+        worker = page._owner._worker
+        # Let the real worker return, withhold Qt polling until after Stop.
+        deadline = time.monotonic() + 20
+        while worker._terminal is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert worker._terminal is not None and worker._terminal.status is OperationTerminalStatus.RETURNED
+        assert page.run_bar.stopButton.isEnabled()
+        page.run_bar.stopButton.click()
+        page._poll()
+        assert not page._owner.busy, page.run_bar.readinessLabel.full_text()
+        assert page.run_bar.readinessLabel.full_text() == "RSM stopped"
+    finally:
+        page.stop()
+        _wait(page, qapp, lambda: not page.active())
+        _close(page, qapp)
+
+
+def test_cancel_is_checked_while_naming_queued_output_slots(tmp_path, monkeypatch):
+    from threading import Event
+    from xdart.gui.pages.operation_owner import OperationCancelled
+    from xdart.gui.tabs.rsm.page import _queue_refusals
+    from xrd_tools.io import output_path
+
+    event = Event()
+    real = output_path.resolve_finite_output_target
+    named = []
+
+    def stop_after_first(*args, **kwargs):
+        result = real(*args, **kwargs)
+        named.append(result)
+        event.set()
+        return result
+
+    monkeypatch.setattr(output_path, "resolve_finite_output_target", stop_after_first)
+    groups = tuple(((tmp_path / "source", f"{i}.1"),) for i in range(1, 4))
+    with pytest.raises(OperationCancelled):
+        _queue_refusals((tmp_path, tmp_path / "output"), groups, event)
+    assert len(named) == 1
+
+
+def test_directory_search_checks_stop_between_source_headers(tmp_path, monkeypatch):
+    from threading import Event
+    from xrd_tools.analysis.stitch_sources import (
+        SourceSearchCancelled, StitchSourceSelection, resolve_stitch_sources,
+    )
+    from xrd_tools.io import spec as spec_io
+
+    _scans(tmp_path, 3)
+    folder = tmp_path / "source"
+    (folder / "other").write_bytes((folder / "RSM_synth").read_bytes())
+    cancel = Event()
+    inspected = []
+    real = spec_io.is_spec_file
+
+    def stop_after_first(path):
+        result = real(path)
+        inspected.append(path)
+        cancel.set()
+        return result
+
+    monkeypatch.setattr(spec_io, "is_spec_file", stop_after_first)
+    with pytest.raises(SourceSearchCancelled):
+        resolve_stitch_sources(StitchSourceSelection("Directory", (str(folder),)), {},
+                               cancelled=cancel.is_set)
+    assert len(inspected) == 1

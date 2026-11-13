@@ -633,7 +633,7 @@ def find_image_files(
     directory = Path(directory)
     exts = exts or SUPPORTED_EXTS
     shared = _SHARED_LISTINGS.get()
-    key = (os.path.normcase(os.path.abspath(directory)), stem or "", frozenset(exts))
+    key = (os.fspath(directory), stem or "", frozenset(exts))
     if shared is not None and key in shared:
         return list(shared[key])
     pattern = f"*{stem}*" if stem else "*"

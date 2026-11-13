@@ -499,8 +499,9 @@ class ResultDirectoryBrowser(QtCore.QObject):
         ``again`` at a Run's start, so each result lists and shows as it finishes."""
         from .controls_editing import save_path_folder
         folder = save_path_folder(save_path, project_root)
-        if folder and (again or folder != getattr(self, "_followed_folder", None)):
-            self._followed_folder = folder
+        location = (save_path, project_root)
+        if folder and (again or location != getattr(self, "_followed_location", None)):
+            self._followed_location = location
             self.follow_save_path(folder)
 
     def follow_result(self, path):

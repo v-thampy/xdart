@@ -1524,7 +1524,8 @@ class StitchPage(QtWidgets.QWidget):
         self._revision += 1
         self._prepared_revision = None
         self._queued_jobs.clear()
-        self._follow_save_path()
+        if not self._drafting:
+            self._follow_save_path()
         if (_args and not self._drafting and tuple(_args[0]) in {
                 self._fields[key].path for key in ("image_dir", "image_stem", "detector_rows",
                                                    "detector_cols", "raw_dtype", "raw_header_skip")

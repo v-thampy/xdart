@@ -396,10 +396,10 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
         raise PointImagesRequired(resolution.pending[0], resolution.pending)  # every one, for one question (C-13)
     groups, skipped = [], list(resolution.skipped)
     for group in resolution.groups:
-        if cancelled is not None and cancelled():
-            raise SourceSearchCancelled("the scan search was stopped")
         members = []
         for spec in group:
+            if cancelled is not None and cancelled():
+                raise SourceSearchCancelled("the scan search was stopped")
             if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)
                 members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, spec.entry or "entry",
                                                   frame_selector, tuple(detector_shape), motor_selectors,

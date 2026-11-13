@@ -613,6 +613,16 @@ def save_path_folder(save_path: str, project_root: str) -> str:
     return str(path)
 
 
+def project_output_request(save_path: str, project_root: str) -> str:
+    """Interpret Int's configured output request, preserving explicit filenames and the saved spelling."""
+    if not save_path:
+        return ""
+    path = Path(save_path).expanduser()
+    if not path.is_absolute() and project_root:
+        path = Path(project_root).expanduser() / path
+    return str(path)
+
+
 def save_path_follows_project(save_path: str, project_root: str) -> bool:
     """Whether a Project change moves this Save Path, in every tool: it is blank, or it is that Project's default
     folder however it is spelled (a relative Save Path is inside the Project). A folder the user chose is kept."""

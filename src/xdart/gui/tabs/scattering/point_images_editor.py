@@ -183,6 +183,7 @@ class PointImagesSettings(SubsectionCard):
         self._remembered_shown = []
         self._answered_silently = set()  # C-13: the scans answered without a question, as found
         self._rendering = False
+        self._question = None
         self.scan = _row('Scan', 'None confirmed', kind='combo', choices=('None confirmed',),
                          tip='Choose a confirmed scan whose images-per-point settings you want to change.')
         self.count = _row('Images/pt', '', tip='Confirmed number of consecutive images in each scan point.')
@@ -292,6 +293,10 @@ class PointImagesSettings(SubsectionCard):
         policy = self._choices.get(point_source_key(spec))
         return spec if policy is None else replace(spec, options={**spec.options, 'point_images': policy.to_dict()})
 
+    def cancel_question(self):
+        if self._question is not None:
+            self._question.reject()
+
     def confirm(self, detections, parent=None, *, current=None):
         if any(isinstance(window, PointImagesDialog) and window.isVisible()
                for window in QtWidgets.QApplication.topLevelWidgets()):
@@ -313,6 +318,7 @@ class PointImagesSettings(SubsectionCard):
                 self._answered_silently.discard(found)
                 dialog = PointImagesDialog(detection, parent, self._choices.get(key) or remembered,
                                            countdown=not repeated, current=current)
+                self._question = dialog
                 try:
                     if (dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted
                             or current is not None and not current()):
@@ -328,6 +334,7 @@ class PointImagesSettings(SubsectionCard):
                     if dialog.remember_file.current_value():
                         self._file_defaults[_file_key(file)] = (file, chosen)
                 finally:
+                    self._question = None
                     dialog.deleteLater()
                 policy = _for_count(chosen, count)
             else:

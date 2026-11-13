@@ -34,7 +34,7 @@ import threading
 from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.pages.handle import AppMenuHosts, PageHandle, RunBarWriteMode
-from xdart.gui.pages.operation_owner import OperationTerminalStatus, SingleWorkerOwner
+from xdart.gui.pages.operation_owner import OperationCancelled, OperationTerminalStatus, SingleWorkerOwner
 from xdart.gui.pages.values import (
     ActionAccepted, ActionCompleted, ActionRefused, CloseReceipt, PageCleanup,
     RSM_TOOL_KEY, SCATTERING_PAGE_KEY, STITCH_TOOL_KEY,
@@ -216,17 +216,18 @@ def no_ub_warning(members) -> str:
 def _resolve_rsm_groups(arguments, cancel, _progress):
     """The member groups of a source selection (``rsm_member_groups``: Stitch's own discovery, the Selection
     syntax and Directory mode), off the GUI thread: it reads SPEC files and lists images."""
-    from xdart.gui.pages.operation_owner import OperationCancelled
     from xdart.gui.tools.rsm_values import rsm_member_groups
     from xrd_tools.analysis.stitch_sources import SourceSearchCancelled
     if cancel.is_set():
-        return None
+        raise OperationCancelled("the scan search was stopped")
     selection, options, queue = arguments
     try:  # C-16: Stop is checked between scans, and the scans searched are counted
         groups, skipped = rsm_member_groups(selection, **options, cancelled=cancel.is_set,
                                             progress=lambda done, total: _progress(_SEARCHING, done, total))
         ubs = _source_ubs(groups, cancel)
     except PointImagesRequired as error:
+        if cancel.is_set():
+            raise OperationCancelled("the scan search was stopped") from error
         return _PendingGroupings(error.pending)  # every grouped scan, asked about together (C-13)
     except SourceSearchCancelled as error:
         raise OperationCancelled(str(error)) from error
@@ -241,13 +242,15 @@ class _PendingGroupings(tuple):
     "so it's not waiting every time"): one question covers them all, and the scans are found once more after it."""
 
 
-def queue_output_slots(project, folder, groups):
+def queue_output_slots(project, folder, groups, *, cancel=None):
     """Each queued RSM's (family, output) in the Save Path's folder (``<folder>/<family>_rsm.nexus``, the
     family's stable slot): what ``build_forms`` writes to, and what a queued Run checks before its first RSM is
     gridded (G11). One helper for both, so the outputs checked are the outputs written."""
     from xrd_tools.io.output_path import resolve_finite_output_target
     slots = []
     for members in groups:
+        if cancel is not None and cancel.is_set():
+            raise OperationCancelled("the scan search was stopped")
         family = suggested_family(project, members)
         slots.append((family, resolve_finite_output_target(folder, family, operation_token="rsm")))
     return tuple(slots)
@@ -259,15 +262,19 @@ def _queue_refusals(queue, groups, cancel):
     maintainer, 2026-10-01, on queued runs: "Yes for your recommendation" (check every output before the first
     RSM is gridded, as Stitch does). Several RSMs only (one RSM's own preflight checks its output); empty while
     the Save Path is not usable (``build_forms`` refuses it then)."""
+    if cancel.is_set():
+        raise OperationCancelled("the scan search was stopped")
     if queue is None or len(groups) < 2:
         return {}
     from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, analysis_output_refusal
     project, folder = queue
     checked = {}
-    for _family, output in queue_output_slots(project, folder, groups):
+    for _family, output in queue_output_slots(project, folder, groups, cancel=cancel):
         if cancel.is_set():
-            return {}
+            raise OperationCancelled("the scan search was stopped")
         checked[str(output)] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
+    if cancel.is_set():
+        raise OperationCancelled("the scan search was stopped")
     return checked
 
 
@@ -284,7 +291,6 @@ def _source_ubs(groups, cancel=None):
             return ()
     def checked(member):
         if cancel is not None and cancel.is_set():
-            from xdart.gui.pages.operation_owner import OperationCancelled
             raise OperationCancelled("the scan search was stopped")
         return own(member)
     return tuple(checked(member) for group in groups for member in group)
@@ -380,6 +386,7 @@ class RSMPage(QtWidgets.QWidget):
         self._source_kind_shown = None
         self._output_suggested = True  # the Save Path follows the Project until the user chooses a folder (C-6)
         self._run_requested = False
+        self._stopping_preflight = False
         # Several RSMs per run (Stitch's Selection: 42,43 two RSMs), queued through the one owner one form at a
         # time as Stitch queues its outputs: the forms still to prepare (Preview) or prepare and grid (Run)
         self._jobs = []
@@ -2165,17 +2172,20 @@ class RSMPage(QtWidgets.QWidget):
         self._sync_actions()
 
     def stop(self):
+        self._stopping_preflight |= self._run_requested and self._owner.busy
+        self._run_requested = False
         self._clear_jobs()  # Stop stops the queue: the RSM being gridded is cancelled, the rest never start
         if self._grouping_question is not None:
             self._grouping_question = None
+            self.point_images.cancel_question()
             self._notice("RSM stopped")
         if self._resolving is not None and self._resolving[1] is not None:
             identity, _action, key = self._resolving
             self._resolver.cancel(identity)
-            self._resolving = (identity, None, key)  # finding the scans has no stop point: its result is dropped
+            self._resolving = (identity, None, key)  # discard even a result returned just before Stop
             self._status("Stopping…")
             self._sync_actions()
-        elif self._owner.cancel():
+        elif self._owner.cancel() or self._stopping_preflight:
             self._status("Stopping…")
         return ActionAccepted("rsm-stop")
 
@@ -2209,6 +2219,11 @@ class RSMPage(QtWidgets.QWidget):
     def _accept(self, update):
         if type(update) is not RSMOwnerUpdate:
             raise TypeError("the RSM page requires an exact owner update")
+        if self._stopping_preflight and update.action is RSMOwnerAction.PREFLIGHT:
+            if update.progress is None:
+                self._stopping_preflight = False
+                self._notice("RSM stopped")
+            return
         if update.progress is not None:
             progress = update.progress
             self._status(_progress_text(progress.stage, progress.completed, progress.total))

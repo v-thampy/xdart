@@ -132,6 +132,7 @@ from .controls_readiness import (
     ControlsReadinessProjection,
     SectionHeaderProjection,
 )
+from .controls_editing import project_output_request
 from .coordinator import ScatteringCoordinator
 from .detector_projection import detector_calibration_ready, detector_summary, poni_detector
 from .display_values import (
@@ -752,6 +753,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._processed_browser = ProcessedBrowserOwner(
             save_path=initial_intent.save_path,
+            project_root=initial_intent.project_root,
             processing_mode=initial_intent.processing_mode,
             deliver=lambda wake: ScatteringWorkspace._deliver_browser_catalog(
                 page_ref, wake
@@ -760,6 +762,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         )
         self._deferred_browse_selection: _DeferredBrowseSelection | None = None
         self._deferred_browse_reopen: _DeferredBrowseReopen | None = None
+        self._browse_follow_directory = None
         # The latest Browse open a click admitted: All frames applies to its READY adoption alone (ALL-FRAMES-128)
         self._all_frames_open: BrowseLoadRequest | None = None
         # A changed file's reopen after a re-click and the frame labels it returns to (BROWSE-CLICK-128)
@@ -3323,7 +3326,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if not name:
                 raise ValueError("Average source scan name is empty.")
             generated = _resolved_generated_target(
-                intent.save_path, name,
+                project_output_request(intent.save_path, intent.project_root), name,
                 grazing_incidence=bool(intent.gi.enabled),
             )
             target = os.path.abspath(os.path.expanduser(str(generated)))
@@ -4836,7 +4839,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 outcome.run_identity,
                 live_mode=outcome.configuration.live_mode,
             )
-            self._processed_browser.begin_follow(outcome.run_identity)
+            self._processed_browser.begin_follow(outcome.run_identity, save_path=outcome.configuration.save_path,
+                                                 project_root=outcome.configuration.project_root)
             retirement = self._batch_terminal.begin_run(
                 outcome.run_identity,
                 batch_mode=outcome.configuration.batch_mode,
@@ -5322,6 +5326,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 self._ensure_timer()
             return
         self._all_frames_open = request
+        self._browse_follow_directory = self._processed_browser.directory
         self._click_perf = _ClickBrowsePerf(request, click_started) if _click_perf_enabled() else None
         if terminal_request is not None and request is not terminal_request:
             self._processed_browser.retire_terminal(
@@ -5733,7 +5738,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         load_outcome.status is BrowseLoadStatus.READY and not successor_settled,
                     )
                 current = self._context_controller.navigation.current
-                if current is not None:
+                if current is not None and (terminal_request is not None or successor_settled
+                                            or self._browse_follow_directory == self._processed_browser.directory):
                     self._follow_processed_artifact(current)
             if self._retire_cancelled_reintegrate_successor():
                 changed = True
@@ -8086,7 +8092,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
         project_key = (
             str(intent.project_root or ""),
-            str(intent.save_path or ""),
+            project_output_request(intent.save_path, intent.project_root),
         )
         if project_key != self._project_readiness_key:
             self._project_readiness = project_header_projection(controls)
@@ -9240,6 +9246,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             prior,
             current,
         )
+        if (prior_intent.save_path, prior_intent.project_root) != (current_intent.save_path, current_intent.project_root):
+            self._deferred_browse_reopen = None
+            self._deferred_browse_selection = None
         self._processed_browser.reconcile_intent(prior, current)
         ScatteringWorkspace._observe_operation_stamp(
             self,

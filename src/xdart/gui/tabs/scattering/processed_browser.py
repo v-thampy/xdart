@@ -526,6 +526,7 @@ class ProcessedBrowserOwner:
         self,
         *,
         save_path: str,
+        project_root: str = "",
         processing_mode: str,
         deliver: CatalogDelivery,
         catalog_reader: CatalogReader | None = None,
@@ -546,7 +547,7 @@ class ProcessedBrowserOwner:
         self._operation: _BrowserCatalogOperation | None = None
         self._queued: BrowserCatalogRequest | None = None
         self._token = 0
-        self._directory = processed_directory(save_path)
+        self._directory = processed_directory(save_path, project_root)
         self._accepted_suffixes = browser_suffixes_for_mode(processing_mode)
         self._catalog: tuple[BrowserCatalogEntry, ...] = ()
         self._scan_index: BrowserScanIndex | None = None
@@ -1280,20 +1281,17 @@ class ProcessedBrowserOwner:
         self._accepted_suffixes = accepted_suffixes
         # C-14 (his pick "Always follow (Recommended)"): a Save Path change moves the browser there, replacing a
         # folder opened with Open Folder; a relative Save Path is inside the Project.
-        directory_changed = before.save_path != after.save_path
+        directory_changed = (before.save_path, before.project_root) != (after.save_path, after.project_root)
         if directory_changed:
             self._explicit_directory = False
-            saved = str(after.save_path or "")
-            if saved and after.project_root and not os.path.isabs(os.path.expanduser(saved)):
-                saved = os.path.join(os.path.expanduser(str(after.project_root)), saved)
-            self._directory = processed_directory(saved)
+            self._directory = processed_directory(after.save_path, after.project_root)
         if directory_changed or policy_changed:
             self._catalog = ()
             self.request_catalog()
             return ProcessedBrowserTransition(BrowserRefreshEffect.FULL)
         return ProcessedBrowserTransition(BrowserRefreshEffect.NONE)
 
-    def begin_follow(self, identity: RunIdentity) -> None:
+    def begin_follow(self, identity: RunIdentity, *, save_path: str = "", project_root: str = "") -> None:
         if (
             self._closing
             or self._closed
@@ -1303,6 +1301,9 @@ class ProcessedBrowserOwner:
         self._explicit_directory = False
         self._follow_identity = identity
         self._seen_artifacts.clear()
+        directory = processed_directory(save_path, project_root)
+        if directory and directory != self._directory:
+            self.set_directory(directory, explicit=False)
 
     def follow_processed_artifact(
         self,

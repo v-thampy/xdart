@@ -99,12 +99,13 @@ class DirectoryModifiedCache:
         return effective_mtime_ns
 
 
-def processed_directory(save_path: str) -> str:
+def processed_directory(save_path: str, project_root: str = "") -> str:
     """Return the directory that owns the configured processed artifacts."""
 
     if type(save_path) is not str or not save_path:
         return ""
-    requested = Path(save_path).expanduser()
+    from .controls_editing import project_output_request
+    requested = Path(project_output_request(save_path, project_root))
     directory = (
         requested.parent
         if is_readable_output_path(requested) and not requested.is_dir()

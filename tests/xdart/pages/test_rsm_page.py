@@ -3419,7 +3419,7 @@ def test_a_grouping_question_cannot_restart_an_invalidated_rsm_search(qapp, tmp_
     import tifffile
     from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
     page = _page(qapp)
-    answered, searches = [], []
+    answered, searches, closed_by_stop = [], [], []
     timer = QtCore.QTimer()
 
     def invalidate_and_answer():
@@ -3431,7 +3431,9 @@ def test_a_grouping_question_cannot_restart_an_invalidated_rsm_search(qapp, tmp_
             dialog.reject()
             return
         if action == "stop":
+            dialog.apply_remaining.editor.setChecked(True)  # editing disarms the countdown
             page.stop()
+            closed_by_stop.append(not dialog.isVisible())
         else:
             page.set_sources((replacement,))
         dialog.remember_file.editor.setChecked(True)
@@ -3455,6 +3457,8 @@ def test_a_grouping_question_cannot_restart_an_invalidated_rsm_search(qapp, tmp_
         _wait(page, qapp, lambda: answered and page._resolving is None)
         assert len(searches) == 1
         assert page.point_images.document() == {"choices": []}
+        if action == "stop":
+            assert closed_by_stop == [True]
     finally:
         timer.stop()
         _close(page, qapp)

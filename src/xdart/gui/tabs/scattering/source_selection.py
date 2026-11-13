@@ -48,6 +48,7 @@ from .controls_projection import (
     source_mode,
 )
 from .controls_inventory import SOURCE_EDIT_PATHS
+from .controls_editing import project_output_request
 from .events import RunIdentity
 from .state_machine import RunPhase
 
@@ -71,7 +72,7 @@ def _count_skip(snapshot: RunIntentSnapshot) -> tuple[str, ...]:
     source = intent.source_spec
     if type(source) is not DirectorySourceSpec or not source.recursive:
         return ()
-    return scan_skip_dirs(source.root, intent.save_path or None)
+    return scan_skip_dirs(source.root, project_output_request(intent.save_path, intent.project_root) or None)
 
 class SourceRefreshEffect(Enum):
     """Smallest shell repaint required by one source transition."""

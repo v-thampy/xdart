@@ -79,14 +79,16 @@ _NOT_SPEC = frozenset({".raw", ".tif", ".tiff", ".edf", ".cbf", ".img", ".mar345
 _CONTAINER_SUFFIXES = frozenset({".nxs", ".h5", ".hdf5", ".nexus", ".cxi"})
 
 
-def _directory_spec_files(directory, recursive, name_ok):
+def _directory_spec_files(directory, recursive, name_ok, check):
     """The SPEC files in a Directory (its subfolders' too) whose names pass the filter, in discovery
     order. A known image or data file is never opened to find out: with subfolders, an images folder
     of thousands of frames would otherwise each be read."""
     from xrd_tools.io.spec import is_spec_file
     from xrd_tools.sources.discover import _walk_files
-    return [path for path in _walk_files(directory, recursive)
-            if path.suffix.lower() not in _NOT_SPEC and name_ok(path.name) and is_spec_file(path)]
+    for path in _walk_files(directory, recursive, check=check):
+        check()
+        if path.suffix.lower() not in _NOT_SPEC and name_ok(path.name) and is_spec_file(path):
+            yield path
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +277,7 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
                 close()
 
     def spec_file(path, all_scans):
+        step()
         keys = tuple(list_spec_scans(path))
         requested = tuple((key,) for key in keys) if all_scans else parse_stitch_scan_groups(selection.scans)
         searched[1] += sum(len(group) for group in requested)
@@ -303,11 +306,14 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
         if not entries:
             raise ValueError(f"{path.name} has no NeXus entries")
         # Each file remains one output/group; its exact entries contribute.
-        members = tuple(value for entry in entries
-                        if (value := confirmed(SourceSpec(path, kind, entry=entry), directory=directory))
-                        is not None)
+        members = []
+        for entry in entries:
+            step()
+            value = confirmed(SourceSpec(path, kind, entry=entry), directory=directory)
+            if value is not None:
+                members.append(value)
         names.update(dict.fromkeys(map(id, members), int_scan_name(path)))
-        return members
+        return tuple(members)
 
     if selection.kind == "Spec":
         for path in selection.paths:
@@ -319,11 +325,11 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
         if not directory.is_dir():
             raise ValueError("Source directory is unavailable")
         name_ok = compile_filter(selection.name_filter)
-        for path in _directory_spec_files(directory, selection.recursive, name_ok):
+        for path in _directory_spec_files(directory, selection.recursive, name_ok, step):
             spec_file(path, True)
         seen_nexus = set()
         for kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
-            for spec in discover_scans(directory, kind, recursive=selection.recursive):
+            for spec in discover_scans(directory, kind, recursive=selection.recursive, check=step):
                 path = Path(spec.uri)
                 if not name_ok(path.stem if path.suffix.lower() in _CONTAINER_SUFFIXES else path.name):
                     continue
@@ -331,6 +337,7 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
                 if resolved not in seen_nexus:
                     seen_nexus.add(resolved)
                     groups.append(nexus_members(path, directory=True))
+    step()
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
     if pending:
