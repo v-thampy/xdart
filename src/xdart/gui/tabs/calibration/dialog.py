@@ -2993,18 +2993,18 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
 
     def _guard(self, operation, *, refused=None):
         try:
-            operation()
+            return operation()
         except Exception as error:
             self.status.setText(str(error))
             if refused is not None:
                 refused(str(error))
 
-    def _save_refused(self, message):
+    def _save_refused(self, message, *, geometry_saved=False):
         """A "Save geometry and use" that was refused or failed, said on the fit window its click came from as well
-        as on this window's status line beneath it, so the click never ends silently (C-7)."""
+        as on this window's status line beneath it (C-7)."""
         window = self._calibration_fit_window
         if window is not None and window.isVisible():
-            window.show_save_refusal(message)
+            window.show_save_refusal(message, geometry_saved=geometry_saved)
 
     def _enumerate(self):
         def go():
@@ -3352,16 +3352,21 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 raise ValueError(self._BUSY_WAIT)
             if self.fit is None:
                 raise ValueError('fit the current controls before saving')
+            fit = self.fit
             if self._finish_after_save and self._save_session(validate_only=True) is None:
                 raise ValueError('Record a valid calibration session before closing.')
             selected = self._save_path(beam=False)
             if selected is not None:
+                if self.active():
+                    raise ValueError(self._BUSY_WAIT)
+                if self.fit is not fit:
+                    raise ValueError('The fit changed while choosing a file. Review it before saving.')
                 if self._finish_after_save and self._save_session(validate_only=True, selected_path=selected) is None:
                     raise ValueError('Record a valid calibration session before closing.')
-                self._saving = self.fit
-                self._start('save', (self.fit, selected, pair_validation_angles(
-                    self.fit, scan_angles=self._scan_angles(self.fit))))
-        self._guard(go, refused=self._save_refused if self._finish_after_save else None)
+                self._saving = fit
+                self._start('save', (fit, selected, pair_validation_angles(fit, scan_angles=self._scan_angles(fit))))
+                return True
+        return self._guard(go, refused=self._save_refused if self._finish_after_save else None)
 
     def _save_and_close(self):
         """Finish through the existing pair writer; only a successful session and handoff close the windows."""
@@ -3370,8 +3375,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._save_refused(self._BUSY_WAIT)
             return
         self._finish_after_save = True
-        self._save()
-        if not self._owner.busy:  # Cancel in the picker, or a refusal before starting the writer
+        if not self._save():  # Cancel in the picker, or a refusal before starting the writer
             self._finish_after_save = False
 
     def _setup_state(self):
@@ -3418,7 +3422,9 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             folder.mkdir(parents=True, exist_ok=True)  # Qt opens a Save panel whose start folder is missing elsewhere
             suggested = self._default_name(beam, folder=folder)
             offered = str(suggested)
-        picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
+        window = self._calibration_fit_window
+        parent = window if self._finish_after_save and window is not None and window.isVisible() else self
+        picks = file_dialogs.browse(parent, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
                                     current=str(suggested), fallback=str(self.project_root),
                                     default_name=offered)
         path = picks[0] if picks else ''
@@ -3434,7 +3440,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             raise ValueError('Choose a new calibration filename; Save on close preserves the original pair')
         if not selected.exists() and any(companion.exists() for companion in companions):
             # Qt confirms an existing primary. Orphan companions need the same explicit choice.
-            answer = QtWidgets.QMessageBox.question(self, 'Replace calibration files?',
+            answer = QtWidgets.QMessageBox.question(parent, 'Replace calibration files?',
                 f'Replace the existing companion files for {selected.name}?',
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
             if answer != QtWidgets.QMessageBox.Yes:
@@ -4370,7 +4376,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 self._finish_after_save = False
                 self._job_status(str(error))
                 if finishing:
-                    self._save_refused(str(error))
+                    self._save_refused(str(error), geometry_saved=True)
         elif terminal.status is OperationTerminalStatus.CANCELLED:
             self._close_after_save = False
             self._finish_after_save = False

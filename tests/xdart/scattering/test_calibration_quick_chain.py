@@ -1096,7 +1096,7 @@ def _quick_rsm_fit_outside_project(qapp, tmp_path, monkeypatch, answer):
     offered = []
     # Qt's external chooser is the boundary; the shared Browse/Save path stays real.
     monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(
-        lambda parent, title, start, filt: offered.append(start) or (answer(start), filt)))
+        lambda parent, title, start, filt: offered.append((parent, start)) or (answer(start), filt)))
     return page, dialog, project, offered
 
 
@@ -1111,7 +1111,8 @@ def test_save_and_use_offers_the_projects_calibration_folder_when_the_scan_is_ou
         window.save_button.click()
         _wait(dialog, timeout=120)
         _pump(qapp, lambda: not dialog.isVisible(), seconds=30)
-        (start,) = offered
+        ((parent, start),) = offered
+        assert parent is window
         assert Path(start).parent == project.resolve() / 'calibration', start
         used = Path(page._value('geometry_path'))
         used = used if used.is_absolute() else project / used
@@ -1139,6 +1140,43 @@ def test_a_refused_save_and_use_says_why_on_the_fit_window(qapp, tmp_path, monke
         assert window.pattern_view.status.text() == refusal
         assert window.summary.text().splitlines()[0] == refusal
         assert not dialog.active()
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_save_and_use_reports_a_job_started_while_the_picker_was_open(qapp, tmp_path, monkeypatch):
+    page, dialog, project, _offered = _quick_rsm_fit_outside_project(
+        qapp, tmp_path, monkeypatch, lambda start: start)
+    try:
+        window = dialog._calibration_fit_window
+        selected = project / 'calibration' / 'busy.json'
+
+        def choose(parent, title, start, filt):
+            dialog._source_details()  # a real worker starts during the picker's nested event loop
+            assert dialog._job == 'source_details' and dialog.active()
+            return str(selected), filt
+
+        monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(choose))
+        window.save_button.click()
+        assert not dialog._finish_after_save
+        assert window.summary.text().splitlines()[0] == f'Not saved: {dialog._BUSY_WAIT}'
+        _wait(dialog, timeout=60)
+        assert not selected.exists() and page._value('geometry_path') == ''
+    finally:
+        _close(qapp, page, dialog)
+
+
+def test_save_and_use_distinguishes_a_saved_geometry_from_a_session_failure(qapp, tmp_path, monkeypatch):
+    page, dialog, _project, offered = _quick_rsm_fit_outside_project(qapp, tmp_path, monkeypatch, lambda start: start)
+    try:
+        (dialog.session_dir / 'calibration-session.tmp').mkdir()
+        window = dialog._calibration_fit_window
+        window.save_button.click()
+        _wait(dialog, timeout=60)
+        ((_parent, start),) = offered
+        assert Path(start).is_file() and page._value('geometry_path') == ''
+        assert dialog.isVisible() and window.isVisible()
+        assert window.summary.text().startswith('Geometry saved, but not used: ')
     finally:
         _close(qapp, page, dialog)
 
