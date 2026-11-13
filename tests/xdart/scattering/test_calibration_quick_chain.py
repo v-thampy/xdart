@@ -1141,3 +1141,29 @@ def test_a_refused_save_and_use_says_why_on_the_fit_window(qapp, tmp_path, monke
         assert not dialog.active()
     finally:
         _close(qapp, page, dialog)
+
+
+def test_the_offered_calibration_folder_exists_when_the_save_panel_opens(qapp, tmp_path, monkeypatch):
+    """C-7: a Save panel whose start folder is missing opens elsewhere (Qt), outside the Project again, and the save
+    is refused. A fresh Project need not have its calibration folder before a session is saved (Save rough saves no
+    fit), so the folder offered must exist when the panel opens."""
+    from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
+    from xdart.utils.browse import remember_browse_path
+    monkeypatch.delenv('XDART_SESSION_FRESH', raising=False)
+    monkeypatch.setenv('XDART_SESSION_FILE', str(tmp_path / 'session.json'))
+    data, project = tmp_path / 'data', tmp_path / 'project'
+    data.mkdir()
+    project.mkdir()
+    remember_browse_path(str(data))  # he browsed his SPEC file there, outside the Project
+    seen = []
+    monkeypatch.setattr(QtWidgets.QFileDialog, 'getSaveFileName', staticmethod(
+        lambda parent, title, start, filt: seen.append((start, Path(start).parent.is_dir())) or ('', filt)))
+    dialog = CalibrationDialog(CalibrationContext('RSM', project))
+    try:
+        assert dialog._save_path() is None  # cancelled
+        ((start, folder_there),) = seen
+        assert Path(start).parent == project.resolve() / 'calibration', start
+        assert folder_there
+    finally:
+        dialog.close()
+        dialog.deleteLater()
