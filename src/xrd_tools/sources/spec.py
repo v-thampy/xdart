@@ -17,6 +17,7 @@ All SPEC parsing + image I/O is reused from the headless ``xrd_tools.io`` layer
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -45,12 +46,30 @@ def find_spec_image_files(directory: str | Path, spec_stem: str, scan: Any,
 
     files = find_image_files(directory, stem=image_stem or None)
     if not image_stem:
-        files = [path for path in files if _spec_scan_match(path, spec_stem, scan) is not None]
+        # C-16: the listing indexed by scan number once per search (a scan's own pattern over every name of a
+        # 20,700-image folder, twice per scan, was most of a search's time); outside a search, as before.
+        from xrd_tools.io.image import shared_listing
+        listing = files
+        index = shared_listing(("spec-scan-index", os.path.normcase(os.path.abspath(str(directory))), spec_stem),
+                               lambda: _index_by_scan(listing, spec_stem))
+        files = list(index.get(int(str(scan).split(".")[0]), ()))
     files = [path for path in files if path.is_file()]
     return [path for path in files if not (
         (match := re.fullmatch(r"(.+)_data_\d+", path.stem))
         and path.suffix.lower() == ".h5"
         and path.with_name(match[1] + "_master.h5").is_file())]
+
+
+def _index_by_scan(files, spec_stem: str) -> dict[int, tuple[Path, ...]]:
+    """Each scan number's files, in listing order: a file is a scan's when its name holds ``<spec_stem>_scan<N>_``
+    for that N (``_spec_scan_match``'s rule)."""
+    import re
+    pattern = re.compile(re.escape(spec_stem) + r"_scan(\d+)_")
+    index: dict[int, list[Path]] = {}
+    for path in files:
+        for number in dict.fromkeys(int(match[1]) for match in pattern.finditer(Path(path).name)):
+            index.setdefault(number, []).append(path)
+    return {number: tuple(paths) for number, paths in index.items()}
 
 
 def _spec_scan_match(path: str | Path, spec_stem: str, scan: Any):

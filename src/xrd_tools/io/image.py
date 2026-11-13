@@ -608,6 +608,17 @@ def shared_image_listings():
             _SHARED_LISTINGS.reset(token)
 
 
+def shared_listing(key, build):
+    """Inside :func:`shared_image_listings`, ``build()`` once per ``key`` for the search (C-16: an index of a
+    listing, made once); outside it, ``build()``."""
+    shared = _SHARED_LISTINGS.get()
+    if shared is None:
+        return build()
+    if key not in shared:
+        shared[key] = build()
+    return shared[key]
+
+
 def find_image_files(
     directory: Path | str,
     stem: str | None = None,
