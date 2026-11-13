@@ -93,10 +93,18 @@ def test_stop_returns_at_once_while_the_writer_holds_its_lock(tmp_path, monkeypa
         started = time.monotonic()
         page._shell.run_controls.stopButton.click()
         took = time.monotonic() - started
-        writer_still_held = not release.is_set()
         shown = page._progress.detail
+        stalls = []  # the window stays live while the writer is still held: no other GUI path waits on its lock
+        until = time.monotonic() + .5
+        while time.monotonic() < until and not release.is_set():
+            pumped = time.monotonic()
+            app.processEvents()
+            stalls.append(time.monotonic() - pumped)
+            time.sleep(.01)
+        writer_still_held = not release.is_set()
         release.set()
         assert writer_still_held and took < _STOP_BOUND_S, f"Stop took {took:.2f} s while the writer held its lock"
+        assert stalls and max(stalls) < .25, f"the window stalled {max(stalls, default=0):.2f} s after Stop"
         assert shown == "Stopping run…"
         assert _wait(app, lambda: any(event.kind in _TERMINAL for event in events)), page._notice_text
         terminal = next(event for event in events if event.kind in _TERMINAL)
