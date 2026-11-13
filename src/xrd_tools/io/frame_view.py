@@ -3843,9 +3843,10 @@ def read_contributing_frame_view(
             raise AnalysisArtifactInvalid("artifact changed before frame hydration")
         # a stitched record keeps its contributors (and their source base) under entry/stitch
         container = handle["entry"][STITCH_GROUP]
-        master, index, thumbnail = _raw_frame_parts_from_entry(
+        master, index, thumbnail_reader = _raw_frame_parts_from_entry(
             path, container, frame, scan=scan, source_root=source_root,
         )
+        thumbnail = None if thumbnail_reader is None else thumbnail_reader()  # this view shows it
         group = _frame_group_for_label(container, frame, scan=scan)
         options = _frame_source_read_options(group)
         point = read_point_source_ref(group.get("source"))
@@ -3887,7 +3888,7 @@ def read_contributing_frame_view(
             if not raw_reason:
                 raw = (_point_raw_frame(path, point, source_base=frame_manifest["source_base"],
                     source_root=source_root) if point is not None else
-                    _raw_frame_or_thumbnail(path, frame, master, index, thumbnail,
+                    _raw_frame_or_thumbnail(path, frame, master, index, thumbnail_reader,
                         allow_thumbnail=False, preserve_dtype=True, raw_options=options))
                 if not all(state.matches_disk() for state in states):
                     raw, raw_reason = None, "raw source changed during reading"

@@ -33,7 +33,9 @@ def test_a_broken_thumbnail_never_stops_a_valid_raw_read(processed_with_master, 
 
 
 def test_a_raw_read_decodes_the_thumbnail_only_to_substitute_it(processed_with_master, monkeypatch):  # noqa: F811
-    nxs, raw, thumb = processed_with_master
+    nxs, raw, _thumb = processed_with_master
+    with h5py.File(nxs, "r") as handle:  # the stored thumbnail, decoded independently (it is quantized and clipped)
+        stored = read._dequantize_thumbnail(handle["entry/frames/frame_0000/thumbnail"])
     calls = _decodes(monkeypatch)
     np.testing.assert_array_equal(get_raw_frame(nxs, 0, allow_thumbnail=False), raw[1])
     assert calls == []  # strict: never opened
@@ -43,5 +45,5 @@ def test_a_raw_read_decodes_the_thumbnail_only_to_substitute_it(processed_with_m
     with pytest.raises(KeyError, match="thumbnail fallback disabled"):
         get_raw_frame(nxs, 0, allow_thumbnail=False)
     assert calls == []
-    np.testing.assert_allclose(get_raw_frame(nxs, 0), thumb, atol=(thumb.max() - thumb.min()) / 255)
+    np.testing.assert_array_equal(get_raw_frame(nxs, 0), stored)
     assert calls == ["/entry/frames/frame_0000/thumbnail"]  # substituted, so decoded once
