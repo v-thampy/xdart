@@ -173,10 +173,14 @@ class CalibrationFitWindow(FitWindow):
         self.save_button.apply_spec(replace(self.save_button.spec, enabled=enabled, reason=reason))
 
     def show_save_refusal(self, message):
-        """Why a "Save geometry and use" did not save, on this window's own status line (the Stitched calibrant
-        panel's, shown); the next preview's summary replaces it (C-7)."""
-        self.panels.setCurrentWidget(self.pattern_view)
-        self.pattern_view.status.setText(f'Not saved: {message}')
+        """Why a "Save geometry and use" did not save, on this window whichever panel is shown (C-7): the Stitched
+        calibrant panel's status line and the top of the Fit residuals summary. It switches no panel, since showing
+        the Stitched calibrant panel starts its preview; the next fit or preview replaces the text."""
+        text = f'Not saved: {message}'
+        self.pattern_view.status.setText(text)
+        if self.summary is not None:
+            kept = [line for line in self.summary.text().splitlines() if not line.startswith('Not saved: ')]
+            self.summary.setText('\n'.join([text, *kept]))
 
     def _panel_changed(self, index):
         if (self.panels.widget(index) is self.pattern_view

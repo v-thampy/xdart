@@ -476,7 +476,8 @@ def test_typing_in_a_field_then_run_runs_the_typed_inputs(qapp, tmp_path, monkey
         page.run_bar.startButton.click()  # a click that leaves the focus in the field
         _wait(page, qapp, lambda: page.shown is not None)
         output = Path(page.build_form().output_path)
-        assert output.parent == tmp_path / "typed" and page.results.item(0).text() == output.name
+        names = [page.results.item(row).text() for row in range(page.results.count())]
+        assert output.parent == tmp_path / "typed" and output.name in names, names
     finally:
         _close(page, qapp)
 

@@ -153,7 +153,8 @@ def test_the_save_mode_offers_its_name_in_the_last_folder_and_remembers_only_a_p
 def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_path, monkeypatch):
     """Codex's Stitch/Int reuse audit R5: the mask's frame chooser, the calibration save, Stitch's settings and
     RSM's Output called Qt's dialog directly, so a pick never became the shared last folder and the mask chooser
-    had no file types. Through ``file_dialogs`` each remembers its pick, and a cancel changes nothing."""
+    had no file types. Through ``file_dialogs`` each remembers its pick, and a cancel changes nothing. RSM's Save
+    Path is a folder chooser since NEXT-1210-RESPONSIVENESS C-6."""
     from xdart.gui.pages.services import empty_host_services
     from xdart.gui.tabs.rsm.page import RSMPage
     from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
@@ -174,6 +175,11 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
         return staticmethod(static)
     for kind in ("getSaveFileName", "getOpenFileName"):
         monkeypatch.setattr(QtWidgets.QFileDialog, kind, dialog(kind))
+
+    def folder(parent, title, start, *options):
+        asked.append(("getExistingDirectory", title, start, ""))
+        return answer[0]
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getExistingDirectory", staticmethod(folder))
     picked = tmp_path / "picked"
     picked.mkdir()
     (tmp_path / "calibration").mkdir()
@@ -188,13 +194,15 @@ def test_every_stitch_and_rsm_chooser_goes_through_the_shared_rule(qapp, tmp_pat
         assert calibration._save_path() is None and asked[-1][2] == str(calibration._default_name(False))
         assert page._choose_settings_path("save", str(tmp_path)) is None
         assert asked[-1][1:] == ("Save Stitch settings", str(tmp_path), file_dialogs.SETTINGS_FILTER)
-        rsm.set_field("output_path", str(tmp_path / "old_rsm.nexus"))
+        old = tmp_path / "old"
+        old.mkdir()
+        rsm.set_field("output_path", str(old))
         rsm._browse("output_path")
-        assert rsm._value("output_path") == str(tmp_path / "old_rsm.nexus")  # a cancel changes nothing
-        answer[0] = str(picked / "new_rsm.nexus")
+        assert rsm._value("output_path") == str(old)  # a cancel changes nothing
+        assert asked[-1][:3] == ("getExistingDirectory", "Choose processed-data folder", str(old))  # no last yet
+        answer[0] = str(picked)
         rsm._browse("output_path")
         assert rsm._value("output_path") == answer[0] and last_browse_dir() == str(picked)
-        assert asked[-1][2] == str(tmp_path / "old_rsm.nexus")  # its name, in its own folder (no last yet)
         answer[0] = str(picked / "settings.json")
         assert page._choose_settings_path("load", "") == answer[0] and asked[-1][0] == "getOpenFileName"
         saved = tmp_path / "calibration" / "geometry.json"

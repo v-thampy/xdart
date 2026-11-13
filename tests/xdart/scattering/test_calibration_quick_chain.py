@@ -1123,9 +1123,9 @@ def test_save_and_use_offers_the_projects_calibration_folder_when_the_scan_is_ou
 
 
 def test_a_refused_save_and_use_says_why_on_the_fit_window(qapp, tmp_path, monkeypatch):
-    """C-7: a refusal of "Save geometry and use" is said on the fit window the click came from (its own status line,
-    on the Stitched calibrant panel), not only on the calibration window beneath it; nothing is written and both
-    windows stay open."""
+    """C-7: a refusal of "Save geometry and use" is said on the fit window the click came from (the Stitched calibrant
+    panel's status line and the top of the Fit residuals summary), not only on the calibration window beneath it;
+    nothing is written, both windows stay open, and no panel switch starts a preview."""
     outside = tmp_path / 'data' / 'outside.json'
     page, dialog, project, offered = _quick_rsm_fit_outside_project(
         qapp, tmp_path, monkeypatch, lambda start: str(outside))
@@ -1135,7 +1135,9 @@ def test_a_refused_save_and_use_says_why_on_the_fit_window(qapp, tmp_path, monke
         _wait(dialog, timeout=60)
         assert offered and not outside.exists() and page._value('geometry_path') == ''
         assert dialog.isVisible() and window.isVisible()
-        assert window.panels.currentWidget() is window.pattern_view
-        assert window.pattern_view.status.text() == 'Not saved: save the geometry inside the RSM project'
+        refusal = 'Not saved: save the geometry inside the RSM project'
+        assert window.pattern_view.status.text() == refusal
+        assert window.summary.text().splitlines()[0] == refusal
+        assert not dialog.active()
     finally:
         _close(qapp, page, dialog)
