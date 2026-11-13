@@ -7,7 +7,7 @@ from pathlib import Path
 from xrd_tools.core.filters import compile_filter
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.io.nexus import list_entries
-from xrd_tools.io.spec import list_spec_scans
+from xrd_tools.io.spec import UnusableSpecScan, list_spec_scans
 from xrd_tools.sources.descriptor import describe_container
 from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.grouping import parse_stitch_scan_groups
@@ -207,7 +207,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             spec = replace(spec, options={**spec.options, "point_images": policy.to_dict()})
         return spec
 
-    def spec_member(path, key):
+    def spec_member(path, key, every_scan):
         stem = selection.image_stem.format(spec=path.stem, scan=key.split(".")[0], occurrence=key)
         spec = SourceSpec(path, SourceKind.SPEC, options={
             "scan": key, "image_dir": selection.image_dir or str(path.parent),
@@ -222,6 +222,13 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             source = open_source(spec)
         except PointImagesRequired as error:
             pending.append(error.detection)
+            return None
+        except UnusableSpecScan as error:
+            # All Scans and Directory skip a scan they cannot grid and list why (C-10, the maintainer: "a lot of
+            # scans in a spec file ... should be skipped"); an explicitly selected scan is still refused.
+            if not every_scan:
+                raise
+            skipped.append((str(path), key, error.reason))
             return None
         try:
             if not source.capabilities.has_raw_references:
@@ -245,7 +252,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 key = token if token in keys else token + ".1"
                 if key not in keys:
                     raise ValueError(f"{path.name}: scan {token} is not present")
-                value = spec_member(path, key)
+                value = spec_member(path, key, all_scans)
                 if value is not None and value not in members:
                     members.append(value)
             if members:

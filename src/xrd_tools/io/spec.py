@@ -116,6 +116,16 @@ def read_spec_scan_table(
     return columns, dict(motor_positions), npts
 
 
+class UnusableSpecScan(ValueError):
+    """One SPEC scan cannot be read as a grid of points (NEXT-1210-RESPONSIVENESS C-10): no data points (an aborted
+    scan), a malformed data table, or detector images that do not match its points. All Scans and Directory skip
+    such a scan and list ``reason``; an explicitly selected one is refused with the message."""
+
+    def __init__(self, message: str, reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason or message
+
+
 _SPEC_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
@@ -162,7 +172,7 @@ def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
             problem = _spec_row_problem(line.split(), labels)
             if problem is not None:
                 index, label, token = problem
-                raise ValueError(
+                raise UnusableSpecScan(
                     f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
                     f"physical row {physical_row}, column {index + 1} ({label!r}): "
                     f"expected a complete decimal/scientific numeric token, got {token!r}"
@@ -190,7 +200,10 @@ def read_spec_scan_columns(
     _validate_spec_numeric_tokens(spec_file, scan_data, labels)
     data = np.asarray(scan_data.data)
     if data.ndim != 2 or data.shape[0] != len(labels):
-        raise ValueError("SPEC #L labels do not match the physical data table")
+        if data.size == 0:  # #L written, no point recorded: the scan was aborted (1.2.9 said "labels do not match")
+            reason = "no data points (an aborted scan)"
+            raise UnusableSpecScan(f"SPEC scan {scan_data.number}.{scan_data.order}: {reason}", reason)
+        raise UnusableSpecScan("SPEC #L labels do not match the physical data table")
     npts = int(data.shape[1])
     columns = tuple(
         (name, np.array(data[index], dtype=float, copy=True))

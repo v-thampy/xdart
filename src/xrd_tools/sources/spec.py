@@ -227,16 +227,21 @@ class SpecSource(BaseFrameSource):
                     detection = detect_point_images(source_spec, self.scan_key, npts, frames)
                     if detection is not None:
                         raise PointImagesRequired(detection)
-                    raise ValueError(
+                    from xrd_tools.io.spec import UnusableSpecScan
+                    raise UnusableSpecScan(
                         f"SPEC scan {self.scan_key}: {npts} metadata points but {frames} image frames in "
-                        f"{len(files)} files matching *{stem}* in {self.image_dir}; check the image stem and folder")
+                        f"{len(files)} files matching *{stem}* in {self.image_dir}; check the image stem and folder",
+                        f"{npts} scan points but {frames} detector images")
                 if len(files) > 1 and all(layout.frame_count == 1 for layout in layouts):
                     import re
                     positions = [re.search(r"(\d+)(?:\.[^.]+)?$", path.name) for path in files]
                     if all(positions):
                         numbers = [int(match[1]) for match in positions]
                         if numbers not in [list(range(frames)), list(range(1, frames + 1))]:
-                            raise ValueError(f"SPEC scan {self.scan_key}: image point numbers contain gaps or duplicates")
+                            from xrd_tools.io.spec import UnusableSpecScan
+                            raise UnusableSpecScan(
+                                f"SPEC scan {self.scan_key}: image point numbers contain gaps or duplicates",
+                                "detector image numbers have gaps or duplicates")
             if (require_complete_images or self.point_image_policy is not None or nexus_entry) and files:
                 self._frame_map = [(path, i) for path, layout in zip(files, layouts)
                                    for i in range(layout.frame_count)]
