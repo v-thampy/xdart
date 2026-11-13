@@ -3365,3 +3365,50 @@ def test_all_scans_skips_the_scans_it_cannot_grid_and_lists_them(qapp, tmp_path)
             f"Skipped RSM_synth {scan}.1" for scan in (3, 4, 5, 6, 7)], skipped
     finally:
         _close(page, qapp)
+
+
+def test_all_scans_asks_once_for_its_grouped_scans_and_finds_them_once_more(qapp, tmp_path, monkeypatch):
+    """NEXT-1210-RESPONSIVENESS C-13. The maintainer, 2026-11-13: "can we add an option of "Apply to all" so it's not
+    waiting every time"; his pick "Remember per SPEC file (Recommended)", whose terms said RSM stops re-reading the
+    file after each answer. RSM asked about one grouped scan at a time and found the Source's scans again after each
+    answer (with "Apply to compatible remaining scans" ticked, three grouped scans made four searches); it now asks
+    about them together, once, and finds the scans once more."""
+    import tifffile
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    page = _page(qapp)
+    seen, searches = [], []
+    timer = QtCore.QTimer()
+
+    def answer():
+        dialog = qapp.activeModalWidget()
+        if isinstance(dialog, PointImagesDialog) and dialog not in seen:
+            seen.append(dialog)
+            dialog.apply_remaining.editor.setChecked(True)
+            dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+    timer.timeout.connect(answer)
+    timer.start(5)
+    try:
+        spec = _synthetic_source(tmp_path)
+        spec.write_text(spec.read_text() + "\n" + "\n".join(_spec_scan(scan, 9 + scan) for scan in (3, 4, 5)),
+                        encoding="utf-8")
+        images = tmp_path / "source" / "images"
+        for scan in (3, 4, 5):
+            for label in range(4):  # two images for each of its two points
+                tifffile.imwrite(images / f"RSM_synth_scan{scan}_{label:04d}.tif",
+                                 np.arange(20, dtype=np.uint16).reshape(4, 5) + label)
+        _with_source(page, tmp_path)
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy)
+        begin = page._resolver.begin
+        monkeypatch.setattr(page._resolver, "begin", lambda request: (searches.append(request), begin(request))[1])
+        page.set_field("scan_mode", "All Scans")
+        page.begin_preview()
+        label = page.run_bar.readinessLabel
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy and page._job_form is None
+              and any(word in label.full_text() for word in ("Preview ready", "refused", "not confirmed")))
+        assert label.full_text().startswith("Preview ready · 5 RSMs"), label.full_text()
+        assert len(seen) == 1, len(seen)
+        assert len(searches) == 2, f"{len(searches)} searches of the Source for one answer"
+        assert sorted(scan for _uri, scan, _policy in page.point_images.choices) == ["3.1", "4.1", "5.1"]
+    finally:
+        timer.stop()
+        _close(page, qapp)
