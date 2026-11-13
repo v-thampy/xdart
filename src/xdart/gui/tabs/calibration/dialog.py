@@ -3414,7 +3414,9 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if not (start and Path(start).resolve().is_relative_to(self.project_root)):
             # His pick, 2026-11-12 ("<Project>/calibration (Recommended)"): a start the check below would refuse,
             # outside the Project, offers the Project's calibration folder instead, as an absolute name (C-7).
-            suggested = self._default_name(beam, folder=self.project_root / 'calibration')
+            folder = self.project_root / 'calibration'
+            folder.mkdir(parents=True, exist_ok=True)  # Qt opens a Save panel whose start folder is missing elsewhere
+            suggested = self._default_name(beam, folder=folder)
             offered = str(suggested)
         picks = file_dialogs.browse(self, 'Save calibrated geometry', save=True, file_filter='JSON (*.json)',
                                     current=str(suggested), fallback=str(self.project_root),
