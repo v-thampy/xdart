@@ -89,6 +89,22 @@ class PointImagesRequired(ValueError):
                          "grouping and choose average, difference or one image")
 
 
+class PointImagesStale(ValueError):
+    """A grouping stored for a scan that its counts no longer show (NEXT-1210-RESPONSIVENESS C-13): one answered while
+    the scan recorded (one point, two images) no longer fits once it reads one image per point."""
+
+    def __init__(self, spec: SourceSpec):
+        self.spec = spec
+        super().__init__("the scan's stored images-per-point grouping no longer fits its image and point counts")
+
+
+def stale_point_images(spec: SourceSpec, detection: "PointImageDetection | None") -> bool:
+    """Whether ``spec`` carries a grouping its scan's counts no longer show: a SPEC-backed scan (a SPEC scan or an
+    image series named by one) whose inspection finds no whole multiple."""
+    return (detection is None and "point_images" in spec.options
+            and spec.kind in (SourceKind.SPEC, SourceKind.TIFF_SERIES))
+
+
 def detect_point_images(spec: SourceSpec, scan_label: str, point_count: int,
                         image_count: int, *, metadata_path: str | None = None) -> PointImageDetection | None:
     """Return a ratio greater than one, without applying a source policy."""

@@ -269,6 +269,11 @@ class PointImagesSettings(SubsectionCard):
             self._file_defaults.pop(self._remembered_shown[index], None)
         self._catalog_remembered()
 
+    def forget_choice(self, spec):
+        """C-13: a scan's stored grouping that its counts no longer show is forgotten (Int's Run, on admission)."""
+        if self._choices.pop(point_source_key(spec), None) is not None:
+            self._catalog()
+
     def options(self, spec):
         policy = self._choices.get(point_source_key(spec))
         return spec if policy is None else replace(spec, options={**spec.options, 'point_images': policy.to_dict()})
@@ -347,7 +352,7 @@ class PointImagesSettings(SubsectionCard):
 
     def apply_intent(self, intent):
         """Apply only confirmed source choices; the run-only checkbox has no persisted value."""
-        if self._choices or self._file_defaults:
+        if self._choices or self._file_defaults or 'point_image_choices' in intent.run_options:
             intent.run_options['point_image_choices'] = self.document()
         if type(intent.source_spec) is SourceSpec:
             intent.source_spec = self.options(intent.source_spec)

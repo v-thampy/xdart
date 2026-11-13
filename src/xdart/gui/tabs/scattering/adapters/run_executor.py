@@ -47,7 +47,7 @@ from xrd_tools.session.run_configuration import FrozenRunConfiguration
 from xrd_tools.sources import open_source
 from xrd_tools.sources.adapters import registry_identity
 from xrd_tools.sources.base import source_metadata_energy_eV
-from xrd_tools.sources.point_images import PointImagesRequired
+from xrd_tools.sources.point_images import PointImagesRequired, PointImagesStale
 from xrd_tools.sources.cursor import open_container_cursor
 from xrd_tools.sources.execution_graph import (
     LivePrefixProof, published_metadata_drift, validate_consumed_metadata,
@@ -1310,6 +1310,7 @@ class StandardRunExecutor:
                  if live_point_images else detach_exception(error, 'admission').message),
                 append_refused=isinstance(error, AppendRefused),
                 point_images=None if live_point_images else point_images,
+                stale_point_images=isinstance(error, PointImagesStale),
             )
         finally:
             operation.finish_worker(result)

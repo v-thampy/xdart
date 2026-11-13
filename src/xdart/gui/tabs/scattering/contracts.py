@@ -263,10 +263,12 @@ class AdmissionFailure:
     reason: str
     append_refused: bool = False
     point_images: PointImageDetection | None = None
+    #: C-13: the scan's stored grouping no longer fits its counts; the page forgets it and starts again
+    stale_point_images: bool = False
 
     def __post_init__(self) -> None:
         if (type(self.token) is not AdmissionToken or type(self.reason) is not str
-                or type(self.append_refused) is not bool
+                or type(self.append_refused) is not bool or type(self.stale_point_images) is not bool
                 or (self.point_images is not None and type(self.point_images) is not PointImageDetection)):
             raise TypeError("admission failure values are invalid")
 

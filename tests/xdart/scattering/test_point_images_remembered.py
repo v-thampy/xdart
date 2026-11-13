@@ -305,6 +305,8 @@ def test_ints_run_drops_a_stored_grouping_its_finished_scan_no_longer_shows(qapp
     page.show()
     try:
         assert page.point_images.choices  # the stored grouping, as the scan's settings hold it
+        notices = []
+        page.noticeChanged.connect(notices.append)
         _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
         page._shell.run_controls.startButton.click()
         _wait(qapp, lambda: bool(list(output.glob('*.nexus'))), timeout=30,
@@ -313,7 +315,7 @@ def test_ints_run_drops_a_stored_grouping_its_finished_scan_no_longer_shows(qapp
               timeout=30)
         assert 'point_images' not in store.snapshot().thaw().source_spec.options
         assert page.point_images.choices == ()
-        assert 'no longer' in page._notice_text, page._notice_text
+        assert any('no longer fits' in notice for notice in notices), notices
     finally:
         _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
         page.close()

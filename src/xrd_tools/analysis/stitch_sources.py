@@ -199,6 +199,10 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 skipped.append((str(spec.uri), str(spec.entry or "entry"), reason))
                 return None
             raise ValueError(f"{Path(spec.uri).name} is {reason}")
+        if detection is None and policy is not None and spec.kind is SourceKind.SPEC:
+            # C-13: a grouping stored while the scan recorded no longer fits once it reads one image per point (or an
+            # unfinished count); the scan is read as it is now, its stored grouping set aside.
+            policy = None
         if detection is not None and (policy is None or policy.images_per_point != detection.images_per_point):
             pending.append(detection)
             return None

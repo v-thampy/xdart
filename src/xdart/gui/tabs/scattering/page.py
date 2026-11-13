@@ -4582,6 +4582,30 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._refresh_shell(preserve_display=True)
         self._ensure_timer()
 
+    def _forget_stale_grouping(self, token):
+        """C-13 (his pick, 2026-11-13: "Fix first, then push (Recommended)"): the scan's stored images-per-point
+        grouping no longer fits its counts (it was answered while the scan recorded); it is forgotten, from the card
+        and the Source, and the Run starts again with the scan as it is now."""
+        prior = self._intents.snapshot()
+        if prior.revision != token.revision:
+            self._notice('The Source changed; press Run again.')
+            return
+        candidate = prior.thaw()
+        spec = candidate.source_spec
+        self.point_images.forget_choice(spec)
+        candidate.source_spec = replace(spec, options={key: value for key, value in spec.options.items()
+                                                      if key != 'point_images'})
+        candidate = self.point_images.apply_intent(candidate)
+        committed = self._intents.commit(candidate, expected_revision=prior.revision)
+        if type(committed) is not IntentCommitAccepted:
+            self.point_images.restore_intent(self._intents.snapshot().thaw())
+            self._notice('The Source changed; press Run again.')
+            return
+        self._reconcile_snapshot(prior, committed.snapshot)
+        self._notice("The scan's stored images-per-point grouping no longer fits its images (it was confirmed while "
+                     "the scan recorded): it is forgotten, and the scan is processed as it is now.")
+        self._begin_run()
+
     def _poll_admission(self) -> bool:
         state = self._admission_state
         token = None if state is None else state.token
@@ -4629,6 +4653,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 else:
                     self._notice('Grouping not confirmed; scan unprocessed.')
                 self.point_images.finish_run()
+            elif result.stale_point_images:
+                self._forget_stale_grouping(token)
             elif result.append_refused:
                 self._confirm_append_overwrite(result)
             else:

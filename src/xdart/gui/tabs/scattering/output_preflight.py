@@ -46,7 +46,9 @@ from xrd_tools.sources.directory_session import DirectoryIndexSession
 from xrd_tools.sources.probe import ProbeState
 from xrd_tools.sources.run_plan import RunCandidatePlan
 from xrd_tools.sources.selection import DirectorySourceSpec, holds_containers, live_metadata_format, live_selection
-from xrd_tools.sources.point_images import PointImagePolicy, PointImagesRequired, inspect_point_images
+from xrd_tools.sources.point_images import (
+    PointImagePolicy, PointImagesRequired, PointImagesStale, inspect_point_images, stale_point_images,
+)
 from xrd_tools.sources.execution_graph import (
     _CapturedSourceTopology,
     _capture_source_topology,
@@ -557,6 +559,8 @@ def prepare_output(
             policy = None if raw_policy is None else PointImagePolicy.from_dict(raw_policy)
             if policy is None or policy.images_per_point != detection.images_per_point:
                 raise PointImagesRequired(detection)
+        elif stale_point_images(intent.source_spec, detection):
+            raise PointImagesStale(intent.source_spec)  # C-13: the page forgets it and starts the Run again
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None
