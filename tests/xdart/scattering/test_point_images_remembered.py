@@ -243,3 +243,28 @@ def test_a_scan_answered_again_by_a_remembered_file_asks_instead(qapp, tmp_path)
     finally:
         answers.stop()
         settings.deleteLater()
+
+
+def test_ints_profile_keeps_a_remembered_file_and_a_path_written_otherwise_matches(qapp, tmp_path):
+    """Int keeps the card's document in the Run's options: a profile carries a remembered file and the card reopens
+    it; the same file written another way (a ``..`` here; case and separators on Windows) is the same file."""
+    from tests.xdart.scattering.test_p1b_output_graph import _intent
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
+    from xrd_tools.session.run_intent_profile import dump_run_intent_profile, load_run_intent_profile
+    settings = PointImagesSettings()
+    answers = _Answers(qapp, [('Average', False, True)])
+    try:
+        assert settings.confirm((_detected(tmp_path, 'Calibrant_SPEC', '1.1', 2),)), answers.errors
+        intent = settings.apply_intent(_intent(tmp_path / 'a.tif', tmp_path / 'out', tmp_path / 'cal.poni'))
+        loaded = load_run_intent_profile(dump_run_intent_profile(intent))
+        restored = PointImagesSettings()
+        restored.restore_intent(loaded)
+        assert restored.document() == settings.document()
+        assert restored.remembered.editor.currentText() == 'Calibrant_SPEC · Average'
+        (tmp_path / 'sub').mkdir()
+        assert restored.confirm((_detected(tmp_path / 'sub' / '..', 'Calibrant_SPEC', '2.1', 2),))
+        assert len(answers.seen) == 1
+        restored.deleteLater()
+    finally:
+        answers.stop()
+        settings.deleteLater()

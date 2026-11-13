@@ -439,3 +439,31 @@ def test_the_page_built_by_its_builder_is_unchanged_by_an_empty_session(qapp, se
     finally:
         _close(built, qapp)
         _close(plain, qapp)
+
+
+def test_a_remembered_grouping_file_is_saved_and_loaded_with_the_settings(qapp, tmp_path):
+    """NEXT-1210-RESPONSIVENESS C-13 (his pick: "Remember per SPEC file (Recommended)", saved with the window's
+    settings): a file remembered for new scans goes through File ▸ Save/Load Settings into another page, listed by its
+    name as written, and the rest of the settings load as before."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    page = _page(qapp, owner=_Owner())
+    handle = build_rsm_page(empty_host_services(_Status()), None)
+    other = handle.widget
+    try:
+        _synthetic_source(tmp_path)
+        _with_source(page, tmp_path)
+        written = str(tmp_path / "source" / "RSM_synth")
+        page.point_images.restore({"choices": [], "file_defaults": [
+            {"file": written, "policy": PointImagePolicy(2, "average", 1, False).to_dict()}]})
+        page._settings_path_chooser = lambda action, start: str(tmp_path / "rsm-settings")
+        assert page.save() == ActionCompleted("rsm-settings-saved")
+        saved = tmp_path / "rsm-settings.json"
+        other._settings_path_chooser = lambda action, start: str(saved)
+        assert handle.settings_io.load() == ActionCompleted("rsm-settings-loaded")
+        assert other.point_images.document() == page.point_images.document()
+        assert other.point_images.document()["file_defaults"][0]["file"] == written
+        assert other.point_images.remembered.editor.currentText() == "RSM_synth · Average"
+        assert other.settings() == page.settings()
+    finally:
+        _close(page, qapp)
+        _close(other, qapp)

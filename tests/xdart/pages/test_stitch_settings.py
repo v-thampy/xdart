@@ -350,3 +350,30 @@ def test_a_document_saved_without_a_calibration_window_closes_the_one_opened_sin
         assert page._calibration_dialog is again and page.settings()["calibration"]["fields"]["rms"] == ".02"
     finally:
         _close(page, qapp)
+
+
+def test_a_remembered_grouping_file_is_saved_loaded_and_kept_by_a_form_load(qapp, tmp_path):
+    """NEXT-1210-RESPONSIVENESS C-13 (his pick: "Remember per SPEC file (Recommended)", saved with the window's
+    settings): a file remembered for new scans goes through File ▸ Save/Load Settings into another page, listed by its
+    name as written; loading a Stitch form, which carries its own scan groupings, keeps the window's remembered
+    files."""
+    from xrd_tools.sources.point_images import PointImagePolicy
+    page = _edited_page(tmp_path)
+    handle = build_stitch_page(empty_host_services(_Status()), None)
+    other = handle.widget
+    try:
+        written = str(tmp_path / "Stitch_Scans")
+        page.point_images.restore({"choices": [], "file_defaults": [
+            {"file": written, "policy": PointImagePolicy(2, "average", 1, False).to_dict()}]})
+        page._settings_path_chooser = lambda action, start: str(tmp_path / "stitch-settings")
+        assert page.save() == ActionCompleted("stitch-settings-saved")
+        other._settings_path_chooser = lambda action, start: str(tmp_path / "stitch-settings.json")
+        assert handle.settings_io.load() == ActionCompleted("stitch-settings-loaded")
+        assert other.point_images.document()["file_defaults"][0]["file"] == written
+        assert other.point_images.remembered.editor.currentText() == "Stitch_Scans · Average"
+        assert other.build_form().fingerprint == page.build_form().fingerprint
+        other.load_form(page.build_form())
+        assert other.point_images.document()["file_defaults"][0]["file"] == written
+    finally:
+        _close(page, qapp)
+        _close(other, qapp)

@@ -22,8 +22,14 @@ def point_source_key(spec):
 
 
 def grouping_file(detection):
-    """The file a remembered grouping is kept for (C-13): an image series' SPEC file, else the source's own file."""
-    return os.path.normcase(os.path.abspath(str(detection.metadata_path or detection.source_spec.uri)))
+    """The file a remembered grouping is kept for (C-13): an image series' SPEC file, else the source's own file, as
+    written (shown and saved so); ``_file_key`` matches it."""
+    return os.path.abspath(str(detection.metadata_path or detection.source_spec.uri))
+
+
+def _file_key(path):
+    """A remembered file's match key: normalized (Windows: case and separators), never shown."""
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 _REMEMBERED_TIP = ('Files whose new scans are grouped without asking, each with the grouping it applies (ticked '
@@ -159,7 +165,7 @@ class PointImagesSettings(SubsectionCard):
         self._choices = {}
         self._shown = []
         self._remaining = None
-        self._file_defaults = {}  # C-13: grouping_file -> the grouping its new scans get without asking
+        self._file_defaults = {}  # C-13: _file_key -> (the file as written, the grouping its new scans get)
         self._remembered_shown = []
         self._answered_silently = set()  # C-13: the scans answered without a question, as found
         self._rendering = False
@@ -243,11 +249,12 @@ class PointImagesSettings(SubsectionCard):
         self._rendering = True
         try:
             self._remembered_shown = list(self._file_defaults)
+            files = [file for file, _policy in self._file_defaults.values()]
             self.remembered.editor.clear()
             self.remembered.editor.addItems([f'{Path(file).name} · {_grouping_name(policy)}'
-                                             for file, policy in self._file_defaults.items()] or ['None'])
-            self.remembered.editor.setToolTip('\n\n'.join((_REMEMBERED_TIP, '\n'.join(self._remembered_shown)))
-                                              if self._remembered_shown else _REMEMBERED_TIP)
+                                             for file, policy in self._file_defaults.values()] or ['None'])
+            self.remembered.editor.setToolTip('\n\n'.join((_REMEMBERED_TIP, '\n'.join(files)))
+                                              if files else _REMEMBERED_TIP)
             self.remember.editor.setChecked(bool(self._remembered_shown))
             self.remember.setEnabled(bool(self._remembered_shown))
         finally:
@@ -270,16 +277,17 @@ class PointImagesSettings(SubsectionCard):
         for detection in detections:
             count = detection.images_per_point
             key, file = point_source_key(detection.source_spec), grouping_file(detection)
+            remembered = self._file_defaults.get(_file_key(file), (None, None))[1]
             # its file's remembered grouping first, then this run's answer for the remaining scans (C-13)
-            policy = next((_for_count(candidate, count) for candidate in (self._file_defaults.get(file), self._remaining)
+            policy = next((_for_count(candidate, count) for candidate in (remembered, self._remaining)
                            if candidate is not None and candidate.compatible_with(count)), None)
             # The question was the only brake on search -> ask -> search: a scan found again as it was when it was
             # answered without a question is asked about, without a countdown, rather than answered again.
-            found = (key, detection.scan_label, count, file)
+            found = (key, detection.scan_label, count, _file_key(file))
             repeated = policy is not None and found in self._answered_silently
             if policy is None or repeated:
                 self._answered_silently.discard(found)
-                dialog = PointImagesDialog(detection, parent, self._choices.get(key) or self._file_defaults.get(file),
+                dialog = PointImagesDialog(detection, parent, self._choices.get(key) or remembered,
                                            countdown=not repeated)
                 try:
                     if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -289,7 +297,7 @@ class PointImagesSettings(SubsectionCard):
                     answered_all = dialog.apply_remaining.current_value() or dialog.auto_confirmed
                     self._remaining = chosen if answered_all else None
                     if dialog.remember_file.current_value():
-                        self._file_defaults[file] = chosen
+                        self._file_defaults[_file_key(file)] = (file, chosen)
                 finally:
                     dialog.deleteLater()
                 policy = _for_count(chosen, count)
@@ -308,7 +316,7 @@ class PointImagesSettings(SubsectionCard):
                                 for uri, scan, policy in self.choices]}
         if self._file_defaults:  # C-13; a document without a remembered file is unchanged
             document['file_defaults'] = [{'file': file, 'policy': policy.to_dict()}
-                                         for file, policy in self._file_defaults.items()]
+                                         for file, policy in self._file_defaults.values()]
         return document
 
     def restore(self, value):
@@ -320,7 +328,7 @@ class PointImagesSettings(SubsectionCard):
         for row in value.get('file_defaults', ()):
             if type(row.get('file')) is not str:
                 raise ValueError('a remembered grouping names its file')
-            defaults[row['file']] = PointImagePolicy.from_dict(row['policy'])
+            defaults[_file_key(row['file'])] = (row['file'], PointImagePolicy.from_dict(row['policy']))
         self._choices = choices
         self._file_defaults = defaults
         self._answered_silently.clear()
