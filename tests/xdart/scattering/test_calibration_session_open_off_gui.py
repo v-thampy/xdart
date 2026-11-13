@@ -95,3 +95,47 @@ def test_the_image_digest_is_unchanged_without_the_extra_copy(image):
     original = np.array(image, copy=True)
     assert calibration_image_identity(image) == _identity_before(image)
     assert image.tobytes() == original.tobytes()  # the caller's pixels are untouched, NaN payloads included
+
+
+@pytest.mark.parametrize('how', ['cancel', 'close'])
+def test_a_cancelled_or_closed_open_applies_nothing(qapp, tmp_path, monkeypatch, how):
+    """Cancel while the session is read, or closing the window then, applies nothing; Cancel leaves the window usable
+    (the plan: "with the window's busy state and Cancel")."""
+    from xrd_tools.integrate import stitch_calibration
+    from xrd_tools.integrate.stitch_calibration import save_calibration_session
+    (tmp_path / 'frames').mkdir()
+    frames = _guided_frames(tmp_path)
+    page, dialog = _page_with_dialog(tmp_path)
+    try:
+        (tmp_path / 'session-a').mkdir()
+        path = save_calibration_session(tmp_path / 'session-a', frames, arm=('del', 'nu'),
+                                        fit_policy=dialog._fit_policy())
+        entered, release = Event(), Event()
+        real = stitch_calibration.validate_frame_files
+
+        def held(frame, **kwargs):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+            return real(frame, **kwargs)
+        monkeypatch.setattr(stitch_calibration, 'validate_frame_files', held)
+        monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(path)])
+        applied, before = [], dialog.frames
+        monkeypatch.setattr(dialog, '_session_opened', lambda *args: applied.append(args))
+        dialog._resume()
+        assert entered.wait(10)
+        dialog.cancel_button.click() if how == 'cancel' else dialog.close()
+        release.set()
+        until = time.monotonic() + 30
+        while (dialog.active() or until - time.monotonic() > 29.5) and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.01)
+        assert applied == [] and dialog.frames == before, dialog.status.text()
+        assert not dialog.active()
+        if how == 'cancel':
+            assert dialog.isVisible() and 'Cancelled' in dialog.status.text(), dialog.status.text()
+        else:
+            assert not dialog.isVisible()
+    finally:
+        release.set()
+        _dispose(page)
