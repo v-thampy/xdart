@@ -35,6 +35,7 @@ class _Answers:
 
     def __init__(self, qapp, answers):
         self.qapp, self.answers, self.seen, self.errors = qapp, list(answers), [], []
+        self.counting = []
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._answer)
         self.timer.start(5)
@@ -45,6 +46,7 @@ class _Answers:
         if not isinstance(dialog, PointImagesDialog) or dialog in self.seen:
             return
         self.seen.append(dialog)
+        self.counting.append(dialog._counting)  # as it opened, before this answer changes anything
         try:
             operation, remaining, remember = self.answers[len(self.seen) - 1]
             dialog.operation.editor.setCurrentText(operation)
@@ -318,17 +320,10 @@ def test_a_scan_answered_again_by_a_remembered_file_asks_instead(qapp, tmp_path)
         assert settings.confirm((_detected(tmp_path, 'A', '2.1', 2),))
         assert len(answers.seen) == 1
         settings.finish_run()
-        countdown = []
-        probe = QtCore.QTimer()
-        probe.timeout.connect(lambda: countdown.append(getattr(qapp.activeModalWidget(), '_countdown', None)))
-        probe.start(1)
-        try:
-            assert settings.confirm((_detected(tmp_path, 'A', '2.1', 2),))
-        finally:
-            probe.stop()
+        assert settings.confirm((_detected(tmp_path, 'A', '2.1', 2),))
         assert len(answers.seen) == 2, 'the same scan, already given that grouping, is asked about'
-        timers = [timer for timer in countdown if timer is not None]
-        assert timers and not any(timer.isActive() for timer in timers)
+        # Recorded as each question opened (hosted CI 43488500230: a 1 ms probe could miss the open question).
+        assert answers.counting == [True, False], answers.counting
     finally:
         answers.stop()
         settings.deleteLater()
