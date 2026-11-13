@@ -160,3 +160,53 @@ def test_a_project_the_user_did_not_change_moves_no_focus(tmp_path, monkeypatch,
         tool.set_project_by_code(str(other))  # a restore or another tool's Project, not his edit
         _pump(app, lambda: False, .2)
         assert project.hasFocus() and not tool.save_path().editor.hasFocus()
+
+
+@pytest.mark.parametrize("name", tuple(SAVE_PATHS))
+def test_each_project_commit_is_judged_against_the_last_one(tmp_path, monkeypatch, name):
+    """Changed back, the Project moves focus again; Return on the Project just set moves none (Stitch and RSM read
+    their editors and never project the typed Project back into the row)."""
+    with _tool(name, tmp_path, monkeypatch) as (app, tool, first):
+        second = tmp_path / "second"
+        second.mkdir()
+        save = tool.save_path()
+        _type_project(app, tool, str(second))
+        assert _pump(app, lambda: save.editor.hasFocus())
+        project = tool.project().editor
+        project.setFocus()
+        app.processEvents()
+        QtTest.QTest.keyClick(project, QtCore.Qt.Key.Key_Return)  # the Project just set, committed again
+        _pump(app, lambda: False, .2)
+        assert project.hasFocus()
+        _type_project(app, tool, str(first))  # and back
+        assert _pump(app, lambda: save.editor.hasFocus()), QtWidgets.QApplication.focusWidget()
+        assert save.editor.text() == str(first / "xdart_processed_data")
+
+
+def test_ints_first_project_moves_focus_to_its_save_path(tmp_path, monkeypatch):
+    """Int opened without a Project: naming the first one, as he does in a fresh session, focuses the Save Path."""
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.events import CleanupStatus
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.session.run_configuration import RunIntent
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    monkeypatch.setenv("XDART_SESSION_FILE", str(tmp_path / "session.json"))
+    project = tmp_path / "project"
+    project.mkdir()
+    page = ScatteringWorkspace(intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+                               sources=FilesystemSourceAdapter())
+    page.resize(1400, 1000)
+    page.show()
+    page.activateWindow()
+    try:
+        app.processEvents()
+        tool = _Tool("int", page, page._shell.controls, None, [])
+        _type_project(app, tool, str(project))
+        assert _pump(app, lambda: tool.save_path().editor.hasFocus()), QtWidgets.QApplication.focusWidget()
+        assert tool.save_path().editor.text() == str(project / "xdart_processed_data")
+    finally:
+        assert _pump(app, lambda: page.close_workspace().cleanup_status is CleanupStatus.CLEANED)
+        page.deleteLater()
+        app.processEvents()
