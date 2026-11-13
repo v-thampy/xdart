@@ -3329,3 +3329,39 @@ def test_the_refinement_toggle_says_whether_the_calibrations_refinement_is_used(
         assert editor.text() == "Using the calibration's refinement" and page._value("refinement") is True
     finally:
         _close(page, qapp)
+
+
+_ABORTED_SCAN = ("#S {n} ascan eta 0 1 1 1\n#D Mon Jan 15 10:30:00 2024\n#P0 13000.007 10 20 30 40 50\n"
+                 "#G3 1 0 0 0 1 0 0 0 1\n#N 4\n#L eta  Seconds  Seconds  foil status\n#C aborted\n")
+
+
+def test_all_scans_skips_the_scans_it_cannot_grid_and_lists_them(qapp, tmp_path):
+    """NEXT-1210-RESPONSIVENESS C-10. The maintainer, 2026-11-12: Scans "All" refused his SPEC file ("SPEC #L
+    labels do not match the physical data table"), and "in general there will be a lot of scans in a spec file
+    which will not have detector data and should be skipped"; his pick "Also mismatched scans". All grids the
+    complete scans and Preview lists each skipped scan: 3 without images, 4 aborted without images, 5 aborted with
+    its first image, 6 stopped part-way (one image for two points), 7 with a numbering gap (images 0 and 2)."""
+    import tifffile
+    page = _page(qapp)
+    try:
+        spec = _synthetic_source(tmp_path)
+        spec.write_text(spec.read_text() + "\n" + "\n".join(
+            [_spec_scan(3, 12), _ABORTED_SCAN.format(n=4), _ABORTED_SCAN.format(n=5), _spec_scan(6, 15),
+             _spec_scan(7, 16)]), encoding="utf-8")
+        images = tmp_path / "source" / "images"
+        for scan, numbers in ((5, (0,)), (6, (0,)), (7, (0, 2))):
+            for number in numbers:
+                tifffile.imwrite(images / f"RSM_synth_scan{scan}_{number:04d}.tif", np.zeros((4, 5), np.uint16))
+        _with_source(page, tmp_path)
+        page.set_field("scan_mode", "All Scans")
+        page.begin_preview()
+        label = page.run_bar.readinessLabel
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy and page._job_form is None
+              and any(word in label.full_text() for word in ("Preview ready", "refused")))
+        assert label.full_text().startswith("Preview ready · 2 RSMs"), label.full_text()
+        assert [[member.scan for member in form.members] for form in page.build_forms()] == [["1.1"], ["2.1"]]
+        skipped = [line for line in page.preview_text.toPlainText().splitlines() if line.startswith("Skipped ")]
+        assert [line.split(":")[0] for line in skipped] == [
+            f"Skipped RSM_synth {scan}.1" for scan in (3, 4, 5, 6, 7)], skipped
+    finally:
+        _close(page, qapp)
