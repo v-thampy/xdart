@@ -839,7 +839,7 @@ def test_run_checks_the_inputs_itself_and_stops_when_nothing_is_left_to_stitch(q
         _wait(page, qapp)
         assert page.run_bar.readinessLabel.full_text() == "Nothing to stitch · 1 scan skipped (Preview lists them)"
         assert page._owner.prepared is not None and not page._owner.prepared.requests
-        assert page.results.count() == 0 and not page.preview_dialog.isVisible()
+        assert not page.browser.listed_results() and not page.preview_dialog.isVisible()
     finally:
         _dispose(page, qapp)
         qapp.processEvents()

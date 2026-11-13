@@ -508,7 +508,7 @@ def test_stop_cancels_a_run(qapp, tmp_path, monkeypatch):
         page.stop()
         _wait(page, qapp, lambda: not page.active())
         assert page.run_bar.readinessLabel.full_text() == "RSM stopped"
-        assert page.shown is None and page.results.count() == 0 and page._readiness[1]
+        assert page.shown is None and not page.browser.listed_results() and page._readiness[1]
     finally:
         _close(page, qapp)
 
@@ -1778,7 +1778,7 @@ def test_stop_mid_queue_cancels_the_rsm_gridding_and_starts_no_other(qapp, tmp_p
         for _ in range(20):  # nothing further starts
             qapp.processEvents()
             page._poll()
-        assert len(started) == 1 and page._jobs == [] and page.results.count() == 0
+        assert len(started) == 1 and page._jobs == [] and not page.browser.listed_results()
     finally:
         _close(page, qapp)
 
@@ -1842,7 +1842,7 @@ def test_a_queued_run_refuses_a_foreign_file_at_any_output_before_gridding_the_f
         assert label.full_text().startswith("Run refused (RSM 2 of 2): OUTPUT_NOT_PREVIOUS_ANALYSIS: ")
         assert f"{second.name} is not an RSM result that Replace can overwrite (" in label.full_text()
         assert label.full_text().endswith(" · nothing was gridded")
-        assert grids == [] and page.results.count() == 0 and page._jobs == []
+        assert grids == [] and not page.browser.listed_results() and page._jobs == []
         assert second.read_bytes() == b"an operator's own file"
     finally:
         _close(page, qapp)

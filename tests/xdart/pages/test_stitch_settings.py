@@ -222,7 +222,12 @@ def test_the_last_session_is_restored_and_a_fresh_start_ignores_it(qapp, tmp_pat
     first = build_stitch_page(empty_host_services(_Status()), None)
     first.widget.set_field("project_root", str(tmp_path))
     first.widget.set_field("npt_1d", "77")
-    assert first.close().status is PageCleanup.CLEAN
+    receipt = first.close()  # C-14: the browser reads the Save Path's folder after the Project change; retry close
+    while receipt.status is PageCleanup.PENDING:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = first.close()
+    assert receipt.status is PageCleanup.CLEAN
     first.widget.deleteLater()
     assert json.loads(session.read_text())[SESSION_KEY]["fields"]["npt_1d"] in (77, "77")
 

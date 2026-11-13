@@ -1278,12 +1278,15 @@ class ProcessedBrowserOwner:
         accepted_suffixes = browser_suffixes_for_mode(after.processing_mode)
         policy_changed = accepted_suffixes != self._accepted_suffixes
         self._accepted_suffixes = accepted_suffixes
-        directory_changed = (
-            before.save_path != after.save_path
-            and not self._explicit_directory
-        )
+        # C-14 (his pick "Always follow (Recommended)"): a Save Path change moves the browser there, replacing a
+        # folder opened with Open Folder; a relative Save Path is inside the Project.
+        directory_changed = before.save_path != after.save_path
         if directory_changed:
-            self._directory = processed_directory(after.save_path)
+            self._explicit_directory = False
+            saved = str(after.save_path or "")
+            if saved and after.project_root and not os.path.isabs(os.path.expanduser(saved)):
+                saved = os.path.join(os.path.expanduser(str(after.project_root)), saved)
+            self._directory = processed_directory(saved)
         if directory_changed or policy_changed:
             self._catalog = ()
             self.request_catalog()

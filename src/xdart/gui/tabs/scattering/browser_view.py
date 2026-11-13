@@ -481,6 +481,19 @@ class ResultDirectoryBrowser(QtCore.QObject):
             self.set_directory(picks[0])
         return ActionAccepted("browser-directory")
 
+    def follow_save_path(self, folder):
+        """NEXT-1210-RESPONSIVENESS C-14 (the maintainer, 2026-11-13: "this should follow the save path"; his pick
+        "Always follow (Recommended)"): the browser moves to the Save Path's folder, replacing a folder opened with Open
+        Folder, and follows the results written there."""
+        if not folder:
+            return
+        path = os.path.abspath(os.path.expanduser(str(folder)))
+        if path != self.directory or self._owner.explicit_directory:
+            self._active = True
+            self._owner.set_directory(path, explicit=False)
+            self._timer.start()
+            self.changed.emit()
+
     def follow_result(self, path):
         if not self._active or not self._owner.explicit_directory:
             self.set_directory(os.path.dirname(os.path.abspath(path)), explicit=False)

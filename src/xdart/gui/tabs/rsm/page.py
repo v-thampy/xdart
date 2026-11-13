@@ -1312,6 +1312,22 @@ class RSMPage(QtWidgets.QWidget):
             raise ValueError(f"{len(groups)} RSMs in the Source: Preview and Run queue them (build_forms)")
         return groups[0]
 
+    def _follow_save_path(self, *, again=False):
+        """C-14: the Data Browser follows the Save Path's folder (a relative one is inside the Project) whenever that
+        folder changes, and ``again`` at a Run's start (C-15), so each result lists and shows as it finishes."""
+        browser = getattr(self, "_result_browser", None)
+        if browser is None:
+            return
+        project = str(self._value("project_root") or "").strip()
+        output = str(self._value("output_path") or "").strip()
+        if not output:
+            return
+        path = Path(output).expanduser()
+        folder = str(path if path.is_absolute() or not project else Path(project).expanduser() / path)
+        if again or folder != getattr(self, "_followed_save_path", None):
+            self._followed_save_path = folder
+            browser.follow_save_path(folder)
+
     def _apply_suggestion(self):
         """The Save Path while it follows the Project: the Project's processed-data folder, the rule Int and Stitch
         share (C-6); True when it changed. The result is named inside it from the scans (``build_form``)."""
@@ -1467,6 +1483,7 @@ class RSMPage(QtWidgets.QWidget):
         self._form_revision += 1
         self._prepared_fingerprint = None
         self._apply_suggestion()
+        self._follow_save_path()
         project = str(self._value("project_root")).strip()
         self.controls.apply_card_visibility(project)
         self._source_hints(project)
@@ -1936,6 +1953,7 @@ class RSMPage(QtWidgets.QWidget):
         still the current form (as Stitch's Run prepares first)."""
         self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
+        self._follow_save_path(again=True)  # C-15: the browser lists this Run's results as they finish
         if not self._readiness[1]:
             self._notice(self._readiness[0])
             return

@@ -234,7 +234,12 @@ def test_the_last_session_is_restored_and_a_fresh_start_neither_reads_nor_writes
     first.widget.set_field("grid", "Full 200×200×200")
     first.widget._threshold_edited(THRESHOLD_MAX, 50000.0)
     kept = first.widget._threshold_state
-    assert first.close().status is PageCleanup.CLEAN
+    receipt = first.close()  # C-14: the browser reads the Save Path's folder after the Project change; retry close
+    while receipt.status is PageCleanup.PENDING:
+        qapp.processEvents()
+        time.sleep(.005)
+        receipt = first.close()
+    assert receipt.status is PageCleanup.CLEAN
     first.widget.deleteLater()
     remembered = json.loads(session.read_text())[SESSION_KEY]
     assert [remembered["fields"][f"grid_{axis}"] for axis in "hkl"] == ["200"] * 3
