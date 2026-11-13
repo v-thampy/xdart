@@ -18,6 +18,7 @@ from .display_values import DisplayFrameKey
 from .shell_values import (
     ALL_FRAMES_PLOT_MODES,
     BrowserProjection,
+    BrowserScan,
     FrameSelectionIntent,
     FrameNavigationProjection,
     ShellCommand,
@@ -1356,14 +1357,13 @@ class BrowserView(QtWidgets.QFrame):
         if selection_mode_changed:
             self.scans.setSelectionMode(selection_mode)
         scans_changed = state.scans != self._scans
+        rebuilt = False
         if scans_changed:
-            self.scans.clear()
-            for scan in state.scans:
-                item = QtWidgets.QListWidgetItem(scan.label)
-                item.setData(_USER_ROLE, scan.identifier)
-                item.setData(_DIRECTORY_ROLE, scan.is_directory)
-                item.setToolTip(scan.detail)
-                self.scans.addItem(item)
+            if not _update_scan_rows(self.scans, self._scans, state.scans):
+                self.scans.clear()
+                for scan in state.scans:
+                    self.scans.addItem(_scan_item(scan))
+                rebuilt = True
             self._scans = state.scans
         selected_artifacts = (
             state.selected_artifacts
@@ -1387,8 +1387,20 @@ class BrowserView(QtWidgets.QFrame):
         selected_identifiers = tuple(
             item.data(_USER_ROLE) for item in self.scans.selectedItems()
         )
+        # Rows changed in place keep their selection and current row (C-9): sweep only when the list now differs
+        # from what the projection selects among the rows listed (a selected row left, or the projected one came).
+        listed_differs = False
+        if scans_changed and not rebuilt:
+            listed = {scan.identifier for scan in state.scans}
+            listed_differs = (
+                current_identifier
+                != (state.selected_scan if state.selected_scan in listed else None)
+                or set(selected_identifiers)
+                != {artifact for artifact in highlighted_artifacts if artifact in listed}
+            )
         reconcile_artifact_selection = (
-            scans_changed
+            rebuilt
+            or listed_differs
             or selection_mode_changed
             or selection_contract != self._artifact_selection_contract
             or selected_identifiers != self._applied_artifact_selection
@@ -1990,6 +2002,47 @@ def _listed_entries(widget: QtWidgets.QListWidget) -> tuple[BrowserResult, ...]:
                       item.data(_MUTED_ROLE) is True, item.data(_DIRECTORY_ROLE) is True)
         for item in (widget.item(index) for index in range(widget.count()))
     )
+
+
+def _scan_item(scan: BrowserScan) -> QtWidgets.QListWidgetItem:
+    """One Browse row for ``scan``."""
+    item = QtWidgets.QListWidgetItem(scan.label)
+    item.setData(_USER_ROLE, scan.identifier)
+    item.setData(_DIRECTORY_ROLE, scan.is_directory)
+    item.setToolTip(scan.detail)
+    return item
+
+
+def _update_scan_rows(widget: QtWidgets.QListWidget, old: tuple[BrowserScan, ...],
+                      new: tuple[BrowserScan, ...]) -> bool:
+    """The Browse list moved from ``old`` to ``new`` in place (NEXT-1210-RESPONSIVENESS C-9): rows whose scans
+    left are removed, arriving scans' rows are inserted where they belong, changed rows are updated, and the rows
+    that stay (the current one among them) are the same items. Linear in the rows. False, with nothing changed,
+    when no row stays (a new folder) or the rows that stay changed order or repeat; the caller then refills."""
+    if widget.count() != len(old):
+        return False
+    old_ids = [scan.identifier for scan in old]
+    new_ids = [scan.identifier for scan in new]
+    old_set, new_set = set(old_ids), set(new_ids)
+    if len(old_set) != len(old_ids) or len(new_set) != len(new_ids):
+        return False
+    kept = [identifier for identifier in old_ids if identifier in new_set]
+    if not kept or kept != [identifier for identifier in new_ids if identifier in old_set]:
+        return False
+    for row in range(len(old_ids) - 1, -1, -1):
+        if old_ids[row] not in new_set:
+            widget.takeItem(row)
+    previous = dict(zip(old_ids, old))
+    for row, scan in enumerate(new):
+        before = previous.get(scan.identifier)
+        if before is None:
+            widget.insertItem(row, _scan_item(scan))
+        elif before != scan:
+            item = widget.item(row)
+            item.setText(scan.label)
+            item.setToolTip(scan.detail)
+            item.setData(_DIRECTORY_ROLE, scan.is_directory)
+    return True
 
 
 def _fill(widget: QtWidgets.QListWidget, entries: tuple[BrowserResult, ...]) -> None:

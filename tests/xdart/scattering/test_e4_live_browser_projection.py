@@ -1028,7 +1028,15 @@ def test_unchanged_artifact_selection_reconcile_touches_no_scan_rows(
             scans=(*changed.scans, replace(changed.scans[-1],
                 identifier="/out/d.nexus", label="d.nexus")),
         )
-        assert apply(extended) == len(paths) + 1
+        # A scan arriving adds its row in place and sweeps no row while the selection already matches
+        # (NEXT-1210-RESPONSIVENESS C-9, the maintainer's "Add it as C-9 (Recommended)"; 1.2.9 swept every row).
+        assert apply(extended) == 0
+        assert browser.scans.count() == len(paths) + 1
+        assert tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for item in browser.scans.selectedItems()
+        ) == (paths[0], paths[2])
+        assert browser.scans.currentItem().data(QtCore.Qt.ItemDataRole.UserRole) == paths[2]
     finally:
         browser.deleteLater()
         app.processEvents()
