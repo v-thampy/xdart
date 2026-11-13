@@ -171,6 +171,10 @@ _FULL_PATH_DISPLAY_PATHS = {
     ("Project", "project_folder"),
 }
 _PROJECT_ROOT_PATH = ("Project", "project_folder")
+#: Each tool's Save Path row: Int's, Stitch's and RSM's. After the user changes the Project row, focus moves to the
+#: nearest of these, which shows its full path while focused (NEXT-1210-RESPONSIVENESS C-11; the maintainer,
+#: 2026-11-12: "If the project path is changed, move fo cus to save path and show the full path").
+_SAVE_PATH_PATHS = frozenset({("Project", "h5_dir"), ("Stitch", "output_path"), ("RSM", "output_path")})
 
 
 class ActionButton(QtWidgets.QPushButton):
@@ -840,6 +844,7 @@ class FormRow(QtWidgets.QWidget):
         self._model_value = "" if value is None else str(value)
         self._editor_dirty = False
         self._help_focus_transfer = False
+        self._owner_applied = False  # set by apply_field: whether the owner projected this row back during a commit
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(FORM_ROW_GAP)
@@ -952,7 +957,7 @@ class FormRow(QtWidgets.QWidget):
         self.browse_button = None
         if browse:
             btn = browse_button(label)
-            btn.clicked.connect(lambda _=False, p=self._path: self.browseRequested.emit(p))
+            btn.clicked.connect(self._browse_clicked)
             btn.setEnabled(self._enabled)
             lay.addWidget(btn)
             self.browse_button = btn
@@ -1102,6 +1107,7 @@ class FormRow(QtWidgets.QWidget):
         kind = field.kind.value if isinstance(field.kind, ControlFieldKind) else str(field.kind)
         if kind != self._kind:
             return False
+        self._owner_applied = True
 
         self._enabled = bool(field.enabled)
         self.editor.setEnabled(self._enabled)
@@ -1239,9 +1245,34 @@ class FormRow(QtWidgets.QWidget):
         self._editor_dirty = True
         self.draftChanged.emit(self._path, text)
 
+    def _browse_clicked(self, _checked=False) -> None:
+        # The owner's chooser runs and applies its pick inside this emit (a modal dialog).
+        before = self._model_value
+        self.browseRequested.emit(self._path)
+        self._after_user_edit(self._model_value != before)
+
+    def _after_user_edit(self, changed: bool) -> None:
+        """The user's own commit or Browse pick changed the Project: focus the Save Path (C-11). A Project set by
+        code (a restore, another tool's Project, a settings load) never comes here."""
+        if changed and self._path == _PROJECT_ROOT_PATH:
+            QtCore.QTimer.singleShot(0, self, self._focus_save_path)
+
+    def _focus_save_path(self) -> None:
+        """Focus the nearest visible Save Path row: in this row's own card or panel first, never another page's."""
+        widget = self.parentWidget()
+        while widget is not None:
+            rows = [row for row in widget.findChildren(FormRow)
+                    if row._path in _SAVE_PATH_PATHS and row.isVisible() and row.editor.isEnabled()]
+            if rows:
+                rows[0].editor.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+                return
+            widget = widget.parentWidget()
+
     def _emit_editor_edit(self) -> None:
         if self._help_focus_transfer:
             return
+        before = self._model_value
+        self._owner_applied = False
         value = self.current_value()
         if self._file_name_only:
             # A focused Return commit can precede any owner reconciliation,
@@ -1255,6 +1286,10 @@ class FormRow(QtWidgets.QWidget):
                 for widget in (self, self.editor, self.label):
                     widget.setToolTip(self._model_value)
         self._emit_edit(value)
+        # An owner that projects the row back (Int) has the last word, a refusal included; one that reads the editor
+        # (Stitch, RSM) takes the committed text.
+        committed = self._model_value if self._owner_applied else ("" if value is None else str(value))
+        self._after_user_edit(committed != before)
 
     def _emit_edit(self, value) -> None:
         edit = ControlFormEdit(path=self._path, value=value)

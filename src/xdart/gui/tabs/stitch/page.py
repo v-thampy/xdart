@@ -736,6 +736,7 @@ class StitchPage(QtWidgets.QWidget):
             self.controls.source_card, self.controls.processing_card,
         )
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
+        self._rows["project_root"].valueChanged.connect(self._project_typed)
         self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
         # One Data format for this page (LT-004; maintainer, October 14: Stitch and RSM each remember their own): the
@@ -1431,6 +1432,16 @@ class StitchPage(QtWidgets.QWidget):
                 self._fields[low] = replace(self._fields[low], value=0.)
                 self._fields[high] = replace(self._fields[high], value=6.2 if q else 90.)
         self._render_ranges()
+
+    def _project_typed(self, _path, value):
+        """A typed Project commit takes the Save Path rule a set one does (C-6): the Save Path moves with the Project
+        while it is that Project's default. The prior Project is the last one set, since the row already reads the
+        typed text."""
+        prior = str(self._fields["project_root"].value or "")
+        value = str(value or "")
+        self._fields["project_root"] = replace(self._fields["project_root"], value=value)
+        if value != prior and save_path_follows_project(str(self._value("output_path") or ""), prior):
+            self.set_field("output_path", processed_data_folder(value))
 
     def set_field(self, key, value):
         prior_project = str(self._value("project_root") or "") if key == "project_root" else ""
