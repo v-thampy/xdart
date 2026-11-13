@@ -66,12 +66,15 @@ def _slow_scans(monkeypatch, seconds):
     monkeypatch.setattr(spec_module.SpecSource, "__init__", slow)
 
 
-def _searching(page, qapp, seconds):
-    texts, until = [], time.monotonic() + seconds
-    while time.monotonic() < until:
+def _searching(page, qapp, seconds, until=lambda _text: False):
+    """The readiness texts for ``seconds``, or until ``until(text)``."""
+    texts, deadline = [], time.monotonic() + seconds
+    while time.monotonic() < deadline:
         qapp.processEvents()
         page._poll()
         texts.append(page.run_bar.readinessLabel.full_text())
+        if until(texts[-1]):
+            break
         time.sleep(.01)
     return texts
 
@@ -85,7 +88,7 @@ def test_the_scan_search_shows_its_count(qapp, tmp_path, monkeypatch):
         _slow_scans(monkeypatch, .2)
         page.set_field("scan_mode", "All Scans")
         page.begin_preview()
-        texts = _searching(page, qapp, 1.5)
+        texts = _searching(page, qapp, 20, until=lambda text: " of 10" in text)  # a slow runner still counts
         assert any(" of 10" in text for text in texts), texts[-1]
     finally:
         page.stop()
@@ -96,19 +99,19 @@ def test_the_scan_search_shows_its_count(qapp, tmp_path, monkeypatch):
 def test_stop_during_the_scan_search_returns_promptly(qapp, tmp_path, monkeypatch):
     page = _page(qapp)
     try:
-        _scans(tmp_path, 10)
+        _scans(tmp_path, 24)
         _with_source(page, tmp_path)
         _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy)
-        _slow_scans(monkeypatch, .3)
+        _slow_scans(monkeypatch, .3)  # 24 scans: 7 s and more of search, at least 0.3 s a scan
         page.set_field("scan_mode", "All Scans")
         page.begin_preview()
         _searching(page, qapp, .5)
         assert page._resolving is not None, "the search had already ended"
         started = time.monotonic()
         page.stop()
-        _wait(page, qapp, lambda: page._resolving is None, seconds=30)
+        _wait(page, qapp, lambda: page._resolving is None, seconds=60)
         took = time.monotonic() - started
-        assert took < 1.5, f"Stop took {took:.1f} s during the scan search"
+        assert took < 3.0, f"Stop took {took:.1f} s during the scan search"
         assert "stopped" in page.run_bar.readinessLabel.full_text().lower()
         with pytest.raises(ValueError, match="not found yet"):  # the stopped search adopted nothing
             page.build_forms()

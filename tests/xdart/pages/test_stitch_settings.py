@@ -223,7 +223,8 @@ def test_the_last_session_is_restored_and_a_fresh_start_ignores_it(qapp, tmp_pat
     first.widget.set_field("project_root", str(tmp_path))
     first.widget.set_field("npt_1d", "77")
     receipt = first.close()  # C-14: the browser reads the Save Path's folder after the Project change; retry close
-    while receipt.status is PageCleanup.PENDING:
+    deadline = time.monotonic() + 5
+    while receipt.status is PageCleanup.PENDING and time.monotonic() < deadline:
         qapp.processEvents()
         time.sleep(.005)
         receipt = first.close()
