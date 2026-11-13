@@ -1120,7 +1120,8 @@ class DynamicOutputAdapter:
             with self._command_lock:
                 self._activating = False
                 stop = self._stop_requested or cancelled()
-                self._stop_requested = self._stop_requested or stop
+                if stop:  # set only: a concurrent Stop (C-1) is never cleared
+                    self._stop_requested = True
         if stop:
             try:
                 self.stop()
@@ -1833,7 +1834,8 @@ class DynamicOutputAdapter:
                 raise RuntimeError("dynamic output has a pending epoch")
             retrying = graph["transition"] == "finish"
             graph["transition"] = "finish"
-            graph["stop_requested"] = graph["stop_requested"] or stopped
+            if stopped:  # set only: a concurrent Stop (C-1) is never cleared
+                graph["stop_requested"] = True
             stop = graph["stop_requested"]
         if (
             stop and not retrying and not stop_already_applied
@@ -1869,9 +1871,8 @@ class DynamicOutputAdapter:
         for graph in tuple(self._graphs.values()):
             try:
                 with self._command_lock:
-                    graph["stop_requested"] = (
-                        graph["stop_requested"] or stopped
-                    )
+                    if stopped:  # set only: a concurrent Stop (C-1) is never cleared
+                        graph["stop_requested"] = True
                     transition = graph["transition"]
                 if transition == "epoch":
                     try:
@@ -1908,10 +1909,12 @@ class DynamicOutputAdapter:
                 self._current["stop_requested"] = True
 
     def stop(self) -> None:
-        with self._command_lock:
-            self._stop_requested = True
-            for graph in tuple(self._graphs.values()):
-                graph["stop_requested"] = True
+        """Request every graph to stop, without the writer's file lock (NEXT-1210-RESPONSIVENESS C-1): Stop on the GUI
+        thread returns at once while the writer flushes, and the writer reads the flags at its next boundary. Every
+        write of these flags only sets them, so an update made under the lock never clears a Stop set here."""
+        self._stop_requested = True
+        for graph in tuple(self._graphs.values()):
+            graph["stop_requested"] = True
 
     def abort(self, _result=None) -> None:
         self.stop()
