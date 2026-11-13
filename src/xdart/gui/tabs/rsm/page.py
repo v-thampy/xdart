@@ -42,7 +42,7 @@ from xdart.gui.pages.values import (
 from xdart.gui.tabs.rsm.display import rsm_empty_projection, rsm_keyed_projection, rsm_slice_normals
 from xdart.gui.tabs.rsm.settings import RSM_SETTINGS, apply_page_settings, page_settings
 from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
-from xrd_tools.sources.point_images import PointImagesRequired, PointImageDetection
+from xrd_tools.sources.point_images import PointImagesRequired
 from xdart.gui.tabs.rsm.tool_windows import RSMCustomSliceWindow, RSMVolumeWindow
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.browser_view import BrowserProfile, BrowserResult, BrowserView, ResultDirectoryBrowser
@@ -223,8 +223,13 @@ def _resolve_rsm_groups(arguments, cancel, _progress):
     try:
         groups, skipped = rsm_member_groups(selection, **options)
     except PointImagesRequired as error:
-        return error.detection
+        return _PendingGroupings(error.pending)  # every grouped scan, asked about together (C-13)
     return groups, skipped, _source_ubs(groups), _queue_refusals(queue, groups, cancel)
+
+
+class _PendingGroupings(tuple):
+    """The scans a search found that need their images-per-point grouping confirmed (C-13: the maintainer, 2026-11-13,
+    "so it's not waiting every time"): one question covers them all, and the scans are found once more after it."""
 
 
 def queue_output_slots(project, folder, groups):
@@ -1962,8 +1967,8 @@ class RSMPage(QtWidgets.QWidget):
             self.point_images.finish_run()
             self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
         elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
-            if type(terminal.payload) is PointImageDetection:
-                if self.point_images.confirm((terminal.payload,), self):
+            if type(terminal.payload) is _PendingGroupings:
+                if self.point_images.confirm(terminal.payload, self):
                     self._find_scans(action)
                 else:
                     self._notice("Multiple images per point: grouping was not confirmed; scan unprocessed")

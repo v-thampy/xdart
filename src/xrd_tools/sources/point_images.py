@@ -72,24 +72,29 @@ class PointImageDetection:
     image_count: int
     images_per_point: int
     source_spec: SourceSpec
+    #: The SPEC file an image series' scan came from (C-13): a remembered grouping is kept per SPEC file, and a series
+    #: names only its images' folder. None where the source is that file itself.
+    metadata_path: str | None = None
 
 
 class PointImagesRequired(ValueError):
     """A strict source needs explicit confirmation of a detected grouping."""
 
-    def __init__(self, detection: PointImageDetection):
+    def __init__(self, detection: PointImageDetection, pending: tuple = ()):
         self.detection = detection
+        #: every detection the search found, ``detection`` first (C-13: one question for them all)
+        self.pending = tuple(pending) or (detection,)
         super().__init__(f"{detection.image_count} images for {detection.point_count} scan points "
                          f"({detection.images_per_point} images per point); confirm consecutive "
                          "grouping and choose average, difference or one image")
 
 
 def detect_point_images(spec: SourceSpec, scan_label: str, point_count: int,
-                        image_count: int) -> PointImageDetection | None:
+                        image_count: int, *, metadata_path: str | None = None) -> PointImageDetection | None:
     """Return a ratio greater than one, without applying a source policy."""
     if point_count > 0 and image_count > point_count and image_count % point_count == 0:
         return PointImageDetection(str(scan_label), point_count, image_count,
-                                   image_count // point_count, spec)
+                                   image_count // point_count, spec, metadata_path)
     return None
 
 
@@ -174,7 +179,8 @@ def inspect_point_images(spec: SourceSpec, *, warn_missing_spec: bool = True) ->
             return None
         spec_path, scan = resolved
         metadata = SpecSource(spec_path, scan=scan, require_complete_images=True)
-        detection = detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files))
+        detection = detect_point_images(spec, metadata.scan_key, len(metadata.frame_indices), len(files),
+                                        metadata_path=str(spec_path))
         if detection is None:
             return None
         recorded = tuple(find_spec_image_files(files[0].parent, spec_path.stem, metadata.scan_key))

@@ -382,7 +382,7 @@ def rsm_member_groups(
                          "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
     resolution = resolve_stitch_sources(selection, read_image_kwargs)
     if resolution.pending:
-        raise PointImagesRequired(resolution.pending[0])
+        raise PointImagesRequired(resolution.pending[0], resolution.pending)  # every one, for one question (C-13)
     groups, skipped = [], list(resolution.skipped)
     for group in resolution.groups:
         members = []

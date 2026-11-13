@@ -2249,7 +2249,9 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field(key, fields[key])
         self._adopt_mapping(form.source_motors)  # the form's motors become the geometry's
         selection = form.source_selection
-        self.point_images.restore({'choices': [dict(uri=uri, scan=scan, policy=policy.to_dict())
+        # the form's own scan groupings; the files remembered for new scans (C-13) are the window's, kept
+        self.point_images.restore({**self.point_images.document(),
+                                   'choices': [dict(uri=uri, scan=scan, policy=policy.to_dict())
                                                for uri, scan, policy in selection.point_image_choices]})
         self.set_field("source_kind", selection.kind)
         self.set_sources(selection.paths)
