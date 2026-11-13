@@ -120,6 +120,22 @@ def _spec_image_layout(path, read_image_kwargs, nexus_entry=None):
     }), None
 
 
+def _validate_image_numbers(files, layouts, scan_key):
+    """Reject a discontinuous one-file-per-frame sequence before offering grouping."""
+    import re
+
+    from xrd_tools.io.spec import UnusableSpecScan
+
+    if len(files) > 1 and all(layout.frame_count == 1 for layout in layouts):
+        positions = [re.search(r"(\d+)(?:\.[^.]+)?$", path.name) for path in files]
+        if all(positions):
+            numbers = [int(match[1]) for match in positions]
+            if numbers not in [list(range(len(files))), list(range(1, len(files) + 1))]:
+                raise UnusableSpecScan(
+                    f"SPEC scan {scan_key}: image point numbers contain gaps or duplicates",
+                    "detector image numbers have gaps or duplicates")
+
+
 class SpecSource(BaseFrameSource):
     """FrameSource over ONE scan of a SPEC file (metadata; raw images optional).
 
@@ -152,6 +168,7 @@ class SpecSource(BaseFrameSource):
                  point_images: Mapping[str, Any] | None = None,
                  nexus_entry: str | None = None) -> None:
         from xrd_tools.io.spec import (
+            UnusableSpecScan,
             get_spec_scanned_axes,
             list_spec_scans,
             read_spec_scan_columns,
@@ -221,27 +238,20 @@ class SpecSource(BaseFrameSource):
                 frames = sum(layout.frame_count for layout in layouts)
                 if self.point_image_policy is not None:
                     if npts <= 0 or frames != npts * self.point_image_policy.images_per_point:
-                        raise ValueError("confirmed images per point does not match image and point counts")
+                        raise UnusableSpecScan(
+                            "confirmed images per point does not match image and point counts",
+                            f"{npts} scan points but {frames} detector images")
                 elif frames != npts:  # a ratio is a suggestion, never an implicit mapping
                     from xrd_tools.sources.point_images import detect_point_images, PointImagesRequired
                     detection = detect_point_images(source_spec, self.scan_key, npts, frames)
                     if detection is not None:
+                        _validate_image_numbers(files, layouts, self.scan_key)
                         raise PointImagesRequired(detection)
-                    from xrd_tools.io.spec import UnusableSpecScan
                     raise UnusableSpecScan(
                         f"SPEC scan {self.scan_key}: {npts} metadata points but {frames} image frames in "
                         f"{len(files)} files matching *{stem}* in {self.image_dir}; check the image stem and folder",
                         f"{npts} scan points but {frames} detector images")
-                if len(files) > 1 and all(layout.frame_count == 1 for layout in layouts):
-                    import re
-                    positions = [re.search(r"(\d+)(?:\.[^.]+)?$", path.name) for path in files]
-                    if all(positions):
-                        numbers = [int(match[1]) for match in positions]
-                        if numbers not in [list(range(frames)), list(range(1, frames + 1))]:
-                            from xrd_tools.io.spec import UnusableSpecScan
-                            raise UnusableSpecScan(
-                                f"SPEC scan {self.scan_key}: image point numbers contain gaps or duplicates",
-                                "detector image numbers have gaps or duplicates")
+                _validate_image_numbers(files, layouts, self.scan_key)
             if (require_complete_images or self.point_image_policy is not None or nexus_entry) and files:
                 self._frame_map = [(path, i) for path, layout in zip(files, layouts)
                                    for i in range(layout.frame_count)]
@@ -251,7 +261,8 @@ class SpecSource(BaseFrameSource):
             else:
                 self._frame_map = [(f, 0) for f in files]
         if self.point_image_policy is not None and not self._frame_map:
-            raise ValueError("confirmed point image grouping requires detector images and scan points")
+            raise UnusableSpecScan("confirmed point image grouping requires detector images and scan points",
+                                   "No detector images for the confirmed grouping")
         has_raw = bool(self._frame_map)
 
         # Frame count: the metadata point count is authoritative; with one file

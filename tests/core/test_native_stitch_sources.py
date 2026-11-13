@@ -268,3 +268,37 @@ def test_an_explicitly_selected_scan_that_cannot_be_gridded_is_still_refused(tmp
     resolved = _resolved_or_refusal(StitchSourceSelection("Spec", (str(_ungriddable_spec(tmp_path)),), scans))
     assert isinstance(resolved, str), resolved
     assert re.search(refusal, resolved), resolved
+
+
+@pytest.mark.parametrize("mode", ("Spec", "Directory"))
+def test_all_skips_unusable_scans_even_with_a_saved_grouping(tmp_path, mode):
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+    from xrd_tools.sources.point_images import PointImagePolicy
+
+    spec = _ungriddable_spec(tmp_path)
+    folder_or_file = tmp_path if mode == "Directory" else spec
+    choices = tuple((str(spec), scan, PointImagePolicy(2, "average")) for scan in ("6.1", "8.1", "9.1"))
+    resolved = _resolved_or_refusal(StitchSourceSelection(
+        mode, (str(folder_or_file),), stitch_all=mode == "Spec", point_image_choices=choices))
+    assert not isinstance(resolved, str), resolved
+    assert [[member.options["scan"] for member in group] for group in resolved.groups] == [["5.1"]]
+    reasons = {key: reason for _path, key, reason in resolved.skipped}
+    assert "No detector images" in reasons["6.1"]
+    assert reasons["8.1"] == "no data points (an aborted scan)"
+    assert reasons["9.1"] == "3 scan points but 2 detector images"
+
+
+@pytest.mark.parametrize("with_choice", (False, True))
+def test_all_does_not_prompt_to_group_images_with_numbering_gaps(tmp_path, with_choice):
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+    from xrd_tools.sources.point_images import PointImagePolicy
+
+    spec = _ungriddable_spec(tmp_path)
+    for number in (4, 5, 6):  # scan 10 now has six images for three points, but still lacks image 2
+        np.ones((2, 2), dtype=np.uint16).tofile(tmp_path / f"myscan_scan10_{number:04}.raw")
+    choices = ((str(spec), "10.1", PointImagePolicy(3, "average")),) if with_choice else ()
+    resolved = _resolved_or_refusal(StitchSourceSelection(
+        "Spec", (str(spec),), stitch_all=True, point_image_choices=choices))
+    assert not isinstance(resolved, str), resolved
+    assert not resolved.pending, resolved
+    assert any(key == "10.1" and "gaps or duplicates" in reason for _path, key, reason in resolved.skipped)

@@ -215,10 +215,10 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             "require_complete_images": True,
             **({"nexus_entry": selection.nexus_entry} if selection.nexus_entry else {}),
         })
-        spec = confirmed(spec)
-        if spec is None:
-            return None
         try:
+            spec = confirmed(spec)
+            if spec is None:
+                return None
             source = open_source(spec)
         except PointImagesRequired as error:
             pending.append(error.detection)
