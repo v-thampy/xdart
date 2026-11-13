@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tests.xdart.pages.test_rsm_page import (  # noqa: F401
     _close, _page, _spec_scan, _synthetic_source, _wait, _with_source, qapp,
@@ -109,6 +110,7 @@ def test_stop_during_the_scan_search_returns_promptly(qapp, tmp_path, monkeypatc
         took = time.monotonic() - started
         assert took < 1.5, f"Stop took {took:.1f} s during the scan search"
         assert "stopped" in page.run_bar.readinessLabel.full_text().lower()
-        assert page.build_forms() == () or page.build_forms() == [], page.build_forms()
+        with pytest.raises(ValueError, match="not found yet"):  # the stopped search adopted nothing
+            page.build_forms()
     finally:
         _close(page, qapp)

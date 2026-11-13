@@ -9,7 +9,10 @@ Masks come from pyFAI's detector registry, not hardcoded arrays.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
+import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -588,6 +591,23 @@ def read_images_parallel(
     return np.stack([f for f in frames if f is not None])
 
 
+_SHARED_LISTINGS = contextvars.ContextVar("xdart_shared_image_listings", default=None)
+
+
+@contextlib.contextmanager
+def shared_image_listings():
+    """Within this block, :func:`find_image_files` lists each (folder, stem, extensions) once and reuses it
+    (NEXT-1210-RESPONSIVENESS C-16: a search of a SPEC file's scans listed a 20,700-image folder twice per scan, about
+    0.94 s each). One search's own scope: images that arrive during it are found by the next search. Nested blocks
+    share the outermost one's listings."""
+    token = _SHARED_LISTINGS.set({}) if _SHARED_LISTINGS.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _SHARED_LISTINGS.reset(token)
+
+
 def find_image_files(
     directory: Path | str,
     stem: str | None = None,
@@ -595,17 +615,25 @@ def find_image_files(
 ) -> list[Path]:
     """
     Find image files in a directory, optionally filtered by stem pattern and extension.
-    Returns naturally sorted list (so scan_10 comes after scan_9).
+    Returns naturally sorted list (so scan_10 comes after scan_9). Inside :func:`shared_image_listings` a listing is
+    made once and reused.
     """
     from natsort import os_sorted   # optional dep, graceful fallback below
     directory = Path(directory)
     exts = exts or SUPPORTED_EXTS
+    shared = _SHARED_LISTINGS.get()
+    key = (os.path.normcase(os.path.abspath(directory)), stem or "", frozenset(exts))
+    if shared is not None and key in shared:
+        return list(shared[key])
     pattern = f"*{stem}*" if stem else "*"
     candidates = [p for p in directory.glob(pattern) if p.suffix.lower() in exts]
     try:
-        return os_sorted(candidates)
+        found = os_sorted(candidates)
     except Exception:
-        return sorted(candidates)
+        found = sorted(candidates)
+    if shared is not None:
+        shared[key] = tuple(found)
+    return found
 
 
 def read_nexus_frame(

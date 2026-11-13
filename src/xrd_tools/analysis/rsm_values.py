@@ -368,23 +368,36 @@ def rsm_member_groups(
     raw_dtype: str,
     raw_header_skip: int,
     motor_selectors,
+    cancelled=None,
+    progress=None,
 ):
     """Stitch's source selection, resolved by Stitch's own owner (``resolve_stitch_sources``: discovery, the
     Selection syntax, Directory mode and its skips), as RSM member groups: one RSM per group, each SPEC scan one
     member with the run's one frame range, raw decoder and angle mapping (design §2: ``[42-44]`` one RSM from
     three scans, ``42,43`` two). Returns (groups, skipped). A raw NeXus stack is a member too (stage 2b C5c:
     ``RSMNexusMemberForm``, its path, kind and entry), in an explicit selection and in Directory mode; any other
-    kind is refused, or skipped in Directory mode."""
-    from xrd_tools.analysis.stitch_sources import StitchSourceSelection, resolve_stitch_sources
+    kind is refused, or skipped in Directory mode. C-16: ``cancelled`` and ``progress`` reach the scan search, and the
+    whole call lists each image folder once."""
+    from xrd_tools.io.image import shared_image_listings
+    with shared_image_listings():
+        return _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw_header_skip,
+                                  motor_selectors, cancelled, progress)
+
+
+def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw_header_skip, motor_selectors,
+                       cancelled, progress):
+    from xrd_tools.analysis.stitch_sources import SourceSearchCancelled, StitchSourceSelection, resolve_stitch_sources
     if type(selection) is not StitchSourceSelection:
         raise TypeError("RSM members come from an exact Stitch source selection")
     read_image_kwargs = {"detector_shape": tuple(detector_shape), "raw_dtype": np.dtype(raw_dtype).str,
                          "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
-    resolution = resolve_stitch_sources(selection, read_image_kwargs)
+    resolution = resolve_stitch_sources(selection, read_image_kwargs, cancelled=cancelled, progress=progress)
     if resolution.pending:
         raise PointImagesRequired(resolution.pending[0], resolution.pending)  # every one, for one question (C-13)
     groups, skipped = [], list(resolution.skipped)
     for group in resolution.groups:
+        if cancelled is not None and cancelled():
+            raise SourceSearchCancelled("the scan search was stopped")
         members = []
         for spec in group:
             if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)

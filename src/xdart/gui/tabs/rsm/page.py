@@ -216,15 +216,24 @@ def no_ub_warning(members) -> str:
 def _resolve_rsm_groups(arguments, cancel, _progress):
     """The member groups of a source selection (``rsm_member_groups``: Stitch's own discovery, the Selection
     syntax and Directory mode), off the GUI thread: it reads SPEC files and lists images."""
+    from xdart.gui.pages.operation_owner import OperationCancelled
     from xdart.gui.tools.rsm_values import rsm_member_groups
+    from xrd_tools.analysis.stitch_sources import SourceSearchCancelled
     if cancel.is_set():
         return None
     selection, options, queue = arguments
-    try:
-        groups, skipped = rsm_member_groups(selection, **options)
+    try:  # C-16: Stop is checked between scans, and the scans searched are counted
+        groups, skipped = rsm_member_groups(selection, **options, cancelled=cancel.is_set,
+                                            progress=lambda done, total: _progress(_SEARCHING, done, total))
+        ubs = _source_ubs(groups, cancel)
     except PointImagesRequired as error:
         return _PendingGroupings(error.pending)  # every grouped scan, asked about together (C-13)
-    return groups, skipped, _source_ubs(groups), _queue_refusals(queue, groups, cancel)
+    except SourceSearchCancelled as error:
+        raise OperationCancelled(str(error)) from error
+    return groups, skipped, ubs, _queue_refusals(queue, groups, cancel)
+
+
+_SEARCHING = "Finding the source's scans"
 
 
 class _PendingGroupings(tuple):
@@ -262,7 +271,7 @@ def _queue_refusals(queue, groups, cancel):
     return checked
 
 
-def _source_ubs(groups):
+def _source_ubs(groups, cancel=None):
     """Every RSM's members' own UBs, in order (``rsm_member_source_ub``: None where a member records none), for
     the Source header's warning and Run's wait: a queue of RSMs waits while any of its members needs a UB. A
     member whose UB cannot be read counts as recording one: Preview names what is wrong."""
@@ -273,7 +282,12 @@ def _source_ubs(groups):
             return rsm_member_source_ub(member)
         except (OSError, KeyError, ValueError):
             return ()
-    return tuple(own(member) for group in groups for member in group)
+    def checked(member):
+        if cancel is not None and cancel.is_set():
+            from xdart.gui.pages.operation_owner import OperationCancelled
+            raise OperationCancelled("the scan search was stopped")
+        return own(member)
+    return tuple(checked(member) for group in groups for member in group)
 
 
 def _read_rsm_record(path, cancel, _progress):
@@ -1953,6 +1967,9 @@ class RSMPage(QtWidgets.QWidget):
             return
         identity, action, key = self._resolving
         update = self._resolver.poll(identity)
+        if update is not None and update.terminal is None and update.progress is not None and action is not None:
+            # C-16: the search says how far it has got (a SPEC file of many scans on a slow share takes a while)
+            self._status(f"{_SEARCHING}… {update.progress.completed} of {update.progress.total}")
         if update is None or update.terminal is None:
             return
         self._resolving = None

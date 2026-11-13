@@ -176,11 +176,35 @@ def spec_scan_name(path, key, image_dir, image_stem) -> str | None:
     return int_scan_name(files[0]) if files else None
 
 
-def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) -> StitchSourceResolution:
-    """Freeze discovery and skips once at Preview; never rediscover during Run."""
+class SourceSearchCancelled(InterruptedError):
+    """A search of a Source's scans stopped between scans (NEXT-1210-RESPONSIVENESS C-16)."""
+
+
+def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs, *, cancelled=None,
+                           progress=None) -> StitchSourceResolution:
+    """Freeze discovery and skips once at Preview; never rediscover during Run.
+
+    C-16: ``cancelled()`` is checked before each scan (``SourceSearchCancelled``); ``progress(done, total)`` follows the
+    scans searched; each image folder is listed once for the whole search (``shared_image_listings``)."""
+    from xrd_tools.io.image import shared_image_listings
+    with shared_image_listings():
+        return _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress)
+
+
+def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
     if type(selection) is not StitchSourceSelection:
         raise TypeError("exact Stitch source selection required")
     groups, skipped, names, pending = [], [], {}, {}
+    searched = [0, 0]  # scans searched, scans to search (a Directory's grows file by file)
+
+    def step():
+        if cancelled is not None and cancelled():
+            raise SourceSearchCancelled("the scan search was stopped")
+
+    def searched_one():
+        searched[0] += 1
+        if progress is not None:
+            progress(searched[0], max(searched))
     choices = {(uri, scan): policy for uri, scan, policy in selection.point_image_choices}
 
     def choice_key(spec):
@@ -253,19 +277,23 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
     def spec_file(path, all_scans):
         keys = tuple(list_spec_scans(path))
         requested = tuple((key,) for key in keys) if all_scans else parse_stitch_scan_groups(selection.scans)
+        searched[1] += sum(len(group) for group in requested)
         for group in requested:
             members = []
             for token in group:
+                step()
                 key = token if token in keys else token + ".1"
                 if key not in keys:
                     raise ValueError(f"{path.name}: scan {token} is not present")
                 value = spec_member(path, key, all_scans)
+                searched_one()
                 if value is not None and value not in members:
                     members.append(value)
             if members:
                 groups.append(tuple(members))
 
     def nexus_members(path, *, directory=False):
+        step()
         if selection.nexus_entry and selection.nexus_entry not in list_entries(path):
             raise ValueError(f"{path.name}: NeXus entry {selection.nexus_entry!r} is not present")
         kind = describe_container(path, entry=selection.nexus_entry or "entry").kind

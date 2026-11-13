@@ -129,8 +129,8 @@ def test_directory_mode_maps_a_folders_nexus_files_beside_its_spec_scans(tmp_pat
     spec = _pair(tmp_path / "data")
     real = stitch_sources.resolve_stitch_sources
 
-    def with_a_nexus_group(selection, read_image_kwargs):
-        resolved = real(selection, read_image_kwargs)
+    def with_a_nexus_group(selection, read_image_kwargs, **search):  # C-16: Stop and progress reach the search
+        resolved = real(selection, read_image_kwargs, **search)
         nexus = (SourceSpec(tmp_path / "data" / "burst_master.h5", SourceKind.EIGER_MASTER, entry="entry"),)
         return replace(resolved, groups=resolved.groups + (nexus,), names=resolved.names + (("burst_master",),))
     monkeypatch.setattr(stitch_sources, "resolve_stitch_sources", with_a_nexus_group)
