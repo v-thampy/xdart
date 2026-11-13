@@ -598,6 +598,21 @@ def processed_data_folder(project_root: str) -> str:
     return str(Path(str(project_root)).expanduser() / PROCESSED_DATA_FOLDER)
 
 
+def save_path_folder(save_path: str, project_root: str) -> str:
+    """The folder a Save Path names, in every tool: blank is the Project's processed-data folder, a relative path is
+    inside the Project; "" when neither names one (C-14: the Data Browser follows it)."""
+    text = str(save_path or "").strip()
+    project = str(project_root or "").strip()
+    if not text:
+        return processed_data_folder(project) if project else ""
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        if not project:
+            return ""
+        path = Path(project).expanduser() / path
+    return str(path)
+
+
 def save_path_follows_project(save_path: str, project_root: str) -> bool:
     """Whether a Project change moves this Save Path, in every tool: it is blank, or it is that Project's default
     folder however it is spelled (a relative Save Path is inside the Project). A folder the user chose is kept."""

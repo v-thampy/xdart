@@ -1313,20 +1313,10 @@ class RSMPage(QtWidgets.QWidget):
         return groups[0]
 
     def _follow_save_path(self, *, again=False):
-        """C-14: the Data Browser follows the Save Path's folder (a relative one is inside the Project) whenever that
-        folder changes, and ``again`` at a Run's start (C-15), so each result lists and shows as it finishes."""
+        """C-14/C-15: the Data Browser follows this tool's Save Path folder (``follow_project_save_path``)."""
         browser = getattr(self, "_result_browser", None)
-        if browser is None:
-            return
-        project = str(self._value("project_root") or "").strip()
-        output = str(self._value("output_path") or "").strip()
-        if not output:
-            return
-        path = Path(output).expanduser()
-        folder = str(path if path.is_absolute() or not project else Path(project).expanduser() / path)
-        if again or folder != getattr(self, "_followed_save_path", None):
-            self._followed_save_path = folder
-            browser.follow_save_path(folder)
+        if browser is not None:
+            browser.follow_project_save_path(self._value("output_path"), self._value("project_root"), again=again)
 
     def _apply_suggestion(self):
         """The Save Path while it follows the Project: the Project's processed-data folder, the rule Int and Stitch

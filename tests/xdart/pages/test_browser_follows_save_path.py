@@ -54,8 +54,16 @@ def test_the_browser_follows_the_projects_and_the_save_paths_changes(qapp, tmp_p
         tool.set_project(str(first))
         assert browser.directory == str(first / "xdart_processed_data")
         browser.set_directory(str(opened))  # File > Open Folder, a folder he chose
+        notices = []
+        browser.notice.connect(notices.append)
         tool.set_project(str(second))
         assert browser.directory == str(second / "xdart_processed_data")
+        until = time.monotonic() + 10  # its folder does not exist yet: the read ends quietly
+        while browser.busy and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.01)
+        qapp.processEvents()
+        assert not browser.busy and notices == [], notices
         tool.set_save_path(str(chosen))
         assert browser.directory == str(chosen)
         tool.set_save_path("xdart_processed_data")  # a relative Save Path is inside the Project
@@ -98,5 +106,29 @@ def test_a_stitch_run_brings_the_browser_back_and_shows_its_result(qapp, tmp_pat
         assert page._result_browser.directory == str(target.parent)
         assert page.browser.current_result() == str(target), page.browser.listed_results()
         assert page.curve.listDataItems(), "the finished result is drawn"
+    finally:
+        _dispose(page, qapp)
+
+
+def test_a_stitch_run_with_a_blank_save_path_lists_its_result_from_the_projects_folder(qapp, tmp_path):
+    """Stitch reads a blank Save Path as the Project's processed-data folder; its Run brings the browser there."""
+    from xdart.gui.pages.services import empty_host_services
+    from xdart.gui.tabs.stitch.page import StitchPage
+    from tests.xdart.pages.test_stitch_page import _Status, _dispose, _wait as wait_stitch
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        page.set_field("output_path", "")
+        page._result_browser.set_directory(str(tmp_path / "opened"))  # he had opened another folder
+        page.preview_button.click()
+        wait_stitch(page, qapp, catalog=True)
+        target = Path(page._owner.prepared.request.module.output.target)
+        assert target.parent == Path(page._value("project_root")) / "xdart_processed_data"
+        page.run_bar.startButton.click()
+        wait_stitch(page, qapp, catalog=True)
+        assert page._result_browser.directory == str(target.parent)
+        assert page.browser.current_result() == str(target), page.browser.listed_results()
     finally:
         _dispose(page, qapp)

@@ -494,6 +494,15 @@ class ResultDirectoryBrowser(QtCore.QObject):
             self._timer.start()
             self.changed.emit()
 
+    def follow_project_save_path(self, save_path, project_root, *, again=False):
+        """C-14/C-15: follow the folder a tool's Save Path names (``save_path_folder``) whenever it changes, and
+        ``again`` at a Run's start, so each result lists and shows as it finishes."""
+        from .controls_editing import save_path_folder
+        folder = save_path_folder(save_path, project_root)
+        if folder and (again or folder != getattr(self, "_followed_folder", None)):
+            self._followed_folder = folder
+            self.follow_save_path(folder)
+
     def follow_result(self, path):
         if not self._active or not self._owner.explicit_directory:
             self.set_directory(os.path.dirname(os.path.abspath(path)), explicit=False)
