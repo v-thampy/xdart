@@ -285,6 +285,9 @@ def _dispatch_job(request, cancelled, publish):
         if adopted.poni_sha256 != result.candidates[0].proof.sha256 or adopted.npt_sha256 != result.control_points_sha256:
             raise ValueError('saved PONI or points changed during adoption')
         return adopted, _prediction_after(seed, adopted, cancelled)
+    if kind == 'open':  # a saved session: its files' hashes and staged images, off the GUI thread (C-5)
+        path, = arguments
+        return path, load_calibration_session(path, with_resume=True)
     if kind == 'import':
         frame, poni, npt, seed = arguments
         adopted = adopt_calibration_pair(frame, poni, npt)
@@ -2977,6 +2980,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         self.cancel_button.setEnabled(True)
         self._job_status('Stitching calibrant preview…' if kind == 'stitch_preview' else
                             'Checking direct-beam scan…' if kind == 'beam_detect'
+                            else 'Opening calibration session…' if kind == 'open'
                             else f'{kind.capitalize()} in progress…')
         self._timer.start()
         self._sync_quick_button()
@@ -3910,42 +3914,50 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                            fallback=str(self.project_root))
             path = picks[0] if picks else ''
             if path:
-                frames, arm, policy, resume = load_calibration_session(path, with_resume=True)
-                # an older session names no arm: del and nu in order, or a vertical 2θ arm
-                motors = arm or ((tuple(frames[0].motors) + (None,))[:2] if frames
-                                 else self.geometry_editor.value().stitch_arm())
-                if (resume is None and policy is not None and 'instrument_geometry' not in policy
-                        and tuple(self.geometry_editor.value().stitch_arm()) != tuple(motors)):
-                    # a version-4 session's zeros are by circle of its arm: never read by another
-                    raise ValueError(f"this session's arm is del = {motors[0] or 'held'}, nu = {motors[1] or 'held'}: "
-                                     'choose that Diffractometer under 1 · Instrument, then open it again')
-                self.frames, self._frame_motors = frames, motors
-                self.session_dir = Path(path).parent
-                if resume is not None:
-                    self._invalidate_fit()
-                    self._pending_session_resume = resume
-                    self.apply_settings(resume.setup)
-                    if policy is not None:
-                        self._apply_fit_policy(policy)
-                    self._prediction = None
-                    self._render_frames()
-                    self.status.setText('Restoring calibration inputs and checking source metadata…')
-                    self._restore_session_when_ready(resume)
-                    return
-                if policy is not None:  # its own zeros and bounds, before anything is predicted (Codex F6)
-                    self._apply_fit_policy(policy)
-                self._invalidate_fit()
-                self._prediction = None
-                self._render_frames()
-                self._show_tab('calibrate')
-                if any(frame.complete for frame in self.frames):  # its calibrated frames predict the rest
-                    self._start('predict', (self._calibrated_key(), self._seed_options()))
-                if policy is None:
-                    self.status.setText('This session records no fit bounds: the window\'s zeros and bounds are used.')
-                elif 'refine_energy' not in policy:
-                    self.status.setText('This session records no energy, motor-scale or Diffractometer choice: '
-                                        'the window\'s are used.')
+                # NEXT-1210-RESPONSIVENESS C-5: the session's hashes and staged images are checked on the window's
+                # worker (its busy state and Cancel); a job that started while the picker was open refuses it, said.
+                if self._owner.busy:
+                    raise ValueError(self._BUSY_WAIT)
+                self._start('open', (path,))
         self._guard(go)
+
+    def _session_opened(self, path, loaded):
+        """A session the worker read and checked (C-5): its frames, arm, fit policy and resume, into the window."""
+        frames, arm, policy, resume = loaded
+        # an older session names no arm: del and nu in order, or a vertical 2θ arm
+        motors = arm or ((tuple(frames[0].motors) + (None,))[:2] if frames
+                         else self.geometry_editor.value().stitch_arm())
+        if (resume is None and policy is not None and 'instrument_geometry' not in policy
+                and tuple(self.geometry_editor.value().stitch_arm()) != tuple(motors)):
+            # a version-4 session's zeros are by circle of its arm: never read by another
+            raise ValueError(f"this session's arm is del = {motors[0] or 'held'}, nu = {motors[1] or 'held'}: "
+                             'choose that Diffractometer under 1 · Instrument, then open it again')
+        self.frames, self._frame_motors = frames, motors
+        self.session_dir = Path(path).parent
+        if resume is not None:
+            self._invalidate_fit()
+            self._pending_session_resume = resume
+            self.apply_settings(resume.setup)
+            if policy is not None:
+                self._apply_fit_policy(policy)
+            self._prediction = None
+            self._render_frames()
+            self.status.setText('Restoring calibration inputs and checking source metadata…')
+            self._restore_session_when_ready(resume)
+            return
+        if policy is not None:  # its own zeros and bounds, before anything is predicted (Codex F6)
+            self._apply_fit_policy(policy)
+        self._invalidate_fit()
+        self._prediction = None
+        self._render_frames()
+        self._show_tab('calibrate')
+        if any(frame.complete for frame in self.frames):  # its calibrated frames predict the rest
+            self._start('predict', (self._calibrated_key(), self._seed_options()))
+        if policy is None:
+            self.status.setText('This session records no fit bounds: the window\'s zeros and bounds are used.')
+        elif 'refine_energy' not in policy:
+            self.status.setText('This session records no energy, motor-scale or Diffractometer choice: '
+                                'the window\'s are used.')
 
     def _restore_session_when_ready(self, resume):
         if self._pending_session_resume is not resume:
@@ -4283,6 +4295,11 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 elif kind == 'predict':
                     self._prediction = result
                     self._render_frames()
+                elif kind == 'open':
+                    # On the next turn, as Open saved session applied it before (C-5): the reads its settings queue
+                    # then wait for their own turn rather than starting with this terminal; its refusals say why.
+                    opened = result
+                    QtCore.QTimer.singleShot(0, self, lambda: self._guard(lambda: self._session_opened(*opened)))
                 elif kind in ('fit', 'refine'):
                     if self._job_policy and 'conditioning' in self._job_policy:
                         result.asset['provenance']['calibration_conditioning'] = self._job_policy['conditioning']
@@ -4363,6 +4380,8 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                                                              self._distance_held, self._distance_warning))
                 elif kind in ('fit', 'refine'):  # what it found, as the direct-beam fit says its distance
                     self.status.setText(calibration_fit_text(result, kind))
+                elif kind == 'open':
+                    self.status.setText('Calibration session opened.')  # its own messages follow (_session_opened)
                 elif kind == 'stitch_preview':
                     # An adopted preview keeps the summary show_preview wrote (busy ended above); one stitched for
                     # a fit or inputs that changed meanwhile was discarded, and never says it is complete.

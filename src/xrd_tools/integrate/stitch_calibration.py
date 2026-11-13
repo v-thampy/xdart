@@ -49,12 +49,20 @@ def calibration_image_identity(image):
     if (values.ndim != 2 or not all(values.shape) or values.size > 1 << 25
             or values.dtype.kind not in 'iuf'):
         raise ValueError('calibration image must be a bounded real two-dimensional array')
-    values = np.array(values, dtype='<f8', order='C', copy=True)
-    values[np.isnan(values)] = np.nan
-    shape = tuple(int(v) for v in values.shape)
+    # Canonical little-endian float64 pixels, hashed in place (NEXT-1210-RESPONSIVENESS C-5): a new buffer only where
+    # the dtype or layout differs, and a copy of the caller's pixels only to canonicalize NaNs; the digest every saved
+    # session records is unchanged.
+    canonical = np.ascontiguousarray(values, dtype='<f8')
+    if values.dtype.kind == 'f':
+        invalid = np.isnan(canonical)
+        if invalid.any():
+            if np.shares_memory(canonical, values):
+                canonical = canonical.copy()
+            canonical[invalid] = np.nan
+    shape = tuple(int(v) for v in canonical.shape)
     digest = hashlib.sha256(b'xdart-calibration-image-float64-v1\0')
     digest.update(np.asarray(shape, dtype='<u8').tobytes())
-    digest.update(values.tobytes())
+    digest.update(memoryview(canonical).cast('B'))
     return shape, digest.hexdigest()
 
 

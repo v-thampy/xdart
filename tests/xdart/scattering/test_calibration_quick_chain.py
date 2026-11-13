@@ -683,8 +683,8 @@ def test_quick_chain_resumes_then_saves_and_uses_geometry(qapp, tmp_path, monkey
         from xdart.gui.widgets import file_dialogs
         with monkeypatch.context() as picker:
             picker.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
-            dialog.open_session_button.click()
-            _pump(qapp, lambda: dialog.fit is not None and not dialog.active())
+            dialog.open_session_button.click()  # read and checked on the window's worker, then applied (C-5)
+            _pump(qapp, lambda: dialog.fit is not None and dialog.fit is not original and not dialog.active())
         assert dialog.fit is not original
         np.testing.assert_array_equal(dialog.fit.asset['calibration']['param'], original.asset['calibration']['param'])
         np.testing.assert_array_equal(dialog.fit.point_residuals['dq'], original.point_residuals['dq'])

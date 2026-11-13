@@ -191,9 +191,17 @@ def test_refine_starts_from_the_seed_calibrations_zeros_unless_one_is_typed(qapp
 
 
 def _captured(dialog):
-    started = []
-    dialog._start = lambda kind, arguments: started.append((kind, arguments))
+    """The jobs the window starts, captured instead of run; opening a session stays the window's own job (C-5)."""
+    started, real = [], dialog._start
+    dialog._start = lambda kind, arguments: (real(kind, arguments) if kind == 'open'
+                                             else started.append((kind, arguments)))
     return started
+
+
+def _open(dialog):
+    """Open saved session, and wait for the window's worker to read and check it (NEXT-1210-RESPONSIVENESS C-5)."""
+    dialog._resume()
+    _wait(dialog)
 
 
 @pytest.mark.parametrize('record,motor,zeros', [
@@ -344,7 +352,7 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
         dialog._fields['distance_bounds'].setText('')
         started = _captured(dialog)
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(path)])
-        dialog._resume()
+        _open(dialog)
         assert dialog.geometry_editor.value().arm_zeros() == {'del': 2.3}
         assert (dialog._text('displacement_limit'), dialog._text('distance_bounds')) == ('0.02', '385, 395')
         (kind, (key, seed)), = started
@@ -373,7 +381,7 @@ def test_a_resumed_session_fits_and_predicts_with_its_own_zeros_and_bounds(qapp,
         older = save_calibration_session(older, frames, arm=('del', 'nu'))  # version 3: no policy recorded
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(older)])
         started.clear()
-        dialog._resume()
+        _open(dialog)
         assert 'records no fit bounds' in dialog.status.text()
         assert dialog.geometry_editor.value().arm_zeros() == {'del': 2.3}  # the window's own are kept
     finally:
@@ -416,7 +424,7 @@ def test_a_session_records_the_choices_its_fit_took_and_a_resume_restores_them(q
         dialog._set_field_text('energy_bound', '100')
         started = _captured(dialog)
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse', lambda *args, **kwargs: [str(path)])
-        dialog._resume()
+        _open(dialog)
         assert dialog.geometry_editor.value().arm_zeros() == pytest.approx(TRUTH_ZEROS)
         assert not dialog.refine_energy.isChecked() and dialog._text('energy_bound') == '200'
         assert dialog._text('displacement_limit') == '5'
@@ -459,12 +467,12 @@ def test_a_horizontal_arm_session_reopens_with_its_nu_zero(qapp, tmp_path, monke
         started = _captured(dialog)
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse',
                             lambda *args, **kwargs: [str(sessions[4])])
-        dialog._resume()
+        _open(dialog)
         assert "this session's arm is del = held, nu = tth" in dialog.status.text()
         assert dialog.frames == () and started == []  # refused before anything changed
         monkeypatch.setattr('xdart.gui.widgets.file_dialogs.browse',
                             lambda *args, **kwargs: [str(sessions[5])])
-        dialog._resume()
+        _open(dialog)
         assert dialog.geometry_editor.value() == horizontal and dialog._frame_motors == (None, 'tth')
         (kind, (_key, seed)), = started
         assert kind == 'predict' and dict(seed['bounds'].zeros_deg) == {'nu': 2.3}

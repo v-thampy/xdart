@@ -494,6 +494,8 @@ def test_a_horizontal_twoc_scan_is_staged_and_resumed_as_nu(tmp_path, monkeypatc
         monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
         other.set_instrument(InstrumentGeometry('twoc'))
         other._resume()
+        from tests.xdart.scattering.test_stitch_calibration_fit_dialog import _wait
+        _wait(other)  # the session is read and checked on the window's worker (C-5)
         assert other._frame_motors == (None, 'tth')
         # it also restores the Diffractometer it recorded (combined Stitch review F3)
         assert other.geometry_editor.value() == dialog.geometry_editor.value()

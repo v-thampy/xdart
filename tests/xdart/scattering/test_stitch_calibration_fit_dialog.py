@@ -398,8 +398,14 @@ def test_a_fit_made_while_a_session_restores_is_kept(qapp, tmp_path, monkeypatch
             return show(*args, **kwargs)
         monkeypatch.setattr(dialog, '_show_calibration_fit', showing)
         monkeypatch.setattr(file_dialogs, 'browse', lambda *args, **kwargs: [str(session)])
-        dialog.open_session_button.click()
+        dialog.open_session_button.click()  # the session is read and checked on the window's worker (C-5)
+        until = time.monotonic() + 60
+        while dialog._pending_session_resume is None and time.monotonic() < until:
+            QtWidgets.QApplication.processEvents()
+            time.sleep(.005)
         assert dialog._pending_session_resume is not None and not dialog._owner.busy, dialog.status.text()
+        assert started == ['open']
+        started.clear()
         assert dialog.fit is None and dialog.fit_button.isEnabled()
         dialog.fit_button.click()
         assert started == ['fit'], (started, dialog.status.text())
