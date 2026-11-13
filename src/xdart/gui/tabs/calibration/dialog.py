@@ -287,7 +287,10 @@ def _dispatch_job(request, cancelled, publish):
         return adopted, _prediction_after(seed, adopted, cancelled)
     if kind == 'open':  # a saved session: its files' hashes and staged images, off the GUI thread (C-5)
         path, = arguments
-        return path, load_calibration_session(path, with_resume=True)
+        loaded = load_calibration_session(path, with_resume=True)
+        if cancelled.is_set():  # Cancel, or the window closing, while it was read: nothing is applied
+            raise OperationCancelled('calibration session open cancelled')
+        return path, loaded
     if kind == 'import':
         frame, poni, npt, seed = arguments
         adopted = adopt_calibration_pair(frame, poni, npt)
@@ -4295,7 +4298,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                 elif kind == 'predict':
                     self._prediction = result
                     self._render_frames()
-                elif kind == 'open':
+                elif kind == 'open' and not self._close_pending:  # a window closing applies no session
                     # On the next turn, as Open saved session applied it before (C-5): the reads its settings queue
                     # then wait for their own turn rather than starting with this terminal; its refusals say why.
                     opened = result
