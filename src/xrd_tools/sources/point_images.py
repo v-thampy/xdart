@@ -99,10 +99,41 @@ class PointImagesStale(ValueError):
 
 
 def stale_point_images(spec: SourceSpec, detection: "PointImageDetection | None") -> bool:
-    """Whether ``spec`` carries a grouping its scan's counts no longer show: a SPEC-backed scan (a SPEC scan or an
-    image series named by one) whose inspection finds no whole multiple."""
+    """Whether ``spec`` carries a grouping its scan now shows is stale: a SPEC-backed scan (a SPEC scan or an image
+    series named by one) whose inspection finds no grouping and whose counts read exactly one image per point. Counts
+    still in flux, or a scan that cannot be counted (its SPEC file not found), keep the grouping (its Run refuses as
+    before, and recovers)."""
     return (detection is None and "point_images" in spec.options
-            and spec.kind in (SourceKind.SPEC, SourceKind.TIFF_SERIES))
+            and spec.kind in (SourceKind.SPEC, SourceKind.TIFF_SERIES) and _reads_one_image_per_point(spec))
+
+
+def _reads_one_image_per_point(spec: SourceSpec) -> bool:
+    """Positive evidence only: as many images as SPEC points, at least one; anything unreadable is not evidence."""
+    from xrd_tools.sources.spec import SpecSource, find_spec_image_files, resolve_spec_image_scan, _spec_image_layout
+    options = dict(spec.options)
+    try:
+        if spec.kind is SourceKind.SPEC:
+            metadata = SpecSource(spec.uri, scan=options.get("scan"))
+            directory = options.get("image_dir")
+            if not directory or metadata.scan_key is None:
+                return False
+            files = find_spec_image_files(directory, Path(spec.uri).stem, metadata.scan_key, options.get("image_stem"))
+            decode = dict(options.get("read_image_kwargs") or {})
+            images = sum(_spec_image_layout(path, decode, options.get("nexus_entry"))[0].frame_count for path in files)
+        else:
+            if options.get("metadata_format", "auto") not in {"spec", "auto"}:
+                return False
+            files = tuple(Path(value).expanduser() for value in options.get("files", ()))
+            resolved = resolve_spec_image_scan(files[0], meta_dir=options.get("meta_dir"),
+                                               warn_missing=False) if files else None
+            if resolved is None:
+                return False
+            metadata = SpecSource(resolved[0], scan=resolved[1])
+            images = len(files)
+        points = len(metadata.frame_indices)
+    except Exception:  # noqa: BLE001 - an unreadable scan is no evidence; its Run refuses as before
+        return False
+    return points > 0 and images == points
 
 
 def detect_point_images(spec: SourceSpec, scan_label: str, point_count: int,

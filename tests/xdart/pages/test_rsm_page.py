@@ -3461,3 +3461,56 @@ def test_a_scan_grouped_while_recording_is_gridded_once_it_reads_one_image_per_p
     finally:
         timer.stop()
         _close(page, qapp)
+
+
+def test_a_grouped_scan_still_recording_is_skipped_then_gridded_grouped_once_complete(qapp, tmp_path):
+    """C-13, the terms of his pick "Fix first, then push (Recommended)": a count still in flux is skipped with its
+    reason and recovers. A scan confirmed two images per point (two points, four images) that reads two points and
+    three images while recording is skipped with its reason, keeps its grouping, and is gridded grouped, without a
+    question, once its fourth image arrives."""
+    import tifffile
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    page = _page(qapp)
+    seen = []
+    timer = QtCore.QTimer()
+
+    def answer():
+        dialog = qapp.activeModalWidget()
+        if isinstance(dialog, PointImagesDialog) and dialog not in seen:
+            seen.append(dialog)
+            dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+    timer.timeout.connect(answer)
+    timer.start(5)
+
+    def preview():
+        page.set_field("scan_mode", "All Scans")
+        page.begin_preview()
+        label = page.run_bar.readinessLabel
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy and page._job_form is None
+              and any(word in label.full_text() for word in ("Preview ready", "refused", "not confirmed")))
+        skipped = [line for line in page.preview_text.toPlainText().splitlines() if line.startswith("Skipped ")]
+        return label.full_text(), skipped
+    try:
+        spec = _synthetic_source(tmp_path)
+        spec.write_text(spec.read_text() + "\n" + _spec_scan(3, 12), encoding="utf-8")
+        images = tmp_path / "source" / "images"
+
+        def image(label):
+            tifffile.imwrite(images / f"RSM_synth_scan3_{label:04d}.tif",
+                             np.arange(20, dtype=np.uint16).reshape(4, 5) + label)
+        for label in range(4):
+            image(label)
+        _with_source(page, tmp_path)
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy)
+        assert preview()[0].startswith("Preview ready · 3 RSMs") and len(seen) == 1
+        (images / "RSM_synth_scan3_0003.tif").unlink()  # as while it recorded: three of its four images
+        text, skipped = preview()
+        assert text.startswith("Preview ready · 2 RSMs") and [line.split(":")[0] for line in skipped] == [
+            "Skipped RSM_synth 3.1"], (text, skipped)
+        assert [(scan, policy.images_per_point) for _uri, scan, policy in page.point_images.choices] == [("3.1", 2)]
+        image(3)
+        assert preview()[0].startswith("Preview ready · 3 RSMs")
+        assert len(seen) == 1
+    finally:
+        timer.stop()
+        _close(page, qapp)

@@ -559,8 +559,9 @@ def prepare_output(
             policy = None if raw_policy is None else PointImagePolicy.from_dict(raw_policy)
             if policy is None or policy.images_per_point != detection.images_per_point:
                 raise PointImagesRequired(detection)
-        elif stale_point_images(intent.source_spec, detection):
-            raise PointImagesStale(intent.source_spec)  # C-13: the page forgets it and starts the Run again
+        elif not intent.live_mode and stale_point_images(intent.source_spec, detection):
+            # C-13: a finite Run's page forgets it and starts again; Live keeps its behaviour before C-13
+            raise PointImagesStale(intent.source_spec)
     assets = _load_scientific_assets(intent, cancelled=cancelled)
     candidate = OutputCandidate.from_start_capture(capture, assets)
     source, choices, deferred = candidate.source, None, None
