@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 
+import h5py
 import pytest
 
 from xrd_tools.io import append
@@ -221,6 +222,29 @@ def test_a_tampered_compact_history_is_refused(name):
         append._lineage_labels(json.loads(json.dumps(broken)))
 
 
+@pytest.mark.parametrize("name", ("member ordinal", "member range", "extent beyond members", "digest downgraded",
+                                  "path changed", "labels gapped", "labels overlap"))
+def test_semantic_tampers_refuse_in_both_history_versions(name):
+    broken = _grow([_image_source(n, n) for n in (1, 2, 3, 4)])
+    IMAGE_TAMPERS[name](broken)
+    expanded = append._expand_lineage(broken)
+    for lineage in (broken, expanded):
+        with pytest.raises(ValueError):
+            append._lineage_labels(lineage)
+
+
+def test_repeating_an_inherited_member_is_noncanonical_even_when_expansion_is_valid():
+    lineage = _grow([_image_source(1, 1), _image_source(2, 2)])
+    first, last = lineage["epochs"]
+    last["inherited_members"] = 0
+    last["source"]["image_members"].insert(0, first["source"]["image_members"][0])
+    expanded = append._expand_lineage(lineage)
+    assert append._lineage_labels(expanded) == (0, 1)
+    assert append._compact_lineage(expanded) != lineage
+    with pytest.raises(ValueError, match="not canonical"):
+        append._lineage_labels(lineage)
+
+
 CONTAINER_TAMPERS = {
     "grown member changed path": _set(("epochs", 1, "source", "external_members", 0, "path"), "/data/other.h5"),
     "grown member shrank": _also(_set(("epochs", 1, "source", "external_members", 0, "source_stop"), 4),
@@ -244,3 +268,24 @@ def test_a_one_epoch_version_two_history_is_refused():
     lineage["epochs"][0]["labels"] = [0]
     with pytest.raises(ValueError):
         append._lineage_labels(lineage)
+
+
+@pytest.mark.parametrize("version", [2.0, True, 1.0])
+def test_persisted_lineage_versions_require_exact_integers(tmp_path, version):
+    sources = [_image_source(1, 1), _image_source(2, 2)] if version == 2 else [_image_source(1, 1)]
+    lineage = _grow(sources)
+    target = tmp_path / "scan.nexus"
+    intent = _intent(sources[-1])
+    with h5py.File(target, "w") as handle:
+        entry = handle.create_group("entry")
+        entry.attrs[append.SOURCE_BASE_ATTR] = intent.source_base
+        append._write_lineage(entry, lineage)
+        assert append.decode_replacement_lineage(handle)[2] == lineage
+        assert append.AppendCommittedPrefix(str(target), intent, append._json(lineage)).committed_labels == intent.labels
+
+        lineage["version"] = version
+        append._write_lineage(entry, lineage)
+        with pytest.raises(ValueError, match="lineage is not committed"):
+            append.AppendCommittedPrefix(str(target), intent, append._json(lineage))
+        with pytest.raises(ValueError, match="lineage identity is malformed"):
+            append.decode_replacement_lineage(handle)

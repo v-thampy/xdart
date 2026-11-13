@@ -190,11 +190,12 @@ def _prepared_plan(
     return offer, plan
 
 
-def _install_prepared_append_lineage(seeded, *, multi_epoch=False):
+def _install_prepared_append_lineage(seeded, *, multi_epoch=False, compact=False):
     from xrd_tools.io.append import (
         AppendExternalMember,
         AppendIntent,
         AppendSource,
+        _compact_lineage,
         _json as canonical_append_json,
         begin_same_run_lineage,
         commit_append_lineage,
@@ -262,6 +263,8 @@ def _install_prepared_append_lineage(seeded, *, multi_epoch=False):
                 {"source": prior_source, "labels": [0]},
                 {"source": current_source, "labels": [1]},
             ]
+            if compact:
+                lineage = _compact_lineage(lineage)
             del config["append_lineage"]
             config.create_dataset(
                 "append_lineage", data=canonical_append_json(lineage),
@@ -1110,16 +1113,17 @@ def test_unicode_single_epoch_append_is_prepared_and_preserved(
         )
 
 
-def test_multi_epoch_append_is_one_typed_prepared_miss(tmp_path):
+@pytest.mark.parametrize("compact", [False, True])
+def test_multi_epoch_append_is_one_typed_prepared_miss(tmp_path, compact):
     from xrd_tools.reduction import prepare_reintegrate_bundle
 
     seeded = _seed_existing(
         tmp_path, labels=(0, 1), name="multi-epoch-append",
     )
     source, raw = _install_prepared_append_lineage(
-        seeded, multi_epoch=True,
+        seeded, multi_epoch=True, compact=compact,
     )
-    assert len(json.loads(raw)["epochs"]) == 2
+    assert len(json.loads(raw)["epochs"]) == 2 and json.loads(raw)["version"] == (2 if compact else 1)
     offer = prepare_reintegrate_bundle(
         source,
         entry="entry",

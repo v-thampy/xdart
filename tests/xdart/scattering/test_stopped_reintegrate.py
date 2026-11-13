@@ -532,13 +532,13 @@ def test_real_run_reintegrates_only_its_saved_labels(tmp_path, monkeypatch, sour
         app.processEvents()
 
 
-@pytest.mark.parametrize("saved_count", [1, 3])
-def test_stopped_external_prefix_keeps_the_whole_raw_graph(tmp_path, saved_count):
+@pytest.mark.parametrize(("saved_count", "multi_epoch"), [(1, False), (3, False), (3, True)])
+def test_stopped_external_prefix_keeps_the_whole_raw_graph(tmp_path, saved_count, multi_epoch):
     from xdart.gui.tabs.scattering.contracts import (
         ExternalSourceState, SourceExecutionStamp, SourceFileState,
     )
     from xrd_tools.io.append import (
-        AppendExternalMember, AppendSource, _source_dict, truncate_append_source,
+        AppendExternalMember, AppendSource, _compact_lineage, _source_dict, truncate_append_source,
     )
 
     members = []
@@ -565,6 +565,10 @@ def test_stopped_external_prefix_keeps_the_whole_raw_graph(tmp_path, saved_count
         ) for member in members),
     )
     prefix = _source_dict(truncate_append_source(complete, saved_count))
+    epochs = [{"source": prefix, "labels": list(range(saved_count))}]
+    if multi_epoch:
+        earlier = _source_dict(truncate_append_source(complete, 1))
+        epochs = [{"source": earlier, "labels": [0]}, {"source": prefix, "labels": list(range(1, saved_count))}]
     fact = {
         "label": saved_count - 1, "path": state.path, "frame_index": saved_count - 1,
         "source_base": "", "snapshot": {
@@ -572,7 +576,7 @@ def test_stopped_external_prefix_keeps_the_whole_raw_graph(tmp_path, saved_count
             "frame_count": 4, "dataset_path": selectors[0], "self_contained": False,
         },
         "source_execution": execution,
-        "append_lineage": {"epochs": [{"source": prefix, "labels": list(range(saved_count))}]},
+        "append_lineage": {"version": 1, "epochs": epochs},
         "metadata": {}, "geometry": {}, "background_dependency": None,
     }
     topology = reintegrate._admit_source_topology(
@@ -582,9 +586,18 @@ def test_stopped_external_prefix_keeps_the_whole_raw_graph(tmp_path, saved_count
     assert topology.external_paths == selectors
     np.testing.assert_array_equal(reintegrate._source_fact(fact, read=True, topology=topology)[3],
                                   np.full((5, 7), int(saved_count > 2), np.uint16))
+    if multi_epoch:
+        compact = {**fact, "append_lineage": _compact_lineage(fact["append_lineage"])}
+        assert compact["append_lineage"]["version"] == 2
+        compact_topology = reintegrate._admit_source_topology(
+            compact, full_inventory=True, selected_labels=tuple(range(saved_count)),
+        )
+        assert compact_topology.frame_routes == topology.frame_routes
+        np.testing.assert_array_equal(reintegrate._source_fact(compact, read=True, topology=compact_topology)[3],
+                                      np.full((5, 7), 1, np.uint16))
     for field, bad_value in (("dataset_path", "/entry/foreign"), ("size", 0)):
         broken = copy.deepcopy(fact)
-        broken["append_lineage"]["epochs"][0]["source"]["external_members"][-1][field] = bad_value
+        broken["append_lineage"]["epochs"][-1]["source"]["external_members"][-1][field] = bad_value
         with pytest.raises(ValueError, match="REPLACEMENT_"):
             reintegrate._admit_source_topology(
                 broken, full_inventory=True, selected_labels=tuple(range(saved_count)),

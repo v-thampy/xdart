@@ -282,7 +282,7 @@ def read_ring_record(path: str | Path, *, entry: str = "entry") -> SavedRingReco
     nothing detector-sized and no handle survives the call.
     """
 
-    from xrd_tools.io.append import _lineage_labels
+    from xrd_tools.io.append import COMPACT_LINEAGE_VERSION, LINEAGE_VERSION, _lineage_labels
     from xrd_tools.io.frame_view import _is_current_average_frame_one
 
     unreadable: list[str] = []
@@ -320,6 +320,9 @@ def read_ring_record(path: str | Path, *, entry: str = "entry") -> SavedRingReco
             lineage = node("append_lineage")
             if lineage is not None:
                 try:
+                    version = lineage.get("version")
+                    if type(version) is not int or version not in (LINEAGE_VERSION, COMPACT_LINEAGE_VERSION):
+                        raise ValueError("unsupported Append lineage version")
                     _lineage_labels(lineage)  # the Append owner's own validation
                     epochs = tuple(tuple(epoch["labels"]) for epoch in lineage["epochs"])
                 except (KeyError, TypeError, ValueError):

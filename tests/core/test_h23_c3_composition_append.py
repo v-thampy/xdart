@@ -4617,6 +4617,28 @@ def test_prefix_bound_preflight_refuses_dimension_incompatible_modes(
     _assert_lease_available(target)
 
 
+def test_prefix_bound_preflight_preserves_legacy_epoch_extension_fields(tmp_path):
+    from xrd_tools.io import AppendRefused, prepare_append_preflight
+
+    target = tmp_path / "legacy-epoch.nexus"
+    _commit_image_series_target(target, _image_series_intent(tmp_path, 2, generation=0))
+
+    def set_annotation(value):
+        with h5py.File(target, "r+") as handle:
+            config = handle["entry/reduction/config"]
+            lineage = json.loads(config["append_lineage"][()])
+            lineage["epochs"][0]["legacy_annotation"] = value
+            del config["append_lineage"]
+            config.create_dataset("append_lineage", data=json.dumps(lineage, sort_keys=True, separators=(",", ":")))
+
+    set_annotation("observed")
+    prefix = _decode_image_series_prefix(target)
+    set_annotation("changed")
+    with pytest.raises(AppendRefused, match="committed Append epochs diverged"):
+        prepare_append_preflight(target, _image_series_intent(tmp_path, 3, generation=1), committed_prefix=prefix)
+    _assert_lease_available(target)
+
+
 def test_prefix_bound_preflight_accepts_concurrent_exact_successor_as_noop(
     tmp_path,
 ):

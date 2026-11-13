@@ -734,6 +734,7 @@ def decode_replacement_lineage(handle: h5py.File, *, entry: str = "entry") -> tu
     expected = {"version", "state", "entry", "source_base", "source_identity",
                 "science_fingerprint", "modes", "epochs"}
     if (raw != _json(value) or set(value) != expected
+            or type(value.get("version")) is not int
             or value.get("version") not in (LINEAGE_VERSION, COMPACT_LINEAGE_VERSION)
             or value.get("state") != "committed" or type(value.get("entry")) is not str or value["entry"] != entry or (lineage_group := _replacement_hard_group(handle, value["entry"])) is None or lineage_group.name != group.name
             or value.get("source_base") != _normalize_base(source_base)
@@ -1595,8 +1596,12 @@ def qualify_append(target: str | Path, intent: AppendIntent, *, committed_prefix
             if current.committed_labels[:len(committed_prefix.committed_labels)] \
                     != committed_prefix.committed_labels:
                 raise ValueError("committed Append labels no longer retain observed prefix")
-            if _json({"epochs": _compact_epochs_of(current_lineage)[:len(observed_epochs)]}) \
-                    != _json({"epochs": _compact_epochs_of(observed_lineage)}):
+            if current_lineage["version"] == observed_lineage["version"]:
+                current_epochs = current_lineage["epochs"]
+            else:
+                current_epochs = _compact_epochs_of(current_lineage)
+                observed_epochs = _compact_epochs_of(observed_lineage)
+            if _json({"epochs": current_epochs[:len(observed_epochs)]}) != _json({"epochs": observed_epochs}):
                 raise ValueError("committed Append epochs diverged from observed prefix")
         if _intent_identity(current.intent) != _intent_identity(intent):
             raise ValueError(f"foreign Append identity: {_identity_difference(current.intent, intent)}")

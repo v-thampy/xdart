@@ -338,6 +338,20 @@ def test_h2b_synthetic_refusals_beside_their_eligible_original(qapp, tmp_path):
         assert refused.frame_snapshot(labels[0]) is None and refused.frame_reason(labels[0]) == reason, name
 
 
+def test_energy_ring_record_rejects_an_invalid_lineage_version(qapp, tmp_path):
+    from xrd_tools.io.browse_presentation import read_ring_record
+
+    output, _ = _fresh_output(qapp, tmp_path / 'run')
+    assert read_ring_record(output).epochs is not None
+    with h5py.File(output, 'r+') as handle:
+        config = handle['entry/reduction/config']
+        lineage = _json(config['append_lineage'])
+        lineage['version'] = True
+        _replace_json(config, 'append_lineage', lineage)
+    record = read_ring_record(output)
+    assert record.epochs is None and 'append_lineage' in record.unreadable
+
+
 def test_h4_ring_facts_come_from_the_declared_nodes_and_forbidden_forms_refuse(qapp, tmp_path):
     from xrd_tools import geometry_figures as gf
     from xrd_tools.io.browse_presentation import read_browse_presentation
