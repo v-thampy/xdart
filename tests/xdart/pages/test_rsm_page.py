@@ -1901,7 +1901,7 @@ def test_a_save_path_changed_while_the_scans_were_found_asks_for_another_run(qap
         release.set()
         _wait(page, qapp, lambda: not page.active() and "Run again" in label.full_text())
         assert label.full_text() == "The output changed while the scans were found: Run again"
-        assert grids == [] and page.results.count() == 0
+        assert grids == [] and not page.browser.listed_results()
         names = [Path(form.output_path) for form in page.build_forms()]
         assert [path.parent for path in names] == [elsewhere, elsewhere]
         page.begin_run()
