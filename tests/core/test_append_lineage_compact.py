@@ -81,7 +81,7 @@ def _version_one(sources):
     for source in sources:
         epochs.append({"source": append._source_dict(source), "labels": list(range(done, source.extent))})
         done = source.extent
-    return {"version": 1, "state": "committed", "entry": "entry", "source_base": "/data",
+    return {"version": 1, "state": "committed", "entry": "entry", "source_base": append._normalize("/data"),
             "source_identity": "scan-identity", "science_fingerprint": "science", "modes": ["1d"], "epochs": epochs}
 
 
