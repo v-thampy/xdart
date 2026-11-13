@@ -3412,3 +3412,52 @@ def test_all_scans_asks_once_for_its_grouped_scans_and_finds_them_once_more(qapp
     finally:
         timer.stop()
         _close(page, qapp)
+
+
+def test_a_scan_grouped_while_recording_is_gridded_once_it_reads_one_image_per_point(qapp, tmp_path):
+    """NEXT-1210-RESPONSIVENESS C-13, his pick "Fix first, then push (Recommended)": a scan caught while recording
+    (one point, two images) is grouped two images per point by a remembered file; once it finishes (two points, two
+    images) its stored grouping no longer fits, and the scan is gridded ungrouped rather than skipped from then on
+    ("2 scan points but 2 detector images", leaves/c13/midrecording.txt)."""
+    import tifffile
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    page = _page(qapp)
+    seen = []
+    timer = QtCore.QTimer()
+
+    def answer():
+        dialog = qapp.activeModalWidget()
+        if isinstance(dialog, PointImagesDialog) and dialog not in seen:
+            seen.append(dialog)
+            getattr(dialog, "remember_file", dialog.apply_remaining).editor.setChecked(True)
+            dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+    timer.timeout.connect(answer)
+    timer.start(5)
+
+    def preview():
+        page.set_field("scan_mode", "All Scans")
+        page.begin_preview()
+        label = page.run_bar.readinessLabel
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy and page._job_form is None
+              and any(word in label.full_text() for word in ("Preview ready", "refused", "not confirmed")))
+        return label.full_text()
+    try:
+        spec = _synthetic_source(tmp_path)
+        base = spec.read_text()
+        recording = _spec_scan(3, 12).rsplit("\n", 2)[0] + "\n"  # its first data row only
+        spec.write_text(base + "\n" + recording, encoding="utf-8")
+        images = tmp_path / "source" / "images"
+        for label in range(2):
+            tifffile.imwrite(images / f"RSM_synth_scan3_{label:04d}.tif",
+                             np.arange(20, dtype=np.uint16).reshape(4, 5) + label)
+        _with_source(page, tmp_path)
+        _wait(page, qapp, lambda: page._resolving is None and not page._owner.busy)
+        assert preview().startswith("Preview ready · 3 RSMs") and len(seen) == 1
+        assert [(scan, policy.images_per_point) for _uri, scan, policy in page.point_images.choices] == [("3.1", 2)]
+        spec.write_text(base + "\n" + _spec_scan(3, 12), encoding="utf-8")  # the scan finished
+        assert preview().startswith("Preview ready · 3 RSMs"), page.preview_text.toPlainText()
+        assert [[member.scan for member in form.members] for form in page.build_forms()] == [["1.1"], ["2.1"], ["3.1"]]
+        assert len(seen) == 1
+    finally:
+        timer.stop()
+        _close(page, qapp)

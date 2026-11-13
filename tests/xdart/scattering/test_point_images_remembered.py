@@ -268,3 +268,52 @@ def test_ints_profile_keeps_a_remembered_file_and_a_path_written_otherwise_match
     finally:
         answers.stop()
         settings.deleteLater()
+
+
+def test_ints_run_drops_a_stored_grouping_its_finished_scan_no_longer_shows(qapp, tmp_path):
+    """His pick "Fix first, then push (Recommended)": a grouping stored for a scan answered while it recorded (two
+    images per point) no longer fits once the scan reads one image per point; Int's Run forgets it, says so, and
+    processes the scan ungrouped, rather than refusing it from then on."""
+    from dataclasses import replace
+    from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
+    from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
+    from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
+    from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+    from xdart.gui.tabs.scattering.state_machine import RunPhase
+    from xrd_tools.session.intent_store import RunIntentStore
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from xrd_tools.sources.selection import image_series_spec
+    from tests.xdart.scattering._e2sd_support import write_poni
+    from tests.xdart.scattering.test_e3_join_oracle import _wait
+    from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff
+    spec = tmp_path / 'calibrant'
+    spec.write_text('#F calibrant\n#E 1\n#O0 del  nu\n\n#S 1 ascan del 10 12 2 1\n#P0 10 0\n#N 3\n'
+                    '#L del  nu  i0\n10 0 100\n11 0 200\n')
+    paths = [tmp_path / f'calibrant_scan001_{index:04}.tif' for index in range(2)]
+    for path, value in zip(paths, (10, 12)):
+        _write_tiff(path, value)
+    poni, output = tmp_path / 'cal.poni', tmp_path / 'processed'
+    write_poni(poni)
+    intent = _intent(paths[0], output, poni)
+    series = image_series_spec(paths[0], metadata_format='spec')
+    intent.source_spec = replace(series, options={**series.options,
+                                                  'point_images': PointImagePolicy(2, 'average', 1, False).to_dict()})
+    lifecycle = ScatteringCoordinator()
+    store = RunIntentStore(intent)
+    page = ScatteringWorkspace(intents=store, lifecycle=lifecycle,
+                               sources=FilesystemSourceAdapter(), executor=StandardRunExecutor())
+    page.show()
+    try:
+        assert page.point_images.choices  # the stored grouping, as the scan's settings hold it
+        _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
+        page._shell.run_controls.startButton.click()
+        _wait(qapp, lambda: bool(list(output.glob('*.nexus'))), timeout=30,
+              diagnostic=lambda: f'{lifecycle.phase.value}: {page._notice_text}')
+        _wait(qapp, lambda: lifecycle.phase in {RunPhase.IDLE, RunPhase.FAILED} and page._admission is None,
+              timeout=30)
+        assert 'point_images' not in store.snapshot().thaw().source_spec.options
+        assert page.point_images.choices == ()
+        assert 'no longer' in page._notice_text, page._notice_text
+    finally:
+        _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
+        page.close()
