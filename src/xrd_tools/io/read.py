@@ -833,6 +833,12 @@ def get_raw_frame(
         source_base = _decode(entry_group.attrs.get("source_base", ""))
         execution_node = entry_group.get("reduction/config/source_execution")
         execution = None if execution_node is None else json.loads(_decode(execution_node[()]))
+        if point is None and allow_thumbnail:
+            # A fallback must use the same file that supplied the raw pointer.
+            return _raw_frame_or_thumbnail(
+                scan_file, int(frame), master, src_frame_idx, thumb,
+                preserve_dtype=preserve_dtype, raw_options=raw_options,
+            )
     if point is not None:
         return _point_raw_frame(scan_file, point, source_base=source_base, source_root=source_root, execution=execution)
     return _raw_frame_or_thumbnail(
@@ -841,7 +847,7 @@ def get_raw_frame(
         master,
         src_frame_idx,
         thumb,
-        allow_thumbnail=allow_thumbnail,
+        allow_thumbnail=False,
         preserve_dtype=preserve_dtype,
         raw_options=raw_options,
     )
@@ -950,7 +956,7 @@ def _raw_frame_parts_from_entry(
     *,
     scan: str | int | None = None,
     source_root: str | Path | None = None,
-) -> tuple[Path | None, int, Callable[[], np.ndarray] | None]:
+) -> tuple[Path | None, int, Callable[[], np.ndarray | None]]:
     """Resolve one processed frame's raw source pointer and its thumbnail reader (decoded only when called).
 
     ``scan`` selects a grouped-scan record (``frames/scan_<scan>/frame_NNNN``);
@@ -1033,7 +1039,7 @@ def _raw_frame_parts_from_group(
     frame_group: h5py.Group,
     *,
     source_root: str | Path | None = None,
-) -> tuple[Path | None, int, Callable[[], np.ndarray] | None]:
+) -> tuple[Path | None, int, Callable[[], np.ndarray | None]]:
     """Resolve raw parts from an already-selected stored frame group."""
     source_base = (
         _decode(entry_group.attrs["source_base"])
@@ -1055,23 +1061,14 @@ def _raw_frame_parts_from_group(
             source_root=source_root,
         )
 
-    return master, src_frame_idx, _thumbnail_reader(scan_file, frame_group)
+    return master, src_frame_idx, _thumbnail_reader(frame_group)
 
 
-def _thumbnail_reader(scan_file: Path, frame_group: h5py.Group):
-    """The frame's thumbnail, decoded only when called (NEXT-1210-RESPONSIVENESS C-2): a raw read decodes it only to
-    substitute it, never for a strict read or one whose raw source reads. None when no thumbnail is stored. Called
-    after the processed file is closed, it reopens it."""
-    dataset = frame_group.get("thumbnail")
-    if dataset is None:
-        return None
-    name = dataset.name
-
-    def decode() -> np.ndarray:
-        if dataset.id.valid:
-            return _dequantize_thumbnail(dataset)
-        with h5py.File(scan_file, "r") as handle:
-            return _dequantize_thumbnail(handle[name])
+def _thumbnail_reader(frame_group: h5py.Group) -> Callable[[], np.ndarray | None]:
+    """Read the optional thumbnail only on demand, while its processed file is open."""
+    def decode() -> np.ndarray | None:
+        dataset = frame_group.get("thumbnail")
+        return None if dataset is None else _dequantize_thumbnail(dataset)
     return decode
 
 
@@ -1080,7 +1077,7 @@ def _raw_frame_or_thumbnail(
     frame: int,
     master: Path | None,
     src_frame_idx: int,
-    thumb: Callable[[], np.ndarray] | None,
+    thumb: Callable[[], np.ndarray | None],
     *,
     allow_thumbnail: bool = True,
     preserve_dtype: bool = False,
@@ -1109,8 +1106,10 @@ def _raw_frame_or_thumbnail(
                 "falling back to" if allow_thumbnail else "not falling back to",
                 exc_info=True,
             )
-    if allow_thumbnail and thumb is not None:
-        return thumb()
+    if allow_thumbnail:
+        thumbnail = thumb()
+        if thumbnail is not None:
+            return thumbnail
     raise KeyError(
         f"frame {frame}: source master file not found/readable"
         + (

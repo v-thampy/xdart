@@ -3846,7 +3846,7 @@ def read_contributing_frame_view(
         master, index, thumbnail_reader = _raw_frame_parts_from_entry(
             path, container, frame, scan=scan, source_root=source_root,
         )
-        thumbnail = None if thumbnail_reader is None else thumbnail_reader()  # this view shows it
+        thumbnail = thumbnail_reader()  # this view shows it
         group = _frame_group_for_label(container, frame, scan=scan)
         options = _frame_source_read_options(group)
         point = read_point_source_ref(group.get("source"))

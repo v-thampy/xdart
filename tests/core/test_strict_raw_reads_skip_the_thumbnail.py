@@ -47,3 +47,21 @@ def test_a_raw_read_decodes_the_thumbnail_only_to_substitute_it(processed_with_m
     assert calls == []
     np.testing.assert_array_equal(get_raw_frame(nxs, 0), stored)
     assert calls == ["/entry/frames/frame_0000/thumbnail"]  # substituted, so decoded once
+
+
+def test_fallback_uses_the_already_open_processed_file(processed_with_master, monkeypatch):  # noqa: F811
+    nxs, _raw, _thumb = processed_with_master
+    from pathlib import Path
+
+    (nxs.parent / "scan_master.h5").unlink()
+    original_enter = h5py.File.__enter__
+    opened = []
+
+    def enter(handle):
+        if Path(handle.filename) == nxs:
+            opened.append(handle.filename)
+        return original_enter(handle)
+
+    monkeypatch.setattr(h5py.File, "__enter__", enter)
+    assert get_raw_frame(nxs, 0).shape == _thumb.shape
+    assert opened == [str(nxs)]
