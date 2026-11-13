@@ -1,5 +1,100 @@
 # Release notes
 
+## 1.2.10 (2026-11-13)
+
+### New
+
+- **Remember an images-per-point grouping for a SPEC file:** the "Multiple
+  images per scan point" question has **Apply to all scans in this file,
+  including new ones**. Later scans of that file whose image count fits are
+  grouped the same way without asking, and the choice is saved with the
+  window's settings. A scan it cannot apply to (Difference on three images per
+  point) still asks. The **Images per point** card lists the remembered files;
+  untick one there to be asked again.
+- **The grouping question confirms itself:** left unanswered, it confirms the
+  grouping it shows after 30 s while it is the active window, for the rest of
+  that Run's scans. Any change in it stops the countdown. RSM asks about all
+  the scans that need a grouping together (scans whose grouping cannot be
+  shared may still each ask).
+- **The Save Path takes focus after a Project change:** after you change the
+  Project (typed or with Browse), focus moves to the Save Path, shown in full
+  while focused, in Int, Stitch and RSM.
+
+### Changed
+
+- **One Save Path rule in every tool:** Int, Stitch and RSM default to the
+  Project's `xdart_processed_data` folder and keep a folder you choose. A
+  relative Save Path is inside the Project.
+- **The Data Browser follows the Save Path:** a Project or Save Path change
+  moves it to the Save Path folder in Int, Stitch and RSM, replacing a folder
+  opened with Open Folder, and a Run brings it back so each result is listed
+  as it finishes and the newest is shown.
+- **RSM's scan search is much faster, shows its progress and can be
+  stopped:** a search of a SPEC file's scans lists each image folder once and
+  shows "Finding the source's scans… N of M"; Stop works between scans. In our
+  test of 100 scans and 20,700 images on a local disk, it fell from about
+  264 s to 2 s.
+- **All Scans and Directory skip the scans they cannot grid:** in Stitch and
+  RSM, a scan with no detector images, no data points (an aborted scan), an
+  unreadable data table, an image count different from its points or a gap in
+  its image numbering is skipped and listed with its reason. A scan you select
+  explicitly is still refused, with the reason.
+- **A Live Run's saved Append history stores each image once:** it grew with
+  the square of the frames (an estimated 100 MB at 1,000 single-frame epochs);
+  it now grows with the frames (636 KB measured). A file whose history has two
+  or more epochs, written by 1.2.10, is refused by 1.2.9's Append and
+  Reintegrate.
+- **Faster saves and fresh Appends:** Stitch, RSM and analysis saves check the
+  new file once rather than several times, and an Append to a new output uses
+  the fast writer (a failed write reprocesses that scan on the next Append and
+  leaves no partial file). Config ▸ Debug ▸ Performance Monitoring shows the
+  readback and hash timings.
+- **Memory-aware limits on Windows use the PC's installed memory:** they used
+  fixed fallbacks. A restored session keeps its saved Cores.
+- **Performance Diagnostics, metadata and authored-asset dialogs use the shared
+  forms and file choosers**, with tooltips.
+
+### Fixes
+
+- **Stop returns at once while a save is in progress:** it no longer waits for
+  the writer, and the window stays responsive.
+- **Opening a calibration session no longer freezes the window:** its file
+  checks run in the background with Cancel; Cancel or closing the window
+  applies nothing.
+- **A damaged thumbnail no longer blocks a good raw image:** the thumbnail is
+  read only when it stands in for a missing raw image.
+- **Performance Diagnostics Apply no longer breaks later Runs:** a Live,
+  Batch, Append or XYE Run ignores a pipeline choice it cannot take and says
+  so; sessions and profiles from 1.2.9 that carried the setting start clean.
+- **A Calibrate or Import replaces the old fit before the session is saved.**
+- **`~` in calibration's Image Path and the Refine card's Geometry file means
+  your home folder** (a 1.2.9 known limitation).
+- **The Browse list updates in place as files arrive**, keeping its rows and
+  selection.
+- **The refinement toggle says its state.**
+- **Calibration's "Save geometry and use" offers a place inside the Project.**
+- **A grouping confirmed while a scan was still recording no longer sticks:**
+  once the scan reads one image per point it is processed ungrouped; a count
+  still settling is skipped with its reason and recovers.
+- **Pillow is declared for the GUI**, and the GUI utilities no longer load
+  pandas when imported.
+
+### Known limitations
+
+- Grouped scans inside an Int GI Folder Run are refused (select the scan as
+  the Source), and Stitch's Directory mode refuses on the first scan that
+  needs a grouping instead of asking.
+- A full Reintegrate of a folder-mode Live Run later extended with Append is
+  refused, as in 1.2.9.
+- Stitch's Stop still waits for its own source search to finish.
+- RSM settings saved by 1.2.10 do not load in 1.2.9, which starts RSM on its
+  defaults.
+- When the Data Browser moves to a new Save Path folder, Stitch's plot can
+  clear if the result it shows is not in that folder.
+- An Int Save Path typed as a relative path is now inside the Project, so an
+  output an earlier version wrote under the working folder is not continued by
+  Append; a new output starts in the Project.
+
 ## 1.2.9 (2026-11-09)
 
 ### Fixes

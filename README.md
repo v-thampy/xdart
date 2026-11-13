@@ -9,7 +9,7 @@ integration and [xrayutilities](https://xrayutilities.sourceforge.io/) for
 stitching and reciprocal-space mapping. The same processing tools are available
 in Python through **`xrd_tools`**, the headless core included with xdart.
 
-This README describes **xdart 1.2.9**.
+This README describes **xdart 1.2.10**.
 [Release notes](RELEASE_NOTES.md) · [Upgrading from 1.1.5](MIGRATION.md#upgrading-from-115-to-120) ·
 [Limitations and workarounds](docs/LIMITATIONS.md)
 
@@ -294,7 +294,7 @@ pixi run --locked xdart
 ```
 
 The default `main` branch contains the current source. To use the release
-described here, run `git switch --detach v1.2.9` before installing.
+described here, run `git switch --detach v1.2.10` before installing.
 The lockfile covers Apple Silicon macOS, Linux x86-64, and Windows x86-64.
 Each machine installs its own environment; keep the shared lockfile unchanged
 when testing on another machine.
