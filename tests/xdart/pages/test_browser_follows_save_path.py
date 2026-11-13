@@ -119,7 +119,12 @@ def test_int_folder_run_returns_to_save_path_before_publishing(qapp, tmp_path):
         assert followed == [str(output)]
         paths = {str(path) for path in output.glob("*.nexus")}
         assert len(paths) == 2
-        assert ready == paths
+        # Int paces its presentation latest-only: a result that finishes before the one ahead of it is drawn can
+        # replace it unshown (hosted CI 43505703540: the first was skipped). The newest result is drawn, and only
+        # this Run's results are (the browser and display follow the Save Path; his C-15 request).
+        # ``_flush_presentation_target`` draws the newest queued result when the Run ends: wait for it.
+        assert _pump(qapp, lambda: str(output / "second_int2d.nexus") in ready, seconds=10), (ready, paths)
+        assert ready <= paths, (ready, paths)
         assert _pump(qapp, lambda: paths.issubset(
             {entry.artifact for entry in page._processed_browser.catalog}), seconds=10)
 
