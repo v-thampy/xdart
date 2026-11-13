@@ -3414,6 +3414,52 @@ def test_all_scans_asks_once_for_its_grouped_scans_and_finds_them_once_more(qapp
         _close(page, qapp)
 
 
+@pytest.mark.parametrize("action", ["change source", "stop"])
+def test_a_grouping_question_cannot_restart_an_invalidated_rsm_search(qapp, tmp_path, monkeypatch, action):
+    import tifffile
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    page = _page(qapp)
+    answered, searches = [], []
+    timer = QtCore.QTimer()
+
+    def invalidate_and_answer():
+        dialog = qapp.activeModalWidget()
+        if not isinstance(dialog, PointImagesDialog) or dialog in answered:
+            return
+        answered.append(dialog)
+        if len(answered) > 1:
+            dialog.reject()
+            return
+        if action == "stop":
+            page.stop()
+        else:
+            page.set_sources((replacement,))
+        dialog.remember_file.editor.setChecked(True)
+        dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+
+    timer.timeout.connect(invalidate_and_answer)
+    timer.start(5)
+    try:
+        spec = _synthetic_source(tmp_path)
+        replacement = spec.with_name("Other")
+        replacement.write_text(spec.read_text(), encoding="utf-8")
+        spec.write_text(spec.read_text() + "\n" + _spec_scan(3, 12), encoding="utf-8")
+        for label in range(4):
+            tifffile.imwrite(spec.parent / "images" / f"RSM_synth_scan3_{label:04d}.tif",
+                             np.arange(20, dtype=np.uint16).reshape(4, 5) + label)
+        _with_source(page, tmp_path)
+        page.set_field("scan_mode", "All Scans")
+        begin = page._resolver.begin
+        monkeypatch.setattr(page._resolver, "begin", lambda request: (searches.append(request), begin(request))[1])
+        page.begin_preview()
+        _wait(page, qapp, lambda: answered and page._resolving is None)
+        assert len(searches) == 1
+        assert page.point_images.document() == {"choices": []}
+    finally:
+        timer.stop()
+        _close(page, qapp)
+
+
 def test_a_scan_grouped_while_recording_is_gridded_once_it_reads_one_image_per_point(qapp, tmp_path):
     """NEXT-1210-RESPONSIVENESS C-13, his pick "Fix first, then push (Recommended)": a scan caught while recording
     (one point, two images) is grouped two images per point by a remembered file; once it finishes (two points, two

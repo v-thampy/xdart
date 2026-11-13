@@ -4140,6 +4140,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         ):
             self._average_action(snapshot)
             return
+        self.point_images.finish_run(reset_brake=True)
         self._begin_run()
 
     def _commit_focused_control_edit_for_run(self) -> bool:
@@ -4641,11 +4642,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 prior = self._intents.snapshot()
                 if prior.revision != token.revision:
                     self._notice('The Source changed; press Run again to confirm the current scan.')
-                elif self.point_images.confirm((result.point_images,), self):
+                elif type(prior.thaw().source_spec) is DirectorySourceSpec:
+                    self._notice('A Folder Run cannot apply an images-per-point grouping. Select the scan as the Source.')
+                elif self.point_images.confirm((result.point_images,), self, current=lambda: (
+                    not self._closing and not self._closed and self._intents.snapshot().revision == prior.revision
+                )):
                     candidate = self.point_images.apply_intent(prior.thaw())
                     committed = self._intents.commit(candidate, expected_revision=prior.revision)
                     if type(committed) is IntentCommitAccepted:
-                        self._reconcile_snapshot(prior, committed.snapshot)
+                        self._reconcile_snapshot(prior, committed.snapshot, retrying_grouping=True)
                         self._begin_run()
                     else:
                         self.point_images.restore_intent(self._intents.snapshot().thaw())
@@ -9248,8 +9253,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         current: RunIntentSnapshot,
         *,
         preserve_terminal: bool = False,
+        retrying_grouping: bool = False,
     ) -> None:
-        self.point_images.restore_intent(current.thaw())
+        self.point_images.restore_intent(current.thaw(), retrying_grouping=retrying_grouping)
         source_transition = self._apply_snapshot_effects(
             prior,
             current,

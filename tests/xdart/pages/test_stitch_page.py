@@ -103,6 +103,48 @@ def test_native_preview_displays_conditional_affine_warning_and_keeps_run_availa
         qapp.processEvents()
 
 
+def test_a_stitch_grouping_question_cannot_apply_to_a_superseded_source(qapp, tmp_path):
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    selection = form.source_selection
+    source = Path(selection.paths[0])
+    replacement = source.with_name("other")
+    replacement.write_text(source.read_text(), encoding="utf-8")
+    files = sorted(Path(selection.image_dir).glob("sample_scan1_*.raw"))
+    for index, path in enumerate(files):
+        grouped = path.with_name(f"{path.stem.rsplit('_', 1)[0]}_{len(files) + index:04d}.raw")
+        grouped.write_bytes(path.read_bytes())
+    page = StitchPage(empty_host_services(_Status()))
+    seen = []
+    timer = QtCore.QTimer()
+
+    def replace_source():
+        dialog = qapp.activeModalWidget()
+        if not isinstance(dialog, PointImagesDialog) or dialog in seen:
+            return
+        seen.append(dialog)
+        if len(seen) == 1:
+            page.set_sources((replacement,))
+            dialog.remember_file.editor.setChecked(True)
+            dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+        else:
+            dialog.reject()
+
+    timer.timeout.connect(replace_source)
+    timer.start(5)
+    page.show()
+    try:
+        page.load_form(form)
+        page.set_sources((source,))
+        _wait(page, qapp)
+        assert len(seen) == 1
+        assert page.point_images.document() == {"choices": []}
+    finally:
+        timer.stop()
+        _dispose(page, qapp)
+
+
 @pytest.mark.parametrize("grouped", [False, True])
 def test_metadata_shows_experimental_columns_and_separate_provenance(qapp, tmp_path, grouped):
     from xdart.gui.tabs.scattering.analysis_mount import MetadataResultDialog

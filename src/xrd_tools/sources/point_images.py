@@ -129,6 +129,8 @@ def _reads_one_image_per_point(spec: SourceSpec) -> bool:
             if resolved is None:
                 return False
             metadata = SpecSource(resolved[0], scan=resolved[1])
+            if tuple(find_spec_image_files(files[0].parent, resolved[0].stem, metadata.scan_key)) != files:
+                return False
             images = len(files)
         points = len(metadata.frame_indices)
     except Exception:  # noqa: BLE001 - an unreadable scan is no evidence; its Run refuses as before

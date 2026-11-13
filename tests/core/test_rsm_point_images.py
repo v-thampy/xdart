@@ -106,6 +106,21 @@ def test_source_selection_requires_confirmation_and_keeps_the_confirmed_member_p
     assert dict(groups[0][0].point_images) == policy.to_dict()
 
 
+def test_repeated_scan_memberships_only_request_one_grouping(tmp_path):
+    member = _member(tmp_path, "detected", [np.ones(SHAPE, np.uint16)] * 4)
+    selection = StitchSourceSelection("Spec", (str(member.spec_path),), "1,1,[1]")
+    kwargs = dict(frame_selector=member.frame_selector, detector_shape=SHAPE,
+                  raw_dtype="uint16", raw_header_skip=0, motor_selectors=MOTORS)
+    with pytest.raises(PointImagesRequired) as pending:
+        rsm_member_groups(selection, **kwargs)
+    assert len(pending.value.pending) == 1
+    policy = PointImagePolicy(2, "average")
+    groups, skipped = rsm_member_groups(replace(selection, point_image_choices=(
+        (str(member.spec_path), "1.1", policy),)), **kwargs)
+    assert skipped == () and len(groups) == 3
+    assert all(dict(group[0].point_images) == policy.to_dict() for group in groups)
+
+
 @pytest.mark.parametrize("operation,reverse,mode", [
     ("average", False, "manual"), ("average", False, "auto"),
     ("difference", False, "manual"), ("difference", True, "manual"),

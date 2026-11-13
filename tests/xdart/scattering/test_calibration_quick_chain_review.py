@@ -57,3 +57,39 @@ def test_cancelled_quick_never_opens_a_grouping_confirmation(qapp, tmp_path, mon
     finally:
         watcher.stop()
         _close(qapp, page, dialog)
+
+
+def test_a_calibration_question_cannot_restart_a_closed_window(qapp, tmp_path, monkeypatch):
+    from tests.xdart.scattering.test_calibration_quick_chain import _wait
+    pair = _stitch_pair(tmp_path / 'data')
+    page, dialog = _page_with_dialog(tmp_path / 'project')
+    watcher = QtCore.QTimer(dialog)
+    shown = []
+
+    def close_then_answer():
+        popup = qapp.activeModalWidget()
+        if isinstance(popup, PointImagesDialog) and not shown:
+            shown.append(popup)
+            dialog.close()
+            if popup.isVisible():
+                popup.remember_file.editor.setChecked(True)
+                popup.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).click()
+
+    watcher.timeout.connect(close_then_answer)
+    watcher.setInterval(5)
+    try:
+        _configure(dialog, _quick_card(dialog), pair, camera=UPRIGHT_CAMERA)
+        count = len(RING_ANGLES)
+        for index in range(count):
+            shutil.copyfile(pair.ring.parent / f'ring_scan1_{index:04d}.raw',
+                            pair.ring.parent / f'ring_scan1_{index + count:04d}.raw')
+        started = _starts(dialog, monkeypatch)
+        watcher.start()
+        dialog._start('enumerate', (dialog._spec(), dialog.geometry_editor.value().to_record()))
+        _wait(dialog, timeout=15)
+        assert shown and not dialog.isVisible()
+        assert started == ['enumerate']
+        assert dialog.point_images.document() == {'choices': []}
+    finally:
+        watcher.stop()
+        _close(qapp, page, dialog)

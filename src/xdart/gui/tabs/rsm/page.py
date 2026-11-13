@@ -376,6 +376,7 @@ class RSMPage(QtWidgets.QWidget):
         self._job_lines = []  # the Preview's lines, every RSM's
         self._job_skipped = 0  # Append's up-to-date RSMs, skipped
         self._form_revision = 0
+        self._grouping_question = None
         self._active_revision = None
         self._prepared_fingerprint = None
         self._results = OrderedDict()  # path → payload, the most recent last
@@ -1912,14 +1913,14 @@ class RSMPage(QtWidgets.QWidget):
     def begin_preview(self):
         """Preview: find the Source's scans, check the inputs and list every exact identity, without
         gridding."""
-        self.point_images.finish_run()
+        self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
         self._find_scans("preview")
 
     def begin_run(self):
         """Run: find the Source's scans again, then grid them, Previewing first unless the prepared Preview is
         still the current form (as Stitch's Run prepares first)."""
-        self.point_images.finish_run()
+        self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
         if not self._readiness[1]:
             self._notice(self._readiness[0])
@@ -1929,7 +1930,7 @@ class RSMPage(QtWidgets.QWidget):
     def _find_scans(self, action):
         """Find the Source's member groups on the shared single worker (``rsm_member_groups`` reads the SPEC
         files and lists the images, off the GUI thread; S2), then go on to ``action`` (``_continue``)."""
-        if self._owner.busy or self._resolving is not None:  # a running result keeps its form
+        if self._closing or self._owner.busy or self._resolving is not None or self._grouping_question is not None:
             self._notice("RSM is busy · try again once it is done")
             return
         try:  # a queued Run checks its outputs as the scans are found; a Preview grids nothing, and each RSM's
@@ -1968,7 +1969,23 @@ class RSMPage(QtWidgets.QWidget):
             self._notice(f"Source refused: {terminal.failure_message or terminal.failure_type}")
         elif terminal.status is OperationTerminalStatus.RETURNED and terminal.payload is not None:
             if type(terminal.payload) is _PendingGroupings:
-                if self.point_images.confirm(terminal.payload, self):
+                revision = self._form_revision
+                self._grouping_question = identity
+
+                def current():
+                    return (not self._closing and self._grouping_question is identity
+                            and self._form_revision == revision)
+
+                try:
+                    confirmed = self.point_images.confirm(terminal.payload, self, current=current)
+                    still_current = current()
+                finally:
+                    self._grouping_question = None
+                if not still_current:
+                    self.point_images.finish_run()
+                    if not self._closing and self._form_revision != revision:
+                        self._notice('The Source changed; Preview again to confirm its scans.')
+                elif confirmed:
                     self._find_scans(action)
                 else:
                     self._notice("Multiple images per point: grouping was not confirmed; scan unprocessed")
@@ -2124,6 +2141,9 @@ class RSMPage(QtWidgets.QWidget):
 
     def stop(self):
         self._clear_jobs()  # Stop stops the queue: the RSM being gridded is cancelled, the rest never start
+        if self._grouping_question is not None:
+            self._grouping_question = None
+            self._notice("RSM stopped")
         if self._resolving is not None and self._resolving[1] is not None:
             identity, _action, key = self._resolving
             self._resolver.cancel(identity)
@@ -2822,6 +2842,7 @@ class RSMPage(QtWidgets.QWidget):
         """Close the owner, the reader, the finder, the authoring windows and the tool windows' workers; PENDING
         while any still has a worker."""
         self._closing = True
+        self._grouping_question = None
         self._timer.stop()
         self._authoring_timer.stop()
         for dialog in (self._metadata_dialog, self._metadata_plot_dialog):

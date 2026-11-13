@@ -1612,7 +1612,16 @@ class StitchPage(QtWidgets.QWidget):
         problem = terminal.failure_message if terminal.status is OperationTerminalStatus.FAILED else ""
         resolution = terminal.payload
         if resolution is not None and resolution.pending:
-            if self.point_images.confirm(resolution.pending, self):
+            revision = self._revision
+
+            def current():
+                return not self._closing and self._revision == revision
+
+            confirmed = self.point_images.confirm(resolution.pending, self, current=current)
+            if not current():
+                self.point_images.finish_run()
+                return False
+            if confirmed:
                 self.point_images.finish_run()
                 self._point_images_edited()
                 return True

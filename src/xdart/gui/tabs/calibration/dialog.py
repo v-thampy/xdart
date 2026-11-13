@@ -3903,6 +3903,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
     def _new_session(self):
         if self._owner.busy:
             return
+        self._point_request = None
         self._session_open_request = None
         self._pending_session_resume = None
         self.session_dir = self.project_root / 'calibration' / f'session-{uuid.uuid4().hex[:12]}'
@@ -4194,6 +4195,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         if self._quick_stage is not None:  # Cancel operation stops Quick calibration at its step
             self._quick_cancelled = True
         self.point_images.finish_run()
+        self._point_request = None
         if self._identity is not None:
             if self._job == 'open':
                 self._session_open_request = None
@@ -4208,6 +4210,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             self._job_status(f'{self._job.capitalize()}: {update.progress.stage}…')
             return
         terminal, kind = update.terminal, self._job
+        point_request = self._point_request
         open_request = self._session_open_request if kind == 'open' else None
         if kind == 'open' and terminal.status is not OperationTerminalStatus.RETURNED:
             self._session_open_request = None
@@ -4238,18 +4241,24 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
                     self._quick_after_terminal(kind, terminal.status)
                     self._sync_quick_button()
                     return
-                if self.point_images.confirm((result,), self):
-                    _, arguments = self._point_request
+                def current():
+                    return (point_request is not None and self.isVisible()
+                            and self._point_request is point_request and not self._quick_cancelled)
+
+                if self.point_images.confirm((result,), self, current=current):
+                    _, arguments = point_request
                     arguments = tuple(self.point_images.options(value) if type(value) is SourceSpec else value
                                       for value in arguments)
                     if kind == 'enumerate':
                         self._enumerated_spec = arguments[0]
                     self.point_images.finish_run()
                     self._start(kind, arguments)
-                else:
+                elif current():
                     self.status.setText('Grouping not confirmed; scan unprocessed')
                     self._quick_after_terminal(kind, None)
                     self._sync_quick_button()
+                else:
+                    self.point_images.finish_run()
                 return
             self.point_images.finish_run()
             try:
@@ -4512,6 +4521,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
             event.ignore()
         else:
             self._session_open_request = None
+            self._point_request = None
             self._timer.stop()
             self._save_session_quietly()
             self._help_owner.shutdown()
@@ -4550,6 +4560,7 @@ class CalibrationDialog(RetainedDialogKeyPolicy, QtWidgets.QDialog):
         """Host Exit: cancel and return the existing retryable close receipt."""
         from xdart.gui.pages.values import PageCleanup
         self._session_open_request = None
+        self._point_request = None
         self._pending_session_resume = None
         self._quick_stage = self._quick_kind = None
         self._beam_probe_timer.stop()

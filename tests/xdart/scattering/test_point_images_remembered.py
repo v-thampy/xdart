@@ -217,6 +217,95 @@ def test_a_question_someone_answers_does_not_confirm_itself(qapp, tmp_path, monk
         settings.deleteLater()
 
 
+def test_countdown_waits_while_another_modal_covers_the_question(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering import point_images_editor
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    dialog = point_images_editor.PointImagesDialog(_detected(tmp_path, 'A', '1.1', 2))
+    covered = QtWidgets.QDialog(dialog)
+    during_cover = []
+
+    def uncover():
+        during_cover.append((dialog.auto_confirmed, dialog.isVisible()))
+        covered.reject()
+
+    def cover():
+        QtCore.QTimer.singleShot(1300, covered, uncover)
+        covered.exec()
+        dialog.activateWindow()
+
+    QtCore.QTimer.singleShot(0, dialog, cover)
+    QtCore.QTimer.singleShot(5000, dialog, dialog.reject)
+    assert dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
+    assert during_cover == [(False, True)]
+    assert dialog.auto_confirmed
+
+
+def test_changing_the_operation_stops_the_countdown_before_the_deferred_form_edit(qapp, tmp_path, monkeypatch):
+    from PySide6.QtTest import QTest
+    from xdart.gui.tabs.scattering import point_images_editor
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    dialog = point_images_editor.PointImagesDialog(_detected(tmp_path, 'A', '1.1', 2))
+    counting = []
+
+    def choose():
+        dialog.operation.editor.setFocus()
+        QTest.keyClick(dialog.operation.editor, QtCore.Qt.Key.Key_Down)
+        counting.append(dialog._countdown.isActive())
+
+    QtCore.QTimer.singleShot(0, dialog, choose)
+    QtCore.QTimer.singleShot(2200, dialog, dialog.reject)
+    assert dialog.exec() == QtWidgets.QDialog.DialogCode.Rejected
+    assert dialog.operation.current_value() == 'Difference (2 − 1)'
+    assert counting == [False] and not dialog.auto_confirmed
+
+
+def test_a_disabled_confirmation_cannot_resume_an_elapsed_countdown(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering import point_images_editor
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    dialog = point_images_editor.PointImagesDialog(_detected(tmp_path, 'A', '1.1', 2))
+    button = dialog.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+    button.setEnabled(False)
+    QtCore.QTimer.singleShot(1500, dialog, dialog.reject)
+    assert dialog.exec() == QtWidgets.QDialog.DialogCode.Rejected
+    assert button.text() == 'Confirm grouping'
+    button.setEnabled(True)
+    QtCore.QTimer.singleShot(1300, dialog, dialog.reject)
+    assert dialog.exec() == QtWidgets.QDialog.DialogCode.Rejected
+    assert not dialog.auto_confirmed
+
+
+def test_a_second_grouping_request_cannot_open_over_the_current_question(qapp, tmp_path):
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesDialog, PointImagesSettings
+    first, second = PointImagesSettings(), PointImagesSettings()
+    answered = _Answers(qapp, [('Average', False, False), ('Average', False, False)])
+    result = []
+
+    def request_second():
+        if isinstance(qapp.activeModalWidget(), PointImagesDialog) and not result:
+            result.append(second.confirm((_detected(tmp_path, 'B', '1.1', 2),)))
+
+    QtCore.QTimer.singleShot(0, first, request_second)
+    try:
+        assert first.confirm((_detected(tmp_path, 'A', '1.1', 2),))
+        assert result == [False] and len(answered.seen) == 1
+        assert second.choices == ()
+    finally:
+        answered.stop()
+
+
+def test_cancelling_a_later_question_leaves_the_accepted_file_visible(qapp, tmp_path):
+    from xdart.gui.tabs.scattering.point_images_editor import PointImagesSettings
+    settings = PointImagesSettings()
+    answers = _Answers(qapp, [('Average', False, True)])
+    try:
+        assert not settings.confirm((_detected(tmp_path, 'A', '1.1', 2), _detected(tmp_path, 'B', '1.1', 2)))
+        assert settings.document()['file_defaults'][0]['file'] == str(tmp_path / 'A')
+        assert settings.remembered.editor.currentText() == 'A · Average'
+        assert settings.remember.isEnabled()
+    finally:
+        answers.stop()
+
+
 def test_a_scan_answered_again_by_a_remembered_file_asks_instead(qapp, tmp_path):
     """The question was the only brake on resolve → ask → resolve: a scan that comes back with the grouping it was
     already given is asked about, without a countdown, rather than answered again."""
@@ -243,6 +332,22 @@ def test_a_scan_answered_again_by_a_remembered_file_asks_instead(qapp, tmp_path)
     finally:
         answers.stop()
         settings.deleteLater()
+
+
+def test_a_scan_returning_after_its_own_countdown_has_no_second_countdown(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering import point_images_editor
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    settings = point_images_editor.PointImagesSettings()
+    detection = _detected(tmp_path, 'A', '1.1', 2)
+    seen = []
+    watchdog = _reject_after(qapp, 4, seen)
+    try:
+        assert settings.confirm((detection,))
+        settings.finish_run()
+        assert not settings.confirm((detection,))
+        assert seen[-1] == 'Confirm grouping'
+    finally:
+        watchdog.stop()
 
 
 def test_ints_profile_keeps_a_remembered_file_and_a_path_written_otherwise_matches(qapp, tmp_path):
@@ -321,7 +426,7 @@ def test_ints_run_drops_a_stored_grouping_its_finished_scan_no_longer_shows(qapp
         page.close()
 
 
-def _int_page(tmp_path, *, points, images, policy):
+def _int_page(tmp_path, *, points, images, policy=None, folder=False):
     """Int on a SPEC-backed image series of ``points`` rows and ``images`` files with a stored grouping."""
     from dataclasses import replace
     from xdart.gui.tabs.scattering.adapters.run_executor import StandardRunExecutor
@@ -329,7 +434,7 @@ def _int_page(tmp_path, *, points, images, policy):
     from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
     from xdart.gui.tabs.scattering.page import ScatteringWorkspace
     from xrd_tools.session.intent_store import RunIntentStore
-    from xrd_tools.sources.selection import image_series_spec
+    from xrd_tools.sources.selection import DirectorySourceSpec, image_series_spec
     from tests.xdart.scattering._e2sd_support import write_poni
     from tests.xdart.scattering.test_p1b_output_graph import _intent, _write_tiff
     rows = ''.join(f'{10 + point} 0 {100 * (point + 1)}\n' for point in range(points))
@@ -342,13 +447,99 @@ def _int_page(tmp_path, *, points, images, policy):
     write_poni(poni)
     intent = _intent(paths[0], output, poni)
     series = image_series_spec(paths[0], metadata_format='spec')
-    intent.source_spec = replace(series, options={**series.options, 'point_images': policy.to_dict()})
+    intent.source_spec = series if policy is None else replace(
+        series, options={**series.options, 'point_images': policy.to_dict()})
+    if folder:
+        intent.source_spec = DirectorySourceSpec(tmp_path, suffixes=('.tif',), metadata_format='spec')
+        intent.gi.enabled = True
     lifecycle = ScatteringCoordinator()
     store = RunIntentStore(intent)
     page = ScatteringWorkspace(intents=store, lifecycle=lifecycle,
                                sources=FilesystemSourceAdapter(), executor=StandardRunExecutor())
     page.show()
     return page, store, lifecycle, output
+
+
+def test_int_folder_does_not_keep_retrying_an_unappliable_answer(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering import point_images_editor
+    from tests.xdart.scattering.test_e3_join_oracle import _wait
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    page, _store, lifecycle, output = _int_page(tmp_path, points=1, images=2, folder=True)
+    seen = []
+    notices = []
+    page.noticeChanged.connect(notices.append)
+    watchdog = _reject_after(qapp, 5, seen)
+    try:
+        _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
+        page._shell.run_controls.startButton.click()
+        _wait(qapp, lambda: page._admission is None and lifecycle.phase.value in {'idle', 'failed'}
+              and any('group' in notice.lower() for notice in notices), timeout=15,
+              diagnostic=lambda: f'{lifecycle.phase.value}: {notices}')
+        assert len(seen) <= 2, 'a Folder Run must not ask for a grouping it cannot apply on its retry'
+        assert any('Folder' in notice for notice in notices), notices
+        assert not list(output.glob('*.nexus'))
+    finally:
+        watchdog.stop()
+        _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
+        page.close()
+
+
+def test_int_image_series_keeps_its_own_confirmed_operation(qapp, tmp_path, monkeypatch):
+    from xdart.gui.tabs.scattering import point_images_editor
+    from xrd_tools.sources.point_images import inspect_point_images
+    from xrd_tools.sources.selection import image_series_spec
+    from tests.xdart.scattering.test_p1b_output_graph import _write_tiff
+    monkeypatch.setattr(point_images_editor, 'AUTO_CONFIRM_SECONDS', 1)
+    spec = tmp_path / 'calibrant'
+    spec.write_text('#F calibrant\n#E 1\n#O0 del  nu\n\n#S 1 ascan del 10 11 1 1\n#P0 10 0\n#N 3\n'
+                    '#L del  nu  i0\n10 0 100\n11 0 200\n'
+                    '\n#S 2 ascan del 20 21 1 1\n#P0 20 0\n#N 3\n#L del  nu  i0\n20 0 300\n21 0 400\n')
+    for scan in (1, 2):
+        for index in range(4):
+            _write_tiff(tmp_path / f'calibrant_scan{scan:03}_{index:04}.tif', 10 + index)
+    first, second = (inspect_point_images(image_series_spec(
+        tmp_path / f'calibrant_scan{scan:03}_0000.tif', metadata_format='spec')) for scan in (1, 2))
+    settings = point_images_editor.PointImagesSettings()
+    answers = _Answers(qapp, [('Difference (2 − 1)', False, False), ('Average', False, False)])
+    try:
+        assert settings.confirm((first,))
+        assert settings.confirm((second,))
+    finally:
+        answers.stop()
+    settings.restore(settings.document())
+    seen = []
+    watchdog = _reject_after(qapp, 5, seen)
+    try:
+        assert settings.confirm((first,))
+        assert settings.options(first.source_spec).options['point_images']['operation'] == 'difference'
+        assert settings.options(second.source_spec).options['point_images']['operation'] == 'average'
+    finally:
+        watchdog.stop()
+
+
+def test_int_does_not_drop_a_grouping_from_a_frozen_partial_image_series(qapp, tmp_path):
+    from xrd_tools.sources.point_images import PointImagePolicy
+    from tests.xdart.scattering.test_e3_join_oracle import _wait
+    from tests.xdart.scattering.test_p1b_output_graph import _write_tiff
+    policy = PointImagePolicy(2, 'difference')
+    page, store, lifecycle, output = _int_page(tmp_path, points=2, images=2, policy=policy)
+    notices = []
+    page.noticeChanged.connect(notices.append)
+    seen = []
+    watchdog = _reject_after(qapp, 5, seen)
+    try:
+        for index in (2, 3):
+            _write_tiff(tmp_path / f'calibrant_scan001_{index:04}.tif', 10 + index)
+        _wait(qapp, lambda: page._shell.run_controls.startButton.isEnabled())
+        page._shell.run_controls.startButton.click()
+        _wait(qapp, lambda: page._admission is None and lifecycle.phase.value in {'idle', 'failed'}
+              and bool(notices), timeout=20, diagnostic=lambda: f'{lifecycle.phase.value}: {notices}')
+        assert store.snapshot().thaw().source_spec.options.get('point_images') == policy.to_dict()
+        assert not list(output.glob('*.nexus')) and not seen
+    finally:
+        watchdog.stop()
+        _wait(qapp, lambda: page.close_workspace().cleanup_status.value == 'cleaned')
+        page.close()
 
 
 @pytest.mark.parametrize('case', ['counts in flux', 'SPEC file not found'])

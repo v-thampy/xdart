@@ -180,11 +180,14 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
     """Freeze discovery and skips once at Preview; never rediscover during Run."""
     if type(selection) is not StitchSourceSelection:
         raise TypeError("exact Stitch source selection required")
-    groups, skipped, names, pending = [], [], {}, []
+    groups, skipped, names, pending = [], [], {}, {}
     choices = {(uri, scan): policy for uri, scan, policy in selection.point_image_choices}
 
+    def choice_key(spec):
+        return str(spec.uri), str(spec.options.get("scan") or spec.entry or "entry")
+
     def confirmed(spec, *, directory=False):
-        policy = choices.get((str(spec.uri), str(spec.options.get("scan") or spec.entry or "entry")))
+        policy = choices.get(choice_key(spec))
         detection = (inspect_point_images(spec) if policy is not None or spec.kind is not SourceKind.SPEC else None)
         if (detection is not None and spec.kind is SourceKind.EIGER_MASTER
                 and describe_container(Path(spec.uri), entry=spec.entry or "entry").motor_names == ()):
@@ -204,7 +207,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
             # unfinished count); the scan is read as it is now, its stored grouping set aside.
             policy = None
         if detection is not None and (policy is None or policy.images_per_point != detection.images_per_point):
-            pending.append(detection)
+            pending.setdefault(choice_key(spec), detection)
             return None
         if policy is not None:
             from dataclasses import replace
@@ -225,7 +228,7 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
                 return None
             source = open_source(spec)
         except PointImagesRequired as error:
-            pending.append(error.detection)
+            pending.setdefault(choice_key(error.detection.source_spec), error.detection)
             return None
         except UnusableSpecScan as error:
             # All Scans and Directory skip a scan they cannot grid and list why (C-10, the maintainer: "a lot of
@@ -304,6 +307,6 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs) 
         raise ValueError("Selection exceeds 4096 result groups")
     if pending:
         # A grouped output never silently loses a member awaiting confirmation.
-        return StitchSourceResolution((), tuple(skipped), (), tuple(pending))
+        return StitchSourceResolution((), tuple(skipped), (), tuple(pending.values()))
     return StitchSourceResolution(tuple(group for group in groups if group), tuple(skipped),
                                   tuple(tuple(names[id(spec)] for spec in group) for group in groups if group))

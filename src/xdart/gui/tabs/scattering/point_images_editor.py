@@ -7,7 +7,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.widgets.controls_panel import FormRow, SubsectionCard
-from xrd_tools.core.scan import SourceSpec
+from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.point_images import PointImagePolicy
 
 _OPERATIONS = {'Average': 'average', 'Difference (2 − 1)': 'difference', 'Select one': 'select'}
@@ -18,7 +18,10 @@ AUTO_CONFIRM_SECONDS = 30
 
 
 def point_source_key(spec):
-    return str(spec.uri), str(spec.options.get('scan') or spec.entry or 'entry')
+    scan = spec.options.get('scan')
+    if spec.kind is SourceKind.TIFF_SERIES:
+        scan = scan or spec.options.get('scan_name')
+    return str(spec.uri), str(scan or spec.entry or 'entry')
 
 
 def grouping_file(detection):
@@ -59,10 +62,11 @@ def _row(label, value, *, kind='text', choices=(), tip='', minimum=None, maximum
 class PointImagesDialog(AdvancedDialog):
     """Confirmation uses the same shell and form rows as Int's Advanced editor."""
 
-    def __init__(self, detection, parent=None, policy=None, *, countdown=True):
+    def __init__(self, detection, parent=None, policy=None, *, countdown=True, current=None):
         super().__init__(parent, title='Multiple images per scan point', accept_buttons=True)
         self.setModal(True)
         self.detection = detection
+        self._current = current
         count = detection.images_per_point
         card = self.add_group(f'{detection.scan_label}: {detection.image_count} images / '
                               f'{detection.point_count} points = {count} images/pt')
@@ -101,11 +105,14 @@ class PointImagesDialog(AdvancedDialog):
         self._seconds = AUTO_CONFIRM_SECONDS
         self._counting = bool(countdown)
         self._countdown = QtCore.QTimer(self)
+        self._countdown.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._countdown.setInterval(1000)
         self._countdown.timeout.connect(self._tick)
         for row in (self.operation, self.index, self.reverse, self.apply_remaining, self.remember_file):
             row.valueChanged.connect(self._stop_countdown)
         self.index.editor.textEdited.connect(self._stop_countdown)
+        self.operation.editor.currentIndexChanged.connect(self._stop_countdown)
+        self.finished.connect(self._stop_countdown)
         self._label_confirm()
         self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setToolTip(
             'Confirm consecutive image membership and the displayed operation for this scan.'
@@ -124,11 +131,18 @@ class PointImagesDialog(AdvancedDialog):
             f'Confirm grouping ({self._seconds} s)' if self._counting else 'Confirm grouping')
 
     def _tick(self):
+        if self._current is not None and not self._current():
+            self.reject()
+            return
+        if (not self.isVisible() or not self.isActiveWindow()
+                or QtWidgets.QApplication.activeModalWidget() is not self
+                or self.operation.editor.view().isVisible()):
+            return
         self._seconds -= 1
         if self._seconds > 0:
             self._label_confirm()
             return
-        self._countdown.stop()
+        self._stop_countdown()
         if self.buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).isEnabled():
             self.auto_confirmed = True
             self.accept()
@@ -278,8 +292,13 @@ class PointImagesSettings(SubsectionCard):
         policy = self._choices.get(point_source_key(spec))
         return spec if policy is None else replace(spec, options={**spec.options, 'point_images': policy.to_dict()})
 
-    def confirm(self, detections, parent=None):
+    def confirm(self, detections, parent=None, *, current=None):
+        if any(isinstance(window, PointImagesDialog) and window.isVisible()
+               for window in QtWidgets.QApplication.topLevelWidgets()):
+            return False
         for detection in detections:
+            if current is not None and not current():
+                return False
             count = detection.images_per_point
             key, file = point_source_key(detection.source_spec), grouping_file(detection)
             remembered = self._file_defaults.get(_file_key(file), (None, None))[1]
@@ -289,16 +308,21 @@ class PointImagesSettings(SubsectionCard):
             # The question was the only brake on search -> ask -> search: a scan found again as it was when it was
             # answered without a question is asked about, without a countdown, rather than answered again.
             found = (key, detection.scan_label, count, _file_key(file))
-            repeated = policy is not None and found in self._answered_silently
+            repeated = found in self._answered_silently
             if policy is None or repeated:
                 self._answered_silently.discard(found)
                 dialog = PointImagesDialog(detection, parent, self._choices.get(key) or remembered,
-                                           countdown=not repeated)
+                                           countdown=not repeated, current=current)
                 try:
-                    if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    if (dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted
+                            or current is not None and not current()):
                         self._remaining = None
+                        self._catalog()
+                        self._catalog_remembered()
                         return False
                     chosen = dialog.policy()
+                    if dialog.auto_confirmed:
+                        self._answered_silently.add(found)
                     answered_all = dialog.apply_remaining.current_value() or dialog.auto_confirmed
                     self._remaining = chosen if answered_all else None
                     if dialog.remember_file.current_value():
@@ -313,8 +337,10 @@ class PointImagesSettings(SubsectionCard):
         self._catalog_remembered()
         return True
 
-    def finish_run(self):
+    def finish_run(self, *, reset_brake=False):
         self._remaining = None
+        if reset_brake:
+            self._answered_silently.clear()
 
     def document(self):
         document = {'choices': [{'uri': uri, 'scan': scan, 'policy': policy.to_dict()}
@@ -324,7 +350,7 @@ class PointImagesSettings(SubsectionCard):
                                          for file, policy in self._file_defaults.values()]
         return document
 
-    def restore(self, value):
+    def restore(self, value, *, retrying_grouping=False):
         choices = {}
         for row in value.get('choices', ()):
             policy = PointImagePolicy.from_dict(row['policy'])
@@ -336,15 +362,16 @@ class PointImagesSettings(SubsectionCard):
             defaults[_file_key(row['file'])] = (row['file'], PointImagePolicy.from_dict(row['policy']))
         self._choices = choices
         self._file_defaults = defaults
-        self._answered_silently.clear()
+        if not retrying_grouping:
+            self._answered_silently.clear()
         self.finish_run()
         self._catalog()
         self._catalog_remembered()
 
-    def restore_intent(self, intent):
+    def restore_intent(self, intent, *, retrying_grouping=False):
         """Int profiles keep all source choices in run options, alongside its current source policy."""
         document = intent.run_options.get('point_image_choices', {'choices': []})
-        self.restore(document)
+        self.restore(document, retrying_grouping=retrying_grouping)
         spec = intent.source_spec
         if type(spec) is SourceSpec and 'point_images' in spec.options:
             self._choices[point_source_key(spec)] = PointImagePolicy.from_dict(spec.options['point_images'])
