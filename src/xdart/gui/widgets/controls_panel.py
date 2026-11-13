@@ -1286,9 +1286,11 @@ class FormRow(QtWidgets.QWidget):
                 for widget in (self, self.editor, self.label):
                     widget.setToolTip(self._model_value)
         self._emit_edit(value)
-        # An owner that projects the row back (Int) has the last word, a refusal included; one that reads the editor
-        # (Stitch, RSM) takes the committed text.
+        # An owner that projects the row back (Int) has the last word; one that reads the editor (Stitch, RSM) takes
+        # the committed text, which the Project row then holds as its value, so the next commit is judged against it.
         committed = self._model_value if self._owner_applied else ("" if value is None else str(value))
+        if not self._owner_applied and self._path == _PROJECT_ROOT_PATH:
+            self._model_value = committed
         self._after_user_edit(committed != before)
 
     def _emit_edit(self, value) -> None:
