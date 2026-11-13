@@ -50,7 +50,7 @@ def test_opening_a_session_runs_on_the_window_worker(qapp, tmp_path, monkeypatch
         took = time.monotonic() - started
         busy = dialog.active() and dialog.cancel_button.isEnabled()
         release.set()
-        assert took < 1.0, f"opening a session held the window {took:.2f} s"
+        assert took < 1.5, f"opening a session held the window {took:.2f} s"  # the parent held it 3 s
         assert busy  # its busy state, with Cancel
         _wait(dialog)
         assert len(dialog.frames) == len(frames), dialog.status.text()

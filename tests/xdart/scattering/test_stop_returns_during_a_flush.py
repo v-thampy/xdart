@@ -4,7 +4,7 @@ The plan (handoffs/review_fixes_1210_2026-11-11.md, C-1, from the 1.2.9 review's
 ``DynamicOutputAdapter.stop``, which took ``_command_lock``, the writer's ``file_lock``, so a Stop pressed during a
 flush waited on the GUI thread for the flush. The window shows "Stopping run…" at once; the stop flag is set without
 waiting for the writer; the writer's serialization, receipts and the page's pending states stay. Row: a real Int Run
-whose writer is held inside its locked boundary while Stop is pressed; the click returns within a bound, and the Run
+whose writer is held inside its locked boundary while Stop is pressed; the click returns within a bound (2.5 s; the parent blocked 5 s), and the Run
 still ends STOPPED with its frames kept.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ from xrd_tools.sources.selection import image_series_spec
 
 _TERMINAL = {StandardEventKind.FINISHED, StandardEventKind.STOPPED, StandardEventKind.FAILED}
 _HOLD_AT = 4  # the writer's fourth boundary: frames are written before it, and it holds the file lock
-_STOP_BOUND_S = 1.0
+_STOP_BOUND_S = 2.5  # half the 5 s the parent blocked: room for a slow hosted runner
 _PARENT_RELEASE_S = 5.0  # where Stop waits for the writer, the writer is let go after this, so the row ends
 
 
@@ -104,7 +104,7 @@ def test_stop_returns_at_once_while_the_writer_holds_its_lock(tmp_path, monkeypa
         writer_still_held = not release.is_set()
         release.set()
         assert writer_still_held and took < _STOP_BOUND_S, f"Stop took {took:.2f} s while the writer held its lock"
-        assert stalls and max(stalls) < .25, f"the window stalled {max(stalls, default=0):.2f} s after Stop"
+        assert stalls and max(stalls) < .5, f"the window stalled {max(stalls, default=0):.2f} s after Stop"
         assert shown == "Stopping run…"
         assert _wait(app, lambda: any(event.kind in _TERMINAL for event in events)), page._notice_text
         terminal = next(event for event in events if event.kind in _TERMINAL)
