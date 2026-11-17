@@ -112,3 +112,26 @@ def test_pillow_is_declared_for_the_gui_in_both_installs():
     assert "pillow" in {_name(item) for item in _recipe()["requirements"]["run"]}
     imports = {name for test in _recipe()["tests"] for name in test.get("python", {}).get("imports", ())}
     assert "PIL" in imports
+
+
+def test_macos_shortcut_starts_xdart_without_running_the_activation_script():
+    """Updating from inside xdart on macOS must not stall rebuilding the shortcut.
+
+    xdart's updater runs ``pixi global update`` from the running app. Started that
+    way, with ``"activate": true``, pixi runs the environment's activation script
+    while it rewrites xdart.app, and the update failed every time it was tried
+    (1.2.5 to 1.2.10 on macOS, 2026-11-16: hung until killed, or failed writing the
+    launcher; the same update from a terminal succeeds). macOS attributing pixi to
+    the unnotarized app it rewrites is the likely mechanism. pixi builds the
+    shortcut from the NEW package's menu file, so this setting also protects
+    updates started by older xdart versions. Windows and Linux keep the activated
+    launcher.
+    """
+    import json
+
+    menu = json.loads((ROOT / "recipe" / "menu" / "xdart.json").read_text(encoding="utf-8"))
+    (item,) = menu["menu_items"]
+    assert item["platforms"]["osx"]["activate"] is False
+    assert item["activate"] is True
+    assert "activate" not in item["platforms"]["win"]
+    assert "activate" not in item["platforms"]["linux"]

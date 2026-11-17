@@ -46,6 +46,9 @@ build:
     # Ship the menuinst shortcut: pixi global / conda create the entry at install
     # time from $PREFIX/Menu/*.json.  (noarch builds run on one platform; the
     # shell copy is fine and the JSON is consumed per-platform at install.)
+    # macOS sets "activate": false: an update started from inside xdart stalled
+    # while pixi ran the activation script and rewrote xdart.app
+    # (tests/core/test_packaging_parity.py).
     - mkdir -p "${PREFIX}/Menu"
     - cp "${RECIPE_DIR}/menu/xdart.json" "${PREFIX}/Menu/xdart.json"
     - cp "${RECIPE_DIR}/menu/xdart.png"  "${PREFIX}/Menu/xdart.png"   # linux

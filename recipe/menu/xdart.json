@@ -9,7 +9,7 @@
       "activate": true,
       "platforms": {
         "linux": {"icon": "{{ MENU_DIR }}/xdart.png"},
-        "osx": {"icon": "{{ MENU_DIR }}/xdart.icns"},
+        "osx": {"icon": "{{ MENU_DIR }}/xdart.icns", "activate": false},
         "win": {
           "command": ["{{ PYTHONW }}", "-m", "xdart.xdart_main"],
           "desktop": true,
