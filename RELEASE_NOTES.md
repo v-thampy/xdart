@@ -1,5 +1,19 @@
 # Release notes
 
+## 1.2.11 (2026-11-16)
+
+### Fixes
+
+- **macOS: an in-app update could stall while rebuilding the app shortcut:**
+  Check for Updates installed the new version and could then stall while pixi
+  rebuilt the xdart app shortcut, and the shortcut did not open xdart while it
+  was stalled. The stalled step was pixi running the environment's activation
+  script for the shortcut; the macOS shortcut no longer runs it, and in testing
+  the update then finished in seconds. The shortcut is rebuilt from the new
+  package, so this also covers updates started from older versions. Opened from
+  Finder, xdart also finds a pixi installed with Homebrew, so Check for Updates
+  can still update it.
+
 ## 1.2.10 (2026-11-13)
 
 ### New
