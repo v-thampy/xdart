@@ -24,6 +24,7 @@ PYPI_JSON_URL = "https://pypi.org/pypi/xdart/json"
 #: The conda channel xdart is published to; used when a pixi-global manifest names no URL channel.
 DEFAULT_CONDA_CHANNEL = "https://prefix.dev/xrd-tools"
 _META_FILENAME = "install_meta.json"
+_MACOS_PIXI_FALLBACK_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 
 def current_version():
@@ -150,6 +151,11 @@ def pixi_global_meta(prefix=None, *, platform=None):
     if not pixi.exists():
         found = shutil.which("pixi")
         pixi = Path(found) if found else Path(_pixi_home()) / "bin" / f"pixi{exe}"
+    if platform == "darwin" and not pixi.exists():
+        # A Finder launch may have neither a home-local Pixi nor Homebrew on PATH.
+        found = shutil.which("pixi", path=os.pathsep.join(_MACOS_PIXI_FALLBACK_DIRS))
+        if found:
+            pixi = Path(found)
     # The relaunch command is the one this env's manifest exposes for xdart; an unreadable manifest, no exposed xdart
     # or a missing executable is an unknown state, so the caller shows the copyable command instead.
     name = exposed_xdart_command(pixi_global_entry(env, home))

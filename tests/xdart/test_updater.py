@@ -139,6 +139,34 @@ def test_pixi_global_meta_builds_update_command(monkeypatch, tmp_path):
     assert updater.update_state_dir(meta) == home / "xdart-update" / "xdart-test"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable lookup")
+def test_pixi_global_meta_finds_homebrew_pixi_from_macos_shortcut(monkeypatch, tmp_path):
+    home, env = _pixi_home(tmp_path, env="xdart")
+    (home / "bin" / "pixi").unlink()
+    monkeypatch.setenv("PIXI_HOME", str(home))
+    finder_bin = tmp_path / "finder-bin"
+    finder_bin.mkdir()
+    brew_bin = tmp_path / "homebrew" / "bin"
+    brew_bin.mkdir(parents=True)
+    pixi = brew_bin / "pixi"
+    pixi.touch(mode=0o755)
+    monkeypatch.setattr(updater, "_MACOS_PIXI_FALLBACK_DIRS", (str(brew_bin),), raising=False)
+
+    monkeypatch.setenv("PATH", str(brew_bin))
+    assert updater.pixi_global_meta(prefix=str(env), platform="darwin")["update_cmd"][0] == str(pixi)
+
+    monkeypatch.setenv("PATH", str(finder_bin))
+    meta = updater.pixi_global_meta(prefix=str(env), platform="darwin")
+    assert meta is not None
+    assert meta["update_cmd"] == [str(pixi), "global", "update", "xdart"]
+    assert meta["update_env"] == {"PIXI_HOME": str(home)}
+    assert meta["relaunch_cmd"] == [str(home / "bin" / "xdart")]
+    assert updater.pixi_global_meta(prefix=str(env), platform="linux") is None
+
+    pixi.chmod(0o644)
+    assert updater.pixi_global_meta(prefix=str(env), platform="darwin") is None
+
+
 def test_pixi_global_meta_relaunches_the_exposed_command_or_refuses(tmp_path):
     home, env = _pixi_home(tmp_path, exposed='{ xd = "xdart", py = "python" }')
     (home / "bin" / "xd").write_bytes(b"")
