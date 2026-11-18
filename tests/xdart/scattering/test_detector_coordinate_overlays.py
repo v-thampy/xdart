@@ -140,8 +140,16 @@ def test_terminal_browse_average_and_reintegrate_have_no_grid_geometry(qapp, tmp
         page._refresh_shell(); qapp.processEvents()
         # BROWSE-REFERENCE-RINGS-20261013 (superseded terminal-Browse clause, D4(c)): terminal Browse draws the
         # saved frame's q contours and withholds its χ half-rays; the choice is unchanged and the row says why.
-        select(qapp, page, page._context_controller.frame_keys[0])
-        assert control(view).isEnabled() and control(view).currentText() == 'q + χ', control(view).toolTip()
+        key = page._context_controller.frame_keys[0]
+        select(qapp, page, key)
+        # select() returns on the thumbnail; the grid needs the frame's heavy record, read back separately
+        # (NIGHTLY-REDS-1212).
+        def heavy():
+            state = page._last_scientific_projection
+            return None if state is None else state.heavy
+        settle(qapp, view, lambda: heavy() is not None and heavy().frame is key and heavy().raw is not None)
+        assert control(view).isEnabled() and control(view).currentText() == 'q + χ', (
+            control(view).toolTip(), heavy().ring_origin, heavy().ring_geometry)
         from xrd_tools.geometry_figures import GRID_CHI_WITHHELD_NOTE
         assert GRID_CHI_WITHHELD_NOTE in control(view).toolTip() and view.raw.overlay_families.get('grid')
         from tests.xdart.scattering.e3_shell_support import make_shell_projection

@@ -16,7 +16,7 @@ from xdart.gui.pages.services import empty_host_services
 from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.stitch.page import StitchPage
-from tests.xdart.pages.test_stitch_page import _Status, _wait, qapp  # noqa: F401
+from tests.xdart.pages.test_stitch_page import _Status, _dispose, _wait, qapp  # noqa: F401
 from tests.xdart.tools.test_stitch_native_values import _native_form
 
 
@@ -74,8 +74,7 @@ def test_only_the_shown_results_stay_in_memory_and_the_others_reload(qapp, tmp_p
         assert Path(missing).name in status and "No such file" in status, status
         assert not page.run_bar.readinessDot.property("ready")
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)  # shutdown stays pending while the result browser closes (NIGHTLY-REDS-1212)
         qapp.processEvents()
 
 
@@ -107,8 +106,7 @@ def test_a_pin_survives_selecting_another_result(qapp, tmp_path):
         assert page._last_map_state.traces and all(
             trace.frame is not pinned.trace.frame for trace in page._last_map_state.traces)  # a pin, not selected
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)  # shutdown stays pending while the result browser closes (NIGHTLY-REDS-1212)
         qapp.processEvents()
 
 
@@ -135,8 +133,7 @@ def test_the_chosen_gi_axis_survives_reading_a_result_back(qapp, tmp_path, no_re
         _wait(page, qapp)
         assert page._view.plot_axis == "q_oop" and page._last_map_state.plot_axis == "q_oop"
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)  # shutdown stays pending while the result browser closes (NIGHTLY-REDS-1212)
         qapp.processEvents()
 
 
@@ -179,8 +176,7 @@ def test_a_map_without_the_chosen_cut_shows_i_of_q_and_keeps_the_choice(qapp, tm
         (trace,) = page._last_map_state.traces
         np.testing.assert_array_equal(trace.intensity, dict(page._current_payload().gi)["q_oop"].intensity)
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)  # shutdown stays pending while the result browser closes (NIGHTLY-REDS-1212)
         qapp.processEvents()
 
 
@@ -205,6 +201,5 @@ def test_recently_shown_results_stay_within_the_budget_least_recent_first(qapp, 
         assert set(page._payloads) == {paths[1], paths[0]}  # paths[2] was shown least recently
         assert all(page._payload_bytes[path] == sizes[path] > 0 for path in page._payloads)
     finally:
-        assert page.shutdown().status is PageCleanup.CLEAN
-        page.deleteLater()
+        _dispose(page, qapp)  # shutdown stays pending while the result browser closes (NIGHTLY-REDS-1212)
         qapp.processEvents()
