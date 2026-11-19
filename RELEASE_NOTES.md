@@ -8,11 +8,13 @@
   file several times:** before a Run started, it checked every listed file
   (sidecars included) one by one, then resolved and checked every raw image
   again to keep outputs off raw files. It now takes each file's type from the
-  folder listing and matches raw files by their identity from a single check,
-  resolving a path only where a file reports no identity. Outputs are still
-  refused when they would land on a raw file. In testing, admission of 120
-  saved images went from 720 file-system calls to 120; the time this saves on
-  a share is estimated, not measured.
+  folder listing. On macOS and Linux the raw-file check also matches files by
+  their identity instead of resolving each path; on Windows it still resolves
+  each path, so the saving there comes from the listing. Outputs are still
+  refused when they would land on a raw file. In testing on macOS, admission
+  of 120 saved images went from 720 file-system calls to 120; on Windows it
+  should about halve (from reading the code). The time this saves on a share
+  is estimated, not measured.
 
 ## 1.2.14 (2026-11-19)
 
