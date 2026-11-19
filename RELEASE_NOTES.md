@@ -7,8 +7,8 @@
 - **Int: a Run over several scans could stop between scans with "prior
   light-1D lineage cleanup remains pending":** when the Run moved on to the
   next scan while a frame image was still being read for the display (a frame
-  you picked, or one the display read itself), the Run failed. Reads are slow
-  on a network share, so it happened often there. The Run now goes on: it no
+  you picked, or one the display read itself), the Run failed. Slow reads on
+  a network share make that overlap more likely. The Run now goes on: it no
   longer waits for reads of other scans, and it waits up to 15 s for a read of
   the scan it is finishing.
 

@@ -217,7 +217,7 @@ _METADATA_WAIT_NOTE_S = 2.0
 _METADATA_WAIT_INFO_S = 30.0
 # A scan's boundary waits this long for a frame read of the output it releases (a frame picked from it, read from a slow
 # share) before the Run fails on it; the cleanup resumes from its retry receipt every 20 ms meanwhile
-# (LIVE-1212-LIGHT1D-LINEAGE; maintainer, 2026-11-18: "Keep getting this crap in int 1d in directory mode").
+# (LIVE-1212-LIGHT1D-LINEAGE; reported from the beamline on 2026-11-18: directory-mode Int 1D Runs kept failing).
 _LINEAGE_RELEASE_WAIT_S = 15.0
 # One scan's own failures: its image could not be read, or its output predates its new frames' metadata columns. The
 # scan is skipped and named, the Run goes on (maintainer, 2026-10-24: "That scan/frame should be logged and skipped and

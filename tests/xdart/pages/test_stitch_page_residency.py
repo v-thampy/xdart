@@ -13,7 +13,6 @@ import numpy as np
 from pyqtgraph.Qt import QtCore
 
 from xdart.gui.pages.services import empty_host_services
-from xdart.gui.pages.values import PageCleanup
 from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.stitch.page import StitchPage
 from tests.xdart.pages.test_stitch_page import _Status, _dispose, _wait, qapp  # noqa: F401

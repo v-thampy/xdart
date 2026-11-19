@@ -1,5 +1,5 @@
 """A directory Int 1D Run goes on while a frame read is still running at a scan boundary (LIVE-1212-LIGHT1D-LINEAGE;
-maintainer, 2026-11-18, from the beamline: "Keep getting this crap in int 1d in directory mode", a Run on an X: share
+reported from the beamline on 2026-11-18: directory-mode Int 1D Runs kept failing, a Run on an X: share
 failing with "prior light-1D lineage cleanup remains pending" after 9 of 170 frames).
 
 Releasing a finished scan's light-1D curves refused while any frame read of the Run was still running, and the Run
