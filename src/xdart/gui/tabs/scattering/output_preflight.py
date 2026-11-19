@@ -79,6 +79,9 @@ from .source_metadata import ordered_motor_intersection
 
 load_poni = load_detector_calibration
 _LOG = logging.getLogger(__name__)
+# Windows can obtain identity through different APIs for ordinary and reparse
+# paths. Keep the canonical-path check even when both stat results have IDs.
+_CHECK_RESOLVED_RAW_PATHS = os.name == "nt"
 
 _SCIENTIFIC_ASSET_STREAM_CHUNK_BYTES = 1 << 16
 _SCIENTIFIC_MASK_COMPATIBILITY_FLOOR_BYTES = 64 << 20
@@ -501,16 +504,18 @@ def _directory_matching_paths(
         if not name_ok(stem):
             continue
         try:
-            if not entry.is_file():
-                continue
+            is_file = entry.is_file()
         except OSError:
-            continue
-        paths.append(path)
+            # Keep pathlib's platform/version-specific handling of a failed
+            # type lookup. In 3.13 a matching inaccessible file is an error.
+            is_file = path.is_file()
+        if is_file:
+            paths.append(path)
     return tuple(sorted(dict.fromkeys(paths)))
 
 
 def _listed_entries(root: Path, *, recursive: bool):
-    """The folder's entries, then (``recursive``) those of each real subfolder: one listing per folder, no stat."""
+    """List the folder and its immediate subfolders, using rglob's directory test."""
     if not recursive:
         with os.scandir(root) as listing:
             yield from tuple(listing)
@@ -1242,28 +1247,32 @@ def _validate_deferred_targets(
         + external_paths
     )
     # A proved prefix member is its admitted state: its resolution and identity.
-    held = [(proven or {}).get(str(path)) for path in raw_paths]
+    proven = proven or {}
+    held = [proven.get(str(path)) for path in raw_paths]
+    raw_lexical = {_lexical_key(path) for path in raw_paths}
     raw_norms = {os.path.normcase(state._resolved_path_at_capture) for state in held if state is not None}
-    raw_inodes: set[tuple[int, int]] = {(state.device, state.inode) for state in held if state is not None}
-    # A raw file with a usable identity (device, inode) is matched by it: an existing target that is that file under
-    # any spelling, through a link or as a hardlink stats to the same identity, and a target that does not exist is
-    # no existing raw file. Only a raw path without one is also resolved, as all were before: each resolve is another
-    # round trip on a network share (NEXT-1215-SHARE-LOOKUPS).
-    unidentified: list[Path] = []
+    raw_inodes = {(state.device, state.inode) for state in held if state is not None and state.inode}
+    # A proved member has no live link count. An unidentified file on its
+    # device may be another hard link, even if the canonical paths differ.
+    possible_link_devices = {state.device for state in held if state is not None and not state.inode}
+    resolve_now: list[Path] = []
+    resolve_if_needed: list[Path] = []
     for path, state in zip(raw_paths, held):
         if state is not None:
             continue
         try:
             stat = path.stat()
         except OSError:
-            unidentified.append(path)
+            resolve_now.append(path)
             continue
         if not stat.st_ino:
-            unidentified.append(path)
+            resolve_now.append(path)
+            if stat.st_nlink != 1:
+                possible_link_devices.add(int(stat.st_dev))
             continue
         raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
-    raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in unidentified)
-    every_raw_resolved = len(unidentified) == sum(state is None for state in held)
+        (resolve_now if _CHECK_RESOLVED_RAW_PATHS else resolve_if_needed).append(path)
+    raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in resolve_now)
     protected = tuple(
         Path(value)
         for value in (configuration.poni_file, configuration.mask_file,
@@ -1277,24 +1286,28 @@ def _validate_deferred_targets(
             raise ValueError(f"duplicate output target {target}")
         seen.add(normalized)
         target_inode = None
+        ambiguous_link_device = None
         try:
             stat = target.stat()
-        except FileNotFoundError:
-            stat = None  # no file there yet, so no existing raw file is it
         except OSError:
-            stat = False  # it may exist: compare it by path
-        if stat:
+            # A missing referent can still have raw and output aliases. A
+            # successful raw stat may have preceded a transient disappearance.
+            needs_path_fallback = True
+        else:
+            needs_path_fallback = not stat.st_ino
             if stat.st_ino:
                 target_inode = (int(stat.st_dev), int(stat.st_ino))
-            else:
-                stat = False
-        if stat is False and not every_raw_resolved:
-            # A target that may exist without a usable identity is compared by path with every raw file, as before.
-            raw_norms.update(os.path.normcase(os.path.realpath(path))
-                             for path, state in zip(raw_paths, held) if state is None)
-            every_raw_resolved = True
-        if normalized in raw_norms or (
-            target_inode is not None and target_inode in raw_inodes
+            elif stat.st_nlink != 1:
+                ambiguous_link_device = int(stat.st_dev)
+        if needs_path_fallback and resolve_if_needed:
+            raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in resolve_if_needed)
+            resolve_if_needed.clear()
+        if (
+            _lexical_key(target) in raw_lexical
+            or normalized in raw_lexical
+            or normalized in raw_norms
+            or target_inode in raw_inodes
+            or ambiguous_link_device in possible_link_devices
         ):
             raise OutputCollisionError(
                 f"Reduction output '{target}' is the same file as a raw "

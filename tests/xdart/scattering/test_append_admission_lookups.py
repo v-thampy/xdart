@@ -1,9 +1,9 @@
 """A Folder Append's admission asks the file system little about raw files it already holds (NEXT-1215-SHARE-LOOKUPS;
 maintainer, 2026-11-19, of the 1.2.14 beamline run: "The admission step still takes about 14 s on your share.").
 
-On a network share every stat or resolve is a round trip. Admission used to stat every listed file, sidecars included,
-and resolve and stat every raw image for the output-collision guard: about six calls per image. The real page runs a
-Folder Append over saved scans; the admission thread's calls on raw paths are counted through the real os functions."""
+Admission used to stat every listed file, sidecars included, and resolve and stat every raw image for the collision
+guard. The real page runs Folder Append over saved scans. The admission thread's Python calls on the listed files
+are counted through the real os functions. This does not count filesystem work internal to those functions."""
 from dataclasses import replace
 import os
 import threading
@@ -18,25 +18,32 @@ from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F4
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
-def test_folder_append_admission_makes_about_one_raw_lookup_per_image(qapp, tmp_path, monkeypatch, recursive):  # noqa: F811
+def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeypatch, recursive):  # noqa: F811
     stems, intent = _scans(tmp_path, 30, 4)
     intent = replace(intent, source_spec=replace(intent.source_spec, recursive=recursive))
+    raw = tmp_path / "raw"
+    if recursive:
+        subfolder = raw / "subfolder"
+        subfolder.mkdir()
+        moved_stems = set(stems[::2])
+        for path in tuple(raw.iterdir()):
+            if path.stem.rsplit("_", 1)[0] in moved_stems:
+                path.rename(subfolder / path.name)
     with _page(qapp, intent) as (page, _view, observed):
         page._shell.run_controls.startButton.click()
         assert _terminal(qapp, page, observed).completed == 120
     assert _written(tmp_path, stems)
 
-    raw = tmp_path / "raw"
-    images = len(list(raw.glob("*.tif")))
-    assert images == 120 and len(list(raw.iterdir())) == 240  # each image has its sidecar
-    raw_root = os.path.normcase(os.fspath(raw))
+    images = len(list(raw.rglob("*.tif")))
+    listed_files = {os.path.normcase(os.fspath(path)) for path in raw.rglob("*") if path.is_file()}
+    assert images == 120 and len(listed_files) == 240  # each image has its sidecar
     calls: dict[str, int] = {}
 
     def counted(name, real):
         def call(path, *args, **kwargs):
             if threading.current_thread().name == "scattering-admission" and not isinstance(path, int):
                 spelling = os.path.normcase(os.fsdecode(os.fspath(path)))
-                if spelling == raw_root or spelling.startswith(raw_root + os.sep):
+                if spelling in listed_files:
                     calls[name] = calls.get(name, 0) + 1
             return real(path, *args, **kwargs)
         return call
@@ -49,5 +56,6 @@ def test_folder_append_admission_makes_about_one_raw_lookup_per_image(qapp, tmp_
             terminal = _terminal(qapp, page, observed)
     assert terminal.files_processed == 120 and terminal.frames_new == 0
     total = sum(calls.values())
-    # One stat per image remains: the collision guard's identity check. 1.2.14 made about six per image.
+    # Ordinary POSIX inputs need one stat. Windows retains one canonical-path
+    # check, which does not call Python's os.lstat on this fixture.
     assert 0 < total <= 2 * images, f"admission made {calls} raw calls for {images} images"

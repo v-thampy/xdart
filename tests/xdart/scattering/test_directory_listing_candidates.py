@@ -5,6 +5,7 @@ it now filters names first and asks the listing's own entries. The reference bel
 the same tree in both modes."""
 import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -94,3 +95,26 @@ def test_a_missing_folder_lists_nothing_recursively_and_raises_otherwise(tmp_pat
         _reference(flat)
     with pytest.raises(FileNotFoundError):
         output_preflight._directory_matching_paths(flat, cancelled=lambda: False)
+
+
+@pytest.mark.skipif(os.name != "posix" or sys.version_info >= (3, 14),
+                    reason="requires POSIX search permissions and pathlib 3.13's error policy")
+def test_the_listing_reports_an_unreadable_matching_file(tmp_path):
+    root = tmp_path / "samples"
+    root.mkdir()
+    inaccessible = tmp_path / "inaccessible"
+    inaccessible.mkdir()
+    image = inaccessible / "image.tif"
+    image.write_bytes(b"data")
+    (root / "image.tif").symlink_to(image)
+    source = DirectorySourceSpec(root, recursive=True, suffixes=(".tif",))
+    inaccessible.chmod(0o600)
+    try:
+        if os.access(image, os.F_OK):
+            pytest.skip("the current user can traverse a directory without search permission")
+        with pytest.raises(PermissionError):
+            _reference(source)
+        with pytest.raises(PermissionError):
+            output_preflight._directory_matching_paths(source, cancelled=lambda: False)
+    finally:
+        inaccessible.chmod(0o700)
