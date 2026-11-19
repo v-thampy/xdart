@@ -3493,6 +3493,53 @@ def test_e6pm2_settlement_validates_token_and_is_first_wins(
     assert ticket.result() is exact
 
 
+def test_a_deferred_replacement_does_not_read_a_fenced_scan(monkeypatch, tmp_path):
+    from xdart.modules.frame_publication import PublicationStore
+
+    state, owner, processed, _raw, _events = _bound_state(monkeypatch, tmp_path)
+    _catalog(state, owner, (1, 2, 3))
+    lease = _bind_light_history(state, owner, (3,))
+    art_owner, gate = _acquisition_identity(state)
+    transport = state.transport
+    browse_store = PublicationStore(max_items=2, max_heavy_items=1)
+    entered, finish = threading.Event(), threading.Event()
+    opened = []
+    api = _transport_api()
+    read = api.read_frame_preview
+
+    def hold_browse(key, *args, **kwargs):
+        opened.append(key.frame_identity)
+        if key.frame_identity == 1:
+            entered.set()
+            assert finish.wait(10)
+        return read(key, *args, **kwargs)
+
+    monkeypatch.setattr(api, "read_frame_preview", hold_browse)
+    try:
+        active = _typed_request(state, art_owner, gate, processed, 1, HydrationPurpose.PREVIEW, 1,
+                                stores=(browse_store,))
+        queued = _typed_request(state, art_owner, gate, processed, 2, HydrationPurpose.PREVIEW, 2,
+                                stores=(browse_store,))
+        replacement = _typed_request(state, art_owner, gate, processed, 3, HydrationPurpose.PREVIEW, 3)
+        assert transport.submit(active, closed=True) is not None
+        assert entered.wait(5)
+        assert transport.submit(queued, closed=True) is not None
+        with state._light_admission_lock:
+            detached = transport.submit_detached(replacement, closed=True)
+            assert detached.replacement is not None
+            assert not transport.reads_stores(replacement.stores)
+            lease.fence()
+        transport.dispatch_detached(detached)
+        finish.set()
+        assert _wait_transport_idle(state)
+        assert opened == [1], "the replacement started I/O into the fenced scan's stores"
+        assert detached.ticket.result().outcome is HydrationOutcome.OWNER_MISMATCH
+    finally:
+        finish.set()
+        assert transport.retire(join_timeout=5)
+        lease.release(reason="test", hooks=owner.light_hooks)
+
+
 def test_e6pm2_queued_displacement_cancel_and_worker_failure_settle_exactly(
     monkeypatch, tmp_path
 ):

@@ -435,15 +435,25 @@ class RunDisplayState:
             sleep(0.005)
 
     def _reads_current_generation(self, request) -> bool:
-        """The transport's check before a read starts: an acquisition read
-        (record and publication stores) still hydrates its artifact's current
-        stores.  Browse reads carry one store and are not this Run's."""
+        """Check acquisition admission again when the transport starts the read.
+
+        A queued replacement can be dispatched after the admission lock was
+        released. The lease may have been fenced for cleanup in the meantime.
+        Browse reads carry one store and have their own owner.
+        """
         stores = getattr(request, "stores", ())
         if len(stores) != 2:
             return True
-        with self._lock:
+        with self._light_admission_lock, self._lock:
             art = self.artifacts.get(request.read_key.artifact_identity)
-            return art is not None and stores[0] is art.records and stores[1] is art.publications
+            return art is not None and self._accepts_acquisition_read(art, stores)
+
+    @staticmethod
+    def _accepts_acquisition_read(art: DisplayArtifact, stores: tuple) -> bool:
+        """The current store pair can take reads while its lease is active or released."""
+        lease = art.light_lease
+        return (len(stores) == 2 and stores[0] is art.records and stores[1] is art.publications
+                and (lease is None or lease.state is Light1DLeaseState.ACTIVE))
 
     def bind_checkpoint_hydration(self, owner: DisplayArtifact) -> None:
         owner.records._bind_checkpoint_hydration_lineage(
@@ -981,8 +991,8 @@ class RunDisplayState:
                 return token
             self._full_pending = True
         with self._light_admission_lock:
-            if art.records is not request.stores[0] or art.publications is not request.stores[1]:
-                mutation = DetachedHydrationMutation()  # the artifact began another generation meanwhile
+            if not self._accepts_acquisition_read(art, request.stores):
+                mutation = DetachedHydrationMutation()
             else:
                 mutation = self._transport.submit_detached(request, closed=closed)
         if mutation.token is None:
@@ -1327,11 +1337,7 @@ class RunDisplayState:
         except (TypeError, ValueError):
             return
         with self._light_admission_lock:
-            lease = art.light_lease
-            if lease is not None and lease.state is not Light1DLeaseState.ACTIVE:
-                return
-            if (len(request.stores) != 2 or request.stores[0] is not art.records
-                    or request.stores[1] is not art.publications):
+            if not self._accepts_acquisition_read(art, request.stores):
                 return
             mutation = self._transport.submit_detached(request, closed=closed)
         if mutation is not None:
