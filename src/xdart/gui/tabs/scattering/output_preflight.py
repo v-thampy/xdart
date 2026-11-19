@@ -1279,16 +1279,20 @@ def _validate_deferred_targets(
         target_inode = None
         try:
             stat = target.stat()
+        except FileNotFoundError:
+            stat = None  # no file there yet, so no existing raw file is it
         except OSError:
-            pass
-        else:
+            stat = False  # it may exist: compare it by path
+        if stat:
             if stat.st_ino:
                 target_inode = (int(stat.st_dev), int(stat.st_ino))
-            elif not every_raw_resolved:
-                # An existing target without a usable identity is compared by path with every raw file, as before.
-                raw_norms.update(os.path.normcase(os.path.realpath(path))
-                                 for path, state in zip(raw_paths, held) if state is None)
-                every_raw_resolved = True
+            else:
+                stat = False
+        if stat is False and not every_raw_resolved:
+            # A target that may exist without a usable identity is compared by path with every raw file, as before.
+            raw_norms.update(os.path.normcase(os.path.realpath(path))
+                             for path, state in zip(raw_paths, held) if state is None)
+            every_raw_resolved = True
         if normalized in raw_norms or (
             target_inode is not None and target_inode in raw_inodes
         ):
