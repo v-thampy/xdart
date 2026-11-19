@@ -479,31 +479,57 @@ def _directory_matching_paths(
     root = Path(source.root).expanduser().absolute()
     suffixes = tuple(str(value).casefold() for value in source.suffixes)
     name_ok = compile_filter(source.name_filter)
-    iterator = root.rglob("*") if source.recursive else root.iterdir()
     paths: list[Path] = []
-    for path in iterator:
+    # The names are filtered before any file is asked about, and "is it a file" comes from the listing's own entry:
+    # on a network share every separate stat is a round trip, once per listed file, sidecars included
+    # (NEXT-1215-SHARE-LOOKUPS). The same candidates as rglob's: the folder and one level of real subfolders (a
+    # folder symlink is not followed), an unreadable subfolder left out.
+    for entry in _listed_entries(root, recursive=source.recursive):
         if cancelled():
             raise RuntimeError("admission cancelled")
-        if not path.is_file():
-            continue
-        try:
-            if len(path.absolute().relative_to(root).parts) > 2:
-                continue
-        except ValueError:
-            continue
+        path = Path(entry.path)
         if skip and _under_skipped(path, skip):
             continue
-        low = path.name.casefold()
+        low = entry.name.casefold()
         suffix = next(
             (value for value in suffixes if low.endswith(value)),
             "",
         )
         if suffixes and not suffix:
             continue
-        stem = path.name[:-len(suffix)] if suffix else path.name
-        if name_ok(stem):
-            paths.append(path.absolute())
+        stem = entry.name[:-len(suffix)] if suffix else entry.name
+        if not name_ok(stem):
+            continue
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        paths.append(path)
     return tuple(sorted(dict.fromkeys(paths)))
+
+
+def _listed_entries(root: Path, *, recursive: bool):
+    """The folder's entries, then (``recursive``) those of each real subfolder: one listing per folder, no stat."""
+    if not recursive:
+        with os.scandir(root) as listing:
+            yield from tuple(listing)
+        return
+    try:
+        with os.scandir(root) as listing:
+            entries = tuple(listing)
+    except OSError:
+        return
+    yield from entries
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            with os.scandir(entry.path) as listing:
+                children = tuple(listing)
+        except OSError:
+            continue
+        yield from children
 
 
 def _under_skipped(path: Path, skip: tuple[str, ...]) -> bool:
@@ -1217,17 +1243,27 @@ def _validate_deferred_targets(
     )
     # A proved prefix member is its admitted state: its resolution and identity.
     held = [(proven or {}).get(str(path)) for path in raw_paths]
-    raw_norms = {os.path.normcase(os.path.realpath(path) if state is None else state._resolved_path_at_capture)
-                 for path, state in zip(raw_paths, held)}
+    raw_norms = {os.path.normcase(state._resolved_path_at_capture) for state in held if state is not None}
     raw_inodes: set[tuple[int, int]] = {(state.device, state.inode) for state in held if state is not None}
+    # A raw file with a usable identity (device, inode) is matched by it: an existing target that is that file under
+    # any spelling, through a link or as a hardlink stats to the same identity, and a target that does not exist is
+    # no existing raw file. Only a raw path without one is also resolved, as all were before: each resolve is another
+    # round trip on a network share (NEXT-1215-SHARE-LOOKUPS).
+    unidentified: list[Path] = []
     for path, state in zip(raw_paths, held):
         if state is not None:
             continue
         try:
             stat = path.stat()
         except OSError:
+            unidentified.append(path)
+            continue
+        if not stat.st_ino:
+            unidentified.append(path)
             continue
         raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
+    raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in unidentified)
+    every_raw_resolved = len(unidentified) == sum(state is None for state in held)
     protected = tuple(
         Path(value)
         for value in (configuration.poni_file, configuration.mask_file,
@@ -1246,7 +1282,13 @@ def _validate_deferred_targets(
         except OSError:
             pass
         else:
-            target_inode = (int(stat.st_dev), int(stat.st_ino))
+            if stat.st_ino:
+                target_inode = (int(stat.st_dev), int(stat.st_ino))
+            elif not every_raw_resolved:
+                # An existing target without a usable identity is compared by path with every raw file, as before.
+                raw_norms.update(os.path.normcase(os.path.realpath(path))
+                                 for path, state in zip(raw_paths, held) if state is None)
+                every_raw_resolved = True
         if normalized in raw_norms or (
             target_inode is not None and target_inode in raw_inodes
         ):
