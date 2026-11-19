@@ -1,5 +1,15 @@
 # Release notes
 
+## 1.2.13 (2026-11-19)
+
+### Fixes
+
+- **Int: a frame read could still start in a scan the Run was releasing:**
+  between scans, a Full Raw view, or a frame read queued behind another one,
+  could start reading the scan the Run was releasing. Such a read is now
+  refused while that scan is being released. This follows up the 1.2.12 fix
+  and was found in its review.
+
 ## 1.2.12 (2026-11-18)
 
 ### Fixes
