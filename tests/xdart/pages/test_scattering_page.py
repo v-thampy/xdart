@@ -1076,9 +1076,11 @@ def test_application_close_restores_last_config_and_focused_edit(
             window.close()
         # Main ignores a close while a page's cleanup is pending and retries it every 50 ms; wait well inside the
         # 10 s limit after which it closes anyway, so a cleanup that never settles still fails (NIGHTLY-REDS-1212).
+        # Quit ends the process from a zero-delay timer after the window hides (Main.closeEvent), so wait for that
+        # too: hosted run 44603758746 checked between the two.
         until = time.monotonic() + 5
         qapp.processEvents()
-        while window.isVisible() and time.monotonic() < until:
+        while (window.isVisible() or (quit_action and not exits)) and time.monotonic() < until:
             time.sleep(.01)
             qapp.processEvents()
         assert not window.isVisible()
