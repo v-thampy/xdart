@@ -9,6 +9,7 @@ counted by delegating wrappers on the named seams."""
 from __future__ import annotations
 
 import os
+from collections import Counter
 
 import h5py
 import pytest
@@ -298,6 +299,14 @@ def test_an_already_processed_scan_after_another_scan_is_shown_from_its_saved_fr
         _scan(raw, "scana", 3)
     _scan(raw, "scanc", 1)
     seams = _Seams(monkeypatch)
+    resolved = Counter()
+    real_key = run_executor._physical_file_key
+
+    def count_key(path):
+        resolved[os.fspath(path)] += 1
+        return real_key(path)
+
+    monkeypatch.setattr(run_executor, "_physical_file_key", count_key)
     events, catalog = _run(tmp_path, raw, 9202)
     rows, warnings, navigation = _shown(events, catalog)
     assert [event.kind.name for event in events if event.kind in _TERMINAL] == ["FINISHED"], rows[-1]
@@ -309,6 +318,8 @@ def test_an_already_processed_scan_after_another_scan_is_shown_from_its_saved_fr
     assert seams.materialized == ["scana_int1d.nexus", "scanc_int1d.nexus"][(0 if first_new else 1):]
     assert _labels(tmp_path, "scana") == (1, 2, 3) and _labels(tmp_path, "scanb") == (1, 2)
     assert _labels(tmp_path, "scanc") == (1,)
+    assert {name: count for name, count in resolved.items() if count > 1} == {}
+    assert set(resolved) == {os.fspath(path) for path in raw.glob("*.tif")}
 
 
 def test_an_in_place_append_seals_its_close_after_its_writing_handle_closes(tmp_path, monkeypatch):

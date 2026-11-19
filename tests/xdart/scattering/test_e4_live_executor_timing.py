@@ -13,9 +13,8 @@ from xrd_tools.session.run_configuration import RunIntent
 from xdart.gui.tabs.scattering.adapters import run_executor as executor_module
 from xdart.gui.tabs.scattering.adapters.run_executor import (
     StandardRunExecutor,
+    _DirectoryFileClaims,
     _StandardRun,
-    _candidate_file_owners,
-    _claim_output_physical_files,
     _eager_directory_file_counts,
     _session_terminal_commit_identity,
 )
@@ -66,24 +65,27 @@ def test_linked_candidate_keeps_its_own_directory_counter_slot(
     # is also another selected candidate remains reserved for that candidate.
     assert _eager_directory_file_counts(outputs, discovered) == ((2, 1), 0)
 
-    owners = _candidate_file_owners(((master,), (linked_candidate,)))
-    claimed: set[Path] = set()
-    assert _claim_output_physical_files(
-        first,
-        discovered,
-        claimed,
-        candidate_owners=owners,
-        output_index=0,
-    ) == 2
-    assert linked_candidate not in claimed
-    assert _claim_output_physical_files(
-        second,
-        discovered,
-        claimed,
-        candidate_owners=owners,
-        output_index=1,
-    ) == 1
-    assert claimed == set(discovered)
+    claims = _DirectoryFileClaims(discovered, ((master,), (linked_candidate,)))
+    assert claims.claim(first.group.member_paths, output_index=0) == 2
+    assert linked_candidate not in claims.claimed
+    assert claims.claim(second.group.member_paths, output_index=1) == 1
+    assert claims.claimed == set(discovered)
+
+
+def test_directory_file_counts_keep_discovered_aliases_and_reject_conflicting_owners(tmp_path):
+    source = tmp_path / "scan.tif"
+    source.touch()
+    alias = tmp_path / "alias.tif"
+    try:
+        alias.symlink_to(source)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    discovered = (source, alias)
+    claims = _DirectoryFileClaims(discovered, (discovered,))
+    assert claims.claim((alias,), output_index=0) == 2
+    assert claims.claim((source,), output_index=0) == 0
+    with pytest.raises(ValueError, match="belongs to multiple outputs"):
+        _DirectoryFileClaims(discovered, ((source,), (alias,)))
 
 
 def test_stopped_deferred_skip_counts_known_unowned_sidecar(

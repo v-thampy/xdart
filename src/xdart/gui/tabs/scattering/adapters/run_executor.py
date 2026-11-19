@@ -950,22 +950,41 @@ def _planned_primary_paths(item: PlannedOutput) -> tuple[Path, ...]:
     return members or (item.source_path,)
 
 
-def _candidate_file_owners(
-    primary_groups: tuple[tuple[Path, ...], ...],
-) -> dict[str, int]:
-    """Bind every discovered candidate to exactly one planned output."""
+class _DirectoryFileClaims:
+    """Assign the admitted directory's file counters without reprobes per scan."""
 
-    owners: dict[str, int] = {}
-    for output_index, paths in enumerate(primary_groups):
-        for path in paths:
-            key = _physical_file_key(path)
-            previous = owners.setdefault(key, output_index)
-            if previous != output_index:
-                raise ValueError(
-                    "physical directory candidate belongs to multiple outputs: "
-                    f"{path}"
-                )
-    return owners
+    def __init__(self, discovered_paths: tuple[Path, ...], primary_groups: tuple[tuple[Path, ...], ...]):
+        self.claimed: set[Path] = set()
+        self._keys: dict[str, str] = {}
+        self._paths_by_key: dict[str, list[Path]] = {}
+        self._owners: dict[str, int] = {}
+        for output_index, paths in enumerate(primary_groups):
+            for path in paths:
+                key = self._key(path)
+                previous = self._owners.setdefault(key, output_index)
+                if previous != output_index:
+                    raise ValueError(f"physical directory candidate belongs to multiple outputs: {path}")
+        for path in discovered_paths:
+            self._paths_by_key.setdefault(self._key(path), []).append(path)
+
+    def _key(self, path: Path | str) -> str:
+        spelling = os.fspath(path)
+        key = self._keys.get(spelling)
+        if key is None:
+            key = self._keys[spelling] = _physical_file_key(path)
+        return key
+
+    def claim(self, member_paths: tuple[Path | str, ...], *, output_index: int) -> int:
+        """Claim the members and any discovered dependencies without their own owner."""
+        selected = tuple(
+            path
+            for key in {self._key(path) for path in member_paths}
+            if self._owners.get(key, output_index) == output_index
+            for path in self._paths_by_key.get(key, ())
+            if path not in self.claimed
+        )
+        self.claimed.update(selected)
+        return len(selected)
 
 
 def _receipt_with_entry(receipt: AdmissionReceipt, deferred: DeferredDirectoryPlan, original, replacement):
@@ -998,47 +1017,6 @@ def _remaining_tiff_candidates(deferred: DeferredDirectoryPlan, start_index: int
     return remaining
 
 
-def _claim_physical_files(
-    member_paths: tuple[Path, ...],
-    discovered_paths: tuple[Path, ...],
-    claimed: set[Path],
-    *,
-    candidate_owners: dict[str, int],
-    output_index: int,
-) -> int:
-    """Claim one output's candidates and otherwise-unowned sidecars."""
-
-    member_keys = {
-        _physical_file_key(path) for path in member_paths
-    }
-    selected = tuple(
-        path
-        for path in discovered_paths
-        if path not in claimed
-        and (key := _physical_file_key(path)) in member_keys
-        and candidate_owners.get(key, output_index) == output_index
-    )
-    claimed.update(selected)
-    return len(selected)
-
-
-def _claim_output_physical_files(
-    item: PlannedOutput,
-    discovered_paths: tuple[Path, ...],
-    claimed: set[Path],
-    *,
-    candidate_owners: dict[str, int],
-    output_index: int,
-) -> int:
-    return _claim_physical_files(
-        item.group.member_paths,
-        discovered_paths,
-        claimed,
-        candidate_owners=candidate_owners,
-        output_index=output_index,
-    )
-
-
 def _eager_directory_file_counts(
     outputs: tuple[AdmittedOutput, ...],
     discovered_paths: tuple[Path, ...],
@@ -1050,21 +1028,13 @@ def _eager_directory_file_counts(
             _planned_physical_file_count(output.item) for output in outputs
         )
         return counts, 0
-    candidate_owners = _candidate_file_owners(tuple(
-        _planned_primary_paths(output.item) for output in outputs
-    ))
-    claimed: set[Path] = set()
+    claims = _DirectoryFileClaims(discovered_paths, tuple(
+        _planned_primary_paths(output.item) for output in outputs))
     counts = tuple(
-        _claim_output_physical_files(
-            output.item,
-            discovered_paths,
-            claimed,
-            candidate_owners=candidate_owners,
-            output_index=output_index,
-        )
+        claims.claim(output.item.group.member_paths, output_index=output_index)
         for output_index, output in enumerate(outputs)
     )
-    return counts, len(discovered_paths) - len(claimed)
+    return counts, len(discovered_paths) - len(claims.claimed)
 
 
 def _skips_failed_scans(run: _StandardRun) -> bool:
@@ -2685,6 +2655,7 @@ class StandardRunExecutor:
             return True
         outputs = receipt.outputs
         resources = run.resources
+        validation_started = monotonic()
         try:
             with _run_effect(run):
                 validate_admitted_receipt(
@@ -2705,6 +2676,8 @@ class StandardRunExecutor:
         if type(deferred) is DeferredDirectoryPlan:
             if deferred.live:
                 return self._execute_live_directory(run, receipt, deferred)
+            logger.debug("[DIRECTORY-START] receipt revalidated (%.0f ms)",
+                         1000 * (monotonic() - validation_started))
             return self._execute_deferred_directory(run, receipt, deferred)
         run.pending_partition_count = max(1, len(outputs))
         run.total = sum(output.item.source_stamp.frame_count for output in outputs)
@@ -3404,18 +3377,18 @@ class StandardRunExecutor:
         run.pending_partition_count = max(1, len(deferred.entries))
         run.files_discovered = deferred.discovered_file_count
         run.files_skipped = 0
-        claimed_files: set[Path] = set()
-        candidate_owners = _candidate_file_owners(tuple(
-            entry.physical_paths for entry in deferred.entries
-        ))
+        count_started = monotonic()
+        claims = _DirectoryFileClaims(deferred.discovered_paths, tuple(
+            entry.physical_paths for entry in deferred.entries))
         # Files admission already found processed count as processed from the start, not pending until each scan is
         # shown (maintainer, 2026-10-23: "it says there are 24 images or so remaining and then goes through them in a
         # couple of seconds"); claimed here, their presentation counts nothing again.
         for output_index, entry in enumerate(deferred.entries):
             if entry.completed is not None:
-                run.files_processed += min(len(entry.completed.labels), _claim_physical_files(
-                    tuple(candidate.path for candidate in entry.candidates), deferred.discovered_paths,
-                    claimed_files, candidate_owners=candidate_owners, output_index=output_index))
+                run.files_processed += min(len(entry.completed.labels), claims.claim(
+                    tuple(candidate.path for candidate in entry.candidates), output_index=output_index))
+        logger.debug("[DIRECTORY-START] counted %d already processed of %d files (%.0f ms)",
+                     run.files_processed, run.files_discovered, 1000 * (monotonic() - count_started))
         self._events.put(StandardRunEvent(
             run.identity,
             StandardEventKind.DISCOVERY,
@@ -3452,9 +3425,7 @@ class StandardRunExecutor:
                 )
                 if entry.completed is not None:  # admitted as already processed, its source never captured
                     stopped = self._present_already_processed(
-                        run, deferred, entry, entry.completed, claimed_files,
-                        candidate_owners=candidate_owners,
-                        output_index=output_index,
+                        run, entry, entry.completed, claims, output_index=output_index,
                     )
                     logger.debug(
                         "[APPEND-SCAN] output=%s already processed (%.0f ms)",
@@ -3544,15 +3515,8 @@ class StandardRunExecutor:
                 self._skip_directory_scan(run, entry.target, error)
                 decision, skipped_files = None, 0
             if decision is None:
-                skipped_claims = _claim_physical_files(
-                    tuple(
-                        Path(state.path)
-                        for state in entry.protected_states
-                    ),
-                    deferred.discovered_paths,
-                    claimed_files,
-                    candidate_owners=candidate_owners,
-                    output_index=output_index,
+                skipped_claims = claims.claim(
+                    tuple(state.path for state in entry.protected_states), output_index=output_index,
                 )
                 run.files_skipped += max(skipped_files, skipped_claims)
                 self._events.put(StandardRunEvent(
@@ -3569,13 +3533,7 @@ class StandardRunExecutor:
             run.current_total = item.source_stamp.frame_count
             run.total += run.current_total
             run.current_file_total = reclaimed.pop(output_index) if output_index in reclaimed else (
-                _claim_output_physical_files(
-                    item,
-                    deferred.discovered_paths,
-                    claimed_files,
-                    candidate_owners=candidate_owners,
-                    output_index=output_index,
-                ))
+                claims.claim(item.group.member_paths, output_index=output_index))
             run.current_files_incremental = (
                 item.source_spec.kind is SourceKind.TIFF_SERIES
             )
@@ -3679,24 +3637,17 @@ class StandardRunExecutor:
     def _present_already_processed(
         self,
         run: _StandardRun,
-        deferred: DeferredDirectoryPlan,
         entry,
         completed,
-        claimed_files: set[Path],
+        claims: _DirectoryFileClaims,
         *,
-        candidate_owners: dict[str, int],
         output_index: int,
     ) -> bool:
         """A scan its output already holds, shown as an Append no-op shows it (its saved frames in navigation, its
         files counted processed) without reading the scan again: no source, graph, writer or warning
         (``output_preflight._already_processed``). Returns whether Stop was requested."""
-        run.current_file_total = _claim_physical_files(
-            tuple(candidate.path for candidate in entry.candidates),
-            deferred.discovered_paths,
-            claimed_files,
-            candidate_owners=candidate_owners,
-            output_index=output_index,
-        )
+        run.current_file_total = claims.claim(
+            tuple(candidate.path for candidate in entry.candidates), output_index=output_index)
         run.current_files_incremental = True
         self._follow_saved_output(run, entry.target, completed)
         owner = self._present_saved_output(run, entry.target, entry.candidates[0], completed)
