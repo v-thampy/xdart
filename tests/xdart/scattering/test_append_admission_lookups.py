@@ -17,8 +17,10 @@ from tests.xdart.scattering.test_folder_run_frame_read_at_scan_boundary import _
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 
 
-def test_folder_append_admission_makes_about_one_raw_lookup_per_image(qapp, tmp_path, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
+def test_folder_append_admission_makes_about_one_raw_lookup_per_image(qapp, tmp_path, monkeypatch, recursive):  # noqa: F811
     stems, intent = _scans(tmp_path, 30, 4)
+    intent = replace(intent, source_spec=replace(intent.source_spec, recursive=recursive))
     with _page(qapp, intent) as (page, _view, observed):
         page._shell.run_controls.startButton.click()
         assert _terminal(qapp, page, observed).completed == 120
