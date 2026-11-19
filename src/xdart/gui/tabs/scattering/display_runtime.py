@@ -598,7 +598,10 @@ class RunDisplayState:
         return self._transport.retry_blocked_cleanup(token)
 
     def verify_light_1d(self, owner: DisplayArtifact, commit_gate: object | None) -> None:
-        if commit_gate is not None and self._transport.retains_gate(commit_gate):
+        # Only a read into this output's own stores holds its release. A read of another output of the Run (a frame
+        # picked from an earlier scan, read from a slow share) commits into that output's stores, not these
+        # (LIVE-1212-LIGHT1D-LINEAGE: it failed his directory Int 1D Runs between scans).
+        if commit_gate is not None and self._transport.reads_stores((owner.records, owner.publications)):
             raise RuntimeError("shared hydration gate remains retained")
 
     def release_light_1d(self, owner: DisplayArtifact, *, reason: str, terminal=None) -> bool:

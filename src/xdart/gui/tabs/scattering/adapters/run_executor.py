@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from queue import Empty, Full, Queue, SimpleQueue
 from threading import Event, Lock, Thread, current_thread, get_ident
-from time import monotonic, time as wall_time
+from time import monotonic, sleep, time as wall_time
 from typing import Any, Callable, Mapping
 import numpy as np
 from xdart.utils import log_events
@@ -215,6 +215,10 @@ _METADATA_WAIT_NOTE_S = 2.0
 # .txt lands 5-8 s after its image: "i'm wondering if it needs to be there. perhaps better to fold this in debug?", his
 # pick "Normal log only after 30 s"): a long wait is the one a user can act on, and the status no longer counts pending.
 _METADATA_WAIT_INFO_S = 30.0
+# A scan's boundary waits this long for a frame read of the output it releases (a frame picked from it, read from a slow
+# share) before the Run fails on it; the cleanup resumes from its retry receipt every 20 ms meanwhile
+# (LIVE-1212-LIGHT1D-LINEAGE; maintainer, 2026-11-18: "Keep getting this crap in int 1d in directory mode").
+_LINEAGE_RELEASE_WAIT_S = 15.0
 # One scan's own failures: its image could not be read, or its output predates its new frames' metadata columns. The
 # scan is skipped and named, the Run goes on (maintainer, 2026-10-24: "That scan/frame should be logged and skipped and
 # the remaining scan processing should continue"; 2026-10-26, for an output written before epoch_local: his pick "Skip
@@ -1826,8 +1830,7 @@ class StandardRunExecutor:
                 run.last_written = (Path(str(owner.artifact)), run.current_completed, run.current_total, commit)
             run.display.mark_hydration_closed(owner)
             run.display.keep_released_1d(owner)  # its frames so far keep their curves for the Run's view
-            if not run.display.release_light_1d(owner, reason="lineage-replaced"):
-                raise RuntimeError("prior light-1D lineage cleanup remains pending")
+            self._release_replaced_lineage(run, owner)
             output.drop_released_predecessor(owner, aborted=True)
         # Settlement can make submitted container frames durable. Count those before dropping only the unsaved work.
         run.total -= max(0, run.current_total - run.current_completed)
@@ -2117,11 +2120,23 @@ class StandardRunExecutor:
                                 _session_terminal_commit_identity(session, predecessor.artifact))
         run.display.mark_hydration_closed(predecessor)
         run.display.keep_released_1d(predecessor)  # its curves stay for the Run's view, as it lags (fast Runs)
-        if not run.display.release_light_1d(
-            predecessor, reason="lineage-replaced",
-        ):
-            raise RuntimeError("prior light-1D lineage cleanup remains pending")
+        self._release_replaced_lineage(run, predecessor)
         output.drop_released_predecessor(predecessor)
+
+    @staticmethod
+    def _release_replaced_lineage(run, owner) -> None:
+        """Release ``owner``'s light-1D lineage as the Run moves on from it. A frame read of that output still running
+        refuses the release with a retry receipt; the cleanup resumes from it until the read has finished, for up to
+        _LINEAGE_RELEASE_WAIT_S, and only then fails the Run. A refusal without a receipt fails it at once."""
+        deadline = monotonic() + _LINEAGE_RELEASE_WAIT_S
+        while not run.display.release_light_1d(owner, reason="lineage-replaced"):
+            if owner.light_retry_token is None or monotonic() >= deadline:
+                lease = owner.light_lease
+                receipt = None if lease is None else lease.cleanup_receipt
+                logger.warning("[RUN-CLEANUP] %s kept its light-1D lineage: %s", owner.artifact,
+                               "no retry receipt" if receipt is None else f"{receipt.failed_step}: {receipt.error}")
+                raise RuntimeError("prior light-1D lineage cleanup remains pending")
+            sleep(.02)
 
     def _construct(self, run: _StandardRun, *, item: PlannedOutput | None=None, labels: tuple[int, ...] | None=None, decision: AdmittedOutput | None=None, remaining_frames: int | None=None) -> _StandardRun:
         proof = getattr(run, 'live_admission_proof', None)
