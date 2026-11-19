@@ -1,5 +1,17 @@
 # Release notes
 
+## 1.2.14 (2026-11-19)
+
+### Fixes
+
+- **Int: a Folder Append Run could take minutes to start over many saved
+  scans:** before it showed the first saved scan, the Run looked up the path
+  of every listed file once for each scan that was already processed, so the
+  wait grew with the square of the folder's size (about 2 minutes for 229
+  saved scans on a network share). Each path is now looked up once per Run.
+  In testing, a 30-scan folder took 720 lookups instead of 2,820; the time
+  this saves on a share is estimated, not measured.
+
 ## 1.2.13 (2026-11-19)
 
 ### Fixes
