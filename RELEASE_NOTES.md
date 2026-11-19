@@ -1,5 +1,17 @@
 # Release notes
 
+## 1.2.12 (2026-11-18)
+
+### Fixes
+
+- **Int: a Run over several scans could stop between scans with "prior
+  light-1D lineage cleanup remains pending":** when the Run moved on to the
+  next scan while a frame image was still being read for the display (a frame
+  you picked, or one the display read itself), the Run failed. Reads are slow
+  on a network share, so it happened often there. The Run now goes on: it no
+  longer waits for reads of other scans, and it waits up to 15 s for a read of
+  the scan it is finishing.
+
 ## 1.2.11 (2026-11-16)
 
 ### Fixes
