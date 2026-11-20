@@ -1,5 +1,25 @@
 # Release notes
 
+## 1.2.16 (2026-11-19)
+
+### Fixes
+
+- **Int: a Folder Run's admission grouped its scans slowly:** with many
+  saved scans it parsed every listed file's name once for each scan, twice
+  per Run (about 6 s for 327 scans and 930 images on a beamline PC). Each
+  name is now parsed once, and the scans are grouped exactly as before. In
+  testing with 300 saved scans, that step went from 1.6 s to 0.1 s.
+- **Int: a later Append in the same session no longer reopens every saved
+  output:** each output's committed record is remembered by its size and
+  time, and read again only when the output changes. The first Run after
+  starting xdart still reads them. In testing with 300 saved scans, a second
+  Append read them in 0.06 s instead of 0.75 s.
+- **Int: the raw-file check asks the share less:** each saved output's
+  calibration, mask and folder checks now run once per Run instead of once
+  per output, and on Windows each raw folder is resolved once instead of
+  every raw image. Outputs are still refused when they would land on a raw
+  file. The time this saves on a share is estimated, not measured.
+
 ## 1.2.15 (2026-11-19)
 
 ### Fixes
