@@ -5,16 +5,18 @@
 ### Fixes
 
 - **Int: a Folder Run's admission asked the network share about each raw
-  file several times:** before a Run started, it checked every listed file
-  (sidecars included) one by one, then resolved and checked every raw image
-  again to keep outputs off raw files. It now takes each file's type from the
-  folder listing. On macOS and Linux the raw-file check also matches files by
-  their identity instead of resolving each path; on Windows it still resolves
-  each path, so the saving there comes from the listing. Outputs are still
-  refused when they would land on a raw file. In testing on macOS, admission
-  of 120 saved images went from 720 file-system calls to 120; on Windows it
-  should about halve (from reading the code). The time this saves on a share
-  is estimated, not measured.
+  file several times:** before a Run started, the folder listing checked
+  every listed file one by one, sidecars included; it now takes each file's
+  type from the listing itself. On macOS and Linux the raw-file check also
+  matches raw files by their identity instead of resolving each path; on
+  Windows it still resolves each path. Outputs are still refused when they
+  would land on a raw file. In testing on macOS, admission of 120 saved
+  images went from 720 file-system calls to 120. On Windows the saving is
+  only the listing's, and it is estimated, not measured.
+- **Debug log: where a Folder Run's admission spends its time:** with Debug
+  Logging on, `[DIRECTORY-LIST]` times the folder listing, and
+  `[APPEND-ADMIT]` splits its time into reading the saved outputs' records,
+  the raw-file guard and the scans still to process.
 
 ## 1.2.14 (2026-11-19)
 

@@ -5,6 +5,7 @@ Admission used to stat every listed file, sidecars included, and resolve and sta
 guard. The real page runs Folder Append over saved scans. The admission thread's Python calls on the listed files
 are counted through the real os functions. This does not count filesystem work internal to those functions."""
 from dataclasses import replace
+import logging
 import os
 import threading
 
@@ -18,7 +19,7 @@ from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F4
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
-def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeypatch, recursive):  # noqa: F811
+def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeypatch, caplog, recursive):  # noqa: F811
     stems, intent = _scans(tmp_path, 30, 4)
     intent = replace(intent, source_spec=replace(intent.source_spec, recursive=recursive))
     raw = tmp_path / "raw"
@@ -49,12 +50,20 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
         return call
 
     with _page(qapp, replace(intent, output_mode="Append")) as (page, _view, observed):
+        caplog.set_level(logging.DEBUG, logger="xdart.gui.tabs.scattering.output_preflight")
         with monkeypatch.context() as patch:
             for module, name in ((os, "stat"), (os, "lstat"), (os.path, "realpath")):
                 patch.setattr(module, name, counted(name, getattr(module, name)))
             page._shell.run_controls.startButton.click()
             terminal = _terminal(qapp, page, observed)
     assert terminal.files_processed == 120 and terminal.frames_new == 0
+    # The debug log splits admission's time, so a slow share shows which part to fix (maintainer, 2026-11-19:
+    # "the initial start is still pretty slow"; his pick "Add the timings first (Recommended)").
+    lines = [record.getMessage() for record in caplog.records]
+    assert any(line.startswith("[DIRECTORY-LIST] 120 files listed (") for line in lines), lines
+    admit = [line for line in lines if line.startswith("[APPEND-ADMIT] ")]
+    assert len(admit) == 1 and "already-processed=30" in admit[0], admit
+    assert all(part in admit[0] for part in ("saved records", "raw-file guard", "scans to process")), admit
     total = sum(calls.values())
     # Ordinary POSIX inputs need one stat. Windows retains one canonical-path
     # check, which does not call Python's os.lstat on this fixture.

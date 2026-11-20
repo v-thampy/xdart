@@ -642,11 +642,16 @@ def prepare_output(
             )
             items = ()
         else:
+            listing_started = monotonic()
             directory_discovered_paths = _directory_matching_paths(
                 source,
                 cancelled=cancelled,
                 skip=_run_scan_skip(source, intent),
             )
+            # Timed apart from [APPEND-ADMIT], which starts after it (NEXT-1215-SHARE-LOOKUPS: the maintainer's
+            # admission on a share took 21 s and the listing was not in that figure).
+            _LOG.debug("[DIRECTORY-LIST] %d files listed (%.0f ms)", len(directory_discovered_paths),
+                       1000 * (monotonic() - listing_started))
         if (
             not intent.gi.enabled
             and not intent.live_mode
@@ -1035,17 +1040,22 @@ def _deferred_directory_plan(
         ]
     ] = []
     every_proven, committed_energies = dict(proven), {}
+    records_s = 0.0  # reading the saved outputs' committed records, for [APPEND-ADMIT]
     for group, name in _output_groups(configuration, plan):
         if cancelled():
             raise RuntimeError("admission cancelled")
         representative = group[0]
         target = _directory_target(configuration, plan, representative, name)
+        record_started = monotonic()
         completed = None if proven else _already_processed(configuration, group, target)
+        records_s += monotonic() - record_started
         if completed is not None:  # already processed: no capture, no source fence
             staged.append((group, (), target, (), (), "", completed, None))
             continue
         # A scan that grew: the frames its output holds keep the states its record wrote (no capture).
+        record_started = monotonic()
         found = None if proven else _committed_prefix(configuration, group, name, target)
+        records_s += monotonic() - record_started
         committed = None if found is None else found[0]
         committed_energies[str(target)] = None if found is None else found[1]
         group_proven = {**proven, **proven_states(committed)}
@@ -1083,6 +1093,7 @@ def _deferred_directory_plan(
             )
         )
 
+    guard_started = monotonic()
     _validate_deferred_targets(
         configuration,
         plan,
@@ -1115,6 +1126,7 @@ def _deferred_directory_plan(
         ),
         every_proven,
     )
+    guard_s = monotonic() - guard_started
     entries: list[DeferredDirectoryEntry] = []
     for (
         group,
@@ -1206,11 +1218,15 @@ def _deferred_directory_plan(
             committed_prefix=committed,
             committed_energy_selection=committed_energies.get(str(target)),
         ))
+    total_s = monotonic() - started
+    # Where admission's time goes on a share (NEXT-1215-SHARE-LOOKUPS): the saved outputs' records, the raw-file
+    # guard, and the rest (capturing and freezing the scans still to process).
     _LOG.debug(
-        "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms)",
+        "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms: saved records %.0f ms, "
+        "raw-file guard %.0f ms, scans to process %.0f ms)",
         len(entries), sum(entry.completed is not None for entry in entries),
         sum(entry.committed_prefix is not None for entry in entries), len(plan.candidates),
-        1000 * (monotonic() - started),
+        1000 * total_s, 1000 * records_s, 1000 * guard_s, 1000 * max(0.0, total_s - records_s - guard_s),
     )
     return DeferredDirectoryPlan(
         plan,
