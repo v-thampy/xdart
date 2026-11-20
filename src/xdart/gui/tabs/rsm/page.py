@@ -1229,7 +1229,8 @@ class RSMPage(QtWidgets.QWidget):
         """Everything the Source's member groups are found from, as committed (the cache's key)."""
         return (str(self._value("project_root")).strip(), self._source_paths,
                 *(str(self._value(key)) for key in (
-                    "source_kind", "nexus_entry", "scan_mode", "scan", "image_dir", "image_stem", "subdirs", "name_filter",
+                    "data_format", "source_kind", "nexus_entry", "scan_mode", "scan", "image_dir", "image_stem",
+                    "subdirs", "name_filter",
                     "frame_first", "frame_last", "frame_step", "adv_rows", "adv_columns", "adv_dtype",
                     "adv_header", "adv_angle_mapping")), self.point_images.choices)
 

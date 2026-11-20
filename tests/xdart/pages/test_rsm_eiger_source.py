@@ -6,6 +6,7 @@ the Source card names a scan without images. Real page, real resolver and Previe
 from pathlib import Path
 import time
 
+import h5py
 import numpy as np
 import pytest
 from pyqtgraph.Qt import QtWidgets
@@ -179,6 +180,34 @@ def test_run_resolves_new_container_shape_before_applying_chunk_cap(qapp, tmp_pa
     try:
         _on_source(page, qapp, tmp_path, "2", rows=(2048, 2048))
         page.set_field("adv_max_chunk_mib", "32")
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        page.run_bar.startButton.click()
+        _wait(page, qapp, lambda: not page.active(), seconds=120)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+        assert len(page.browser.listed_results()) == 1, page.run_bar.readinessLabel.full_text()
+    finally:
+        _close(page, qapp)
+
+
+def test_switching_spec_format_resolves_the_newly_enabled_entry_before_run(qapp, tmp_path):
+    _canonical_partner(tmp_path)
+    images = tmp_path / "source" / "images"
+    images.mkdir(parents=True)
+    _spec_file(tmp_path / "source" / "RSM_synth", [_spec_scan(2, 11)])
+    with h5py.File(images / "RSM_synth_scan002_master.h5", "w") as handle:
+        for name, shape in (("entry", (1024, 1024)), ("experiment", (195, 487))):
+            entry = handle.create_group(name)
+            entry.attrs["NX_class"] = "NXentry"
+            entry.create_dataset("data/data", shape=(2, *shape), dtype=np.uint16, fillvalue=1)
+    page = _page(qapp)
+    try:
+        _on_source(page, qapp, tmp_path, "2")
+        page.set_field("nexus_entry", "experiment")
+        _choose(qapp, page._rows["data_format"], "spec_series")
+        page.resolve_source()
+        page.set_field("adv_max_chunk_mib", "32")
+        assert not page.run_bar.startButton.isEnabled()
+        _choose(qapp, page._rows["data_format"], "spec_container")
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
         page.run_bar.startButton.click()
         _wait(page, qapp, lambda: not page.active(), seconds=120)
