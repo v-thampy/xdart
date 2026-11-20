@@ -68,3 +68,34 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     # Ordinary POSIX inputs need one stat. Windows retains one canonical-path
     # check, which does not call Python's os.lstat on this fixture.
     assert 0 < total <= 2 * images, f"admission made {calls} raw calls for {images} images"
+
+
+def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, monkeypatch):  # noqa: F811
+    """On Windows the raw-file guard still compares canonical paths (Codex review 9f0471bc), and used to resolve every
+    raw image: 7.0 s for 930 on the maintainer's share (his pick "Cheaper raw-file guard"). It now resolves each folder
+    once and builds a plain file's canonical path from its folder's and its listed name."""
+    from xdart.gui.tabs.scattering import output_preflight
+    stems, intent = _scans(tmp_path, 30, 4)
+    with _page(qapp, intent) as (page, _view, observed):
+        page._shell.run_controls.startButton.click()
+        assert _terminal(qapp, page, observed).completed == 120
+    raw_root = os.path.normcase(os.fspath(tmp_path / "raw"))
+    resolved: list[str] = []
+    realpath = os.path.realpath
+
+    def counted(path, *args, **kwargs):
+        spelling = os.path.normcase(os.fsdecode(os.fspath(path)))
+        if threading.current_thread().name == "scattering-admission" and (
+                spelling == raw_root or spelling.startswith(raw_root + os.sep)):
+            resolved.append(spelling)
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(output_preflight, "_CHECK_RESOLVED_RAW_PATHS", True)
+    with _page(qapp, replace(intent, output_mode="Append")) as (page, _view, observed):
+        with monkeypatch.context() as patch:
+            patch.setattr(os.path, "realpath", counted)
+            page._shell.run_controls.startButton.click()
+            terminal = _terminal(qapp, page, observed)
+    assert terminal.files_processed == 120 and terminal.frames_new == 0
+    # 1.2.15's Windows branch resolved each of the 120 images; now only the folder (and the source root's checks).
+    assert len(resolved) <= 4, resolved

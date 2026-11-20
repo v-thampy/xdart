@@ -1248,6 +1248,46 @@ def _correction_paths(configuration: object) -> tuple[str, ...]:
     return tuple(str(values[key]) for key in ("flat_file", "dark_file") if values.get(key))
 
 
+def _resolved_raw_keys(paths: list[Path]) -> set[str]:
+    """The canonical keys (normcased realpaths) of ``paths``, with one resolve and one listing per folder.
+
+    A plain file's canonical path is its folder's canonical path plus its on-disk name; a file the listing shows as a
+    link or other reparse point, one the listing does not show, and every file of a folder that cannot be resolved or
+    listed are resolved one by one, as before. On a network share each resolve is a round trip: the maintainer's
+    Windows guard resolved all 930 raw images of his Folder, 7.0 s (NEXT-1215-SHARE-LOOKUPS; his pick "Cheaper raw-file
+    guard")."""
+    keys: set[str] = set()
+    by_folder: dict[str, list[Path]] = {}
+    for path in paths:
+        by_folder.setdefault(os.fspath(Path(path).parent), []).append(Path(path))
+    for folder, members in by_folder.items():
+        try:
+            canonical_folder = os.path.realpath(folder)
+            with os.scandir(folder) as listing:
+                plain = {os.path.normcase(entry.name): entry.name for entry in listing if _plain_file_entry(entry)}
+        except OSError:
+            plain, canonical_folder = {}, None
+        for path in members:
+            name = plain.get(os.path.normcase(path.name)) if canonical_folder is not None else None
+            if name is None:
+                keys.add(os.path.normcase(os.path.realpath(path)))
+            else:
+                keys.add(os.path.normcase(os.path.join(canonical_folder, name)))
+    return keys
+
+
+def _plain_file_entry(entry: os.DirEntry) -> bool:
+    """A listed regular file that is no link or other reparse point, from the listing alone where it can tell."""
+    try:
+        if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            return False
+        # On Windows the listing's own attributes tell a reparse point (no extra call); elsewhere a non-link is plain.
+        attributes = entry.stat(follow_symlinks=False).st_file_attributes if os.name == "nt" else 0
+    except OSError:
+        return False
+    return not attributes & 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
 def _validate_deferred_targets(
     configuration: OutputCandidate,
     plan: RunCandidatePlan,
@@ -1273,6 +1313,7 @@ def _validate_deferred_targets(
     possible_link_devices = {state.device for state in held if state is not None and not state.inode}
     resolve_now: list[Path] = []
     resolve_if_needed: list[Path] = []
+    resolve_by_folder: list[Path] = []
     for path, state in zip(raw_paths, held):
         if state is not None:
             continue
@@ -1287,7 +1328,8 @@ def _validate_deferred_targets(
                 possible_link_devices.add(int(stat.st_dev))
             continue
         raw_inodes.add((int(stat.st_dev), int(stat.st_ino)))
-        (resolve_now if _CHECK_RESOLVED_RAW_PATHS else resolve_if_needed).append(path)
+        (resolve_by_folder if _CHECK_RESOLVED_RAW_PATHS else resolve_if_needed).append(path)
+    raw_norms.update(_resolved_raw_keys(resolve_by_folder))
     raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in resolve_now)
     protected = tuple(
         Path(value)
@@ -1316,7 +1358,7 @@ def _validate_deferred_targets(
             elif stat.st_nlink != 1:
                 ambiguous_link_device = int(stat.st_dev)
         if needs_path_fallback and resolve_if_needed:
-            raw_norms.update(os.path.normcase(os.path.realpath(path)) for path in resolve_if_needed)
+            raw_norms.update(_resolved_raw_keys(resolve_if_needed))
             resolve_if_needed.clear()
         if (
             _lexical_key(target) in raw_lexical

@@ -16,6 +16,15 @@ from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F4
 from xdart.gui.tabs.scattering import output_preflight
 
 
+@pytest.fixture(autouse=True, params=(False, True), ids=("platform-paths", "windows-paths"))
+def _guard_branch(request, monkeypatch):
+    """Run each row with the guard's Windows branch too (raw files resolved folder by folder, NEXT-1215), and with
+    this platform's."""
+    if request.param:
+        monkeypatch.setattr(output_preflight, "_CHECK_RESOLVED_RAW_PATHS", True)
+    return request.param
+
+
 class _StatAnswer:
     """Override fields that a filesystem provider can report differently."""
 
