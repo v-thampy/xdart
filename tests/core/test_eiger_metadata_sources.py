@@ -46,3 +46,24 @@ def test_the_refinement_is_one_way(tmp_path):
                                                                     SourceKind.NEXUS_STACK)
         claimed = run_metadata_table(MetadataTablePlan(str(stack), kind="eiger_master"))
         assert (claimed.disposition, claimed.code) == (AnalysisDisposition.REFUSED, "SOURCE_IDENTITY_MISMATCH")
+
+
+def test_a_receipt_answers_only_its_own_request(tmp_path):
+    """The window's result check (``metadata_receipt_answers``): only ``_select``'s two container resolutions may
+    differ, the entry it chose when none was asked for and the Eiger refinement; a Folder's candidates rely on both."""
+    from xrd_tools.analysis.scan_operations import metadata_receipt_answers
+    master = _vendor_eiger_master(tmp_path / "scan_master.h5", [tmp_path / "scan_data_000001.h5"])
+    other = _vendor_eiger_master(tmp_path / "other_master.h5", [tmp_path / "other_data_000001.h5"])
+    receipt = run_metadata_table(MetadataTablePlan(SourceSpec(master, SourceKind.NEXUS_STACK))).receipt
+    for asked in (SourceSpec(master, SourceKind.NEXUS_STACK), SourceSpec(master, SourceKind.EIGER_MASTER),
+                  SourceSpec(master, SourceKind.EIGER_MASTER, entry="entry"), receipt.source_spec):
+        assert metadata_receipt_answers(receipt, asked), asked
+    for asked in (SourceSpec(other, SourceKind.NEXUS_STACK), SourceSpec(master, SourceKind.NEXUS_STACK, entry="other"),
+                  SourceSpec(master, SourceKind.PROCESSED_NEXUS), SourceSpec(master, SourceKind.SPEC),
+                  SourceSpec(master, SourceKind.NEXUS_STACK, options={"scan": "1"}),
+                  SourceSpec(master, SourceKind.NEXUS_STACK, metadata_uri=tmp_path / "meta"), str(master)):
+        assert not metadata_receipt_answers(receipt, asked), asked
+    plain = _chunked_stack(tmp_path / "plain.nxs")
+    plain_receipt = run_metadata_table(MetadataTablePlan(SourceSpec(plain, SourceKind.NEXUS_STACK))).receipt
+    assert metadata_receipt_answers(plain_receipt, SourceSpec(plain, SourceKind.NEXUS_STACK))
+    assert not metadata_receipt_answers(plain_receipt, SourceSpec(plain, SourceKind.EIGER_MASTER))

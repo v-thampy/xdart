@@ -47,7 +47,9 @@ def test_roi_reduce_reducers_and_mask():
 def test_invalid_pixel_mask_policy():
     img = np.array([[1.0, UINT32_CEILING], [np.nan, 5.0]])
     m = invalid_pixel_mask(img)
-    assert not m[0, 1] and m[1, 0]  # OFF preserves finite sentinel values
+    # the uint32 invalid value (Eiger module gaps) and NaN are always left out (maintainer, 2026-11-20: "Always
+    # exclude gap value (Recommended)"; NEXT-1217-EIGER-SOURCES)
+    assert m[0, 1] and m[1, 0]
     assert invalid_pixel_mask(img, mask_saturation=True)[0, 1]
     assert not m[0, 0] and not m[1, 1]
     # Native ceiling saturation is controlled only by the toggle.
