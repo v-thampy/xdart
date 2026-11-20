@@ -973,7 +973,10 @@ def _already_processed(
         science_fingerprint=_append_science_fingerprint(configuration) if fingerprint is None else fingerprint(),
         modes=_mode_tokens(frozen),
         members=tuple((candidate.path, candidate.size, candidate.mtime_ns) for candidate in group),
-        remember=not live,
+        # Live uses the remembered records too (maintainer, 2026-11-19: "these fixes should apply as generally as
+        # possible"): each is bound to the output's verified revision, a Live poll reads an output only when its scan
+        # or its output changed, and never the output its own epoch writes (live_group_coverage).
+        remember=True,
     )
 
 

@@ -8,6 +8,7 @@ h5py's file-open seam on the admission thread."""
 from dataclasses import replace
 import os
 import shutil
+import sys
 import threading
 
 import pytest
@@ -66,3 +67,53 @@ def test_a_second_append_reads_only_the_saved_outputs_that_changed(qapp, tmp_pat
         stream.write(byte)
     os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     assert append() == [os.path.normcase(touched.name)]  # same inode, size and mtime, later change time
+
+
+def test_a_second_live_append_reads_only_the_saved_outputs_that_changed(qapp, tmp_path, monkeypatch):  # noqa: F811
+    """Live Append uses the same remembered records (maintainer, 2026-11-19: "these fixes should apply as generally as
+    possible"; his pick "Hold 1.2.16 for Live"). Each Live poll already reads a saved output only when its scan or its
+    output changed; a second Live Run in the session read every one again."""
+    from tests.xdart.scattering.test_browse_reference_rings_run import _pump, _TERMINAL
+    stems, intent = _scans(tmp_path, 30, 2)
+    with _page(qapp, intent) as (page, _view, observed):
+        page._shell.run_controls.startButton.click()
+        assert _terminal(qapp, page, observed).completed == 60
+    assert _written(tmp_path, stems)
+    processed = os.path.normcase(os.fspath(tmp_path / "processed")) + os.sep
+    opened: list[str] = []
+    real_open = h5_files.make_fid
+
+    def reading_a_record() -> bool:  # Live also opens its newest scan's output for its own epoch; count records only
+        frame = sys._getframe(2)
+        while frame is not None:
+            if frame.f_code.co_name == "_committed_record":
+                return True
+            frame = frame.f_back
+        return False
+
+    def counted(name, *args, **kwargs):
+        if isinstance(name, (str, bytes)) and reading_a_record():
+            spelling = os.path.normcase(os.fsdecode(name))
+            if spelling.startswith(processed):
+                opened.append(os.path.basename(spelling))
+        return real_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(h5_files, "make_fid", counted)
+
+    def live():
+        opened.clear()
+        with _page(qapp, replace(intent, output_mode="Append", live_mode=True)) as (page, _view, observed):
+            page._shell.run_controls.startButton.click()
+            assert _pump(qapp, lambda: any((getattr(e, "files_processed", 0) or 0) >= 60 for e in observed),
+                         seconds=120), "the saved scans were never all counted"
+            counted_opens = sorted(opened)
+            page._shell.run_controls.stopButton.click()
+            assert _pump(qapp, lambda: any(e.kind in _TERMINAL for e in observed), seconds=120)
+        return counted_opens
+
+    assert len(set(live())) == 30                  # the first Live Run reads every saved record
+    assert live() == []                            # the next one remembers them all
+    touched = tmp_path / "processed" / f"{stems[5]}_int1d.nexus"
+    stat = touched.stat()
+    os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    assert set(live()) == {os.path.normcase(touched.name)}  # a changed output is read again
