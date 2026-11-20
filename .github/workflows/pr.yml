@@ -100,6 +100,16 @@ jobs:
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-browse-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-browse-settings.ini
+      # Queued RSM Runs look outputs up by the form's normcased path (NEXT-1217-EIGER-SOURCES): on Windows the Save
+      # Path's own spelling never matched, so every queued Run asked to run again. Also the Eiger shape and skip rows.
+      - name: Queue RSM Runs over SPEC + Eiger on Windows paths
+        run: >-
+          pixi run --locked python scripts/ci_pytest.py
+          tests/xdart/pages/test_rsm_eiger_source.py
+          -q -ra --timeout=120
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-rsm-eiger-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-rsm-eiger-settings.ini
       # Average, Stitch and RSM publication on the runner's local NTFS; SMB needs an actual share.
       - name: Publish and reopen finite results without directory descriptors
         run: >-
