@@ -27,9 +27,49 @@ Pure: depends only on :mod:`os` and :mod:`pathlib` — no h5py, no Qt, no numpy.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from pathlib import Path
+import threading
 from typing import Iterable
+
+# One check of many outputs (a Folder admission: every saved output of the Run) resolves and stats each path at most
+# once while ``resolution_memo()`` is open; the same inputs, roots and folders otherwise repeat for every output, a
+# round trip each on a network share (NEXT-1215-SHARE-LOOKUPS). Outside it every call asks the file system, as before.
+_MEMO = threading.local()
+
+
+@contextmanager
+def resolution_memo():
+    """Within this block (on this thread), each path's resolution and stat are asked of the file system once."""
+    outer = getattr(_MEMO, "value", None)
+    if outer is None:
+        _MEMO.value = {}
+    try:
+        yield
+    finally:
+        if outer is None:
+            _MEMO.value = None
+
+
+def stat_once(path: "os.PathLike[str] | str") -> os.stat_result:
+    """``os.stat(path)`` (following links), remembered inside :func:`resolution_memo`; raises as ``os.stat`` does."""
+    memo = getattr(_MEMO, "value", None)
+    key = ("stat", os.fspath(path))
+    if memo is not None and key in memo:
+        found = memo[key]
+        if isinstance(found, OSError):
+            raise found
+        return found
+    try:
+        result = os.stat(os.fspath(path))
+    except OSError as error:
+        if memo is not None:
+            memo[key] = error
+        raise
+    if memo is not None:
+        memo[key] = result
+    return result
 
 
 class OutputCollisionError(ValueError):
@@ -52,7 +92,22 @@ def _norm(path: "os.PathLike[str] | str") -> str:
     ``/`` vs ``\\`` on Windows (identity on POSIX), so a not-yet-created output
     and a Windows spelling variant of the same file compare equal.
     """
-    return os.path.normcase(os.path.realpath(os.fspath(path)))
+    memo = getattr(_MEMO, "value", None)
+    key = ("norm", os.fspath(path))
+    if memo is not None and key in memo:
+        return memo[key]
+    value = os.path.normcase(os.path.realpath(os.fspath(path)))
+    if memo is not None:
+        memo[key] = value
+    return value
+
+
+def _exists(path: str) -> bool:
+    try:
+        stat_once(path)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def paths_same_file(a: "os.PathLike[str] | str",
@@ -66,8 +121,8 @@ def paths_same_file(a: "os.PathLike[str] | str",
     a_s = os.fspath(a)
     b_s = os.fspath(b)
     try:
-        if os.path.exists(a_s) and os.path.exists(b_s):
-            return os.path.samefile(a_s, b_s)
+        if _exists(a_s) and _exists(b_s):
+            return os.path.samestat(stat_once(a_s), stat_once(b_s))
     except OSError:
         # A transient stat failure must never mask a collision; fall through to
         # the lexical comparison rather than reporting "different".

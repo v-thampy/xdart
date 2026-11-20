@@ -70,12 +70,20 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     assert 0 < total <= 2 * images, f"admission made {calls} raw calls for {images} images"
 
 
-def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
+def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, monkeypatch, recursive):  # noqa: F811
     """On Windows the raw-file guard still compares canonical paths (Codex review 9f0471bc), and used to resolve every
     raw image: 7.0 s for 930 on the maintainer's share (his pick "Cheaper raw-file guard"). It now resolves each folder
     once and builds a plain file's canonical path from its folder's and its listed name."""
     from xdart.gui.tabs.scattering import output_preflight
     stems, intent = _scans(tmp_path, 30, 4)
+    intent = replace(intent, source_spec=replace(intent.source_spec, recursive=recursive))
+    if recursive:  # his Folder is recursive: half the scans in a subfolder
+        raw = tmp_path / "raw"
+        (raw / "subfolder").mkdir()
+        for path in tuple(raw.iterdir()):
+            if path.is_file() and path.stem.rsplit("_", 1)[0] in set(stems[::2]):
+                path.rename(raw / "subfolder" / path.name)
     with _page(qapp, intent) as (page, _view, observed):
         page._shell.run_controls.startButton.click()
         assert _terminal(qapp, page, observed).completed == 120
@@ -97,5 +105,6 @@ def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, m
             page._shell.run_controls.startButton.click()
             terminal = _terminal(qapp, page, observed)
     assert terminal.files_processed == 120 and terminal.frames_new == 0
-    # 1.2.15's Windows branch resolved each of the 120 images; now only the folder (and the source root's checks).
-    assert len(resolved) <= 4, resolved
+    # 1.2.15's Windows branch resolved each of the 120 images; now a few per Run: each folder once, and the source
+    # root for the folder policy (5 here for the recursive Folder's two folders).
+    assert len(resolved) <= 8, resolved

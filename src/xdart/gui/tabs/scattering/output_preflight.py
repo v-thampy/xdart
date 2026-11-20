@@ -30,6 +30,7 @@ from xrd_tools.io.output_path import (
     is_artifact_family,
     resolve_output_target,
 )
+from xrd_tools.io import output_safety
 from xrd_tools.io.output_safety import (
     OutputCollisionError,
     check_output_not_source,
@@ -1339,15 +1340,25 @@ def _validate_deferred_targets(
         if value
     )
     seen: set[str] = set()
+    with output_safety.resolution_memo():  # each protected input, root and target asked once (NEXT-1215)
+        _check_deferred_targets(configuration, source, targets, protected, seen, raw_lexical, raw_norms, raw_inodes,
+                                possible_link_devices, resolve_if_needed)
+
+
+def _check_deferred_targets(configuration, source, targets, protected, seen, raw_lexical, raw_norms, raw_inodes,
+                            possible_link_devices, resolve_if_needed) -> None:
+    """Refuse an output that is a raw file or a protected input, or that the directory policy forbids."""
+    skipped_dirs = _run_scan_skip(configuration.source, configuration)  # one Save Path, the same for every target
+    containers = source.series is None and holds_containers(source.suffixes)
     for target in targets:
-        normalized = os.path.normcase(os.path.realpath(target))
+        normalized = output_safety._norm(target)
         if normalized in seen:
             raise ValueError(f"duplicate output target {target}")
         seen.add(normalized)
         target_inode = None
         ambiguous_link_device = None
         try:
-            stat = target.stat()
+            stat = output_safety.stat_once(target)
         except OSError:
             # A missing referent can still have raw and output aliases. A
             # successful raw stat may have preceded a transient disappearance.
@@ -1380,8 +1391,8 @@ def _validate_deferred_targets(
             # A series' bound already keeps outputs out; a Folder whose File Type holds no containers never lists an
             # output (maintainer, 2026-10-25, "Skip the Save Path": its scans leave the Save Path out, and a Save
             # Path that is the Folder itself stays refused for HDF5 folders only).
-            container_directory_mode=source.series is None and holds_containers(source.suffixes),
-            skipped_dirs=_run_scan_skip(configuration.source, configuration),
+            container_directory_mode=containers,
+            skipped_dirs=skipped_dirs,
         )
 
 
