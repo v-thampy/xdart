@@ -239,7 +239,7 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
         DisplayedPeakFitResult, DisplayedPhaseFitResult,
     )
     from xrd_tools.analysis.scan_operations import (
-        MetadataTableResult, RoiPreviewResult, RoiScanResult, ScanPlotResult,
+        MetadataTableResult, RoiPreviewResult, RoiScanResult, ScanPlotResult, metadata_receipt_answers,
     )
     if type(facts) is not tuple or len(facts) != 3: return False
     kind, _row, echo = facts
@@ -249,7 +249,7 @@ def analysis_result_matches(payload: object, facts: object) -> bool:
         receipt = payload.receipt
         source_spec = getattr(source, "kind", None) is not None
         identity_matches = (
-            receipt.source_spec == source if source_spec
+            metadata_receipt_answers(receipt, source) if source_spec
             else str(receipt.lexical_root) == str(source)
         )
         if not (payload.table_fingerprint

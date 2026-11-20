@@ -53,7 +53,7 @@ __all__ = [
     "run_metadata_table_requalification", "run_scan_plot", "run_roi_preview", "run_roi_scan",
     "numeric_scan_columns", "scan_plot_defaults", "scan_frame_rows",
     "scan_table_columns", "write_scan_table_csv", "metadata_plot_columns",
-    "analysis_canonical_fingerprint", "requalified_analysis_source",
+    "analysis_canonical_fingerprint", "requalified_analysis_source", "metadata_receipt_answers",
 ]
 # SSRL SPEC scans commonly expose roughly 60 point columns plus the complete
 # 159-motor #O/#P snapshot.  Keep that physical catalog admissible while the
@@ -551,8 +551,12 @@ def _select(plan: MetadataTablePlan) -> tuple[
                 if descriptor is None:
                     raise _Refusal("SOURCE_IDENTITY_MISMATCH")
                 actual = coerce_source_kind(descriptor.kind)
+                # A raw-stack request on a DECTRIS Eiger master reads the master its content says it is: the kind a
+                # name suggests, the Folder's raw-stack pick, an Int profile's nexus_stack (NEXT-1217-EIGER-SOURCES).
+                # One way only: an Eiger claim on a plain stack stays refused.
+                eiger_refinement = kind is SourceKind.NEXUS_STACK and actual is SourceKind.EIGER_MASTER
                 if (
-                    (not series_container and actual is not kind)
+                    (not series_container and not eiger_refinement and actual is not kind)
                     or descriptor.resolved_entry != entry
                 ):
                     raise _Refusal("SOURCE_IDENTITY_MISMATCH")
@@ -574,6 +578,32 @@ def _select(plan: MetadataTablePlan) -> tuple[
     except BaseException:
         _close(selected_source); _close(opened)
         raise
+def metadata_receipt_answers(receipt: AnalysisSourceReceipt, requested: SourceSpec) -> bool:
+    """Whether a metadata table's ``receipt`` answers the exact ``requested`` source.
+
+    Only what ``_select`` resolves for a NeXus container may differ: the entry it chose when the request left it
+    blank (a Folder's discovered candidates do), and a raw-stack request read as the Eiger master its content says
+    it is (NEXT-1217-EIGER-SOURCES). Everything else must be equal.
+    """
+    if type(receipt) is not AnalysisSourceReceipt or type(requested) is not SourceSpec:
+        return False
+    resolved = receipt.source_spec
+    if resolved == requested:
+        return True
+    asked = _freeze_spec(requested)
+    try:
+        asked_kind, resolved_kind = coerce_source_kind(asked.kind), coerce_source_kind(resolved.kind)
+    except (TypeError, ValueError):
+        return False
+    if asked_kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER, SourceKind.PROCESSED_NEXUS}:
+        return False
+    kind_answers = resolved_kind is asked_kind or (
+        asked_kind is SourceKind.NEXUS_STACK and resolved_kind is SourceKind.EIGER_MASTER)
+    return bool(
+        kind_answers and (asked.entry is None or asked.entry == resolved.entry)
+        and (resolved.uri, resolved.metadata_uri, dict(resolved.options))
+        == (asked.uri, asked.metadata_uri, dict(asked.options))
+    )
 def _metadata_scalar(value: Any) -> Any:
     if isinstance(value, np.generic):
         if value.dtype.kind not in "biuf":
