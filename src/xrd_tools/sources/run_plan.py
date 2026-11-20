@@ -416,29 +416,35 @@ def directory_candidate_groups(
 ) -> tuple[tuple[Candidate, ...], ...]:
     from xrd_tools.sources.adapters import get_adapter
     from xrd_tools.core.scan import SourceKind
+    # An image scan is every candidate with its adapter, folder and scan name, in the plan's order. Each candidate's key
+    # is found once: rescanning the whole plan for every scan was quadratic, and admission groups the plan twice (a
+    # Folder of 327 saved scans and 930 images spent about 6 s here on the beamline PC; NEXT-1215-SHARE-LOOKUPS).
+    lost = object()
+    adapters: dict = {}  # adapter id -> adapter (or None when lost)
+    keys: list[object] = []
+    members_of: dict[tuple, list[Candidate]] = {}
+    for candidate in plan.candidates:
+        if candidate.adapter_id not in adapters:
+            adapters[candidate.adapter_id] = get_adapter(candidate.adapter_id)
+        adapter = adapters[candidate.adapter_id]
+        if adapter is None:
+            key = lost  # refused below only if the candidate is reached, as before
+        elif SourceKind.IMAGE_FILE in adapter.kinds:
+            key = (candidate.adapter_id, candidate.path.parent, adapter.scan_name(candidate.path))
+            members_of.setdefault(key, []).append(candidate)
+        else:
+            key = None
+        keys.append(key)
     groups: list[tuple[Candidate, ...]] = []
     consumed: set[Path] = set()
-    for candidate in plan.candidates:
+    for candidate, key in zip(plan.candidates, keys):
         if candidate.path in consumed:
             continue
-        adapter = get_adapter(candidate.adapter_id)
-        if adapter is None:
+        if key is lost:
             raise ValueError(
                 f"directory candidate lost adapter {candidate.adapter_id!r}"
             )
-        if SourceKind.IMAGE_FILE in adapter.kinds:
-            name = adapter.scan_name(candidate.path)
-            members = tuple(
-                value
-                for value in plan.candidates
-                if (
-                    value.adapter_id == candidate.adapter_id
-                    and value.path.parent == candidate.path.parent
-                    and adapter.scan_name(value.path) == name
-                )
-            )
-        else:
-            members = (candidate,)
+        members = (candidate,) if key is None else tuple(members_of[key])
         consumed.update(value.path for value in members)
         groups.append(members)
     return tuple(groups)
