@@ -1220,10 +1220,11 @@ def _deferred_directory_plan(
         ))
     total_s = monotonic() - started
     # Where admission's time goes on a share (NEXT-1215-SHARE-LOOKUPS): the saved outputs' records, the raw-file
-    # guard, and the rest (capturing and freezing the scans still to process).
+    # guard, and the rest: grouping the scans and capturing and freezing the ones still to process (1.2.15 called it
+    # "scans to process", which misled when there were none: the maintainer's 6.2 s was the grouping).
     _LOG.debug(
         "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms: saved records %.0f ms, "
-        "raw-file guard %.0f ms, scans to process %.0f ms)",
+        "raw-file guard %.0f ms, the rest (grouping and scans to process) %.0f ms)",
         len(entries), sum(entry.completed is not None for entry in entries),
         sum(entry.committed_prefix is not None for entry in entries), len(plan.candidates),
         1000 * total_s, 1000 * records_s, 1000 * guard_s, 1000 * max(0.0, total_s - records_s - guard_s),

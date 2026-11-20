@@ -63,7 +63,7 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     assert any(line.startswith("[DIRECTORY-LIST] 120 files listed (") for line in lines), lines
     admit = [line for line in lines if line.startswith("[APPEND-ADMIT] ")]
     assert len(admit) == 1 and "already-processed=30" in admit[0], admit
-    assert all(part in admit[0] for part in ("saved records", "raw-file guard", "scans to process")), admit
+    assert all(part in admit[0] for part in ("saved records", "raw-file guard", "the rest (grouping and scans to process)")), admit
     total = sum(calls.values())
     # Ordinary POSIX inputs need one stat. Windows retains one canonical-path
     # check, which does not call Python's os.lstat on this fixture.
