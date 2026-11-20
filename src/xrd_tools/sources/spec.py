@@ -39,25 +39,31 @@ def find_spec_image_files(directory: str | Path, spec_stem: str, scan: Any,
 
     Explicit stems retain ``find_image_files`` substring/glob semantics. Eiger
     data shards are omitted when their same-prefix master is in the directory.
+    Within a search, this is the same file list for admission and its consumers.
     Discovery uses filenames only; the existing image reader owns content.
     """
     import re
-    from xrd_tools.io.image import find_image_files
+    from xrd_tools.io.image import find_image_files, shared_listing
 
-    files = find_image_files(directory, stem=image_stem or None)
-    if not image_stem and files:
-        # C-16: the listing indexed by scan number once per search (a scan's own pattern over every name of a
-        # 20,700-image folder, twice per scan, was most of a search's time); outside a search, as before.
-        from xrd_tools.io.image import shared_listing
-        listing = files
-        index = shared_listing(("spec-scan-index", os.fspath(Path(directory)), spec_stem),
-                               lambda: _index_by_scan(listing, spec_stem))
-        files = list(index.get(int(str(scan).split(".")[0]), ()))
-    files = [path for path in files if path.is_file()]
-    return [path for path in files if not (
-        (match := re.fullmatch(r"(.+)_data_\d+", path.stem))
-        and path.suffix.lower() == ".h5"
-        and path.with_name(match[1] + "_master.h5").is_file())]
+    folder = Path(directory)
+    folder_key = os.fspath(folder)
+    scan_number = None if image_stem else str(scan).split(".")[0]
+
+    def admitted_files():
+        files = find_image_files(folder, stem=image_stem or None)
+        if scan_number is not None and files:
+            # C-16: index the folder once instead of scanning every filename for every scan.
+            listing = files
+            index = shared_listing(("spec-scan-index", folder_key, spec_stem),
+                                   lambda: _index_by_scan(listing, spec_stem))
+            files = index.get(int(scan_number), ())
+        return tuple(path for path in files if path.is_file() and not (
+            (match := re.fullmatch(r"(.+)_data_\d+", path.stem))
+            and path.suffix.lower() == ".h5"
+            and path.with_name(match[1] + "_master.h5").is_file()))
+
+    key = ("spec-image-files", folder_key, image_stem or "", None if image_stem else spec_stem, scan_number)
+    return list(shared_listing(key, admitted_files))
 
 
 def _index_by_scan(files, spec_stem: str) -> dict[int, tuple[Path, ...]]:

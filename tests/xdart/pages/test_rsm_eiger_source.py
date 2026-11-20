@@ -3,6 +3,7 @@ RSM_MEMBER_IDENTITY_MISMATCH), his picks "Read shape from file (Recommended)" an
 and "the Advanced Rows/columns should update as well when the image source changes". A SPEC + Eiger member takes the
 Eiger's own frame shape and the Advanced Rows/Columns follow it; a real mismatch with the calibration still refuses;
 the Source card names a scan without images. Real page, real resolver and Preview, synthetic DECTRIS masters."""
+from pathlib import Path
 import time
 
 import numpy as np
@@ -12,7 +13,7 @@ from pyqtgraph.Qt import QtWidgets
 from tests.core.test_container_descriptor import _vendor_eiger_master
 from xdart.gui.tabs.scattering.controls_inventory import THRESHOLD_ENABLED
 from tests.xdart.pages.test_rsm_page import (
-    _canonical_partner, _close, _page, _spec_file, _spec_scan,
+    _canonical_partner, _close, _page, _spec_file, _spec_scan, _wait,
 )
 from tests.xdart.scattering.test_lt_data_format import _choose
 
@@ -90,9 +91,12 @@ def test_an_eiger_that_differs_from_the_calibration_still_refuses(qapp, tmp_path
         _close(page, qapp)
 
 
-@pytest.mark.parametrize("scans", ["3", "all"])
-def test_the_source_card_names_a_scan_without_images(qapp, tmp_path, scans):
+@pytest.mark.parametrize("scans, missing_ub", [("3", False), ("all", False), ("all", True)])
+def test_the_source_card_names_a_scan_without_images(qapp, tmp_path, scans, missing_ub):
     _eiger_source(tmp_path, (195, 487))
+    if missing_ub:
+        spec = tmp_path / "source" / "RSM_synth"
+        spec.write_text(spec.read_text(encoding="utf-8").replace("#G3 1 0 0 0 1 0 0 0 1\n", ""), encoding="utf-8")
     page = _page(qapp)
     try:
         _on_source(page, qapp, tmp_path, scans)
@@ -102,6 +106,8 @@ def test_the_source_card_names_a_scan_without_images(qapp, tmp_path, scans):
         header = page._headers["source"]
         assert not header.ready and "no images" in header.text and "scan 3" in header.text, header
         assert "RSM_synth_scan3_" in header.detail
+        if missing_ub:
+            assert "Scans 1 and 2 record no UB matrix" in header.detail
         assert page.controls.source_card.status.text() == header.text
     finally:
         _close(page, qapp)
@@ -144,5 +150,39 @@ def test_a_queued_run_finds_its_outputs_however_the_save_path_is_spelled(qapp, t
         text = page.run_bar.readinessLabel.full_text()
         assert "Run again" not in text, text
         assert len(list((tmp_path / "Out").glob("*_rsm.nexus"))) == 2, text
+    finally:
+        _close(page, qapp)
+
+
+def test_a_queued_run_checks_the_actual_normalized_output_before_gridding(qapp, tmp_path):
+    _eiger_source(tmp_path, (195, 487))
+    page = _page(qapp)
+    try:
+        _on_source(page, qapp, tmp_path, "1,2")
+        page.set_field("output_path", str(tmp_path / "absent" / ".." / "Out"))
+        page.resolve_source()
+        first, second = (Path(form.output_path) for form in page.build_forms())
+        second.parent.mkdir()
+        second.write_bytes(b"operator data")
+        page.begin_run()
+        _wait(page, qapp, lambda: not page.active(), seconds=120)
+        assert not first.exists(), page.run_bar.readinessLabel.full_text()
+        assert "nothing was gridded" in page.run_bar.readinessLabel.full_text()
+        assert second.read_bytes() == b"operator data"
+    finally:
+        _close(page, qapp)
+
+
+def test_run_resolves_new_container_shape_before_applying_chunk_cap(qapp, tmp_path):
+    _eiger_source(tmp_path, (195, 487))
+    page = _page(qapp)
+    try:
+        _on_source(page, qapp, tmp_path, "2", rows=(2048, 2048))
+        page.set_field("adv_max_chunk_mib", "32")
+        assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
+        page.run_bar.startButton.click()
+        _wait(page, qapp, lambda: not page.active(), seconds=120)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+        assert len(page.browser.listed_results()) == 1, page.run_bar.readinessLabel.full_text()
     finally:
         _close(page, qapp)

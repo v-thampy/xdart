@@ -413,16 +413,13 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
                     skipped.append((str(spec.uri), str(spec.entry or ""), reason))
                     continue
                 raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
+            from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
             path, key = Path(spec.uri), spec.options["scan"]
-            stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
-            if spec.options.get("image_stem"):  # the search's memoized listing; no per-file stat for RAW/TIFF
-                from xrd_tools.io.image import find_image_files
-                files = find_image_files(spec.options["image_dir"], stem=spec.options["image_stem"])
-            else:
-                from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
-                files = find_spec_image_files(spec.options["image_dir"], path.stem, key)
-                if files:
-                    stem = spec_image_stem(files[0], path.stem, key)
+            stem = spec.options.get("image_stem")
+            files = find_spec_image_files(spec.options["image_dir"], path.stem, key, stem)
+            if not stem:
+                stem = (spec_image_stem(files[0], path.stem, key) if files
+                        else f"{path.stem}_scan{key.split('.')[0]}_")
             shape = _container_frame_shape(files, spec.options.get("nexus_entry") or None, detector_shape,
                                            read_image_kwargs)
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
@@ -435,22 +432,21 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
 
 
 def _container_frame_shape(files, entry, detector_shape, read_image_kwargs) -> tuple[int, int]:
-    """A member's detector shape: its first container's own frame shape (an Eiger master, a NeXus stack; an Eiger
-    data shard is skipped), from the layout the search's admission read; the decoder's Rows/Columns for images
-    without one (RAW, TIFF), at no extra file-system call. An unreadable layout keeps Rows/Columns: the search
-    admitted the scan, and the preflight names a mismatch (maintainer, 2026-11-20: "Read shape from file
-    (Recommended)"; NEXT-1217-EIGER-SOURCES)."""
-    import re
+    """Read the first admitted container's shape, keeping Rows/Columns for RAW decoding.
+
+    A SPEC scan can include headerless RAW alongside a container. Changing its decoder's shape could silently
+    reinterpret the RAW pixels. RAW-only and TIFF-only scans also keep Rows/Columns.
+    """
     from xrd_tools.io.image import _HDF5_READ_EXTS
     from xrd_tools.sources.spec import _spec_image_layout
     given = tuple(int(value) for value in detector_shape)
-    containers = [Path(item) for item in files if Path(item).suffix.lower() in _HDF5_READ_EXTS]
-    masters = [item for item in containers if not re.fullmatch(r".+_data_\d+", item.stem)]
-    if not containers:
+    if any(path.suffix.lower() == ".raw" for path in files):
         return given
-    path = (masters or containers)[0]
+    path = next((path for path in files if path.suffix.lower() in _HDF5_READ_EXTS), None)
+    if path is None:
+        return given
     try:
-        layout, _selector = _spec_image_layout(Path(path), read_image_kwargs, entry)
+        layout, _selector = _spec_image_layout(path, read_image_kwargs, entry)
     except (OSError, KeyError, TypeError, ValueError):
         return given
     shape = tuple(int(value) for value in layout.shape)

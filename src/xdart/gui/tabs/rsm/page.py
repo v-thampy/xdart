@@ -257,9 +257,7 @@ def queue_output_slots(project, folder, groups, *, cancel=None):
 
 
 def _output_key(path):
-    """An output as the form keeps it (``RSMToolFormV2``: absolute and ``normcase``d, so lower case with backslashes
-    on Windows): the queue check looks outputs up by it. A Save Path's own spelling never matched on Windows, so
-    every queued Run there asked to run again (maintainer at the beamline, 2026-11-20; NEXT-1217-EIGER-SOURCES)."""
+    """The form's absolute, normcased output path, used for both queue lookup and inspection."""
     from xrd_tools.analysis.rsm_values import _absolute_path
     return _absolute_path(path, "output path")
 
@@ -280,7 +278,8 @@ def _queue_refusals(queue, groups, cancel):
     for _family, output in queue_output_slots(project, folder, groups, cancel=cancel):
         if cancel.is_set():
             raise OperationCancelled("the scan search was stopped")
-        checked[_output_key(output)] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
+        output = _output_key(output)
+        checked[output] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
     if cancel.is_set():
         raise OperationCancelled("the scan search was stopped")
     return checked
@@ -1407,15 +1406,24 @@ class RSMPage(QtWidgets.QWidget):
         return None if not text else int(text) * _MIB
 
     def _chunk_cap_refusal(self):
-        """The Max chunk MiB a user set below one frame's need, named as the run would refuse it ("" when
-        Auto or enough). Arithmetic only (``rsm_v2_chunk_bytes``): no file is read; the raw decoder's shape
-        stands for every frame, uncropped, so the need named is an upper bound."""
+        """Show the full-frame estimate for a known, common member shape.
+
+        The saved decoder shape may belong to a previous detector. Let the search read the current
+        shape before gating Run. Preflight checks the actual frame and crop for each RSM.
+        """
         from xrd_tools.analysis.rsm_operation import rsm_v2_chunk_bytes
         if any(self._rows[key].refusal() for key in ("adv_max_chunk_mib", "adv_rows", "adv_columns")):
             return ""  # the row's own refusal names it
         cap = self._max_chunk_bytes()
         if cap is None:
             return ""
+        found = self._groups
+        if found is None or found[0] != self._group_key():
+            return ""
+        shapes = {member.detector_shape for group in found[1] for member in group}
+        if len(shapes) != 1:
+            return ""
+        shape = next(iter(shapes))
         static_hot = bool(str(self._value("static_hot")).strip())
         try:
             solid_angle, factor, _cutoff = self._correction_values()
@@ -1423,7 +1431,6 @@ class RSMPage(QtWidgets.QWidget):
             return ""  # readiness names it
         corrections = RSMFrameCorrections(threshold=self._threshold_policy(), solid_angle=solid_angle,
                                           polarization_factor=factor)  # the run's charge: Int's threshold too
-        shape = (int(self._value("adv_rows")), int(self._value("adv_columns")))
         need = rsm_v2_chunk_bytes(shape, shape, 1, static_hot=static_hot, corrections=corrections,
                                   dark=bool(str(self._value("dark_path")).strip()),
                                   flat=bool(str(self._value("flat_path")).strip()))
@@ -1623,11 +1630,12 @@ class RSMPage(QtWidgets.QWidget):
             label = "no images" if imageless else "skipped"
             texts["source"] = " · ".join(part for part in (
                 texts["source"], f"⚠ {label}: scan{'s' * (len(shown) != 1)} {', '.join(shown)}") if part)
-            details["source"] = ("Skipped by the search (the other scans still run):\n" + "\n".join(
+            details["source"] = ("Skipped by the search:\n" + "\n".join(
                 f"{Path(path).name} · scan {scan}: {why}" for path, scan, why in skipped) + "\n\n" + details["source"])
         if warned:  # the Source header warns in the brief's words, naming the scans, whatever else it needs
             warning = no_ub_warning(missing)
-            details["source"] = warning if not sections["source"] else f"{warning} {details['source']}"
+            details["source"] = f"{warning}\n\n{details['source']}" if skipped else (
+                f"{warning} {details['source']}" if sections["source"] else warning)
             texts["source"] = " · ".join(part for part in (texts["source"], "⚠ no UB matrix") if part)
         self._headers = {key: SectionHeaderProjection(
             texts[key], not sections[key] and not ((warned or skipped) and key == "source"), details[key])

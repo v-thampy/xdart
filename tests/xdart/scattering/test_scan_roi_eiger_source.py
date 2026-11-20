@@ -8,6 +8,7 @@ import pytest
 from pyqtgraph.Qt import QtWidgets
 
 from xrd_tools.core.invalid import UINT32_CEILING
+from xrd_tools.core.scan import SourceKind, SourceSpec
 from xdart.gui.analysis.scan_source_widget import _DIR_KINDS
 from tests.core.test_container_descriptor import _chunked_stack, _vendor_eiger_master
 from tests.xdart.scattering.test_p37_analysis_mount import _close_page, _page
@@ -114,7 +115,8 @@ def test_a_refused_source_reads_as_words_in_the_roi_window(tmp_path, qapp):
         _close_page(page, qapp)
 
 
-def test_the_roi_picker_scales_the_image_to_real_pixels_not_eiger_gaps(tmp_path, qapp):
+@pytest.mark.parametrize("with_spec", [False, True], ids=["direct-master", "spec"])
+def test_the_roi_picker_scales_the_image_to_real_pixels_not_eiger_gaps(tmp_path, qapp, with_spec):
     """The picker's image levels come from real pixels: an Eiger's gap value (4294967295) shows as missing, so the
     frame is not drawn black under it (display only; the statistics read the raw frame)."""
     import pyqtgraph as pg
@@ -127,10 +129,24 @@ def test_the_roi_picker_scales_the_image_to_real_pixels_not_eiger_gaps(tmp_path,
     try:
         page._open_analysis_mount("scan_roi")
         dialog = page._scan_roi_dialog
-        dialog.load_uri(str(master)); _settle(page, qapp)
+        if with_spec:
+            from tests.core.test_rsm_sources import _pair
+            from xrd_tools.analysis.scan_operations import _candidate
+            spec = _pair(tmp_path, with_images=(), scans=(1,))
+            candidate = _candidate(SourceSpec(
+                spec, SourceKind.SPEC,
+                options={"scan": "1.1", "image_dir": str(tmp_path), "image_stem": master.stem},
+            ))
+            dialog.source_widget.set_external_candidates((candidate,))
+            dialog.source_widget.scan_combo.setCurrentIndex(1)
+        else:
+            dialog.load_uri(str(master))
+        _settle(page, qapp)
+        assert dialog.roi_btn.isEnabled(), dialog.status.text()
         dialog.roi_btn.click(); _settle(page, qapp)
         picker = dialog._roi_dialog
-        assert picker._image.dtype == np.uint32 and (picker._image == int(UINT32_CEILING)).sum() == 8  # raw kept
+        assert picker._image.dtype == (np.float64 if with_spec else np.uint32)
+        assert (picker._image == int(UINT32_CEILING)).sum() == 8
         images = [item for view in picker.findChildren(pg.GraphicsView) for item in view.items()
                   if isinstance(item, pg.ImageItem) and item.image is not None]
         assert images and all(float(item.getLevels()[1]) <= 63 for item in images), [i.getLevels() for i in images]

@@ -943,9 +943,9 @@ class ScientificView(QtWidgets.QFrame):
         shown = np.asarray(image)
         rows, columns = shown.shape
         from xrd_tools.core.invalid import UINT32_CEILING
-        if shown.dtype.kind in "ui" and shown.dtype.itemsize >= 4:
+        if shown.dtype.kind in "uif" and shown.dtype.itemsize >= 4:
             gaps = shown >= UINT32_CEILING
-            if gaps.any():  # an Eiger's module gaps show as missing, not as the top of the scale (display only)
+            if gaps.any():  # SPEC-backed previews can carry the same Eiger sentinel in a float array.
                 shown = np.where(gaps, np.float32(np.nan), shown.astype(np.float32))
         panel = KeyedImageProjection(key, title, shown,
             AxisProjection(np.arange(columns, dtype=float) + 0.5, "column", "px"),

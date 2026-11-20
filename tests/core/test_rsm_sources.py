@@ -7,6 +7,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import tifffile
@@ -149,3 +150,29 @@ def test_rsm_automatic_stem_retains_discovered_scan_padding(tmp_path):
     (group,), skipped = _groups(StitchSourceSelection("Spec", (str(spec),), "1"))
     assert skipped == ()
     assert group[0].image_stem == "RSM_pair_scan001_"
+
+
+def test_rsm_mixed_container_and_raw_preserves_the_raw_decoder_shape(tmp_path):
+    spec = _pair(tmp_path, with_images=(), scans=(1,))
+    np.arange(20, dtype=np.uint16).tofile(tmp_path / "RSM_pair_scan1_0000.raw")
+    with h5py.File(tmp_path / "RSM_pair_scan1_0001.h5", "w") as handle:
+        handle["entry/data/data"] = np.zeros((5, 4), dtype=np.uint16)
+    (group,), skipped = rsm_member_groups(
+        StitchSourceSelection("Spec", (str(spec),), "1"),
+        frame_selector=RSMFrameSelector(0, 1, 1), detector_shape=(4, 5),
+        raw_dtype="uint16", raw_header_skip=0, motor_selectors=_MOTORS,
+    )
+    assert skipped == ()
+    assert group[0].detector_shape == (4, 5)
+
+
+def test_rsm_explicit_stem_uses_the_admitted_containers_for_shape(tmp_path):
+    spec = _pair(tmp_path, with_images=(), scans=(1,))
+    (tmp_path / "RSM_pair_scan1_0000.h5").mkdir()
+    with h5py.File(tmp_path / "RSM_pair_scan1_0001.h5", "w") as handle:
+        handle["entry/data/data"] = np.zeros((2, 4, 5), dtype=np.uint16)
+    (group,), skipped = _groups(StitchSourceSelection(
+        "Spec", (str(spec),), "1", image_stem="RSM_pair_scan1_",
+    ))
+    assert skipped == ()
+    assert group[0].detector_shape == (4, 5)
