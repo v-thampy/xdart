@@ -57,16 +57,9 @@ def stat_once(path: "os.PathLike[str] | str") -> os.stat_result:
     memo = getattr(_MEMO, "value", None)
     key = ("stat", os.fspath(path))
     if memo is not None and key in memo:
-        found = memo[key]
-        if isinstance(found, OSError):
-            raise found
-        return found
-    try:
-        result = os.stat(os.fspath(path))
-    except OSError as error:
-        if memo is not None:
-            memo[key] = error
-        raise
+        return memo[key]
+    # A transient failure is not evidence for the next check of this path.
+    result = os.stat(os.fspath(path))
     if memo is not None:
         memo[key] = result
     return result

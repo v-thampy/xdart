@@ -2,11 +2,12 @@
 
 Admission recognizes an already-processed scan from its output's committed record: an HDF5 open per saved output,
 about 22 ms each on the beamline share (maintainer, 2026-11-19, 1.2.15: "saved records 7104 ms" for 327 outputs; his
-pick "Remember saved records (Recommended)"). The record is remembered by the output's path, size and time; an output
-whose time changes is read again. The real page runs the Folder Appends; HDF5 opens on the outputs are counted at
+pick "Remember saved records (Recommended)"). The record is remembered by the output's file revision; replacement
+and in-place changes require another read. The real page runs the Folder Appends; HDF5 opens are counted at
 h5py's file-open seam on the admission thread."""
 from dataclasses import replace
 import os
+import shutil
 import threading
 
 import pytest
@@ -53,3 +54,15 @@ def test_a_second_append_reads_only_the_saved_outputs_that_changed(qapp, tmp_pat
     stat = touched.stat()
     os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     assert append() == [os.path.normcase(touched.name)]  # a changed output is read again
+    replacement = touched.with_suffix(".replace")
+    shutil.copy2(touched, replacement)
+    stat = touched.stat()
+    replacement.replace(touched)
+    assert (touched.stat().st_size, touched.stat().st_mtime_ns) == (stat.st_size, stat.st_mtime_ns)
+    assert append() == [os.path.normcase(touched.name)]  # same size and time, different file
+    with touched.open("r+b") as stream:
+        byte = stream.read(1)
+        stream.seek(0)
+        stream.write(byte)
+    os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert append() == [os.path.normcase(touched.name)]  # same inode, size and mtime, later change time

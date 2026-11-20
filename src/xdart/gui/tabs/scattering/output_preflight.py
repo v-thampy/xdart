@@ -1,8 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
+from functools import cache
 import hashlib
 import json
 import logging
+import ntpath
 import os
 from pathlib import Path
 import tempfile
@@ -931,12 +933,20 @@ def _capture_exact_candidate_state(
     return state
 
 
+def _append_science_fingerprint(configuration: OutputCandidate) -> str:
+    from xrd_tools.io.append import science_fingerprint
+    from .adapters.dynamic_output import _science_projection
+
+    return science_fingerprint(_science_projection(configuration._configuration, configuration.processing_mapping()))
+
+
 def _already_processed(
     configuration: OutputCandidate,
     group: tuple[Candidate, ...],
     target: Path,
     *,
     live: bool = False,
+    fingerprint: Callable[[], str] | None = None,
 ) -> CommittedAppendCoverage | None:
     """A finite directory Append's scan that its output already holds, recognized from this census (each image's
     name, size and time) and the output's committed record, before any source capture: its coverage, or None to admit
@@ -954,17 +964,16 @@ def _already_processed(
         or any(candidate.adapter_id != "image_file" for candidate in group)
     ):
         return None
-    from xrd_tools.io.append import committed_append_coverage, science_fingerprint
-    from .adapters.dynamic_output import _mode_tokens, _science_projection
+    from xrd_tools.io.append import committed_append_coverage
+    from .adapters.dynamic_output import _mode_tokens
     return committed_append_coverage(
         target,
         entry="entry",
         source_base=frozen.project_root or "",
-        science_fingerprint=science_fingerprint(
-            _science_projection(frozen, configuration.processing_mapping())
-        ),
+        science_fingerprint=_append_science_fingerprint(configuration) if fingerprint is None else fingerprint(),
         modes=_mode_tokens(frozen),
         members=tuple((candidate.path, candidate.size, candidate.mtime_ns) for candidate in group),
+        remember=not live,
     )
 
 
@@ -973,6 +982,8 @@ def _committed_prefix(
     group: tuple[Candidate, ...],
     name: str,
     target: Path,
+    *,
+    fingerprint: Callable[[], str],
 ) -> tuple[PreparedSourceExecutionGraph, dict | None] | None:
     """A finite directory Append's scan that grew: the graph of the leading frames its output already holds, recognized
     from this census (each image's name, size and time) and the output's committed record, as ``_already_processed``
@@ -989,16 +1000,14 @@ def _committed_prefix(
         or any(candidate.adapter_id != "image_file" for candidate in group)
     ):
         return None
-    from xrd_tools.io.append import committed_append_execution, science_fingerprint
+    from xrd_tools.io.append import committed_append_execution
     from xrd_tools.sources.execution_graph import record_prefix_graph
-    from .adapters.dynamic_output import _mode_tokens, _science_projection
+    from .adapters.dynamic_output import _mode_tokens
     found = committed_append_execution(
         target,
         entry="entry",
         source_base=frozen.project_root or "",
-        science_fingerprint=science_fingerprint(
-            _science_projection(frozen, configuration.processing_mapping())
-        ),
+        science_fingerprint=fingerprint(),
         modes=_mode_tokens(frozen),
         members=tuple((candidate.path, candidate.size, candidate.mtime_ns) for candidate in group),
     )
@@ -1028,6 +1037,11 @@ def _deferred_directory_plan(
         raise RuntimeError("source has no matching candidates")
     started = monotonic()
     proven = proven_states(prefix)
+
+    @cache
+    def fingerprint() -> str:
+        return _append_science_fingerprint(configuration)
+
     staged: list[
         tuple[
             tuple[Candidate, ...],
@@ -1048,14 +1062,14 @@ def _deferred_directory_plan(
         representative = group[0]
         target = _directory_target(configuration, plan, representative, name)
         record_started = monotonic()
-        completed = None if proven else _already_processed(configuration, group, target)
+        completed = None if proven else _already_processed(configuration, group, target, fingerprint=fingerprint)
         records_s += monotonic() - record_started
         if completed is not None:  # already processed: no capture, no source fence
             staged.append((group, (), target, (), (), "", completed, None))
             continue
         # A scan that grew: the frames its output holds keep the states its record wrote (no capture).
         record_started = monotonic()
-        found = None if proven else _committed_prefix(configuration, group, name, target)
+        found = None if proven else _committed_prefix(configuration, group, name, target, fingerprint=fingerprint)
         records_s += monotonic() - record_started
         committed = None if found is None else found[0]
         committed_energies[str(target)] = None if found is None else found[1]
@@ -1128,6 +1142,10 @@ def _deferred_directory_plan(
         every_proven,
     )
     guard_s = monotonic() - guard_started
+    census_by_key: dict[str, list[tuple[int, Path]]] = {}
+    for position, path in enumerate(discovered_paths):
+        census_by_key.setdefault(_lexical_key(path), []).append((position, path))
+
     entries: list[DeferredDirectoryEntry] = []
     for (
         group,
@@ -1139,14 +1157,10 @@ def _deferred_directory_plan(
         completed,
         committed,
     ) in staged:
-        keys = {
-            os.path.normcase(os.path.abspath(path))
-            for path in (candidate.path for candidate in group)
-        }
+        keys = {_lexical_key(candidate.path) for candidate in group}
+        # Keep all spellings of a key and preserve the listing's order.
         physical = tuple(
-            path
-            for path in discovered_paths
-            if os.path.normcase(os.path.abspath(path)) in keys
+            path for _, path in sorted(match for key in keys for match in census_by_key.get(key, ()))
         )
         if not physical:
             raise ValueError(
@@ -1221,8 +1235,7 @@ def _deferred_directory_plan(
         ))
     total_s = monotonic() - started
     # Where admission's time goes on a share (NEXT-1215-SHARE-LOOKUPS): the saved outputs' records, the raw-file
-    # guard, and the rest: grouping the scans and capturing and freezing the ones still to process (1.2.15 called it
-    # "scans to process", which misled when there were none: the maintainer's 6.2 s was the grouping).
+    # guard, and the remaining planning, including groups, target snapshots and the scans still to process.
     _LOG.debug(
         "[APPEND-ADMIT] groups=%d already-processed=%d grown=%d files=%d (%.0f ms: saved records %.0f ms, "
         "raw-file guard %.0f ms, the rest (grouping and scans to process) %.0f ms)",
@@ -1264,17 +1277,26 @@ def _resolved_raw_keys(paths: list[Path]) -> set[str]:
         by_folder.setdefault(os.fspath(Path(path).parent), []).append(Path(path))
     for folder, members in by_folder.items():
         try:
-            canonical_folder = os.path.realpath(folder)
-            with os.scandir(folder) as listing:
-                plain = {os.path.normcase(entry.name): entry.name for entry in listing if _plain_file_entry(entry)}
+            canonical_folder = os.path.realpath(folder, strict=True)
+            with os.scandir(canonical_folder) as listing:
+                plain = {entry.name for entry in listing if _plain_file_entry(entry)}
         except OSError:
-            plain, canonical_folder = {}, None
+            plain, canonical_folder = set(), None
         for path in members:
-            name = plain.get(os.path.normcase(path.name)) if canonical_folder is not None else None
-            if name is None:
+            # A case-variant spelling can name another file on Windows.
+            if canonical_folder is None or path.name not in plain:
                 keys.add(os.path.normcase(os.path.realpath(path)))
-            else:
-                keys.add(os.path.normcase(os.path.join(canonical_folder, name)))
+                continue
+            canonical = os.path.join(canonical_folder, path.name)
+            # Windows may retain an extended prefix on a leaf even when the
+            # parent lost it. Delegate long and special spellings to realpath.
+            if _CHECK_RESOLVED_RAW_PATHS and (
+                canonical.startswith(("\\\\?\\", "\\\\.\\"))
+                or ntpath.isreserved(path.name)
+                or len(canonical.encode("utf-16-le", "surrogatepass")) >= 2 * 260
+            ):
+                canonical = os.path.realpath(path)
+            keys.add(os.path.normcase(canonical))
     return keys
 
 
@@ -1348,8 +1370,8 @@ def _validate_deferred_targets(
 def _check_deferred_targets(configuration, source, targets, protected, seen, raw_lexical, raw_norms, raw_inodes,
                             possible_link_devices, resolve_if_needed) -> None:
     """Refuse an output that is a raw file or a protected input, or that the directory policy forbids."""
-    skipped_dirs = _run_scan_skip(configuration.source, configuration)  # one Save Path, the same for every target
     containers = source.series is None and holds_containers(source.suffixes)
+    skipped_dirs = _run_scan_skip(configuration.source, configuration) if containers else ()
     for target in targets:
         normalized = output_safety._norm(target)
         if normalized in seen:

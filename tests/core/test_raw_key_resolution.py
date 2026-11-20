@@ -46,6 +46,70 @@ def test_a_file_link_is_resolved_on_its_own(tmp_path):
     assert os.path.normcase(os.path.realpath(target)) in keys
 
 
+def test_a_folded_name_cannot_borrow_a_plain_entry_for_a_link(tmp_path, monkeypatch):
+    plain = _write(tmp_path / "plain.tif")
+    referent = _write(tmp_path / "referent.tif")
+    link = tmp_path / "link.tif"
+    try:
+        link.symlink_to(referent)
+    except OSError as error:
+        pytest.skip(f"file symlinks unavailable: {error}")
+    normcase = os.path.normcase
+
+    def folded(path):
+        # Model two case-distinct directory entries with the same Windows fold.
+        if path in (plain.name, link.name):
+            return plain.name
+        return normcase(path)
+
+    monkeypatch.setattr(os.path, "normcase", folded)
+    assert output_preflight._resolved_raw_keys([link]) == _expected([link])
+
+
+def test_an_unresolved_parent_falls_back_to_the_file(tmp_path, monkeypatch):
+    folder = tmp_path / "samples"
+    folder.mkdir()
+    path = _write(folder / "image.tif")
+    realpath = os.path.realpath
+    expected = os.path.normcase(realpath(path))
+
+    def resolve(value, *, strict=False):
+        # Simulate a provider that cannot resolve the folder, but can resolve its files.
+        if os.fspath(value) == os.fspath(folder):
+            if strict:
+                raise PermissionError(os.fspath(value))
+            return str(tmp_path / "unresolved")
+        return realpath(value, strict=strict)
+
+    monkeypatch.setattr(os.path, "realpath", resolve)
+    assert output_preflight._resolved_raw_keys([path]) == {expected}
+
+
+def test_a_long_windows_leaf_can_keep_a_prefix_its_parent_dropped(tmp_path, monkeypatch):
+    folder = tmp_path / "mapped"
+    folder.mkdir()
+    path = _write(folder / "image.tif")
+    expanded = str(tmp_path / ("a" * 100) / ("\U00010400" * 90))
+    leaf = "\\\\?\\" + os.path.join(expanded, path.name)
+    realpath = os.path.realpath
+    scandir = os.scandir
+
+    def resolve(value, *, strict=False):
+        if os.fspath(value) == str(folder):
+            return expanded
+        if os.fspath(value) == str(path):
+            return leaf
+        return realpath(value, strict=strict)
+
+    def listing(value):
+        return scandir(folder if os.fspath(value) == expanded else value)
+
+    monkeypatch.setattr(output_preflight, "_CHECK_RESOLVED_RAW_PATHS", True)
+    monkeypatch.setattr(os.path, "realpath", resolve)
+    monkeypatch.setattr(os, "scandir", listing)
+    assert output_preflight._resolved_raw_keys([path]) == _expected([path])
+
+
 def test_a_folder_reached_through_a_link_or_junction_resolves_to_its_target(tmp_path):
     real = tmp_path / "real"
     real.mkdir()

@@ -24,6 +24,8 @@ from xrd_tools.io.output_safety import (
     check_output_not_source,
     path_within_dir,
     paths_same_file,
+    resolution_memo,
+    stat_once,
 )
 from xrd_tools.io.processed_scan_id import (
     ProcessedXdartInputError,
@@ -48,6 +50,29 @@ N_FRAMES = 5
 N_Q = 40
 N_CHI = 24
 H, W = 12, 16
+
+
+def test_guard_memo_retries_a_transient_stat_error(tmp_path, monkeypatch):
+    source = tmp_path / "cal.poni"
+    source.write_text("protected")
+    target = tmp_path / "output.nexus"
+    os.link(source, target)
+    stat = os.stat
+    fail_once = True
+
+    def transient(path, *args, **kwargs):
+        nonlocal fail_once
+        if not isinstance(path, int) and os.fspath(path) == str(target) and fail_once:
+            fail_once = False
+            raise PermissionError(str(target))
+        return stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", transient)
+    with resolution_memo():
+        with pytest.raises(PermissionError):
+            stat_once(target)
+        with pytest.raises(OutputCollisionError):
+            check_output_not_source(target, input_files=(source,))
 
 
 def _write_processed_xdart(path, *, stamp_schema=True):

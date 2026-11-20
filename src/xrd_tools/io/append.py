@@ -14,6 +14,10 @@ from typing import Any, Callable, Iterable, Mapping
 
 import h5py
 import numpy as np
+from .output_transaction import (
+    TargetChanged, _comparable_identity, _descriptor_identity, _stat_identity,
+    capture_target_revision,
+)
 from .schema import (
     SOURCE_BASE_ATTR,
     canonical_gi_mode_key,
@@ -1362,29 +1366,56 @@ class CommittedAppendCoverage:
     wavelength_m: float | None
 
 
-# The saved outputs' committed records this process has read, by output path, size and time (maintainer, 2026-11-19:
-# his pick "Remember saved records (Recommended)"; an Append on a network share opened every saved output on every
-# Run, about 22 ms each on the beamline PC). An unchanged output is answered from here; any write changes its size or
-# time and it is read again (a write during the read leaves the file under a newer size or time, so its next lookup
-# reads it again). A record that could not be read is not kept, so a share's hiccup is not remembered.
-_COMMITTED_RECORDS: dict[tuple[str, str, int, int], tuple[object, object]] = {}
+# Finite directory Appends can reuse a committed record for a proved file revision.
+# Keep only the intent and wavelength consumed by the coverage check.
+_RecordRevision = tuple[int, int, int, int, int]
+_CommittedRecord = tuple[AppendIntent, float | None]
+_COMMITTED_RECORDS: dict[tuple[str, str], tuple[_RecordRevision, _CommittedRecord]] = {}
 _COMMITTED_RECORDS_LOCK = threading.Lock()
 _COMMITTED_RECORDS_LIMIT = 8192
 
 
-def _committed_record(target: str | Path, entry: str):
-    """``(prefix, wavelength_m)`` of ``target``'s committed Append, or None for one this reader cannot vouch for."""
-    try:
-        stat = os.stat(target)
-    except OSError:
+def _record_revision(target: str | Path) -> _RecordRevision | None:
+    if os.name != "nt":
+        revision = _descriptor_identity(os.stat(target))
+    else:
+        # Windows pathname ctime is creation time. Use the descriptor ChangeTime.
+        snapshot = capture_target_revision(target)
+        if not snapshot.exists:
+            raise FileNotFoundError(os.fspath(target))
+        revision = (snapshot.device, snapshot.inode, snapshot.size, snapshot.mtime_ns, snapshot.ctime_ns)
+    return revision if revision[1] and revision[4] else None
+
+
+def _opened_record_revision(handle: h5py.File) -> _RecordRevision | None:
+    # The Windows VFD is an alias of sec2 and exposes its CRT file descriptor.
+    if handle.driver not in ("sec2", "windows"):
         return None
-    key = (os.path.normcase(os.path.abspath(os.fspath(target))), entry, int(stat.st_size), int(stat.st_mtime_ns))
-    with _COMMITTED_RECORDS_LOCK:
-        found = _COMMITTED_RECORDS.get(key)
-    if found is not None:
-        return found
+    try:
+        descriptor = handle.id.get_vfd_handle()
+        return _descriptor_identity(os.fstat(descriptor)) if type(descriptor) is int else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _committed_record(target: str | Path, entry: str, *, remember: bool) -> _CommittedRecord | None:
+    revision = None
+    key = (_normalize(target), entry)
+    if remember:
+        try:
+            revision = _record_revision(target)
+        except FileNotFoundError:
+            return None
+        except (OSError, TargetChanged):
+            pass  # perform an uncached read when this provider cannot prove a stable revision
+        if revision is not None:
+            with _COMMITTED_RECORDS_LOCK:
+                found = _COMMITTED_RECORDS.get(key)
+            if found is not None and found[0] == revision:
+                return found[1]
     try:
         with h5py.File(target, "r") as handle:
+            opened = _opened_record_revision(handle) if revision is not None else None
             config = handle.get(f"{entry}/reduction/config")
             if isinstance(config, h5py.Group) and any(
                 f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
@@ -1393,13 +1424,20 @@ def _committed_record(target: str | Path, entry: str):
             prefix = decode_committed_append_prefix(handle, entry=entry)
             from xrd_tools.io.browse_presentation import _monochromator_wavelength_m
             wavelength_m = _monochromator_wavelength_m(handle[entry], entry, scalar_only=True)
+            if opened is not None and (
+                _stat_identity(os.stat(target)) != _comparable_identity(opened)
+                or _opened_record_revision(handle) != opened
+            ):
+                return None
     except Exception:  # anything this reader cannot vouch for goes the full way
         return None
-    with _COMMITTED_RECORDS_LOCK:
-        if len(_COMMITTED_RECORDS) >= _COMMITTED_RECORDS_LIMIT:
-            _COMMITTED_RECORDS.clear()
-        _COMMITTED_RECORDS[key] = (prefix, wavelength_m)
-    return (prefix, wavelength_m)
+    record = (prefix.intent, wavelength_m)
+    if revision is not None and opened == revision:
+        with _COMMITTED_RECORDS_LOCK:
+            if len(_COMMITTED_RECORDS) >= _COMMITTED_RECORDS_LIMIT:
+                _COMMITTED_RECORDS.clear()
+            _COMMITTED_RECORDS[key] = (revision, record)
+    return record
 
 
 def committed_append_coverage(
@@ -1410,6 +1448,7 @@ def committed_append_coverage(
     science_fingerprint: str,
     modes: tuple[str, ...],
     members: tuple[tuple[str | Path, int, int], ...],
+    remember: bool = False,
 ) -> CommittedAppendCoverage | None:
     """Whether ``target``'s committed Append already holds a scan whose image files are ``members`` (path, size,
     mtime_ns), under this entry, source base, science fingerprint and modes: the same files at the same sizes and
@@ -1420,11 +1459,10 @@ def committed_append_coverage(
     DESIGN-append-smb-125). None sends the scan the full way: an absent, pending, dimension-replaced or unfamiliar
     output; other files, sizes or times; point groups or external members; or another identity.
     """
-    read = _committed_record(target, entry)
+    read = _committed_record(target, entry, remember=remember)
     if read is None:
         return None
-    prefix, wavelength_m = read
-    intent = prefix.intent
+    intent, wavelength_m = read
     expected = {_normalize(path): (int(size), int(mtime_ns)) for path, size, mtime_ns in members}
     committed = {member.path: (int(member.size), int(member.mtime_ns)) for member in intent.source.image_members}
     if (

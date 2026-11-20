@@ -7,6 +7,7 @@ are counted through the real os functions. This does not count filesystem work i
 from dataclasses import replace
 import logging
 import os
+import sys
 import threading
 
 import pytest
@@ -16,6 +17,8 @@ pytest.importorskip("pyqtgraph")
 from tests.xdart.scattering.test_browse_reference_rings_run import _page, _terminal
 from tests.xdart.scattering.test_folder_run_frame_read_at_scan_boundary import _scans, _written
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
+from xdart.gui.tabs.scattering import output_preflight
+from xdart.gui.tabs.scattering.adapters import dynamic_output
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
@@ -39,6 +42,22 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     listed_files = {os.path.normcase(os.fspath(path)) for path in raw.rglob("*") if path.is_file()}
     assert images == 120 and len(listed_files) == 240  # each image has its sidecar
     calls: dict[str, int] = {}
+    lexical_calls = science_calls = 0
+    abspath = os.path.abspath
+    science_projection = dynamic_output._science_projection
+
+    def counted_abspath(path):
+        nonlocal lexical_calls
+        if (sys._getframe(1).f_globals.get("__name__") == output_preflight.__name__
+                and os.path.normcase(os.fsdecode(path)) in listed_files):
+            lexical_calls += 1
+        return abspath(path)
+
+    def counted_science(*args, **kwargs):
+        nonlocal science_calls
+        if threading.current_thread().name == "scattering-admission":
+            science_calls += 1
+        return science_projection(*args, **kwargs)
 
     def counted(name, real):
         def call(path, *args, **kwargs):
@@ -54,6 +73,8 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
         with monkeypatch.context() as patch:
             for module, name in ((os, "stat"), (os, "lstat"), (os.path, "realpath")):
                 patch.setattr(module, name, counted(name, getattr(module, name)))
+            patch.setattr(os.path, "abspath", counted_abspath)
+            patch.setattr(dynamic_output, "_science_projection", counted_science)
             page._shell.run_controls.startButton.click()
             terminal = _terminal(qapp, page, observed)
     assert terminal.files_processed == 120 and terminal.frames_new == 0
@@ -68,6 +89,7 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     # Ordinary POSIX inputs need one stat. Windows retains one canonical-path
     # check, which does not call Python's os.lstat on this fixture.
     assert 0 < total <= 2 * images, f"admission made {calls} raw calls for {images} images"
+    assert (0 < lexical_calls <= 4 * images, science_calls) == (True, 1), (lexical_calls, science_calls)
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
@@ -75,7 +97,6 @@ def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, m
     """On Windows the raw-file guard still compares canonical paths (Codex review 9f0471bc), and used to resolve every
     raw image: 7.0 s for 930 on the maintainer's share (his pick "Cheaper raw-file guard"). It now resolves each folder
     once and builds a plain file's canonical path from its folder's and its listed name."""
-    from xdart.gui.tabs.scattering import output_preflight
     stems, intent = _scans(tmp_path, 30, 4)
     intent = replace(intent, source_spec=replace(intent.source_spec, recursive=recursive))
     if recursive:  # his Folder is recursive: half the scans in a subfolder
@@ -107,4 +128,7 @@ def test_the_windows_guard_resolves_raw_files_folder_by_folder(qapp, tmp_path, m
     assert terminal.files_processed == 120 and terminal.frames_new == 0
     # 1.2.15's Windows branch resolved each of the 120 images; now a few per Run: each folder once, and the source
     # root for the folder policy (5 here for the recursive Folder's two folders).
+    assert raw_root in resolved
+    if recursive:
+        assert os.path.join(raw_root, "subfolder") in resolved
     assert len(resolved) <= 8, resolved

@@ -56,7 +56,7 @@ def _tree(tmp_path: Path) -> Path:
     root = tmp_path / "samples"
     for folder in ("", "calibration", "sampleA", "sampleB"):
         (root / folder).mkdir(parents=True, exist_ok=True)
-    names = ("Lab6_0001", "Lab6_0002", "lab6_0001", "LAB6_0003", "scan-0001", "scan-0002", "scan_0001", "odd", "a_b_0007",
+    names = ("Lab6_0001", "Lab6_0002", "lab6_0004", "LAB6_0003", "scan-0001", "scan-0002", "scan_0001", "odd", "a_b_0007",
              "a_b_0008", "x10s_11191151_0001", "x10s_11191151_0002")
     for index, name in enumerate(names):
         for folder in ("", "calibration", "sampleA"):
@@ -71,7 +71,7 @@ def test_the_groups_and_their_order_are_unchanged(tmp_path):
     root = _tree(tmp_path)
     for suffixes in ((".tif",), (".tif", ".txt")):
         plan = _plan(root, suffixes)
-        assert len(plan.candidates) > 30
+        assert len(plan.candidates) == 37
         assert directory_candidate_groups(plan) == _reference(plan)
 
 
