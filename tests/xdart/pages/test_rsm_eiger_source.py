@@ -123,3 +123,25 @@ def test_rows_columns_still_drive_a_raw_free_tiff_source(qapp, tmp_path):
         assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
     finally:
         _close(page, qapp)
+
+
+def test_a_queued_run_finds_its_outputs_however_the_save_path_is_spelled(qapp, tmp_path):
+    """Maintainer, 2026-11-20, at the beamline: "when I try to process all scans in a spec file, I get the error that
+    "the output changed while the scans were found. Run again." Running again just gives the same error". The form
+    keeps its output normalized (on Windows normcase lowers it and turns / into \\) while the queue check kept the
+    Save Path's spelling, so the lookup never matched. A Save Path spelled with '..' differs the same way anywhere."""
+    _eiger_source(tmp_path, (195, 487))
+    (tmp_path / "sub").mkdir()
+    page = _page(qapp)
+    try:
+        _on_source(page, qapp, tmp_path, "1,2")
+        page.set_field("output_path", str(tmp_path / "sub" / ".." / "Out"))
+        page.begin_run()
+        deadline = time.monotonic() + 120
+        while page.active() and time.monotonic() < deadline:
+            qapp.processEvents(); page._poll(); time.sleep(0.005)
+        text = page.run_bar.readinessLabel.full_text()
+        assert "Run again" not in text, text
+        assert len(list((tmp_path / "Out").glob("*_rsm.nexus"))) == 2, text
+    finally:
+        _close(page, qapp)
