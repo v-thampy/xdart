@@ -9,15 +9,17 @@
   matched every listed file against every scan, and rebuilt the same science
   settings fingerprint for each one (about 6 s for 327 scans and 930 images
   on a beamline PC). Each is now done once, and the scans are grouped exactly
-  as before. In testing with 300 saved scans, that part of admission went
-  from 1.6 s to 0.02 s.
-- **Int: a later Append in the same session no longer reopens every saved
-  output:** each output's committed record is remembered with a verified file
-  revision (its device, file ID, size, and modification and change times),
-  and read again whenever the revision changes or cannot be verified. On
-  Windows each check still opens the file to read its change time. The first
-  Run after starting xdart still reads every record. In testing with 300
-  saved scans, a second Append read them in 0.005 s instead of 0.7 s.
+  as before; Append, Overwrite and Live all use it. In testing with 300 saved
+  scans, that part of admission went from 1.6 s to 0.02 s, and a Live Run
+  showed them in 1.3 s instead of 6.9 s.
+- **Int: a later Append or Live Run in the same session no longer reopens
+  every saved output:** each output's committed record is remembered with a
+  verified file revision (its device, file ID, size, and modification and
+  change times), and read again whenever the revision changes or cannot be
+  verified. On Windows each check still opens the file to read its change
+  time. The first Run after starting xdart still reads every record. In
+  testing with 300 saved scans, a second Append read them in 0.005 s instead
+  of 0.7 s.
 - **Int: the raw-file check asks the share less:** each saved output's
   calibration, mask and folder checks now run once per Run instead of once
   per output, and on Windows each raw folder is resolved once instead of
