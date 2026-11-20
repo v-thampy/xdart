@@ -404,7 +404,7 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
                 entry = spec.entry or "entry"
                 members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, entry,
                                                   frame_selector, _container_frame_shape(
-                                                      Path(spec.uri), entry, detector_shape, read_image_kwargs),
+                                                      (Path(spec.uri),), entry, detector_shape, read_image_kwargs),
                                                   motor_selectors, point_images=spec.options.get("point_images")))
                 continue
             if spec.kind is not SourceKind.SPEC:
@@ -415,13 +415,16 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
                 raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
             path, key = Path(spec.uri), spec.options["scan"]
             stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
-            from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
-            # the search's own listing (shared_image_listings), not another one
-            files = find_spec_image_files(spec.options["image_dir"], path.stem, key, spec.options.get("image_stem"))
-            if files and not spec.options.get("image_stem"):
-                stem = spec_image_stem(files[0], path.stem, key)
-            shape = (_container_frame_shape(files[0], spec.options.get("nexus_entry") or None, detector_shape,
-                                            read_image_kwargs) if files else tuple(detector_shape))
+            if spec.options.get("image_stem"):  # the search's memoized listing; no per-file stat for RAW/TIFF
+                from xrd_tools.io.image import find_image_files
+                files = find_image_files(spec.options["image_dir"], stem=spec.options["image_stem"])
+            else:
+                from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
+                files = find_spec_image_files(spec.options["image_dir"], path.stem, key)
+                if files:
+                    stem = spec_image_stem(files[0], path.stem, key)
+            shape = _container_frame_shape(files, spec.options.get("nexus_entry") or None, detector_shape,
+                                           read_image_kwargs)
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
                                              shape, raw_dtype, raw_header_skip,
                                              motor_selectors, point_images=spec.options.get("point_images"),
@@ -431,16 +434,21 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
     return tuple(groups), tuple(skipped)
 
 
-def _container_frame_shape(path, entry, detector_shape, read_image_kwargs) -> tuple[int, int]:
-    """A member's detector shape: a container's own frame shape (an Eiger master, a NeXus stack), from the layout the
-    search's admission read; the decoder's Rows/Columns for images without one (RAW, TIFF). An unreadable layout
-    keeps Rows/Columns: the search admitted the scan, and the preflight explains a mismatch (maintainer, 2026-11-20:
-    "Read shape from file (Recommended)"; NEXT-1217-EIGER-SOURCES)."""
+def _container_frame_shape(files, entry, detector_shape, read_image_kwargs) -> tuple[int, int]:
+    """A member's detector shape: its first container's own frame shape (an Eiger master, a NeXus stack; an Eiger
+    data shard is skipped), from the layout the search's admission read; the decoder's Rows/Columns for images
+    without one (RAW, TIFF), at no extra file-system call. An unreadable layout keeps Rows/Columns: the search
+    admitted the scan, and the preflight names a mismatch (maintainer, 2026-11-20: "Read shape from file
+    (Recommended)"; NEXT-1217-EIGER-SOURCES)."""
+    import re
     from xrd_tools.io.image import _HDF5_READ_EXTS
     from xrd_tools.sources.spec import _spec_image_layout
     given = tuple(int(value) for value in detector_shape)
-    if Path(path).suffix.lower() not in _HDF5_READ_EXTS:
+    containers = [Path(item) for item in files if Path(item).suffix.lower() in _HDF5_READ_EXTS]
+    masters = [item for item in containers if not re.fullmatch(r".+_data_\d+", item.stem)]
+    if not containers:
         return given
+    path = (masters or containers)[0]
     try:
         layout, _selector = _spec_image_layout(Path(path), read_image_kwargs, entry)
     except (OSError, KeyError, TypeError, ValueError):
