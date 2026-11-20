@@ -19,6 +19,7 @@ from tests.xdart.scattering.test_folder_run_frame_read_at_scan_boundary import _
 from tests.xdart.scattering.test_predicted_ring_overlays import qapp  # noqa: F401
 from xdart.gui.tabs.scattering import output_preflight
 from xdart.gui.tabs.scattering.adapters import dynamic_output
+from xrd_tools.sources.discover import Candidate
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))
@@ -43,8 +44,16 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     assert images == 120 and len(listed_files) == 240  # each image has its sidecar
     calls: dict[str, int] = {}
     lexical_calls = science_calls = 0
+    candidate_comparisons = 0
     abspath = os.path.abspath
+    candidate_equal = Candidate.__eq__
     science_projection = dynamic_output._science_projection
+
+    def counted_equality(left, right):
+        nonlocal candidate_comparisons
+        if sys._getframe(1).f_globals.get("__name__") == output_preflight.__name__:
+            candidate_comparisons += 1
+        return candidate_equal(left, right)
 
     def counted_abspath(path):
         nonlocal lexical_calls
@@ -74,6 +83,7 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
             for module, name in ((os, "stat"), (os, "lstat"), (os.path, "realpath")):
                 patch.setattr(module, name, counted(name, getattr(module, name)))
             patch.setattr(os.path, "abspath", counted_abspath)
+            patch.setattr(Candidate, "__eq__", counted_equality)
             patch.setattr(dynamic_output, "_science_projection", counted_science)
             page._shell.run_controls.startButton.click()
             terminal = _terminal(qapp, page, observed)
@@ -90,6 +100,7 @@ def test_folder_append_admission_bounds_raw_file_lookups(qapp, tmp_path, monkeyp
     # check, which does not call Python's os.lstat on this fixture.
     assert 0 < total <= 2 * images, f"admission made {calls} raw calls for {images} images"
     assert (0 < lexical_calls <= 4 * images, science_calls) == (True, 1), (lexical_calls, science_calls)
+    assert candidate_comparisons <= 4 * images, candidate_comparisons
 
 
 @pytest.mark.parametrize("recursive", (False, True), ids=("flat", "recursive"))

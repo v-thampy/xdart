@@ -92,8 +92,8 @@ def _covered_run(tmp_path, monkeypatch, request_value):
     real_coverage, real_shown = run_executor.live_group_coverage, StandardRunExecutor._present_live_saved_output
     real_stat = getattr(run_executor, '_target_stat', None)
 
-    def coverage(receipt, group):
-        result = real_coverage(receipt, group)
+    def coverage(receipt, group, **kwargs):
+        result = real_coverage(receipt, group, **kwargs)
         covered.append((group.target.name, result is not None))
         return result
 
@@ -157,22 +157,36 @@ def test_f3_a_finished_scan_whose_output_is_replaced_is_covered_again_without_sh
     assert not _labels(events, 'done')
 
 
-@pytest.mark.parametrize('change', ['deleted', 'replaced'])
+@pytest.mark.parametrize('change', [
+    'deleted', 'replaced',
+    pytest.param('retimed', marks=pytest.mark.skipif(os.name == 'nt', reason='POSIX pathname change time')),
+])
 def test_f3_an_output_that_changes_while_its_record_is_read_is_not_cached_as_covered(tmp_path, monkeypatch, change):
     """Codex N-770941b2 (its discriminator test_review_coverage_binding.py, d2e9cc11...): the watch was taken after the
     coverage read, so an output deleted or replaced in between stayed covered for the Run. Deleted, the scan is
     reduced again; replaced, it is looked at again and nothing is written."""
     real_coverage, changed = run_executor.live_group_coverage, []
 
-    def coverage(receipt, group):  # the output changes just after its record was read
-        result = real_coverage(receipt, group)
+    def coverage(receipt, group, **kwargs):  # the output changes just after its record was read
+        result = real_coverage(receipt, group, **kwargs)
         if result is not None and not changed:
             if change == 'deleted':
                 group.target.unlink()
-            else:
+            elif change == 'replaced':
                 copy = group.target.with_suffix('.copy')
                 copy.write_bytes(group.target.read_bytes())
                 os.replace(copy, group.target)
+            else:
+                before = group.target.stat()
+                with group.target.open('r+b') as stream:
+                    byte = stream.read(1)
+                    stream.seek(0)
+                    stream.write(byte)
+                os.utime(group.target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                after = group.target.stat()
+                assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+                    before.st_ino, before.st_size, before.st_mtime_ns)
+                assert after.st_ctime_ns != before.st_ctime_ns
             changed.append(group.target.name)
         return result
     monkeypatch.setattr(run_executor, 'live_group_coverage', coverage)
@@ -181,7 +195,7 @@ def test_f3_an_output_that_changes_while_its_record_is_read_is_not_cached_as_cov
     output = tmp_path / 'processed' / 'done_int1d.nexus'
     events = []
     try:
-        _wait(executor, events, lambda values: (2 in _labels(values, 'done') if change == 'deleted' else len(covered) > 1)
+        _wait(executor, events, lambda values: (2 in _labels(values, 'done') if change == 'deleted' else bool(shown))
               or any(event.kind in _TERMINAL for event in values), timeout=20.)
         _settle(executor, events, 1.)
         catalog = [(key.source_scan, key.local_frame_label) for key in executor.frame_catalog(identity).entries]
@@ -205,8 +219,8 @@ def test_a_finished_scans_next_frame_waiting_for_its_sidecar_reads_the_output_on
     raw.mkdir()
     reads, real = [], run_executor.live_group_coverage
 
-    def coverage(receipt, group):
-        result = real(receipt, group)
+    def coverage(receipt, group, **kwargs):
+        result = real(receipt, group, **kwargs)
         reads.append((group.target.name, result is not None))
         return result
     monkeypatch.setattr(run_executor, 'live_group_coverage', coverage)

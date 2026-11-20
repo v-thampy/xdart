@@ -74,6 +74,7 @@ def test_a_second_live_append_reads_only_the_saved_outputs_that_changed(qapp, tm
     possible"; his pick "Hold 1.2.16 for Live"). Each Live poll already reads a saved output only when its scan or its
     output changed; a second Live Run in the session read every one again."""
     from tests.xdart.scattering.test_browse_reference_rings_run import _pump, _TERMINAL
+    from xdart.gui.tabs.scattering.adapters import dynamic_output
     stems, intent = _scans(tmp_path, 30, 2)
     with _page(qapp, intent) as (page, _view, observed):
         page._shell.run_controls.startButton.click()
@@ -81,7 +82,15 @@ def test_a_second_live_append_reads_only_the_saved_outputs_that_changed(qapp, tm
     assert _written(tmp_path, stems)
     processed = os.path.normcase(os.fspath(tmp_path / "processed")) + os.sep
     opened: list[str] = []
+    fingerprints: list[int] = []
+    fingerprint_counts: list[int] = []
     real_open = h5_files.make_fid
+    science_projection = dynamic_output._science_projection
+
+    def counted_projection(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "_append_science_fingerprint":
+            fingerprints.append(1)
+        return science_projection(*args, **kwargs)
 
     def reading_a_record() -> bool:  # Live also opens its newest scan's output for its own epoch; count records only
         frame = sys._getframe(2)
@@ -99,14 +108,17 @@ def test_a_second_live_append_reads_only_the_saved_outputs_that_changed(qapp, tm
         return real_open(name, *args, **kwargs)
 
     monkeypatch.setattr(h5_files, "make_fid", counted)
+    monkeypatch.setattr(dynamic_output, "_science_projection", counted_projection)
 
     def live():
         opened.clear()
+        fingerprints.clear()
         with _page(qapp, replace(intent, output_mode="Append", live_mode=True)) as (page, _view, observed):
             page._shell.run_controls.startButton.click()
             assert _pump(qapp, lambda: any((getattr(e, "files_processed", 0) or 0) >= 60 for e in observed),
                          seconds=120), "the saved scans were never all counted"
             counted_opens = sorted(opened)
+            fingerprint_counts.append(len(fingerprints))
             page._shell.run_controls.stopButton.click()
             assert _pump(qapp, lambda: any(e.kind in _TERMINAL for e in observed), seconds=120)
         return counted_opens
@@ -117,3 +129,4 @@ def test_a_second_live_append_reads_only_the_saved_outputs_that_changed(qapp, tm
     stat = touched.stat()
     os.utime(touched, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     assert set(live()) == {os.path.normcase(touched.name)}  # a changed output is read again
+    assert fingerprint_counts == [1, 1, 1]

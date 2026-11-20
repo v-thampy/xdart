@@ -627,11 +627,6 @@ def prepare_output(
         discovered = observation.discovered_snapshot
         complete_plan = RunCandidatePlan.from_snapshot(discovered)
         bounded_plan = _name_output_groups(_bounded_directory_plan(complete_plan))
-        excluded = tuple(
-            candidate
-            for candidate in complete_plan.candidates
-            if candidate not in bounded_plan.candidates
-        )
         if intent.live_mode:
             directory_discovered_paths = tuple(
                 candidate.path.absolute()
@@ -676,6 +671,8 @@ def prepare_output(
             )
             items = ()
         elif not intent.live_mode:
+            bounded_candidates = set(bounded_plan.candidates)
+            excluded = tuple(candidate for candidate in complete_plan.candidates if candidate not in bounded_candidates)
             session.enable_probes(exclude=excluded)
             while observation.unprobed_count:
                 if cancelled():
@@ -1421,13 +1418,18 @@ def _check_deferred_targets(configuration, source, targets, protected, seen, raw
         )
 
 
-def live_group_coverage(receipt: AdmissionReceipt, group: "LiveDirectoryGroup") -> CommittedAppendCoverage | None:
+def live_group_coverage(
+    receipt: AdmissionReceipt,
+    group: "LiveDirectoryGroup",
+    *,
+    fingerprint: Callable[[], str] | None = None,
+) -> CommittedAppendCoverage | None:
     """A Live group's committed coverage when its output already holds exactly its images, each name, size and time
     as the output's committed record has them: a quiet no-op until its files change. The census and the committed
     record only; no image or sidecar is read (maintainer, 2026-10-23: "If something has already been processed, it
     should be skipped anyway"; Codex, DESIGN-append-image-reprocess-125: a watch, never a permanent skip, and never
     for the output a Live epoch owns)."""
-    return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True)
+    return _already_processed(receipt.candidate, group.plan.candidates, group.target, live=True, fingerprint=fingerprint)
 
 
 def live_directory_groups(

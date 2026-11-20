@@ -1,6 +1,7 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import cache
 import logging
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ from xrd_tools.io.append import AppendRefused, committed_image_members, saved_en
 from xrd_tools.io.frame_view import read_frame_scalar_catalog
 from xrd_tools.io.metadata import MetadataSourceChanged, auto_sidecar_format
 from xrd_tools.io.record_writer import MetadataColumnsAbsent
+from xrd_tools.io.stat_identity import identity_ctime_ns
 from xrd_tools.reduction import FrameBackgroundPlan, resolve_frame_background
 from xrd_tools.reduction.core import EnergyGridWidened, WarmIntegrators, energy_scan_grid_changes
 from xrd_tools.reduction.background import (
@@ -88,7 +90,7 @@ from ..events import (
     ExecutorStartFailed, RunIdentity, detach_exception,
 )
 from ..output_preflight import (
-    _background_frame_fact, _merge_background_binding,
+    _append_science_fingerprint, _background_frame_fact, _merge_background_binding,
     DeferredDirectoryPlan, LiveDirectoryAttempt, LiveDirectoryGroup,
     OutputDisposition, PlannedOutput, SourceRevisionChanged,
     native_int_reduction_plan, materialize_deferred_output,
@@ -760,12 +762,15 @@ def _live_proof(metadata_format, graph, record, registry) -> LivePrefixProof:
                            record=record, registry=registry)
 
 
-def _target_stat(path: Path) -> tuple[int, int, int, int] | None:
+_LiveTargetRevision = tuple[int, int, int, int, int]
+
+
+def _target_stat(path: Path) -> _LiveTargetRevision | None:
     try:
         stat = os.stat(path)
     except OSError:
         return None
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, identity_ctime_ns(stat.st_ctime_ns)
 
 
 @dataclass(slots=True)
@@ -774,7 +779,7 @@ class _CoveredOutput:
     registrations at most every LivePrefixProof.PERIOD_S (Codex N-0243a1bb F3): once the output is deleted, replaced or
     rewritten while the scan's images are not, the scan is looked at again."""
     target: Path
-    signature: tuple[int, int, int, int]  # the output as its record was read (unchanged across that read)
+    signature: _LiveTargetRevision  # the output as its record was read (unchanged across that read)
     registry: tuple
     checked_at: float
 
@@ -2785,9 +2790,15 @@ class StandardRunExecutor:
         ):
             raise RuntimeError("live directory run lost its source owner")
 
+        @cache
+        def fingerprint() -> str:
+            # Coverage uses the receipt's signed settings. The writer still
+            # resolves each admitted scan's energy selection separately.
+            return _append_science_fingerprint(receipt.candidate)
+
         settled_revisions: dict[
             str,
-            tuple[tuple[object, ...], SourceExecutionIdentityV1 | None],
+            tuple[tuple[object, ...], _CoveredOutput | SourceExecutionIdentityV1 | None],
         ] = {}
         retry_revisions: dict[str, tuple[object, ...]] = {}
         # Outputs this Run has already settled once (admitted, presented or published): only these take the
@@ -2795,7 +2806,7 @@ class StandardRunExecutor:
         seen_targets: set[str] = set()
         # Outputs that did not cover their scan, by its images and the output's stat: no second read while neither
         # changes (Claude cloud review of 4c28033b, finding 5: a scan still waiting opened its output every poll).
-        uncovered: dict[str, tuple[tuple[object, ...], tuple[int, int, int, int]]] = {}
+        uncovered: dict[str, tuple[tuple[object, ...], _LiveTargetRevision]] = {}
         # A found output's committed image count by output file version, for its readiness waits.
         committed_counts: dict[str, tuple[tuple[int, int, int, int], int | None]] = {}
         # The image each output's next frame waits on for its metadata, since when, the output's name, the wait's
@@ -2969,7 +2980,7 @@ class StandardRunExecutor:
                     # after the read (Codex N-770941b2: one deleted or replaced during the read stayed covered).
                     signature = _target_stat(group.target)
                     if signature is not None and uncovered.get(target_key) != (revision, signature):
-                        completed = live_group_coverage(receipt, group)
+                        completed = live_group_coverage(receipt, group, fingerprint=fingerprint)
                         if completed is not None and _target_stat(group.target) != signature:
                             completed = None
                         if completed is None:
