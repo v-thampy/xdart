@@ -20,7 +20,7 @@ from xrd_tools.analysis.scan_operations import (
 
 from xdart.gui.widgets.controls_panel import FormRow, ActionButton
 from xdart.gui.widgets.context_help import bind_topic, owner_for
-from xrd_tools.help_topics import diagnostic_text
+from xrd_tools.help_topics import diagnostic_text, diagnostic_words
 from xdart.gui.widgets.file_dialogs import browse
 from xdart.gui.tabs.scattering.browser_view import BrowserResult, BrowserView, keyed_list_profile
 from xdart.gui.tabs.scattering.trend_view import PlotSeries, SeriesProjection, TrendView
@@ -833,6 +833,15 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self._update_roi_caption()
         self._redraw()
         self._sync_help_cue()
+
+    def show_status(self, message):
+        """The status line in words: a known refusal code reads as its help sentence and next action, and the code
+        stays in the window's Help diagnostics (NEXT-1217-EIGER-SOURCES)."""
+        text = str(message or "")
+        words = diagnostic_words(text)
+        self.status.setText(words)
+        if words != text:
+            self.set_help_diagnostic(text)
 
     def set_help_diagnostic(self, code, details=()):
         """Copy only terminal strings for additive help; leave status/results untouched."""

@@ -183,9 +183,9 @@ class RoiSelectionView(QtWidgets.QWidget):
         self.mask_sat_row = FormRow(label="Mask saturated", path=("roi", "mask_saturated"), value=False, kind="bool")
         self.mask_sat_check = self.mask_sat_row.editor
         self.mask_sat_check.setToolTip(
-            "Exclude dead/saturated pixels (the dtype-ceiling module mask) from "
+            "Exclude saturated pixels (the detector's counting ceiling and negative values) from "
             "the ROI stats — matches the integrator's saturated-pixel masking. "
-            "The uint32 dummy + non-finite pixels are always excluded.")
+            "The uint32 invalid value (an Eiger's module gaps) and non-finite pixels are always excluded.")
         action_row.addWidget(self.mask_sat_row)
         action_row.addStretch(1)
         self.compute_btn = self._action("Compute", "Compute or update all ROI statistics over the admitted raw frames.")

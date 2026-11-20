@@ -1123,8 +1123,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self, identity: object, message: object,
     ) -> None:
         dialog = self._metadata_dialog_for(identity)
+        show = getattr(dialog, "show_status", None)
         status = None if dialog is None else getattr(dialog, "status", None)
-        if status is not None:
+        if callable(show):  # the ROI Statistics window reads a refusal as words (NEXT-1217-EIGER-SOURCES)
+            show(message)
+        elif status is not None:
             status.setText(str(message or ""))
 
     def _finish_metadata_refresh(
@@ -2182,7 +2185,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if fit_dialog is not None and update.terminal.payload is not None:
                     fit_dialog.background_template_row.refuse(update.terminal.payload)
             if target == "scan_roi" and self._scan_roi_dialog is not None:
-                self._scan_roi_dialog.status.setText(diagnostic)
+                self._scan_roi_dialog.show_status(diagnostic)
                 terminal_payload = None if update.terminal is None else update.terminal.payload
                 details = tuple(getattr(terminal_payload, "diagnostics", ())) if current and not update.stale else ()
                 self._scan_roi_dialog.set_help_diagnostic(diagnostic, details)
@@ -2216,7 +2219,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         admitted, reason = retention_admission(retained, replacing, payload)
         if not admitted:
             if target == "scan_roi" and self._scan_roi_dialog is not None:
-                self._scan_roi_dialog.status.setText(reason)
+                self._scan_roi_dialog.show_status(reason)
                 self._scan_roi_dialog.set_help_diagnostic(reason)
             if kind == "roi_preview" and self._scan_roi_dialog is not None:
                 self._scan_roi_dialog._roi_preview_waiting = False

@@ -401,9 +401,11 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
             if cancelled is not None and cancelled():
                 raise SourceSearchCancelled("the scan search was stopped")
             if spec.kind in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:  # a raw NeXus stack (C5c)
-                members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, spec.entry or "entry",
-                                                  frame_selector, tuple(detector_shape), motor_selectors,
-                                                  point_images=spec.options.get("point_images")))
+                entry = spec.entry or "entry"
+                members.append(RSMNexusMemberForm(Path(spec.uri), spec.kind, entry,
+                                                  frame_selector, _container_frame_shape(
+                                                      Path(spec.uri), entry, detector_shape, read_image_kwargs),
+                                                  motor_selectors, point_images=spec.options.get("point_images")))
                 continue
             if spec.kind is not SourceKind.SPEC:
                 reason = "RSM reads SPEC scans and raw NeXus stacks"
@@ -413,18 +415,38 @@ def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw
                 raise RSMToolPreflightRefused("SOURCE_KIND_UNSUPPORTED", f"{Path(spec.uri).name}: {reason}")
             path, key = Path(spec.uri), spec.options["scan"]
             stem = spec.options.get("image_stem") or f"{path.stem}_scan{key.split('.')[0]}_"
-            if not spec.options.get("image_stem"):
-                from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
-                files = find_spec_image_files(spec.options["image_dir"], path.stem, key)
-                if files:
-                    stem = spec_image_stem(files[0], path.stem, key)
+            from xrd_tools.sources.spec import find_spec_image_files, spec_image_stem
+            # the search's own listing (shared_image_listings), not another one
+            files = find_spec_image_files(spec.options["image_dir"], path.stem, key, spec.options.get("image_stem"))
+            if files and not spec.options.get("image_stem"):
+                stem = spec_image_stem(files[0], path.stem, key)
+            shape = (_container_frame_shape(files[0], spec.options.get("nexus_entry") or None, detector_shape,
+                                            read_image_kwargs) if files else tuple(detector_shape))
             members.append(RSMScanMemberForm(path, key, spec.options["image_dir"], stem, frame_selector,
-                                             tuple(detector_shape), raw_dtype, raw_header_skip,
+                                             shape, raw_dtype, raw_header_skip,
                                              motor_selectors, point_images=spec.options.get("point_images"),
                                              nexus_entry=spec.options.get("nexus_entry", "")))
         if members:
             groups.append(tuple(members))
     return tuple(groups), tuple(skipped)
+
+
+def _container_frame_shape(path, entry, detector_shape, read_image_kwargs) -> tuple[int, int]:
+    """A member's detector shape: a container's own frame shape (an Eiger master, a NeXus stack), from the layout the
+    search's admission read; the decoder's Rows/Columns for images without one (RAW, TIFF). An unreadable layout
+    keeps Rows/Columns: the search admitted the scan, and the preflight explains a mismatch (maintainer, 2026-11-20:
+    "Read shape from file (Recommended)"; NEXT-1217-EIGER-SOURCES)."""
+    from xrd_tools.io.image import _HDF5_READ_EXTS
+    from xrd_tools.sources.spec import _spec_image_layout
+    given = tuple(int(value) for value in detector_shape)
+    if Path(path).suffix.lower() not in _HDF5_READ_EXTS:
+        return given
+    try:
+        layout, _selector = _spec_image_layout(Path(path), read_image_kwargs, entry)
+    except (OSError, KeyError, TypeError, ValueError):
+        return given
+    shape = tuple(int(value) for value in layout.shape)
+    return shape if len(shape) == 2 and min(shape) >= 2 else given
 
 
 def rsm_member_source_ub(member) -> tuple[float, ...] | None:

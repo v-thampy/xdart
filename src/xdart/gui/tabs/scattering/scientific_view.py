@@ -940,8 +940,14 @@ class ScientificView(QtWidgets.QFrame):
         if image is None:
             self.clear_keyed()
             return key
-        rows, columns = np.asarray(image).shape
-        panel = KeyedImageProjection(key, title, np.asarray(image),
+        shown = np.asarray(image)
+        rows, columns = shown.shape
+        from xrd_tools.core.invalid import UINT32_CEILING
+        if shown.dtype.kind in "ui" and shown.dtype.itemsize >= 4:
+            gaps = shown >= UINT32_CEILING
+            if gaps.any():  # an Eiger's module gaps show as missing, not as the top of the scale (display only)
+                shown = np.where(gaps, np.float32(np.nan), shown.astype(np.float32))
+        panel = KeyedImageProjection(key, title, shown,
             AxisProjection(np.arange(columns, dtype=float) + 0.5, "column", "px"),
             AxisProjection(np.arange(rows, dtype=float) + 0.5, "row", "px"), index, tuple(captions),
             navigation=bool(captions),

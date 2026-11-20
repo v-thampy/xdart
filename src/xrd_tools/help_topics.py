@@ -1082,6 +1082,12 @@ _GUIDANCE = {
 }
 
 
+def diagnostic_words(code: str) -> str:
+    """A known diagnostic code as its sentence and next action, for a status line; any other text unchanged
+    (NEXT-1217-EIGER-SOURCES: the ROI Statistics window showed bare codes)."""
+    return _GUIDANCE.get(code, code)
+
+
 def diagnostic_text(code: str, details: tuple[str, ...] = ()) -> str:
     """Keep every literal string first, then append guidance for exact known codes."""
     originals = (code, *details)

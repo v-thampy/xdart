@@ -1284,6 +1284,7 @@ class RSMPage(QtWidgets.QWidget):
         """Member groups found for ``key``: kept for ``build_form`` with the one RSM's members' own UBs (the
         Source header's warning) and, for several RSMs, each output's check (``_queue_refusals``); the suggested
         output follows them."""
+        key = self._follow_member_shape(key, groups)
         self._groups = (key, tuple(groups), tuple(skipped), tuple(ubs), dict(checked or {}))
         self._render_ub()
         if self._apply_suggestion():
@@ -1291,6 +1292,28 @@ class RSMPage(QtWidgets.QWidget):
         else:  # the found members' UBs: the Source header (no new form: a prepared Preview stays current)
             self._readiness = self._readiness_now()
             self._show_readiness()
+
+    def _follow_member_shape(self, key, groups):
+        """The Advanced Rows/Columns follow the found members' detector shape when the images carry their own (an
+        Eiger master or NeXus stack; maintainer, 2026-11-20: "the Advanced Rows/columns should update as well when
+        the image source changes"). The members' shapes come from their files, so what was found stays found: the
+        cache takes the key with the new values. RAW and TIFF members carry Rows/Columns, so nothing changes."""
+        shapes = {member.detector_shape for group in groups for member in group}
+        try:
+            current = (int(self._value("adv_rows")), int(self._value("adv_columns")))
+        except (TypeError, ValueError):
+            current = None
+        if len(shapes) != 1 or key != self._group_key() or shapes == {current}:
+            return key
+        rows, columns = next(iter(shapes))
+        self.set_field("adv_rows", str(rows))
+        self.set_field("adv_columns", str(columns))
+        return self._group_key()
+
+    def _skipped_scans(self):
+        """The scans the last search skipped for the Source as it stands, as (file, scan, why)."""
+        found = self._groups
+        return () if found is None or found[0] != self._group_key() else tuple(found[2])
 
     def _groups_members(self):
         """Every RSM's ordered members, from the groups found for the Source as it stands: one RSM a group
@@ -1585,12 +1608,21 @@ class RSMPage(QtWidgets.QWidget):
         counts_tip = self._frames_tooltip()
         if counts_tip:
             details["source"] += "\n\n" + counts_tip
+        skipped = self._skipped_scans()
+        if skipped:  # the Source header names the scans a search skipped and why, without a check mark (NEXT-1217)
+            imageless = all(str(why).startswith("No detector images") for _path, _scan, why in skipped)
+            shown = [str(scan)[:-2] if str(scan).endswith(".1") else str(scan) for _path, scan, _why in skipped]
+            label = "no images" if imageless else "skipped"
+            texts["source"] = " · ".join(part for part in (
+                texts["source"], f"⚠ {label}: scan{'s' * (len(shown) != 1)} {', '.join(shown)}") if part)
+            details["source"] = ("Skipped by the search (the other scans still run):\n" + "\n".join(
+                f"{Path(path).name} · scan {scan}: {why}" for path, scan, why in skipped) + "\n\n" + details["source"])
         if warned:  # the Source header warns in the brief's words, naming the scans, whatever else it needs
             warning = no_ub_warning(missing)
             details["source"] = warning if not sections["source"] else f"{warning} {details['source']}"
             texts["source"] = " · ".join(part for part in (texts["source"], "⚠ no UB matrix") if part)
         self._headers = {key: SectionHeaderProjection(
-            texts[key], not sections[key] and not (warned and key == "source"), details[key])
+            texts[key], not sections[key] and not ((warned or skipped) and key == "source"), details[key])
             for key in sections}
         if needs:
             return "Needs " + ", ".join(needs), False

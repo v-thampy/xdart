@@ -116,7 +116,18 @@ def resolve_spec_image_scan(path: str | Path, *, meta_dir: str | Path | None = N
 
 
 def _spec_image_layout(path, read_image_kwargs, nexus_entry=None):
-    """One layout/selector for SPEC admission and optional point grouping."""
+    """One layout/selector for SPEC admission and optional point grouping. A container's layout is its own (the
+    decoder options do not change it), so within one search (``shared_image_listings``) it is read once: RSM takes
+    an Eiger member's frame shape from the read admission made (NEXT-1217-EIGER-SOURCES)."""
+    from xrd_tools.io.image import _HDF5_READ_EXTS, shared_listing
+
+    if Path(path).suffix.lower() in _HDF5_READ_EXTS:
+        return shared_listing(("spec-container-layout", os.fspath(path), nexus_entry or None),
+                              lambda: _read_spec_image_layout(path, read_image_kwargs, nexus_entry))
+    return _read_spec_image_layout(path, read_image_kwargs, nexus_entry)
+
+
+def _read_spec_image_layout(path, read_image_kwargs, nexus_entry=None):
     from xrd_tools.io.image import DetectorImageLayout, _HDF5_READ_EXTS, read_detector_image_layout
 
     if nexus_entry and Path(path).suffix.lower() in _HDF5_READ_EXTS:

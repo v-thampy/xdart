@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from xrd_tools.core.invalid import detector_value_mask
+from xrd_tools.core.invalid import UINT32_CEILING, detector_value_mask
 
 _REDUCERS = ("mean", "sum", "max", "min", "std")
 
@@ -58,10 +58,14 @@ class RoiSpec:
 
 
 def invalid_pixel_mask(image, *, mask_saturation: bool = False, saturation: int | None = None) -> np.ndarray:
-    """Exclude non-finite values and the operator-selected detector values; ``saturation`` is the frame's
-    recorded detector saturation (decision 39), left out at and above when the values are masked."""
+    """Exclude non-finite values, the uint32 invalid value always, and the operator-selected detector values;
+    ``saturation`` is the frame's recorded detector saturation (decision 39), left out at and above when the values
+    are masked. The uint32 invalid value marks an Eiger's module gaps and dead pixels, never a count, so ROI
+    statistics leave it out whatever Mask saturated says, as calibration does (maintainer, 2026-11-20: "Always
+    exclude gap value (Recommended)"; NEXT-1217-EIGER-SOURCES). Int's own value masking is unchanged."""
     a = np.asarray(image)
     bad = ~np.isfinite(a)
+    bad |= a >= UINT32_CEILING
     selected = detector_value_mask(None, a, enabled=mask_saturation, saturation=saturation)
     if selected is not None:
         bad |= selected
