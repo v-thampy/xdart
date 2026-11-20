@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 from contextlib import nullcontext
 from typing import Any, Callable, Iterable, Mapping
 
@@ -1361,6 +1362,46 @@ class CommittedAppendCoverage:
     wavelength_m: float | None
 
 
+# The saved outputs' committed records this process has read, by output path, size and time (maintainer, 2026-11-19:
+# his pick "Remember saved records (Recommended)"; an Append on a network share opened every saved output on every
+# Run, about 22 ms each on the beamline PC). An unchanged output is answered from here; any write changes its size or
+# time and it is read again (a write during the read leaves the file under a newer size or time, so its next lookup
+# reads it again). A record that could not be read is not kept, so a share's hiccup is not remembered.
+_COMMITTED_RECORDS: dict[tuple[str, str, int, int], tuple[object, object]] = {}
+_COMMITTED_RECORDS_LOCK = threading.Lock()
+_COMMITTED_RECORDS_LIMIT = 8192
+
+
+def _committed_record(target: str | Path, entry: str):
+    """``(prefix, wavelength_m)`` of ``target``'s committed Append, or None for one this reader cannot vouch for."""
+    try:
+        stat = os.stat(target)
+    except OSError:
+        return None
+    key = (os.path.normcase(os.path.abspath(os.fspath(target))), entry, int(stat.st_size), int(stat.st_mtime_ns))
+    with _COMMITTED_RECORDS_LOCK:
+        found = _COMMITTED_RECORDS.get(key)
+    if found is not None:
+        return found
+    try:
+        with h5py.File(target, "r") as handle:
+            config = handle.get(f"{entry}/reduction/config")
+            if isinstance(config, h5py.Group) and any(
+                f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
+            ):
+                return None
+            prefix = decode_committed_append_prefix(handle, entry=entry)
+            from xrd_tools.io.browse_presentation import _monochromator_wavelength_m
+            wavelength_m = _monochromator_wavelength_m(handle[entry], entry, scalar_only=True)
+    except Exception:  # anything this reader cannot vouch for goes the full way
+        return None
+    with _COMMITTED_RECORDS_LOCK:
+        if len(_COMMITTED_RECORDS) >= _COMMITTED_RECORDS_LIMIT:
+            _COMMITTED_RECORDS.clear()
+        _COMMITTED_RECORDS[key] = (prefix, wavelength_m)
+    return (prefix, wavelength_m)
+
+
 def committed_append_coverage(
     target: str | Path,
     *,
@@ -1379,18 +1420,10 @@ def committed_append_coverage(
     DESIGN-append-smb-125). None sends the scan the full way: an absent, pending, dimension-replaced or unfamiliar
     output; other files, sizes or times; point groups or external members; or another identity.
     """
-    try:
-        with h5py.File(target, "r") as handle:
-            config = handle.get(f"{entry}/reduction/config")
-            if isinstance(config, h5py.Group) and any(
-                f"dimension_replacement_{dimension}" in config for dimension in ("1d", "2d")
-            ):
-                return None
-            prefix = decode_committed_append_prefix(handle, entry=entry)
-            from xrd_tools.io.browse_presentation import _monochromator_wavelength_m
-            wavelength_m = _monochromator_wavelength_m(handle[entry], entry, scalar_only=True)
-    except Exception:  # anything this reader cannot vouch for goes the full way
+    read = _committed_record(target, entry)
+    if read is None:
         return None
+    prefix, wavelength_m = read
     intent = prefix.intent
     expected = {_normalize(path): (int(size), int(mtime_ns)) for path, size, mtime_ns in members}
     committed = {member.path: (int(member.size), int(member.mtime_ns)) for member in intent.source.image_members}
