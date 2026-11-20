@@ -1917,10 +1917,13 @@ def prepare_rsm_tool_v2(
             expected_shape = (detector["Nch1"], detector["Nch2"])
     except RSMGeometryAssetRefused as error:
         raise RSMToolPreflightRefused(error.code, str(error)) from error
-    if any(member.detector_shape != expected_shape for member in form.members):
+    mismatched = sorted({member.detector_shape for member in form.members if member.detector_shape != expected_shape})
+    if mismatched:  # both shapes named: a beamline refusal said only that they differ (NEXT-1217-EIGER-SOURCES)
         raise RSMToolPreflightRefused(
             "RSM_MEMBER_IDENTITY_MISMATCH",
-            "every member detector shape must match the geometry asset",
+            "every member detector shape must match the geometry asset: the scans' images are "
+            + ", ".join(f"{rows}×{columns}" for rows, columns in mismatched)
+            + f" (rows × columns), the calibration's raw frame is {expected_shape[0]}×{expected_shape[1]}",
         )
 
     sources: list[ModuleSourceReceipt] = []

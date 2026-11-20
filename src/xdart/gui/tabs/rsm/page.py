@@ -256,6 +256,14 @@ def queue_output_slots(project, folder, groups, *, cancel=None):
     return tuple(slots)
 
 
+def _output_key(path):
+    """An output as the form keeps it (``RSMToolFormV2``: absolute and ``normcase``d, so lower case with backslashes
+    on Windows): the queue check looks outputs up by it. A Save Path's own spelling never matched on Windows, so
+    every queued Run there asked to run again (maintainer at the beamline, 2026-11-20; NEXT-1217-EIGER-SOURCES)."""
+    from xrd_tools.analysis.rsm_values import _absolute_path
+    return _absolute_path(path, "output path")
+
+
 def _queue_refusals(queue, groups, cancel):
     """Every queued RSM's output checked as its Replace checks it, from the header only
     (``analysis_output_refusal``), off the GUI thread: {output: refusal, or None when it can be written}. The
@@ -272,7 +280,7 @@ def _queue_refusals(queue, groups, cancel):
     for _family, output in queue_output_slots(project, folder, groups, cancel=cancel):
         if cancel.is_set():
             raise OperationCancelled("the scan search was stopped")
-        checked[str(output)] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
+        checked[_output_key(output)] = analysis_output_refusal(output, AnalysisArtifactKind.RSM)
     if cancel.is_set():
         raise OperationCancelled("the scan search was stopped")
     return checked
@@ -2101,7 +2109,7 @@ class RSMPage(QtWidgets.QWidget):
         for position, form in enumerate(forms, 1):
             if form.overwrite is not AnalysisArtifactOverwrite.REPLACE:
                 continue
-            output = str(Path(form.output_path))
+            output = _output_key(form.output_path)
             if output not in checked:  # the Save Path changed while the scans were found
                 self._notice("The output changed while the scans were found: Run again")
                 return False

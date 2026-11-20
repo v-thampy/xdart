@@ -83,7 +83,8 @@ def test_an_eiger_that_differs_from_the_calibration_still_refuses(qapp, tmp_path
     page = _page(qapp)
     try:
         _on_source(page, qapp, tmp_path, "2")
-        assert "RSM_MEMBER_IDENTITY_MISMATCH" in _preview(page, qapp)
+        refusal = _preview(page, qapp)
+        assert "RSM_MEMBER_IDENTITY_MISMATCH" in refusal and "4×5" in refusal and "195×487" in refusal, refusal
         assert (page._value("adv_rows"), page._value("adv_columns")) == ("4", "5")
     finally:
         _close(page, qapp)
