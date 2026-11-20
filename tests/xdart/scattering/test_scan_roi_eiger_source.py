@@ -112,3 +112,27 @@ def test_a_refused_source_reads_as_words_in_the_roi_window(tmp_path, qapp):
         assert dialog._help_current_diagnostic is not None  # the code stays in the window's Help diagnostics
     finally:
         _close_page(page, qapp)
+
+
+def test_the_roi_picker_scales_the_image_to_real_pixels_not_eiger_gaps(tmp_path, qapp):
+    """The picker's image levels come from real pixels: an Eiger's gap value (4294967295) shows as missing, so the
+    frame is not drawn black under it (display only; the statistics read the raw frame)."""
+    import pyqtgraph as pg
+    master = _master(tmp_path, dtype=np.uint32)
+    with h5py.File(tmp_path / "scan_data_000001.h5", "r+") as handle:
+        frames = np.tile(np.arange(64, dtype=np.uint32).reshape(8, 8), (5, 1, 1))
+        frames[:, 4, :] = int(UINT32_CEILING)
+        handle["entry/data/data"][...] = frames
+    page = _page()
+    try:
+        page._open_analysis_mount("scan_roi")
+        dialog = page._scan_roi_dialog
+        dialog.load_uri(str(master)); _settle(page, qapp)
+        dialog.roi_btn.click(); _settle(page, qapp)
+        picker = dialog._roi_dialog
+        assert picker._image.dtype == np.uint32 and (picker._image == int(UINT32_CEILING)).sum() == 8  # raw kept
+        images = [item for view in picker.findChildren(pg.GraphicsView) for item in view.items()
+                  if isinstance(item, pg.ImageItem) and item.image is not None]
+        assert images and all(float(item.getLevels()[1]) <= 63 for item in images), [i.getLevels() for i in images]
+    finally:
+        _close_page(page, qapp)
