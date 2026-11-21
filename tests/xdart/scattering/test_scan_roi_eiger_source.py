@@ -152,3 +152,50 @@ def test_the_roi_picker_scales_the_image_to_real_pixels_not_eiger_gaps(tmp_path,
         assert images and all(float(item.getLevels()[1]) <= 63 for item in images), [i.getLevels() for i in images]
     finally:
         _close_page(page, qapp)
+
+
+def _browse(page, qapp, path):
+    import time
+    page._select_scan(str(path), reopen=True)
+    deadline = time.monotonic() + 30
+    while page._context_controller.navigation.current is None and time.monotonic() < deadline:
+        qapp.processEvents(); page._drain_executor(); time.sleep(0.01)
+    assert page._context_controller.navigation.current is not None
+
+
+def test_roi_statistics_opens_on_the_scan_selected_in_the_data_browser(tmp_path, qapp):
+    """Maintainer, 2026-11-20: "how quick and easy is it for the ROI statistics window to open with the currently
+    selected file in the data browser if the selection is a valid one?"; picks "Fold into 1.2.17" and "On open only
+    (Recommended)". The Tools button opens the window on the browsed scan; a file picked in the window stays."""
+    from tests.xdart.scattering.test_p37_analysis_mount import _roi_navigation_table
+    other = tmp_path / "other"
+    other.mkdir()
+    _roi_navigation_table(tmp_path)  # processed scans whose frame records reach their raw images
+    _roi_navigation_table(other)
+    page = _page()
+    try:
+        _browse(page, qapp, tmp_path / "navigation.nexus")
+        button = page.findChild(QtWidgets.QPushButton, "e3Tool_roi_statistics")
+        assert "Data Browser" in button.toolTip()
+        button.click(); _settle(page, qapp)
+        dialog = page._scan_roi_dialog
+        assert dialog.source_widget.path_edit.text() == str(tmp_path / "navigation.nexus")
+        table = dialog._vnext_table_result
+        assert table is not None and table.labels == (3, 7, 11), dialog.status.text()
+        assert dialog.roi_btn.isEnabled()
+        dialog.load_uri(str(other / "navigation.nexus")); _settle(page, qapp)
+        button.click(); _settle(page, qapp)  # raised again: on open only
+        assert page._scan_roi_dialog is dialog
+        assert dialog.source_widget.path_edit.text() == str(other / "navigation.nexus")
+    finally:
+        _close_page(page, qapp)
+
+
+def test_roi_statistics_opens_empty_without_a_browsed_scan(qapp):
+    page = _page()
+    try:
+        page.findChild(QtWidgets.QPushButton, "e3Tool_roi_statistics").click(); _settle(page, qapp)
+        dialog = page._scan_roi_dialog
+        assert dialog._vnext_table_result is None and dialog.source_widget.path_edit.text() == ""
+    finally:
+        _close_page(page, qapp)
