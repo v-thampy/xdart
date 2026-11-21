@@ -252,11 +252,11 @@ def test_p37b_literal_commands_open_four_singletons_and_share_scan_roi_mount() -
     # remain accepted for existing command consumers. REFERENCE-PHASES-20261011 added
     # the Reference Phases launcher; PHASE-ANALYSIS-128 folded it and Phase Fitting into one Phase Analysis
     # launcher, which opens the phase analysis mount.
-    from xdart.gui.tabs.scattering.tools_view import PHASE_ANALYSIS_TOOLTIP
+    from xdart.gui.tabs.scattering.tools_view import PHASE_ANALYSIS_TOOLTIP, ROI_STATISTICS_TOOLTIP
     assert ToolsView._TOOLS == (
         ("\u2227 Peak Fitting", "peak_fitting"),
         ("\u2248 Phase Analysis", "phase_analysis", PHASE_ANALYSIS_TOOLTIP),
-        ("\u25a3 ROI Statistics", "roi_statistics"),
+        ("\u25a3 ROI Statistics", "roi_statistics", ROI_STATISTICS_TOOLTIP),
     )
     from xdart.gui.tabs.scattering.analysis_mount import MOUNT_TARGETS
 

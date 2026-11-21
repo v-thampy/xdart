@@ -108,11 +108,12 @@ def test_registry_is_exactly_two_tools_and_imports_no_gui_dependency() -> None:
     # Plot Metadata left Int's tools column for the shared metadata popup and Scan Plot (2fa82580);
     # REFERENCE-PHASES-20261011 added the Reference Phases window's launcher; PHASE-ANALYSIS-128 folded it and
     # Phase Fitting into one Phase Analysis launcher, with its tooltip.
-    from xdart.gui.tabs.scattering.tools_view import PHASE_ANALYSIS_TOOLTIP
+    # NEXT-1217-EIGER-SOURCES gave ROI Statistics its tooltip (it opens on the browsed scan).
+    from xdart.gui.tabs.scattering.tools_view import PHASE_ANALYSIS_TOOLTIP, ROI_STATISTICS_TOOLTIP
     assert ToolsView._TOOLS == (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Analysis", "phase_analysis", PHASE_ANALYSIS_TOOLTIP),
-        ("▣ ROI Statistics", "roi_statistics"),
+        ("▣ ROI Statistics", "roi_statistics", ROI_STATISTICS_TOOLTIP),
     )
     assert ToolsView._EXTERNAL_VIEWERS == (
         ("◇ Open Selected in NeXpy", "nexpy_selected"),

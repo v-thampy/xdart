@@ -1446,9 +1446,16 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 dialog.clear_result()
                 self._metadata_from_current()
         elif target == "scan_roi":
-            if created and self._metadata_result is not None:
-                dialog.set_vnext_metadata(self._metadata_result)
-            if focus_roi and dialog._vnext_table_result is None:
+            # a new window opens on the Data Browser's scan; a file picked in it later stays (maintainer, 2026-11-20:
+            # "Fold into 1.2.17", "On open only (Recommended)"; NEXT-1217-EIGER-SOURCES)
+            browsed = self._metadata_plan_for_current() if created and not self._metadata_held_by_run() else None
+            if browsed is not None and type(browsed.source) is str and browsed.source:
+                dialog.load_uri(browsed.source)
+            else:
+                browsed = None
+                if created and self._metadata_result is not None:
+                    dialog.set_vnext_metadata(self._metadata_result)
+            if focus_roi and browsed is None and dialog._vnext_table_result is None:
                 dialog.status.setText("Choose a source, then Plot ROI.")
 
     def _metadata_from_current(self):

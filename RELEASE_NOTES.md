@@ -8,6 +8,10 @@
   from a Folder as a raw NeXus stack, was refused (SOURCE_IDENTITY_MISMATCH),
   and so was any NeXus file picked from a Folder. They now open, preview and
   compute. The window's refusals read as sentences instead of codes.
+- **ROI Statistics opens on the browsed scan:** the Tools button opens the
+  window on the scan selected in the Data Browser. Another file or folder
+  can still be chosen in the window, and it stays when the window is raised
+  again.
 - **ROI Statistics leaves out Eiger module gaps:** with Mask saturated off
   (its default), the gaps' invalid value (4294967295) was summed. A 200x200
   ROI across a gap read about 3.9e13 per frame instead of about 7e5. That

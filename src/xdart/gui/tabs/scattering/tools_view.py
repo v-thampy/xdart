@@ -20,6 +20,12 @@ PHASE_ANALYSIS_TOOLTIP = ("Phase Analysis: draw reference lines and detector rin
                           "option of the phase-fitting notebook.")
 
 
+#: The Tools button that opens ROI Statistics (NEXT-1217-EIGER-SOURCES): it opens on the browsed scan.
+ROI_STATISTICS_TOOLTIP = ("ROI Statistics: plot a scan's metadata and rectangular-ROI statistics over its raw frames. "
+                          "It opens on the scan selected in the Data Browser; choose another file or folder in the "
+                          "window.")
+
+
 class ToolsView(QtWidgets.QFrame):
     commandRequested = QtCore.Signal(object)
 
@@ -27,7 +33,7 @@ class ToolsView(QtWidgets.QFrame):
     _TOOLS = (
         ("∧ Peak Fitting", "peak_fitting"),
         ("≈ Phase Analysis", "phase_analysis", PHASE_ANALYSIS_TOOLTIP),
-        ("▣ ROI Statistics", "roi_statistics"),
+        ("▣ ROI Statistics", "roi_statistics", ROI_STATISTICS_TOOLTIP),
     )
     _EXTERNAL_VIEWERS = (
         ("◇ Open Selected in NeXpy", "nexpy_selected"),
