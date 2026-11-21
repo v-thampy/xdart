@@ -1,5 +1,34 @@
 # Release notes
 
+## 1.2.17 (2026-11-20)
+
+### Fixes
+
+- **ROI Statistics opens Eiger files:** an Eiger master picked as a file, or
+  from a Folder as a raw NeXus stack, was refused (SOURCE_IDENTITY_MISMATCH),
+  and so was any NeXus file picked from a Folder. They now open, preview and
+  compute. The window's refusals read as sentences instead of codes.
+- **ROI Statistics leaves out Eiger module gaps:** with Mask saturated off
+  (its default), the gaps' invalid value (4294967295) was summed. A 200x200
+  ROI across a gap read about 3.9e13 per frame instead of about 7e5. That
+  value is now always left out, as calibration already does; Mask saturated
+  still controls saturated counts, and Int's masking is unchanged. The ROI
+  picker no longer draws the frame black under the gaps.
+- **RSM with SPEC + Eiger takes the detector shape from the Eiger file:** it
+  took the shape from Advanced Rows/Columns (the raw-file decoder's settings),
+  so a 512x1028 Eiger was refused with RSM_MEMBER_IDENTITY_MISMATCH unless
+  they were typed in. Rows/Columns now follow the file when Preview or Run
+  finds the scans. RAW and TIFF images still use them, and a real mismatch
+  with the calibration still refuses, naming both shapes.
+- **RSM names the scans without images:** the Source header showed a check
+  mark for a scan with no detector images. It now shows "no images: scan N"
+  with the reason in its tooltip, and the other scans still run.
+- **RSM: a queued Run on Windows always asked to run again:** with All
+  Scans, or several RSMs, "The output changed while the scans were found: Run
+  again" came back on every Run, because the check compared two spellings of
+  the same output path. Both sides now use the same normalized path. Found by
+  reading the code and reproduced on macOS; Windows CI now runs the test.
+
 ## 1.2.16 (2026-11-19)
 
 ### Fixes
