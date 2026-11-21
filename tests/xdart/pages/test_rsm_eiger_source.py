@@ -97,7 +97,8 @@ def test_the_source_card_names_a_scan_without_images(qapp, tmp_path, scans, miss
     _eiger_source(tmp_path, (195, 487))
     if missing_ub:
         spec = tmp_path / "source" / "RSM_synth"
-        spec.write_text(spec.read_text(encoding="utf-8").replace("#G3 1 0 0 0 1 0 0 0 1\n", ""), encoding="utf-8")
+        spec.write_text(spec.read_text(encoding="utf-8").replace("#G3 1 0 0 0 1 0 0 0 1\n", ""), encoding="utf-8",
+                        newline="\n")
     page = _page(qapp)
     try:
         _on_source(page, qapp, tmp_path, scans)

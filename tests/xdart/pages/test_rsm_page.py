@@ -226,7 +226,7 @@ def _spec_scan(number, mu):
 
 def _spec_file(path, scans):
     path.write_text(f"#F {path.name}\n#E 1\n#D Mon Jan 15 10:30:00 2024\n#O0 energy  mu  chi  phi  nu  del\n\n"
-                    + "\n".join(scans), encoding="utf-8")
+                    + "\n".join(scans), encoding="utf-8", newline="\n")  # SPEC's own line ends, on Windows too
 
 
 def _synthetic_source(root, *, full=False):
