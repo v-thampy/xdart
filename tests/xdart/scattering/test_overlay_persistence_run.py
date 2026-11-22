@@ -155,6 +155,53 @@ def test_setting_background_updates_every_retained_overlay_curve(qapp, tmp_path)
         np.testing.assert_allclose(restored_second, second, atol=scale)
 
 
+def test_a_background_set_after_the_browse_handoff_corrects_every_kept_curve(qapp, tmp_path):
+    """A one-scan Live Run in Overlay (two frames, no background) ends into Browse; Set BG then corrects every curve
+    with no note (the handoff's curves keep their native basis); after a second Run the kept curves and its own are
+    each drawn as itself minus the background at its axis, which Clear BG shows (LIVE-1218-VIEWER2D-BG, his pick
+    "Any scan or file")."""
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    with _page(qapp, intent) as (page, view, events):
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("a", 2)], "int1d")
+        assert _rows(page) == [("a_int1d.nexus", 1), ("a_int1d.nexus", 2)]
+        before = [item.yData.copy() for item in view.curve.listDataItems()]
+        frames = tuple(page._context_controller.navigation.selected)
+        # Set BG on one frame: a two-frame Browse selection after the handoff refuses Set BG ("Select at least one
+        # display frame"), as in 1.2.17 (seen there too; outside this objective)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[-1], frames=frames[-1:]))
+        assert _pump(qapp, lambda: len(page._context_controller.navigation.selected) == 1)
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG"), page._notice_text
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[-1], frames=frames))
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 2)
+        assert "so it is drawn as it is" not in view.background.toolTip()
+        background = np.asarray(page._background_owner._result.values, dtype=np.float64)
+        scale = 1e-6 * float(np.nanmax(np.abs(background)))
+        for drawn, raw in zip((item.yData for item in view.curve.listDataItems()), before, strict=True):
+            np.testing.assert_allclose(drawn, raw - background, atol=4 * scale)
+        _live_run(qapp, page, events, tmp_path / "raw", [("b", 1)], "int1d")
+        assert ("b_int1d.nexus", 1) in _rows(page) and ("a_int1d.nexus", 1) in _rows(page)
+        assert page._background_owner.phase == "ACTIVE" and "so it is drawn as it is" not in view.background.toolTip()
+        rows = _rows(page)
+        bg_axis = np.asarray(page._background_owner._result.axes[0], dtype=np.float64)
+        natives = [np.asarray(trace.background_basis[0], np.float64) for trace in view.trace_history_projections]
+        corrected = [(axis, np.asarray(item.yData, np.float64))
+                     for axis, item in zip(natives, view.curve.listDataItems(), strict=True)]
+        assert len(corrected) == len(rows)
+        view.background.click()  # Clear BG: the same curves as they are, the kept ones too
+        assert _pump(qapp, lambda: view.background.text() == "Set 1D BG" and len(view.curve.listDataItems()) == len(rows))
+        assert _rows(page) == rows
+        for (x, got), item in zip(corrected, view.curve.listDataItems(), strict=True):
+            raw = np.asarray(item.yData, np.float64)
+            on_bins = x.shape == bg_axis.shape and np.allclose(x, bg_axis, rtol=1e-6)
+            want = raw - (background if on_bins else np.interp(x, bg_axis, background, left=np.nan, right=np.nan))
+            finite = np.isfinite(want)
+            assert finite.any()
+            np.testing.assert_allclose(got[finite], want[finite], atol=4 * scale + 1e-6 * float(np.nanmax(np.abs(raw))))
+
+
 def _gi_run_view(artifact, scan, labels):
     """A GI Run's view of one scan: its frames, all selected, a q curve each, as its payloads name them."""
     frames = tuple(DisplayFrameKey(RunIdentity(7, "overlay-persist"), scan, artifact, label, label) for label in labels)

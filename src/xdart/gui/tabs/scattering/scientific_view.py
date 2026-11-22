@@ -109,12 +109,16 @@ def _frames_text(frames) -> str:
 
 
 def _detached_root_bytes(traces) -> int:
-    """The bytes ``traces`` hold, each backing allocation counted once (their x, y and angular-support roots)."""
+    """The bytes ``traces`` hold, each backing allocation counted once (their x, y, angular-support and background-basis
+    roots: a converted axis keeps its native axis too, for a display background)."""
     roots = {}
     for trace in traces:
         arrays = [trace.axis.values, trace.intensity]
         if trace.angular_support is not None and trace.angular_support.supported_deg is not None:
             arrays.append(trace.angular_support.supported_deg)
+        basis = getattr(trace, "background_basis", None)
+        if basis is not None:
+            arrays.append(basis[0])
         for array in arrays:
             while isinstance(array.base, np.ndarray):
                 array = array.base
@@ -3968,6 +3972,9 @@ class ScientificView(QtWidgets.QFrame):
                             and retained.title == trace.title
                             and retained.epoch == trace.epoch
                             and getattr(retained, "wavelength_m", None) == getattr(trace, "wavelength_m", None)
+                            # a kept curve without the fresh one's background basis would be drawn as it is
+                            and (getattr(retained, "background_basis", None) is None)
+                            == (getattr(trace, "background_basis", None) is None)
                         )
                     )
                 ):

@@ -1074,6 +1074,19 @@ def test_the_view_subtracts_a_1d_background_from_every_curve_it_draws(plot_mode:
         view.close(); qapp.processEvents()
 
 
+def test_the_detached_budget_counts_a_curves_native_basis_once() -> None:
+    """A kept curve on a converted axis holds its native axis too (its background basis): the Browse comparison
+    budget counts that root, once, and not again when the basis is the drawn axis itself."""
+    from xdart.gui.tabs.scattering.scientific_view import _detached_root_bytes
+    frame = make_shell_projection(frame_count=1, selected_index=0).navigation.frames[0]
+    native = np.arange(64.0)
+    shown = TraceProjection(frame, AxisProjection(native * 2.0, "2θ", "deg"), np.ones(64))
+    plain = _detached_root_bytes((shown,))
+    assert _detached_root_bytes((replace(shown, background_basis=(native, "q\0A^-1", "")),)) == plain + native.nbytes
+    same = replace(shown, background_basis=(shown.axis.values, "2θ\0deg", ""))
+    assert _detached_root_bytes((same,)) == plain
+
+
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
     """His pick, 2026-11-22, "Each by its own monitor" (the question's formula I_frame/monitor_frame -
     <I_bg/monitor_bg>): the contributors are each divided by their own monitor before the mean, and a frame is
