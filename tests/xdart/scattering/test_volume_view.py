@@ -610,7 +610,7 @@ def test_axis_arrows_run_from_the_lowest_corner_toward_increasing_coordinate():
     assert [arrow.direction for arrow in arrows] == [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
     assert [arrow.tip for arrow in arrows] == [(4.75, 0.0, 0.0), (0.0, 5.75, 0.0), (0.0, 0.0, 6.75)]
     np.testing.assert_allclose([arrow.label_at for arrow in arrows],
-                               [(4.75 + 0.36, 0.0, 0.0), (0.0, 5.75 + 0.36, 0.0), (0.0, 0.0, 6.75 + 0.36)])
+                               [(4.75 + 0.72, 0.0, 0.0), (0.0, 5.75 + 0.72, 0.0), (0.0, 0.0, 6.75 + 0.72)])
 
     # a falling K axis: the arrows start at its high-index side, and K's points back across the box
     falling = (rising[0], rising[1][::-1].copy(), rising[2])

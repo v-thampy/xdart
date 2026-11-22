@@ -157,7 +157,7 @@ def axis_arrows(shape, axes, labels) -> tuple[AxisArrow, AxisArrow, AxisArrow]:
         reach = size + longest / 8.0
         tip = tuple(corner[part] + direction[part] * reach for part in range(3))
         low, high = sorted((float(axis[0]), float(axis[-1])))
-        label_at = tuple(tip[part] + direction[part] * head for part in range(3))
+        label_at = tuple(tip[part] + direction[part] * 2.0 * head for part in range(3))
         arrows.append(AxisArrow(corner, tip, direction, head, head / 2.5, f"{label} {low:.4g}…{high:.4g}", label_at))
     return tuple(arrows)
 
@@ -561,7 +561,7 @@ class VolumeView(QtWidgets.QFrame):
         for item in (self._volume, self._box, *self._axis_items):
             self.gl.addItem(item)
         self.gl.opts["center"] = QtGui.QVector3D(nx / 2.0, ny / 2.0, nz / 2.0)
-        self.gl.setCameraPosition(distance=2.0 * max(nx, ny, nz))
+        self.gl.setCameraPosition(distance=2.8 * max(nx, ny, nz))  # the box and its arrows, labels included
 
 
 _DRAWING = "Drawing the 3D view…"
