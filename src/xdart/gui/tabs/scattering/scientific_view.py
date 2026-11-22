@@ -1121,7 +1121,15 @@ class ScientificView(QtWidgets.QFrame):
         self._expected_background_key = key
 
     def release_display_background(self, active_key):
-        if active_key != self._rendered_background_key: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
+        if self._rendered_background_key is None:
+            # A scan can advance after promotion and before paint. An exact
+            # expected key has no mounted background buffers to clear yet.
+            released = type(active_key) is tuple and active_key == self._expected_background_key
+            if released:
+                self._expected_background_key = None
+            return DisplayBackgroundRendererReleaseReceipt(active_key, released)
+        if active_key != self._rendered_background_key:
+            return DisplayBackgroundRendererReleaseReceipt(active_key, False)
         domain = active_key[2]
         try:
             if domain == "raw":

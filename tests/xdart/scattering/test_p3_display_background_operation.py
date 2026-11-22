@@ -425,6 +425,38 @@ def test_idle_orphan_release_repaints_the_background_control() -> None:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
+def test_a_scan_boundary_releases_a_promoted_background_before_first_paint() -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    identity, acquisition = _acquisition()
+    controller, view = page._context_controller, page._shell.scientific
+    controller._runtime.adopt_acquisition(identity, acquisition)
+    page._refresh_shell()
+    try:
+        view.background.click()
+        operations = page._workspace_operations
+        worker = operations._slot._worker
+        assert worker is not None
+        worker.join(3)
+        assert not worker.is_alive()
+        # The same ordering as the drain: adopt before advancing navigation
+        # and before reconciling the scientific view.
+        update = operations.poll(operations.current_identity)
+        assert page._consume_background_update(update)
+        owner = page._background_owner
+        assert owner.phase == "ACTIVE" and view.background.text() == "Set 2D BG"
+        wrong_key = (*owner.active_key, "another background")
+        assert not view.release_display_background(wrong_key).released
+        assert controller.release_acquisition(identity)
+        page._drain_executor()
+        _assert_background_released(owner)
+        assert view.background.text() == "Set 2D BG"
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
 @pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
 def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: str) -> None:
     """With the idle tick no longer releasing every background, an Int background whose frames were replaced

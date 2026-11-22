@@ -2389,6 +2389,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if not valid or not self._background_owner.promote(receipt, targets):
             self._background_owner.abort(receipt.reservation, "ADOPTION_FAILED")
             self._notice("Display background context changed before adoption."); return True
+        self._shell.scientific.expect_display_background(receipt.active_key)
         self._context_controller.reseed_background_projection()
         self._notice("Display background set."); return True
 
