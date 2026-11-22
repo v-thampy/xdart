@@ -331,7 +331,32 @@ def test_the_gl_items_are_built_where_opengl_is_available(qapp, monkeypatch):
         assert "red, green and blue arrows point along increasing H, K and L" in view.gl.toolTip()
         view.release()
         assert view.gl.items == []
+        assert not view.gl.toolTip()
     finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_default_camera_frames_axis_labels_in_a_wide_volume_view(qapp, monkeypatch):
+    from pyqtgraph.Qt import QtGui
+    import pyqtgraph.opengl as gl
+    from xdart.gui.tabs.scattering import volume_view
+
+    monkeypatch.setattr(volume_view, "_GL_AVAILABLE", True)
+    view = VolumeView()
+    try:
+        view.gl.resize(800, 400)
+        view.reconcile(_projection((6, 6, 6)))
+        _settled(view)
+        viewport = (0, 0, view.gl.width(), view.gl.height())
+        matrix = view.gl.projectionMatrix(viewport, viewport) * view.gl.viewMatrix()
+        labels = [item for item in view.gl.items if isinstance(item, gl.GLTextItem)]
+        assert len(labels) == 3
+        for label in labels:
+            anchor = matrix.map(QtGui.QVector3D(*label.pos))
+            assert max(abs(anchor.x()), abs(anchor.y())) <= 0.92, (label.text, anchor)
+    finally:
+        view.shutdown()
         view.deleteLater()
         qapp.processEvents()
 

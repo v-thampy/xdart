@@ -533,6 +533,7 @@ class VolumeView(QtWidgets.QFrame):
                 self.gl.removeItem(item)
         self._volume = self._box = None
         self._axis_items = []
+        self.gl.setToolTip("")
 
     def _draw_items(self, axes) -> None:
         if self.gl is None:
@@ -543,7 +544,6 @@ class VolumeView(QtWidgets.QFrame):
         self._volume = gl.GLVolumeItem(self.rgba, sliceDensity=1, smooth=True, glOptions="translucent")
         self._box = gl.GLBoxItem(size=QtGui.QVector3D(nx, ny, nz))
         labels = self._projection.labels
-        self._axis_items = []
         for arrow, colour in zip(axis_arrows((nx, ny, nz), axes, labels), ARROW_COLOURS, strict=True):
             vertexes, faces = arrow_head(arrow)
             shaft = gl.GLLinePlotItem(pos=np.array([arrow.start, vertexes[1]], dtype=np.float32), color=colour,
@@ -561,7 +561,10 @@ class VolumeView(QtWidgets.QFrame):
         for item in (self._volume, self._box, *self._axis_items):
             self.gl.addItem(item)
         self.gl.opts["center"] = QtGui.QVector3D(nx / 2.0, ny / 2.0, nz / 2.0)
-        self.gl.setCameraPosition(distance=2.8 * max(nx, ny, nz))  # the box and its arrows, labels included
+        # GLViewWidget uses a fixed horizontal field of view. Wider viewports
+        # need more distance to leave room above the volume for the labels.
+        aspect = self.gl.width() / max(1, self.gl.height())
+        self.gl.setCameraPosition(distance=2.8 * max(nx, ny, nz) * max(1.0, aspect / 1.55))
 
 
 _DRAWING = "Drawing the 3D view…"
