@@ -2528,9 +2528,9 @@ class RSMPage(QtWidgets.QWidget):
         (the one asked to be shown stays: a late read kept beside it does not push it out)."""
         if show:
             self._requested = path
-        released = self._background_path() == path
-        if released:  # the background's result admitted again: let it go (Stitch's 30f74f29: its identity is
-            self._release_background()  # the data it was set from)
+        # the background's own result admitted again (a Replace, or read back once no longer resident) keeps the
+        # display background: it holds its own payload, and every result shown is drawn minus it
+        # (LIVE-1218-VIEWER2D-BG; his words: "In fact this should work in all modes, int 1d, stitch, RSM")
         self._results[path] = payload
         self._viewers.pop(path, None)  # a result admitted again (Replace, a read back) is drawn from itself
         self._results.move_to_end(path)
@@ -2547,8 +2547,6 @@ class RSMPage(QtWidgets.QWidget):
         self._publish_results()
         if show:
             self._show(path, payload)
-        elif released:  # the view let go of its panels with the background: the result shown, drawn again
-            self._redraw()
 
     def _result_selected(self, path):
         self._requested = path
@@ -2598,9 +2596,9 @@ class RSMPage(QtWidgets.QWidget):
         source = self._background.keyed_source()
         background = name = None
         if source is not None:
-            background_path, _payload, background_values, model = source
+            background_path, background_payload, background_values, model = source
             name = f"the background {Path(background_path).name}"
-            if background_path == path:
+            if background_path == path and background_payload is self._results.get(path):
                 name += " (this result: every panel is zero)"
             background = self._background_panels(background_values, model, snapshot)
         state = apply_keyed_presentation_background(state, background, name or "")
@@ -2655,7 +2653,7 @@ class RSMPage(QtWidgets.QWidget):
         """Int's Set BG and Clear BG, display only, for the six panels: Set BG takes the result shown as the
         background, and every result shown is then drawn minus it, panel by panel (each slice minus the
         background's at the same index); one on another grid is drawn as it is, and says why. Clear BG drops
-        it; so do the background's result admitted again and the page closing."""
+        it; so does the page closing. The background's own result admitted again keeps it."""
         if self._background.phase not in {"EMPTY", "RELEASED"}:
             self._release_background()
             self._redraw()

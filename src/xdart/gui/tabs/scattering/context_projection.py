@@ -19,6 +19,7 @@ from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
 from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
+from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.session.hydration import (
     HydrationPurpose, HydrationReadKey, HydrationScope, HydrationToken,
 )
@@ -40,6 +41,7 @@ from .display_values import (
 )
 from .display_runtime import browse_publication_needs_hydration
 from .events import RunIdentity
+from .scientific_axes import resolve_norm_presentation
 from .shell_projection import (
     ScientificPreferences, build_browser_projection,
     build_run_strip_projection, build_scientific_projection,
@@ -84,15 +86,44 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
+def following_trace_values(trace_values, payloads, norm_channel: str = ""):
+    """The per-pattern hook ``apply_presentation_background`` takes for a 1-D background that follows every
+    pattern drawn (LIVE-1218-VIEWER2D-BG; his words: "the whole idea is to apply it across frames"): for a trace,
+    the background owner's ``trace_values`` on the native pattern of the payload it was drawn from (matched by
+    the frame key itself, never a bare id), with that payload's own normalization divisor, as ``promote`` takes
+    it for the patterns the background was set on. None when ``trace_values`` is not callable."""
+    if not callable(trace_values):
+        return None
+    by_id = {id(payload.frame_key): payload for payload in payloads}
+
+    def values(trace):
+        payload = by_id.get(id(trace.frame))
+        view = None if payload is None or payload.frame_key is not trace.frame else payload.view
+        axis = None if view is None else view.axis_1d
+        if axis is None or type(view.intensity_1d) is not np.ndarray:
+            return None
+        divisor = 1.0
+        if norm_channel:
+            resolved = resolve_monitor_norm(view.metadata_numeric, norm_channel)
+            if resolved is None:
+                return None
+            divisor = float(resolved)
+        return trace_values(view.intensity_1d, axis.values, f"{axis.label}\0{axis.unit}", divisor)
+    return values
+
+
 def apply_presentation_background(
-    state: ScientificProjection, projection, frame_values=None,
+    state: ScientificProjection, projection, frame_values=None, trace_values=None,
 ) -> ScientificProjection:
     """A projection with the presentation background's values in place of its traces' (1-D) or its
-    image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's.
+    image's (raw, 2-D); Int's pages and Stitch's.
 
-    ``frame_values``: the background owner's ``frame_values``, given by Int's host, so a raw background (the 2D
-    Viewer's) or a 2-D one follows the frame drawn (LIVE-1218-VIEWER2D-BG); a frame it does not fit (another
-    shape; for a 2-D one other map axes) is drawn as it is, the button's tip saying why, with no refusal."""
+    The background follows what is drawn (LIVE-1218-VIEWER2D-BG; his words: "the whole idea is to apply it across
+    frames", "If it is dropped on selection change what is the point of it at all?"): ``frame_values`` (the
+    owner's) for a raw (the 2D Viewer's) or 2-D one, the frame drawn; ``trace_values`` (``following_trace_values``)
+    for a 1-D one, each pattern drawn. A frame or pattern it does not fit (another shape; for a 2-D one other map
+    axes; for a 1-D one another axis quantity or unit) is drawn as it is, the button's tip saying why, with no
+    refusal. Without them, only the frames the background was promoted for take its values."""
     if projection is None:
         return replace(state, background_set=False)
     try:
@@ -100,6 +131,24 @@ def apply_presentation_background(
         values = dict(rows)
     except (TypeError, ValueError):
         return replace(state, background_set=False)
+    if domain == "integrated_1d" and callable(trace_values):
+        notes: list[str] = []
+
+        def follow(trace):
+            value = trace_values(trace)
+            if type(value) is np.ndarray and value.shape == trace.intensity.shape:
+                return replace(trace, intensity=value)
+            if type(value) is str:
+                notes.append(value)
+            return trace
+        traces = tuple(follow(trace) for trace in state.traces)
+        pinned = tuple(replace(item, trace=follow(item.trace)) for item in state.pinned_traces)
+        note = ""
+        if notes:
+            count = len(state.traces) + len(state.pinned_traces)
+            note = notes[0] if len(notes) == 1 and count == 1 else (
+                f"{len(notes)} of the {count} patterns shown are drawn as they are: {notes[0]}")
+        return replace(state, traces=traces, pinned_traces=pinned, background_set=True, background_note=note)
     heavy = state.heavy
     if domain in {"raw", "integrated_2d"} and callable(frame_values):
         if heavy is not None:
@@ -460,6 +509,7 @@ class ContextProjection:
         norm_aggregate: object = None,
         presentation_background=None,
         presentation_background_frame_values=None,
+        presentation_background_trace_values=None,
         browse_open: bool = True,
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output. ``browse_open``: whether Browse can open
@@ -564,8 +614,11 @@ class ContextProjection:
                 norm_aggregate=norm_aggregate,
                 # an Int 1D (XYE) Run writes .xye files, no NeXus output to name
                 names_output=intent.processing_mode != "Int 1D (XYE)"))
+        # a 1-D background follows every pattern drawn, each by its own normalization, as Set BG divides it
         scientific = apply_presentation_background(
-            scientific, presentation_background, presentation_background_frame_values)
+            scientific, presentation_background, presentation_background_frame_values,
+            following_trace_values(presentation_background_trace_values, payloads, resolve_norm_presentation(
+                norm_aggregate, preferences.norm_channel, navigation.selected)[2]))
         scientific = replace(scientific, acquisition_selected=(
             selection is not None and selection.kind is ContextKind.ACQUISITION))
         if not viewer_selected and selection is not None and selection.kind is ContextKind.BROWSE:
@@ -931,4 +984,5 @@ def _browse_wavelength(context: BrowseContext) -> float | None:
     return canonical_wavelength_m(value, WavelengthUnit.METRE)
 
 
-__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings"]
+__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings",
+           "following_trace_values"]

@@ -2955,11 +2955,9 @@ class StitchPage(QtWidgets.QWidget):
                 AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
             raise TypeError("Stitch page requires an admitted Stitch result")
         key = str(path)
-        if key in self._listed and self._background.phase not in {"EMPTY", "RELEASED"}:
-            # this result replaces one listed under its key (a run that replaced the output, or the file
-            # opened again): a background made from the earlier one would show its arrays in place of the
-            # new ones (Codex round-2 review F1)
-            self._release_background()
+        # a result replacing one listed under its key (a run that replaced the output, or the file opened again)
+        # keeps the display background: it is subtracted from the new result's own arrays as drawn, never shown
+        # in place of them (Codex round-2 review F1; LIVE-1218-VIEWER2D-BG)
         self._payloads[key] = payload
         self._payload_bytes[key] = payload.resident_bytes
         if key not in self._listed:
@@ -3181,10 +3179,10 @@ class StitchPage(QtWidgets.QWidget):
                 if id(key) in pinned and path in self._payloads:
                     items.setdefault(id(key), (path, self._payloads[path]))
         if self._background.phase == "ACTIVE" and self._background_scope(navigation) != self._background_context:
-            self._release_background()  # as Int's: another selection, result, mode or view releases it
+            self._release_background()  # another layout or Diagnostic lets it go
+        shown = tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in items.values())
         state = build_scientific_projection(
-            tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in items.values()),
-            navigation, frozenset(keys), self._view, "", processing_mode=processing_mode)
+            shown, navigation, frozenset(keys), self._view, "", processing_mode=processing_mode)
         names = {id(key): (key.source_scan, f"{key.source_scan}_{key.local_frame_label}") for key in keys}
 
         def named(trace):  # the result's name, as the list shows it, before any slice note
@@ -3203,8 +3201,12 @@ class StitchPage(QtWidgets.QWidget):
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=label or "Current", status=status)
-        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
-        state = apply_presentation_background(state, self._background.projection())
+        from xdart.gui.tabs.scattering.context_projection import (
+            apply_presentation_background, following_trace_values)
+        # the background follows every result drawn, as Int's (LIVE-1218-VIEWER2D-BG)
+        state = apply_presentation_background(
+            state, self._background.projection(), self._background.frame_values,
+            following_trace_values(self._background.trace_values, shown))
         if (state.heavy is not None and map_mode and self._diagnostic == "Intensity"
                 and state.image_axis in {"Q-Chi", "q_chi"} and not state.derived_2d):
             # Stored counts already have the result's (q, chi) axes; Int renders (chi, q).
@@ -3406,16 +3408,19 @@ class StitchPage(QtWidgets.QWidget):
         self._sync_actions()
 
     def _background_scope(self, navigation):
-        """What a display background belongs to: the layout, the selected and current results, the Diagnostic
-        and the plot axis (Int releases its background at every such boundary)."""
-        return (self._mode, tuple(id(key) for key in navigation.selected), id(navigation.current),
-                self._diagnostic, self._view.plot_axis)
+        """What a display background belongs to: the layout and the Diagnostic (what the values are), whose change
+        lets it go. Another selection, current result or plot axis keeps it: it follows every result drawn, each
+        pattern or map on its grid, others (another quantity, unit or map axes) drawn as they are
+        (LIVE-1218-VIEWER2D-BG; his words: "the whole idea is to apply it across frames", "In fact this should work
+        in all modes, int 1d, stitch, RSM")."""
+        del navigation
+        return (self._mode, self._diagnostic)
 
     def _toggle_background(self):
-        """Int's Set BG and Clear BG, display only: the selected results' mean subtracted from the results
-        shown (a pattern on another grid takes it interpolated, as Int's; in Stitch 2D the current map, from
-        the selected maps of its shape), through Int's background owner, run here at once (Stitch's results
-        are small). Clear BG drops it; so does another selection, result, mode, Diagnostic or plot axis."""
+        """Int's Set BG and Clear BG, display only: the selected results' mean subtracted from every result shown
+        after it (a pattern on another grid takes it interpolated, as Int's; in Stitch 2D the maps of its shape
+        and axes, from the selected maps of its shape), through Int's background owner, run here at once
+        (Stitch's results are small). Clear BG drops it; so does another layout or Diagnostic."""
         from xdart.gui.tabs.scattering.operation_values import OperationContextStamp
         from xdart.gui.tabs.scattering.presentation_background import prepare_background_plan
         owner = self._background
@@ -3427,8 +3432,11 @@ class StitchPage(QtWidgets.QWidget):
         domain = "integrated_2d" if map_mode else "integrated_1d"
         keys, navigation = self._navigation()
         payloads = tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in self._selected())
+        # a map taken as Int's page takes it, through the map the view draws, so its axes are known at Set and
+        # every map shown after it on those axes is subtracted (LIVE-1218-VIEWER2D-BG)
         prepared = (None if not payloads or navigation.current is None else
-                    prepare_background_plan(payloads, domain, navigation.current, contributor_count=len(payloads)))
+                    prepare_background_plan(payloads, domain, navigation.current, contributor_count=len(payloads),
+                                            image_axis=self._view.image_axis if map_mode else None))
         if prepared is None:
             self._status("Select the results to take as the background: Overlay, then the results"
                          + (" (maps of one shape, the current among them)" if map_mode else ""))

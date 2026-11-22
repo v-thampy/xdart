@@ -2695,10 +2695,20 @@ def test_a_background_on_another_grid_is_drawn_unsubtracted_and_says_why(qapp, m
         _close(page, qapp)
 
 
-def test_the_background_is_released_by_clear_bg_by_its_result_admitted_again_and_by_close(qapp, monkeypatch):
+def _minus(shown, background, indices):
+    """``shown``'s six panels at ``indices`` minus ``background``'s, as Set BG draws them."""
+    return [np.subtract(getattr(a, "image", None) if hasattr(a, "image") else a.intensity,
+                        getattr(b, "image", None) if hasattr(b, "image") else b.intensity)
+            for a, b in zip(_panels_at(shown, indices), _panels_at(background, indices), strict=True)]
+
+
+def test_the_background_is_released_by_clear_bg_and_close_and_kept_when_its_result_is_admitted_again(
+        qapp, monkeypatch):
     """Each release path lets go of the background through Int's handshake (the view's receipt, then the
-    owner): Clear BG; the background's result admitted again under its name (Stitch's 30f74f29: its identity is
-    the data it was set from); and a CLEAN close, before the panels go."""
+    owner): Clear BG and a CLEAN close, before the panels go. Since 1.2.18 the background's result admitted again
+    under its name (a Replace) keeps it (LIVE-1218-VIEWER2D-BG; his words: "In fact this should work in all
+    modes, int 1d, stitch, RSM"): the background holds its own payload, so the new result is drawn minus it, and
+    the zero note is only for the payload it was set on."""
     values = {"A": _grid_values(1.0), "A2": _grid_values(5.0), "B": _grid_values(3.0)}
     monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
     page = _page(qapp, owner=_Owner())
@@ -2710,21 +2720,25 @@ def test_the_background_is_released_by_clear_bg_by_its_result_admitted_again_and
         assert page._background.phase == "RELEASED" and page.view._rendered_background_key is None
         assert not page.view.keyed_projection.background_set and page.view.background.text() == "Set BG"
         page.view.background.click()
+        key = page._background.active_key
         page._add_result("/tmp/b_rsm.nexus", "B")
         assert page.view.keyed_projection.background_set
         page._add_result("/tmp/a_rsm.nexus", "A2")  # the background's result admitted again
-        assert page._background.phase == "RELEASED" and not page.view.keyed_projection.background_set
-        page.view.background.click()
-        assert page._background.phase == "ACTIVE"
+        drawn = page.view.keyed_projection
+        assert page._background.active_key == key and drawn.background_set
+        assert "every panel is zero" not in drawn.status and "minus the background a_rsm.nexus" in drawn.status
+        for got, want in zip(_drawn_arrays(page.view),
+                             _minus(values["A2"], values["A"], page.shown[1].state.axis_indices), strict=True):
+            np.testing.assert_array_equal(got, want)
     finally:
         _close(page, qapp)
     assert page._background.phase == "RELEASED" and page._background.keyed_source() is None
 
 
-def test_a_background_admitted_again_beside_another_result_leaves_that_result_drawn(qapp, monkeypatch):
+def test_a_background_admitted_again_beside_another_result_keeps_that_result_drawn_minus_it(qapp, monkeypatch):
     """G8d's self-review: the background's result admitted again while another is shown (a stale run's output,
-    a late read: ``show=False``) releases the background, and the result shown is drawn again without it; the
-    view's release had cleared its panels, which stayed blank until the next draw."""
+    a late read: ``show=False``). Since 1.2.18 it keeps the background, and the result shown stays drawn minus
+    it (LIVE-1218-VIEWER2D-BG)."""
     values = {"A": _grid_values(1.0), "A2": _grid_values(5.0), "B": _grid_values(3.0)}
     monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
     page = _page(qapp, owner=_Owner())
@@ -2734,12 +2748,44 @@ def test_a_background_admitted_again_beside_another_result_leaves_that_result_dr
         page._add_result("/tmp/b_rsm.nexus", "B")
         assert page.view.keyed_projection.background_set
         page._add_result("/tmp/a_rsm.nexus", "A2", show=False)
-        assert page._background.phase == "RELEASED"
+        assert page._background.phase == "ACTIVE"
         drawn = page.view.keyed_projection
-        assert drawn is not None and not drawn.background_set and page.view.background.text() == "Set BG"
-        own = _panels_at(values["B"], page.shown[1].state.axis_indices)
-        for got, panel in zip(_drawn_arrays(page.view), own, strict=True):
-            np.testing.assert_array_equal(got, panel.image if hasattr(panel, "image") else panel.intensity)
+        assert drawn is not None and drawn.background_set and page.view.background.text() == "Clear BG"
+        for got, want in zip(_drawn_arrays(page.view),
+                             _minus(values["B"], values["A"], page.shown[1].state.axis_indices), strict=True):
+            np.testing.assert_array_equal(got, want)
+    finally:
+        _close(page, qapp)
+
+
+def test_a_background_follows_every_result_shown_and_its_own_read_back(qapp, monkeypatch):
+    """LIVE-1218-VIEWER2D-BG (his words: "the whole idea is to apply it across frames"; "If it is dropped on
+    selection change what is the point of it at all?"): Set BG on A, then B and more results shown, past the few
+    kept resident, so A is dropped from memory and read back when shown again: every one is drawn minus A, A
+    itself as zeros, and the background stays until Clear BG."""
+    names = ("A", "B", "C", "D", "E", "F", "G")
+    values = {name: _grid_values(float(index + 1)) for index, name in enumerate(names)}
+    monkeypatch.setattr(page_module, "make_rsm_viewer_values", values.__getitem__)
+    page = _page(qapp, owner=_Owner())
+    try:
+        page._add_result("/tmp/a_rsm.nexus", "A")
+        page.view.background.click()
+        key = page._background.active_key
+        for name in names[1:]:
+            page._add_result(f"/tmp/{name.lower()}_rsm.nexus", name)
+            assert page._background.active_key == key
+            for got, want in zip(_drawn_arrays(page.view),
+                                 _minus(values[name], values["A"], page.shown[1].state.axis_indices), strict=True):
+                np.testing.assert_array_equal(got, want)
+        assert page._results["/tmp/a_rsm.nexus"] is None  # no longer resident: shown again, it is read back
+        page._add_result("/tmp/a_rsm.nexus", "A")  # the read back, as _poll_reader admits it
+        drawn = page.view.keyed_projection
+        assert page._background.active_key == key and drawn.background_set
+        for array in _drawn_arrays(page.view):
+            finite = np.isfinite(array)
+            assert finite.any() and np.all(array[finite] == 0)
+        page.view.background.click()
+        assert page._background.phase == "RELEASED" and not page.view.keyed_projection.background_set
     finally:
         _close(page, qapp)
 

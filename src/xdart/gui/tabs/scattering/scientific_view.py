@@ -147,10 +147,13 @@ PHASES_TOOLTIP = ("Switch every reference phase listed in the Phase Analysis win
                   "each phase's include check and every minimum intensity are kept. Display only: the fit still "
                   "uses every included phase.")
 PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Phase Analysis window."
-#: the top bar's Set/Clear BG button (LIVE-1218-VIEWER2D-BG): Int's background, and the 2D Viewer's raw one, which
-#: follows every frame and file
-BACKGROUND_TOOLTIP = ("Set BG subtracts the mean of the selection from what is shown; Clear BG draws it as it is "
-                      "again. Display only: saved results are unchanged.")
+#: the top bar's Set/Clear BG button (LIVE-1218-VIEWER2D-BG): Int's and Stitch's background, and the 2D Viewer's raw
+#: one; each follows every frame, scan and file shown after it (his words: "the whole idea is to apply it across
+#: frames")
+BACKGROUND_TOOLTIP = ("Set BG subtracts the mean of the selection from every frame shown after it, in any scan or "
+                      "file, until Clear BG. A frame on another grid is drawn as it is. Changing the mode, or what "
+                      "the values are (the normalization or image axis, Stitch's Diagnostic), clears it. Display "
+                      "only: saved results are unchanged.")
 RAW_BACKGROUND_TOOLTIP = ("Set Raw BG subtracts the mean of the selected frames from every frame and file shown "
                           "after it, until Clear Raw BG. A frame of another shape is drawn as it is. Display only: "
                           "the files are unchanged.")

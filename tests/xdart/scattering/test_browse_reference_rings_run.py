@@ -29,6 +29,7 @@ from xdart.gui.tabs.scattering.adapters.source import FilesystemSourceAdapter
 from xdart.gui.tabs.scattering.coordinator import ScatteringCoordinator
 from xdart.gui.tabs.scattering.display_values import StandardEventKind
 from xdart.gui.tabs.scattering.page import ScatteringWorkspace
+from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
 from xdart.gui.tabs.scattering.workspace_shell import ScatteringWorkspaceShell
 from xrd_tools.core.energy import energy_eV_to_wavelength_m
 from xrd_tools.session.intent_store import RunIntentStore
@@ -591,11 +592,37 @@ def test_g4_a_stopped_live_run_browses_with_the_energies_live_published(qapp, tm
             assert _same(browse[key.local_frame_label], _curves(view.raw))
 
 
+def _doubled(directory, stem, index, energy_keV):
+    """``_frame``'s frame with its image doubled: drawn minus a background taken on ``_frame``'s, it shows that
+    background again (integration is linear in the counts)."""
+    target = directory / f'{stem}_{index:04d}.tif'
+    target.with_suffix('.txt').write_text(f'# Counters\nI0 = 1\n# Motors\nenergy = {energy_keV}\n'
+                                          'User: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n')
+    rows, columns = np.mgrid[:SHAPE[0], :SHAPE[1]]
+    partial = directory / f'{stem}_{index:04d}.part'
+    fabio.tifimage.TifImage(data=(2 * (100 + (rows + 2 * columns) % 97)).astype(np.uint16)).write(str(partial))
+    partial.replace(target)
+    return target
+
+
+def _shown_minus_background(page, mode):
+    """The values drawn for the current frame, and the background's own (the frame it was set on, drawn once)."""
+    state, owner = page._last_scientific_projection, page._background_owner
+    drawn = state.heavy.cake if mode == "Int 2D" else state.traces[-1].intensity
+    return np.asarray(drawn, dtype=np.float64), np.asarray(owner._result.values, dtype=np.float64)
+
+
+@pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
 @pytest.mark.parametrize("next_scan", (False, True), ids=("paced-same-scan", "new-scan"))
-def test_live_background_follows_its_scan_only(qapp, tmp_path, next_scan):
-    intent = _directory(tmp_path, live=True, mode="Int 2D")
+def test_live_background_follows_the_next_frame_and_scan(qapp, tmp_path, next_scan, mode):
+    """LIVE-1218-VIEWER2D-BG (his words: "I want to be able to see what the difference between different frames is
+    on the fly"; his pick "Any scan or file"): Set BG on a Live Run's first frame, then the next frame arrives, of
+    the same scan or another: it is drawn minus the background (its image is the first's doubled, so it shows the
+    background itself), through several ticks, until Clear BG, which works while the Run goes on."""
+    intent = _directory(tmp_path, live=True, mode=mode)
     raw = tmp_path / "raw"
     _frame(raw, "scan", 1, 16)
+    label = "Clear 2D BG" if mode == "Int 2D" else "Clear 1D BG"
     with _page(qapp, intent) as (page, view, _observed):
         if next_scan:
             view.plot_mode.setCurrentText("Overlay")  # direct Live selection, without the Single pacer
@@ -603,34 +630,51 @@ def test_live_background_follows_its_scan_only(qapp, tmp_path, next_scan):
 
         def drawn():
             state = page._last_scientific_projection
-            return (state is not None and state.heavy is not None and state.heavy.cake is not None
-                    and state.heavy.frame is controller.navigation.current)
+            if state is None:
+                return False
+            if mode == "Int 2D":
+                return (state.heavy is not None and state.heavy.cake is not None
+                        and state.heavy.frame is controller.navigation.current)
+            return bool(state.traces) and state.traces[-1].frame is controller.navigation.current
 
         page._shell.run_controls.startButton.click()
         assert _pump(qapp, drawn)
         first = controller.navigation.current
-        token = controller.selection.context_token
         view.background.click()
-        assert _pump(qapp, lambda: view.background.text() == "Clear 2D BG")
+        assert _pump(qapp, lambda: view.background.text() == label), page._notice_text
         active = page._background_owner.active_key
 
-        _frame(raw, "other" if next_scan else "scan", 1 if next_scan else 2, 16)
-        assert _pump(qapp, lambda: controller.navigation.current is not first and drawn(), seconds=20)
-        assert controller.selection.context_token == token
+        _doubled(raw, "other" if next_scan else "scan", 1 if next_scan else 2, 16)
+        assert _pump(qapp, lambda: controller.navigation.current is not first and drawn()
+                     and page._last_scientific_projection.background_set, seconds=20)
         assert (controller.navigation.current.source_scan != first.source_scan) is next_scan
-        if next_scan:
-            assert page._background_owner.active_key is None
-            assert view.background.text() == "Set 2D BG"
-        else:
-            assert page._background_owner.active_key == active
-            assert view.background.text() == "Clear 2D BG"
+        for _tick in range(3):
+            page._drain_executor(); qapp.processEvents()
+        assert page._background_owner.active_key == active and view.background.text() == label
+        shown, background = _shown_minus_background(page, mode)
+        assert not page._last_scientific_projection.background_note
+        finite = np.isfinite(background) & np.isfinite(shown)
+        assert finite.any() and np.abs(background[finite]).max() > 0
+        np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
+        view.background.click()  # Clear BG while the Run watches on
+        assert _pump(qapp, lambda: view.background.text().startswith("Set "))
+        assert page._background_owner.phase == "RELEASED"
 
 
-def test_int_1d_browse_background_survives_idle_ticks(qapp, tmp_path):
-    with _page(qapp, _series(tmp_path, (16,), mode="Int 1D")) as (page, view, observed):
+def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_path):
+    """A real Int 1D Set BG on a finished Run's Browse context (Codex's review row), then another frame chosen:
+    the background stays through idle ticks and is subtracted from the frame shown (its image is the first's
+    doubled, so it shows the background itself). Before 1.2.18 a frame choice released it."""
+    _frame(tmp_path, "escan", 1, 16)
+    _doubled(tmp_path, "escan", 2, 16)
+    with _page(qapp, _series(tmp_path, (16, 16), mode="Int 1D")) as (page, view, observed):
         _run(qapp, page, observed)
         _browsing(qapp, page)
-        assert _pump(qapp, lambda: bool(view.curve.listDataItems()))
+        controller = page._context_controller
+        first, second = controller.navigation.frames[:2]
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=first, frames=(first,)))
+        assert _pump(qapp, lambda: bool(view.curve.listDataItems())
+                     and page._last_scientific_projection.traces[-1].frame is first)
         view.background.click()
         assert page._background_identity is not None, page._notice_text
         assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG")
@@ -639,7 +683,19 @@ def test_int_1d_browse_background_survives_idle_ticks(qapp, tmp_path):
         for _tick in range(5):
             page._drain_executor()
             assert page._background_owner.active_key == active
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=second, frames=(second,)))
+        assert _pump(qapp, lambda: page._last_scientific_projection.traces
+                     and page._last_scientific_projection.traces[-1].frame is second)
+        for _tick in range(5):
+            page._drain_executor(); qapp.processEvents()
+            assert page._background_owner.active_key == active
         assert view.background.text() == "Clear 1D BG"
+        shown, background = _shown_minus_background(page, "Int 1D")
+        finite = np.isfinite(background) & np.isfinite(shown)
+        assert finite.any() and np.abs(background[finite]).max() > 0
+        np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
+        drawn = np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
+        np.testing.assert_allclose(drawn[np.isfinite(drawn)], shown[np.isfinite(shown)], rtol=1e-6)
 
 
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):

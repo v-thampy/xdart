@@ -1,5 +1,6 @@
 """Workspace-local bounded custody for presentation-only backgrounds."""
 from __future__ import annotations
+from collections import OrderedDict
 from dataclasses import dataclass
 from threading import Lock
 import weakref
@@ -179,6 +180,11 @@ class PresentationBackgroundOwner:
         self._shown_source: weakref.ref | None = None
         #: the presented map grid captured for a following 2-D background
         self._shown_grid: tuple | None = None
+        #: a 1-D background's values for each pattern drawn (``trace_values``), least recently drawn first: keyed by
+        #: the pattern's id, each holding weak references to its intensity and axis (an id can come back as
+        #: another pattern's), the divisor and the values; charged to this owner's grant, the oldest dropped first
+        self._followed: OrderedDict[int, tuple] = OrderedDict()
+        self._followed_bytes = 0
 
     @property
     def capacity_bytes(self) -> int:
@@ -441,6 +447,67 @@ class PresentationBackgroundOwner:
             self._shown_source = followed
         return displayed
 
+    def trace_values(self, intensity, axis, unit_key: str, divisor: float = 1.0):
+        """An Int 1-D background (Int 1D's, the 1D Viewer's, Stitch 1D's) subtracted from a pattern drawn now, as
+        ``promote`` does for the patterns it was set on (his words: "the whole idea is to apply it across frames";
+        "If it is dropped on selection change what is the point of it at all?"). ``intensity`` and ``axis`` are the
+        pattern's own native values, ``unit_key`` its axis "label\\0unit" and ``divisor`` its normalization (1.0
+        for none): the values are (intensity - background) / divisor, the background taken at the pattern's axis
+        when its grid differs (NaN outside the background's range). A note (a str) when the pattern's axis is on
+        another quantity or unit, so it is drawn as it is; None when no 1-D background is active or the pattern is
+        not one. The same pattern drawn again gets the same array."""
+        with self._lock:
+            if (self._phase != "ACTIVE" or self._result is None or self._plan is None
+                    or self._plan.domain != "integrated_1d"):
+                return None
+            result, reservation = self._result, self._reservation
+            units = self._plan.axis_units[0] if self._plan.axis_units else ()
+            entry = self._followed.get(id(intensity))
+            if (entry is not None and entry[0]() is intensity and entry[1]() is axis
+                    and entry[2] == divisor):
+                self._followed.move_to_end(id(intensity))
+                return entry[3]
+        if (type(intensity) is not np.ndarray or type(axis) is not np.ndarray or intensity.ndim != 1
+                or axis.shape != intensity.shape or type(divisor) is not float
+                or not np.isfinite(divisor) or divisor <= 0.0):
+            return None
+        if (unit_key,) != tuple(units):
+            def named(key):
+                label, _, unit = str(key).partition("\0")
+                return f"{label} ({unit})" if unit else label
+            return (f"The background is on {named(units[0]) if units else 'another axis'}; this pattern is on "
+                    f"{named(unit_key)}, so it is drawn as it is.")
+        try:
+            displayed = np.empty(intensity.shape, dtype=np.float64)
+            if axis.shape == result.axes[0].shape and np.array_equal(axis, result.axes[0]):
+                np.subtract(intensity, result.values, out=displayed, casting="unsafe")
+            else:
+                for start in range(0, displayed.size, _BLOCK):
+                    stop = min(displayed.size, start + _BLOCK)
+                    background = np.interp(axis[start:stop], result.axes[0], result.values,
+                                           left=np.nan, right=np.nan)
+                    np.subtract(intensity[start:stop], background, out=displayed[start:stop])
+            np.divide(displayed, divisor, out=displayed)
+            displayed.setflags(write=False)
+            held = (weakref.ref(intensity), weakref.ref(axis), divisor, displayed)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            if self._reservation != reservation or self._phase != "ACTIVE":
+                return None
+            prior = self._followed.pop(id(intensity), None)
+            if prior is not None:
+                self._followed_bytes -= prior[3].nbytes
+            base = self._active_bytes - self._followed_bytes
+            while self._followed and base + self._followed_bytes + displayed.nbytes > self._capacity:
+                _key, oldest = self._followed.popitem(last=False)
+                self._followed_bytes -= oldest[3].nbytes
+            if base + self._followed_bytes + displayed.nbytes <= self._capacity:
+                self._followed[id(intensity)] = held
+                self._followed_bytes += displayed.nbytes
+            self._active_bytes = base + self._followed_bytes
+        return displayed
+
     def release(self, receipt: DisplayBackgroundRendererReleaseReceipt | None = None) -> bool:
         with self._lock:
             if self._phase == "ACTIVE" and (
@@ -477,6 +544,7 @@ class PresentationBackgroundOwner:
     def _drop_locked(self) -> None:
         self._keyed_source = None
         self._shown_source = self._shown_grid = None
+        self._followed.clear(); self._followed_bytes = 0
         self._contributors = (); self._result = None; self._display_values = ()
         self._plan = None; self._stamp = None; self._active_key = None
         self._projection_keys = (); self._projection_indices = (); self._projection_shapes = ()

@@ -484,10 +484,12 @@ def _stitched_variants(tmp_path):
     return paths, payloads
 
 
-def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_selection(qapp, tmp_path):
+def test_set_bg_subtracts_the_selected_results_mean_from_every_result_shown_until_cleared(qapp, tmp_path):
     """Maintainer, 2026-09-30: Int's plot-only Set BG in Stitch ("would the plot only -set as background like in
-    Int work here easily?" -- "Yes"): the selected results' mean subtracted from each shown; Clear BG, or
-    another selection, drops it (as Int's at every boundary); the records are untouched."""
+    Int work here easily?" -- "Yes"): the selected results' mean subtracted from each shown; Clear BG drops it.
+    Since 1.2.18 another selection keeps it (LIVE-1218-VIEWER2D-BG; his words: "the whole idea is to apply it
+    across frames", "In fact this should work in all modes, int 1d, stitch, RSM"): every result shown after it is
+    drawn minus it, one on another grid minus it taken at its axis; the records are untouched."""
     paths, payloads = _stitched_variants(tmp_path)
     page = StitchPage(empty_host_services(_Status()))
     try:
@@ -519,9 +521,23 @@ def test_set_bg_subtracts_the_selected_results_mean_until_cleared_or_another_sel
         assert any(np.array_equal(first(), row) for row in raw)
         button.click()
         assert button.text() == "Clear 1D BG"
-        page.browser.set_current_result(str(paths[2]), keep_selection=True)  # another selection releases it
+        key = page._background.active_key
+        native = {path: page._display_payload(path, payload).view for path, payload in zip(map(str, paths), payloads)}
+        axis_ab = native[str(paths[0])].axis_1d.values
+        for path in (paths[3], paths[2], paths[0]):  # d (a's grid), c (80 points: another grid), a again
+            page.browser.set_current_result(str(path), keep_selection=False)  # another selection keeps it
+            for _tick in range(3):
+                _wait(page, qapp, catalog=True)
+            assert button.text() == "Clear 1D BG" and page._background.active_key == key
+            view_ = native[str(path)]
+            expected = view_.intensity_1d - np.interp(view_.axis_1d.values, axis_ab, mean, left=np.nan, right=np.nan)
+            np.testing.assert_allclose(first(), expected, rtol=0, atol=1e-9 * np.abs(mean).max(), equal_nan=True)
+        axis = view.plot_axis  # 2θ: the same patterns on their own bins, still minus the background
+        axis.setCurrentIndex(axis.findData("2theta"))
         _wait(page, qapp, catalog=True)
-        assert button.text() == "Set 1D BG" and page._background.phase in {"EMPTY", "RELEASED"}
+        assert axis.currentData() == "2theta" and page._background.active_key == key
+        np.testing.assert_allclose(first(), native[str(paths[0])].intensity_1d - mean, rtol=0,
+                                   atol=1e-9 * np.abs(mean).max(), equal_nan=True)
         stored = read_analysis_artifact(paths[0], expected_kind=AnalysisArtifactKind.STITCH_1D)
         np.testing.assert_array_equal(stored.intensity, payloads[0].intensity)  # display only
     finally:
@@ -1376,7 +1392,8 @@ def _published(form):
 def test_background_does_not_show_old_values_when_the_same_output_is_replaced(qapp, tmp_path):
     """Codex's round-2 review F1 reproduction: a background set on a result, the output replaced (another
     polarization) and opened again under the same key: the page shows the new result, not the arrays the
-    background was made from (the background is released)."""
+    background was made from. Since 1.2.18 the background stays (LIVE-1218-VIEWER2D-BG), so the new result is
+    drawn minus the old one: what changed."""
     from tests.xdart.tools.test_stitch_native_values import _native_form
     form = _native_form(tmp_path, "multigeometry", scans="1")
     path, original = _published(form)
@@ -1392,10 +1409,53 @@ def test_background_does_not_show_old_values_when_the_same_output_is_replaced(qa
         assert not np.array_equal(original.intensity, replacement.intensity, equal_nan=True)
         page.open_result(path)
         _wait(page, qapp)
-        assert page._background.phase in {"EMPTY", "RELEASED"}
-        np.testing.assert_array_equal(page.curve.listDataItems()[0].yData, replacement.intensity)
+        assert page._background.phase == "ACTIVE"
+        np.testing.assert_allclose(page.curve.listDataItems()[0].yData,
+                                   np.asarray(replacement.intensity, np.float64)
+                                   - np.asarray(original.intensity, np.float64), rtol=0, atol=1e-9, equal_nan=True)
     finally:
         page._release_background()
+        _dispose(page, qapp)
+
+
+def test_a_stitch_2d_background_follows_every_map_of_its_grid(qapp, tmp_path):
+    """LIVE-1218-VIEWER2D-BG (his words: "In fact this should work in all modes, int 1d, stitch, RSM"): a Stitch 2D
+    background set on one map is subtracted from every map of its shape and axes shown after it, whatever the
+    selection; a map of another shape is drawn as it is, the button's tip saying why."""
+    from tests.xdart.tools.test_stitch_native_values import _native_form
+    form = replace(_native_form(tmp_path, "multigeometry", scans="1"), mode="2d", npt_1d=41, npt_rad_2d=23,
+                   npt_azim_2d=19)
+    paths = [_published(replace(form, output_family=name, **options))[0] for name, options in (
+        ("a", {}), ("b", {"polarization_factor": .5}), ("c", {"npt_rad_2d": 29}))]
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        for path in paths:
+            page.open_result(path)
+            _wait(page, qapp, catalog=True)
+        page.run_bar.modeCombo.setCurrentText("Stitch 2D")
+        maps = {}
+        for path in paths:
+            page.browser.set_current_result(str(path), keep_selection=False)
+            _wait(page, qapp, catalog=True)
+            maps[str(path)] = np.array(page._last_map_state.heavy.cake, dtype=np.float64)
+        page.browser.set_current_result(str(paths[0]), keep_selection=False)
+        _wait(page, qapp, catalog=True)
+        button = page.scientific.background
+        button.click()
+        assert button.text() == "Clear 2D BG", page.run_bar.readinessLabel.full_text()
+        key = page._background.active_key
+        for path, expected in ((paths[1], maps[str(paths[1])] - maps[str(paths[0])]),
+                               (paths[0], np.zeros_like(maps[str(paths[0])])),
+                               (paths[2], maps[str(paths[2])])):
+            page.browser.set_current_result(str(path), keep_selection=False)
+            for _tick in range(3):
+                _wait(page, qapp, catalog=True)
+            assert page._background.active_key == key and button.text() == "Clear 2D BG"
+            np.testing.assert_allclose(page._last_map_state.heavy.cake, expected, rtol=0, atol=1e-9, equal_nan=True)
+        assert "does not fit" in button.toolTip()
+        button.click()
+        assert button.text() == "Set 2D BG" and page._background.phase == "RELEASED"
+    finally:
         _dispose(page, qapp)
 
 

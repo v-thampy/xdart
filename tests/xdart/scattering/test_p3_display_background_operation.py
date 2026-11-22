@@ -6,6 +6,7 @@ import ast
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -366,8 +367,9 @@ def test_pre_adoption_context_membership_and_shape_drift_release_exact_roots(
 
 @pytest.mark.parametrize("entry", ("context", "mode", "detector", "close"))
 def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: str) -> None:
-    """An Int 2D background goes at a scan, mode or detector change and at close. A frame choice keeps it since
-    1.2.18 (his pick "Int 2D follows frames too"): test_int_2d_background_follows_the_frames_of_its_scan."""
+    """An Int 2D background goes at a mode or detector change and at close. Since 1.2.18 a scan or file choice
+    keeps it, as a frame choice does (his picks "Int 2D follows frames too" and "Any scan or file"; his words:
+    "If it is dropped on selection change what is the point of it at all?")."""
     qapp, page, _acquisition_context = _active_page_background()
     delegated = []
     try:
@@ -391,8 +393,10 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
                 ShellCommandKind.SET_DETECTOR_MODE, "full"))
         else:
             page.close_workspace()
+        if entry == "context":
+            assert delegated == ["ACTIVE"] and page._background_owner.phase == "ACTIVE"
+            return
         _assert_background_released(page._background_owner)
-        if entry in {"selection", "context"}: assert delegated == ["RELEASED"]
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -412,20 +416,27 @@ def test_active_background_survives_idle_drain_ticks() -> None:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
-def test_idle_orphan_release_repaints_the_background_control() -> None:
+def test_a_background_stays_when_the_frames_it_was_set_on_go() -> None:
+    """Since 1.2.18 no idle tick releases a display background, also once the frames it was set on are gone (the
+    acquisition released): it waits for the next frame on its grid, until Clear BG (his pick "Any scan or file")."""
     qapp, page, _acquisition_context = _active_page_background()
     controller = page._context_controller
     try:
+        key = page._background_owner.active_key
         assert page._shell.scientific.background.text() == "Clear 2D BG"
         assert controller.release_acquisition(controller.run_identity)
-        page._drain_executor()
-        _assert_background_released(page._background_owner)
-        assert page._shell.scientific.background.text() == "Set 2D BG"
+        for _tick in range(3):
+            page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+        assert page._background_owner.active_key == key
+        assert page._shell.scientific.background.text() == "Clear 2D BG"
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
-def test_a_scan_boundary_releases_a_promoted_background_before_first_paint() -> None:
+def test_a_mode_change_releases_a_promoted_background_before_first_paint() -> None:
+    """Codex's review (49e0ac70): a background promoted and not yet painted is released at a boundary through the
+    exact key the view expects; another key is refused. The boundary here is a processing-mode change (a scan
+    boundary keeps a background since 1.2.18)."""
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
@@ -449,20 +460,18 @@ def test_a_scan_boundary_releases_a_promoted_background_before_first_paint() -> 
         assert owner.phase == "ACTIVE" and view.background.text() == "Set 2D BG"
         wrong_key = (*owner.active_key, "another background")
         assert not view.release_display_background(wrong_key).released
-        assert controller.release_acquisition(identity)
-        page._drain_executor()
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D"))
         _assert_background_released(owner)
-        assert view.background.text() == "Set 2D BG"
+        assert view.background.text() == "Set 1D BG"
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
 @pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
-def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: str) -> None:
-    """With the idle tick no longer releasing every background, an Int background whose frames were replaced
-    without a frame or scan choice (here the acquisition released and another adopted; a seeded 1-D background on
-    frames the page does not show) still goes on the next tick, as before; the 2D Viewer's raw background follows
-    frames instead."""
+def test_int_background_stays_on_ticks_once_its_frames_are_replaced(mode: str) -> None:
+    """Since 1.2.18 an Int background whose frames were replaced without a frame or scan choice (here the
+    acquisition released and another adopted; a seeded 1-D background on frames the page does not show) stays
+    through idle ticks: it follows the frames shown now (his words: "the whole idea is to apply it across frames")."""
     if mode == "Int 2D":
         qapp, page, _acquisition_context = _active_page_background()
         owner = page._background_owner
@@ -480,11 +489,12 @@ def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: st
         page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
         owner = _seed_page_1d_background(page)
     try:
+        key = owner.active_key
         assert owner.phase == "ACTIVE"
         for _tick in range(3):
             page._drain_executor(); qapp.processEvents(); page._refresh_shell()
-        _assert_background_released(owner)
-        assert page._shell.scientific.background.text().startswith("Set ")
+        assert owner.phase == "ACTIVE" and owner.active_key == key
+        assert page._shell.scientific.background.text().startswith("Clear ")
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -495,17 +505,19 @@ def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: st
     (ShellCommandKind.SET_SLICE_CENTER, 5.0),
     (ShellCommandKind.SET_SLICE_WIDTH, 3.0),
 ))
-def test_active_1d_background_revokes_on_axis_and_slice_edits(kind, value) -> None:
-    """The traces a 1-D background was set on change with the plot axis and the slice: it goes, as on a
-    normalization edit (an idle tick no longer releases it)."""
+def test_active_1d_background_stays_on_plot_axis_and_slice_edits(kind, value) -> None:
+    """Since 1.2.18 a 1-D background is subtracted from each pattern drawn on its own native bins, so another plot
+    axis of the same quantity (Q, 2θ) or a slice edit (Int 1D draws no slices) keeps it; a normalization edit still
+    lets it go (test_active_1d_background_revokes_on_normalization_edit)."""
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter())
     owner = _seed_page_1d_background(page)
     try:
+        key = owner.active_key
         page._handle_shell_command(ShellCommand(kind, value))
-        _assert_background_released(owner)
+        assert owner.phase == "ACTIVE" and owner.active_key == key
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -672,8 +684,9 @@ def test_following_background_matches_the_image_not_a_reused_frame_id() -> None:
     assert again is owner.frame_values(key, other)  # the same image keeps the same array
 
 
-def test_active_1d_background_still_revokes_on_a_frame_choice(monkeypatch) -> None:
-    """A 1-D background holds the traces it was set on: a frame choice lets it go, as before."""
+def test_active_1d_background_stays_on_a_frame_choice(monkeypatch) -> None:
+    """Since 1.2.18 a frame choice keeps a 1-D background (his words: "If it is dropped on selection change what is
+    the point of it at all?"); it is subtracted from each pattern drawn (test_trace_values_*)."""
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
@@ -683,8 +696,9 @@ def test_active_1d_background_still_revokes_on_a_frame_choice(monkeypatch) -> No
     frame = make_shell_projection(frame_count=2, selected_index=1).navigation.frames[0]
     monkeypatch.setattr(page, "_select_frames", lambda _command: None)
     try:
+        key = owner.active_key
         page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,)))
-        _assert_background_released(owner)
+        assert owner.phase == "ACTIVE" and owner.active_key == key
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -824,6 +838,79 @@ def test_1d_renderer_uses_reused_d_with_baseline_role_parity(plot_mode: str) -> 
         assert _renderer_roles(view) == off_roles
     finally:
         view.close(); qapp.processEvents()
+
+
+def _active_1d_owner(background, axis, *, unit="q\0A^-1"):
+    plan = DisplayBackgroundPlan("integrated_1d", ("background",), (background.shape,), ((axis.shape,),),
+                                 ((unit,),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = _reserve(owner, plan, ((background, axis),), keys=(11,), indices=(0,))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, ((background, axis, 1.0),))
+    return owner
+
+
+def test_trace_values_follow_every_pattern_drawn_as_promote_does() -> None:
+    """LIVE-1218-VIEWER2D-BG (his words: "the whole idea is to apply it across frames"): a 1-D background gives
+    each pattern drawn (intensity - background) / divisor, as ``promote`` does for the patterns it was set on;
+    on another grid the background is taken at the pattern's axis (NaN outside its range); another quantity or
+    unit is a note, the pattern drawn as it is; the same pattern drawn again gets the same array, another pattern
+    under a reused id its own values."""
+    axis = np.arange(4.0)
+    background = np.array([1.0, 2.0, 3.0, 4.0])
+    owner = _active_1d_owner(background, axis)
+    pattern = np.array([10.0, 20.0, 30.0, 40.0])
+    drawn = owner.trace_values(pattern, axis, "q\0A^-1", 2.0)
+    np.testing.assert_allclose(drawn, (pattern - background) / 2.0)
+    assert owner.trace_values(pattern, axis, "q\0A^-1", 2.0) is drawn
+    assert not drawn.flags.writeable
+    shifted = np.array([0.5, 1.5, 2.5, 3.5])
+    np.testing.assert_allclose(owner.trace_values(pattern, shifted, "q\0A^-1", 1.0),
+                               [8.5, 17.5, 26.5, np.nan], equal_nan=True)
+    note = owner.trace_values(pattern, axis, "2th\0deg", 1.0)
+    assert type(note) is str and "q (A^-1)" in note and "2th (deg)" in note
+    other = pattern + 1.0
+    np.testing.assert_allclose(owner.trace_values(other, axis, "q\0A^-1", 1.0), other - background)
+    assert owner.trace_values(pattern, axis, "q\0A^-1", float("nan")) is None
+    assert owner.frame_values(11, pattern) is None  # a 1-D background follows patterns, not images
+
+
+def test_trace_values_charge_the_grant_and_go_with_the_background() -> None:
+    """The patterns' values are charged to the owner's one grant and dropped, oldest first, past it; release
+    drops them all. A raw or 2-D background gives none."""
+    axis = np.arange(1024.0)
+    owner = _active_1d_owner(np.zeros(1024), axis)
+    base = owner.active_bytes
+    patterns = [np.full(1024, float(index)) for index in range(4)]
+    for pattern in patterns:
+        owner.trace_values(pattern, axis, "q\0A^-1", 1.0)
+    assert owner.active_bytes == base + 4 * 1024 * 8
+    owner._capacity = base + 2 * 1024 * 8  # a tight grant: only the two newest stay held
+    owner.trace_values(np.ones(1024), axis, "q\0A^-1", 1.0)
+    assert owner.active_bytes <= owner._capacity and len(owner._followed) == 2
+    owner._capacity = 536_870_912
+    assert owner.release(DisplayBackgroundRendererReleaseReceipt(owner.active_key, True))
+    _assert_background_released(owner)
+    assert owner._followed == {} and owner.trace_values(patterns[0], axis, "q\0A^-1", 1.0) is None
+
+
+def test_following_trace_values_take_each_payloads_native_pattern_and_divisor() -> None:
+    """The page's hook gives the owner the native pattern of the payload a trace was drawn from, matched by the
+    frame key itself, with that payload's own normalization divisor."""
+    from xdart.gui.tabs.scattering.context_projection import following_trace_values
+    controller, _lifecycle, _executor, _loader, _acquisition_context = _running_controller()
+    frame = controller.navigation.current; assert frame is not None
+    view = replace(_view(1, 3.0), metadata_numeric={"monitor": 2.0})
+    payload = StandardDisplayPayload(0, frame, "monitored", view)
+    calls = []
+    hook = following_trace_values(lambda *args: calls.append(args) or "seen", (payload,), "monitor")
+    trace = SimpleNamespace(frame=frame)
+    assert hook(trace) == "seen"
+    ((intensity, axis, unit, divisor),) = calls
+    assert intensity is view.intensity_1d and axis is view.axis_1d.values
+    assert unit == f"{view.axis_1d.label}\0{view.axis_1d.unit}" and divisor == 2.0
+    assert hook(SimpleNamespace(frame=replace(frame))) is None  # another key under no payload
+    assert following_trace_values(None, (payload,)) is None
 
 
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
