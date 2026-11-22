@@ -309,8 +309,9 @@ def test_without_opengl_no_gl_widget_is_built_and_release_lets_the_volume_go(qap
 
 
 def test_the_gl_items_are_built_where_opengl_is_available(qapp, monkeypatch):
-    """The GL path's items (the volume, its box and the three axis labels), built as on a display with
-    OpenGL; offscreen nothing is painted, but the items' construction and the camera call are exercised."""
+    """The GL path's items (the volume, its box and the three axis arrows, each a shaft, a head and its label),
+    built as on a display with OpenGL; offscreen nothing is painted, but the items' construction and the camera
+    call are exercised."""
     from xdart.gui.tabs.scattering import volume_view
     monkeypatch.setattr(volume_view, "_GL_AVAILABLE", True)
     view = VolumeView()
@@ -320,8 +321,14 @@ def test_the_gl_items_are_built_where_opengl_is_available(qapp, monkeypatch):
         _settled(view)
         import pyqtgraph.opengl as gl
         kinds = sorted(type(item).__name__ for item in view.gl.items)
-        assert kinds == ["GLBoxItem", "GLTextItem", "GLTextItem", "GLTextItem", "GLVolumeItem"]
-        assert [item.text for item in view.gl.items if isinstance(item, gl.GLTextItem)][0].startswith("H 0…")
+        assert kinds == ["GLBoxItem", *["GLLinePlotItem"] * 3, *["GLMeshItem"] * 3, *["GLTextItem"] * 3,
+                         "GLVolumeItem"]
+        assert [item.text for item in view.gl.items if isinstance(item, gl.GLTextItem)] == [
+            "H 0…1", "K 1…2", "L 2…3"]
+        # the arrows are drawn before the translucent volume, so they show through it
+        assert all(item.depthValue() == -1 for item in view.gl.items
+                   if isinstance(item, (gl.GLLinePlotItem, gl.GLMeshItem)))
+        assert "red, green and blue arrows point along increasing H, K and L" in view.gl.toolTip()
         view.release()
         assert view.gl.items == []
     finally:
@@ -588,3 +595,35 @@ def test_a_log_round_trip_resets_controls_even_when_the_drawn_index_is_reused(qa
         view.shutdown()
         view.deleteLater()
         qapp.processEvents()
+
+
+def test_axis_arrows_run_from_the_lowest_corner_toward_increasing_coordinate():
+    """His word, 2026-11-21: "arrows showing the 3 axes directions. Like a standard 3 arrow thing". Geometry only:
+    offscreen has no GL, so the arrows' items are checked on a real display."""
+    from xdart.gui.tabs.scattering.volume_view import arrow_head, axis_arrows
+
+    shape = (4, 5, 6)
+    rising = tuple(np.linspace(index, index + 1.0, size) for index, size in enumerate(shape))
+    arrows = axis_arrows(shape, rising, ("H", "K", "L"))
+    assert [arrow.label for arrow in arrows] == ["H 0…1", "K 1…2", "L 2…3"]
+    assert all(arrow.start == (0.0, 0.0, 0.0) for arrow in arrows)
+    assert [arrow.direction for arrow in arrows] == [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+    assert [arrow.tip for arrow in arrows] == [(4.75, 0.0, 0.0), (0.0, 5.75, 0.0), (0.0, 0.0, 6.75)]
+    np.testing.assert_allclose([arrow.label_at for arrow in arrows],
+                               [(4.75 + 0.36, 0.0, 0.0), (0.0, 5.75 + 0.36, 0.0), (0.0, 0.0, 6.75 + 0.36)])
+
+    # a falling K axis: the arrows start at its high-index side, and K's points back across the box
+    falling = (rising[0], rising[1][::-1].copy(), rising[2])
+    arrows = axis_arrows(shape, falling, ("Qx", "Qy", "Qz"))
+    assert all(arrow.start == (0.0, 5.0, 0.0) for arrow in arrows)
+    assert arrows[1].direction == (0.0, -1.0, 0.0) and arrows[1].tip == (0.0, -0.75, 0.0)
+    assert arrows[1].label == "Qy 1…2" and arrows[0].tip == (4.75, 5.0, 0.0)
+
+    vertexes, faces = arrow_head(arrows[1], sides=8)
+    np.testing.assert_allclose(vertexes[0], arrows[1].tip)
+    np.testing.assert_allclose(vertexes[1], np.asarray(arrows[1].tip) - np.asarray(arrows[1].direction)
+                               * arrows[1].head_length)
+    np.testing.assert_allclose(vertexes[2:, 1], vertexes[1, 1])  # the base ring is square to the arrow
+    np.testing.assert_allclose(np.hypot(vertexes[2:, 0] - vertexes[1, 0], vertexes[2:, 2] - vertexes[1, 2]),
+                               arrows[1].head_radius, rtol=1e-6)
+    assert faces.shape == (16, 3) and faces.max() == len(vertexes) - 1

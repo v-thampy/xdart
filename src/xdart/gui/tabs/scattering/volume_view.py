@@ -28,6 +28,11 @@ widget is built: the view says so and still computes ``rgba``, so the pipeline i
 Three shared RangeRows select displayed bin centres along the projection's labeled axes. Blank bounds use
 the full axis; a crop shares the existing volume buffer and changes neither the scientific result nor its grid.
 Each new result resets these presentation ranges, and closing the view releases their selected buffer.
+
+Three axis arrows (the maintainer, 2026-11-21: "arrows showing the 3 axes directions. Like a standard 3 arrow
+thing"): red, green and blue, one per axis in the projection's order, from the box corner where every axis is at its
+lowest coordinate along the box's edges toward increasing coordinate and past the box, each tip labeled with its axis
+and range (``axis_arrows``, pure geometry).
 """
 from __future__ import annotations
 
@@ -118,6 +123,65 @@ class _Drawn:
     auto: tuple[float, float] | None = None
 
 
+#: the axis arrows' colours, in the projection's axis order: the usual x, y, z red, green and blue
+ARROW_COLOURS = ((0.90, 0.22, 0.20, 1.0), (0.25, 0.75, 0.30, 1.0), (0.25, 0.50, 0.95, 1.0))
+
+
+@dataclass(frozen=True)
+class AxisArrow:
+    """One axis arrow of the 3D Viewer, in voxel coordinates: from ``start`` to ``tip`` along ``direction`` (a unit
+    vector along one box edge), the head a cone ``head_length`` long and ``head_radius`` wide at ``tip``, and the
+    ``label`` written at ``label_at``, just past the tip so the head does not cover it."""
+
+    start: tuple[float, float, float]
+    tip: tuple[float, float, float]
+    direction: tuple[float, float, float]
+    head_length: float
+    head_radius: float
+    label: str
+    label_at: tuple[float, float, float]
+
+
+def axis_arrows(shape, axes, labels) -> tuple[AxisArrow, AxisArrow, AxisArrow]:
+    """The 3D Viewer's three axis arrows for a volume of ``shape`` drawn in voxel coordinates on bin-centre ``axes``:
+    each from the box corner where every axis is at its lowest coordinate, along the box's edge toward its increasing
+    coordinate and past the box by an eighth of its longest side, labeled with its axis and the range it spans."""
+    sizes = tuple(float(size) for size in shape)
+    longest = max(sizes)
+    rising = tuple(bool(float(axis[-1]) >= float(axis[0])) for axis in axes)
+    corner = tuple(0.0 if up else size for up, size in zip(rising, sizes, strict=True))
+    head = 0.06 * longest
+    arrows = []
+    for index, (label, axis, up, size) in enumerate(zip(labels, axes, rising, sizes, strict=True)):
+        direction = tuple((1.0 if up else -1.0) if part == index else 0.0 for part in range(3))
+        reach = size + longest / 8.0
+        tip = tuple(corner[part] + direction[part] * reach for part in range(3))
+        low, high = sorted((float(axis[0]), float(axis[-1])))
+        label_at = tuple(tip[part] + direction[part] * head for part in range(3))
+        arrows.append(AxisArrow(corner, tip, direction, head, head / 2.5, f"{label} {low:.4g}…{high:.4g}", label_at))
+    return tuple(arrows)
+
+
+def arrow_head(arrow: AxisArrow, sides: int = 16) -> tuple[np.ndarray, np.ndarray]:
+    """The cone at ``arrow``'s tip: its vertices (the apex, the base centre, then the base circle) and triangles."""
+    direction = np.asarray(arrow.direction, dtype=np.float64)
+    axis = int(np.flatnonzero(direction)[0])
+    across = [part for part in range(3) if part != axis]
+    angles = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    base = np.asarray(arrow.tip) - direction * arrow.head_length
+    vertexes = np.empty((sides + 2, 3), dtype=np.float32)
+    vertexes[0], vertexes[1] = arrow.tip, base
+    ring = np.repeat(base[None, :], sides, axis=0)
+    ring[:, across[0]] += arrow.head_radius * np.cos(angles)
+    ring[:, across[1]] += arrow.head_radius * np.sin(angles)
+    vertexes[2:] = ring
+    following = 2 + (np.arange(sides) + 1) % sides
+    around = 2 + np.arange(sides)
+    faces = np.concatenate([np.stack([np.zeros(sides, int), around, following], axis=1),
+                            np.stack([np.ones(sides, int), following, around], axis=1)]).astype(np.uint32)
+    return vertexes, faces
+
+
 def _draw_volume(request: _DrawRequest, cancel, _progress):
     """A draw on the view's worker: the RGBA of ``request`` (``volume_rgba``'s bytes), or the refusal the view
     shows. Cancelled between its steps when a later draw supersedes it."""
@@ -197,7 +261,7 @@ class VolumeView(QtWidgets.QFrame):
         self.half_view.clicked.connect(self.show_half_view)
         layout.addWidget(self.half_view, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         self.gl = self._volume = self._box = None
-        self._texts: list = []
+        self._axis_items: list = []
         if opengl_available():
             import pyqtgraph.opengl as gl  # lazy: an offscreen display never loads the GL items
             self.gl = gl.GLViewWidget()
@@ -464,11 +528,11 @@ class VolumeView(QtWidgets.QFrame):
     def _clear_items(self) -> None:
         if self.gl is None:
             return
-        for item in (self._volume, self._box, *self._texts):
+        for item in (self._volume, self._box, *self._axis_items):
             if item is not None:
                 self.gl.removeItem(item)
         self._volume = self._box = None
-        self._texts = []
+        self._axis_items = []
 
     def _draw_items(self, axes) -> None:
         if self.gl is None:
@@ -479,10 +543,22 @@ class VolumeView(QtWidgets.QFrame):
         self._volume = gl.GLVolumeItem(self.rgba, sliceDensity=1, smooth=True, glOptions="translucent")
         self._box = gl.GLBoxItem(size=QtGui.QVector3D(nx, ny, nz))
         labels = self._projection.labels
-        ends = ((nx, 0, 0), (0, ny, 0), (0, 0, nz))
-        self._texts = [gl.GLTextItem(pos=end, text=f"{label} {float(axis[0]):.4g}…{float(axis[-1]):.4g}")
-                       for label, axis, end in zip(labels, axes, ends, strict=True)]
-        for item in (self._volume, self._box, *self._texts):
+        self._axis_items = []
+        for arrow, colour in zip(axis_arrows((nx, ny, nz), axes, labels), ARROW_COLOURS, strict=True):
+            vertexes, faces = arrow_head(arrow)
+            shaft = gl.GLLinePlotItem(pos=np.array([arrow.start, vertexes[1]], dtype=np.float32), color=colour,
+                                      width=2.0, antialias=True, glOptions="opaque")
+            head = gl.GLMeshItem(vertexes=vertexes, faces=faces, color=colour, smooth=False, drawEdges=False,
+                                 glOptions="opaque")
+            for item in (shaft, head):  # drawn before the translucent volume, so they show through it
+                item.setDepthValue(-1)
+            text = gl.GLTextItem(pos=arrow.label_at, text=arrow.label,
+                                 color=QtGui.QColor.fromRgbF(*colour))
+            self._axis_items.extend((shaft, head, text))
+        self.gl.setToolTip(
+            "Drag to turn the volume, scroll to zoom. The red, green and blue arrows point along increasing "
+            f"{labels[0]}, {labels[1]} and {labels[2]}, each labeled with the range drawn.")
+        for item in (self._volume, self._box, *self._axis_items):
             self.gl.addItem(item)
         self.gl.opts["center"] = QtGui.QVector3D(nx / 2.0, ny / 2.0, nz / 2.0)
         self.gl.setCameraPosition(distance=2.0 * max(nx, ny, nz))
@@ -490,4 +566,5 @@ class VolumeView(QtWidgets.QFrame):
 
 _DRAWING = "Drawing the 3D view…"
 
-__all__ = ["VolumeProjection", "VolumeView", "opengl_available"]
+__all__ = ["ARROW_COLOURS", "AxisArrow", "VolumeProjection", "VolumeView", "arrow_head", "axis_arrows",
+           "opengl_available"]
