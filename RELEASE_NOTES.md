@@ -1,5 +1,50 @@
 # Release notes
 
+## 1.2.18 (2026-11-22)
+
+### Changes
+
+- **Set BG follows every frame, scan and file:** in the 2D Viewer, Int 1D,
+  Int 2D, the 1D Viewer, Stitch and RSM, a display background set on a
+  selection is subtracted from every frame shown after it, in any scan or
+  file, until Clear BG. Before, it was cleared on the next timer tick or
+  frame choice ("immediately reset"). A curve on other bins of the same axis
+  takes the background interpolated onto its bins (blank outside the
+  background's range). A map of another shape or other map axes, or a curve
+  on another axis quantity or unit, is drawn as it is, with a note in the
+  button's tooltip. In Int the background goes at Clear BG, Clear 1D, a
+  processing-mode change, a normalization edit (1-D), an image-axis edit
+  (2-D), a detector-mode change (a raw background), and when the page
+  closes.
+- **Int 1D background with a normalization channel:** each curve is now its
+  own intensity over its own monitor, minus the background's mean of each
+  contributor over its own monitor (I/m − ⟨I_bg/m_bg⟩). 1.2.17 drew
+  (I − B)/m with B in raw counts, so the numbers change when the monitors
+  differ. A curve normalized by another channel than the one the background
+  was set under is drawn as it is.
+- **Overlay curves kept from earlier scans are corrected too**, and Clear BG
+  brings every curve back as it was (it used to remove the kept curves).
+- **Average and Sum include the curves kept from earlier scans:** switching
+  an Overlay of several scans to Average or Sum used to drop the earlier
+  scans' curves. The folded curve's name says how many it holds, for example
+  "Average · 3 curves, 1 kept".
+- **Browse Average and Sum:** they used to draw nothing ("Browse cache
+  display is unavailable for Average/Sum or this operation."). They now fold
+  exactly the selected frames, up to 256; more is refused with a notice, and
+  nothing is drawn. Average or Sum of χ cuts stays unavailable in Browse.
+- **Set BG on several frames in Browse (Int 1D):** it was refused ("Select at
+  least one display frame") when more than the current frame was selected.
+  Set 2D BG in Browse still takes one frame's map.
+- **RSM 3D Viewer: axis arrows.** Three arrows from the volume's corner show
+  the directions of its axes, each labelled, and the default view fits them.
+
+### Fixes
+
+- **Int 1D: opening a frame's raw image during a Run no longer clears the
+  background.**
+- **RSM: the background stays when its own result is read back** after
+  other results were shown.
+
 ## 1.2.17 (2026-11-20)
 
 ### Fixes
