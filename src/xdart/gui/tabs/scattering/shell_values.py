@@ -520,6 +520,10 @@ class TraceProjection:
     #: This native profile's angular coverage, or the reason it has none (COVERAGE-SUPPORT-20261013); None when its
     #: producer carries none. A display conversion of the axis keeps the profile, each bin's own result.
     angular_support: AngularSupportProfile | None = None
+    #: the normalization divisor this trace's intensity was divided by (E6-NORM-N2: its payload's own kernel value,
+    #: resolved once in ``trace_projection``); 1.0 for none. A 1-D display background takes it for each pattern
+    #: drawn (LIVE-1218-VIEWER2D-BG), never resolving the channel again.
+    norm_divisor: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -527,6 +531,9 @@ class TraceProjection:
             or type(self.intensity) is not np.ndarray
             or self.intensity.ndim != 1
             or self.intensity.shape != self.axis.values.shape
+            or type(self.norm_divisor) is not float
+            or not math.isfinite(self.norm_divisor)
+            or self.norm_divisor <= 0.0
         ):
             raise TypeError("trace projection is invalid")
         if self.angular_support is not None and (

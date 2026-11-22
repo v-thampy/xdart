@@ -322,6 +322,7 @@ def trace_projection(
         if selected is None:
             return None
         axis, intensity = selected
+        divisor = 1.0
         if norm_channel:
             # E6-NORM-N2 (§25.3): the divisor is this exact admitted
             # payload's own kernel value.  A complete channel with no valid
@@ -333,6 +334,7 @@ def trace_projection(
             )
             if divisor is None:
                 return None
+            divisor = float(divisor)
             intensity = intensity / divisor
             intensity.setflags(write=False)
         # Match the production accumulator presentation: scan name plus the
@@ -375,6 +377,7 @@ def trace_projection(
             _finite_metadata_value(view.metadata_numeric, "epoch"),
             wavelength_m=payload.wavelength_m,
             angular_support=_trace_angular_support(view, intensity, from_cake=selected_from_cake),
+            norm_divisor=divisor,
         )
     except Exception:
         return None

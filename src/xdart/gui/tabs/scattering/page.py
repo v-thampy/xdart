@@ -2322,8 +2322,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._background_identity is not None
             and operations.current_identity is self._background_identity
         )
-        if (self._experiment_operation_busy() and not background_cancel
-                and owner.phase != "ACTIVE"):  # Clear BG is display only: it works during a Run, which keeps it
+        if self._experiment_operation_busy() and not background_cancel:
             self._notice("Display background is unavailable while another operation is active.")
             self._refresh_shell(
                 preserve_display=True,

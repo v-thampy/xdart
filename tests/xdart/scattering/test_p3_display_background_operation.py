@@ -896,21 +896,32 @@ def test_trace_values_charge_the_grant_and_go_with_the_background() -> None:
 
 def test_following_trace_values_take_each_payloads_native_pattern_and_divisor() -> None:
     """The page's hook gives the owner the native pattern of the payload a trace was drawn from, matched by the
-    frame key itself, with that payload's own normalization divisor."""
+    frame key itself, with the divisor the trace was normalized by (its ``norm_divisor``, the one E6-NORM-N2
+    resolution): a normalized pattern drawn after Set shows (I - B) / d, as ``promote`` gives."""
     from xdart.gui.tabs.scattering.context_projection import following_trace_values
+    from xdart.gui.tabs.scattering.scientific_axes import trace_projection
     controller, _lifecycle, _executor, _loader, _acquisition_context = _running_controller()
     frame = controller.navigation.current; assert frame is not None
     view = replace(_view(1, 3.0), metadata_numeric={"monitor": 2.0})
     payload = StandardDisplayPayload(0, frame, "monitored", view)
     calls = []
-    hook = following_trace_values(lambda *args: calls.append(args) or "seen", (payload,), "monitor")
-    trace = SimpleNamespace(frame=frame)
-    assert hook(trace) == "seen"
+    hook = following_trace_values(lambda *args: calls.append(args) or "seen", (payload,))
+    assert hook(SimpleNamespace(frame=frame, norm_divisor=2.0)) == "seen"
     ((intensity, axis, unit, divisor),) = calls
     assert intensity is view.intensity_1d and axis is view.axis_1d.values
     assert unit == f"{view.axis_1d.label}\0{view.axis_1d.unit}" and divisor == 2.0
     assert hook(SimpleNamespace(frame=replace(frame))) is None  # another key under no payload
     assert following_trace_values(None, (payload,)) is None
+
+    trace = trace_projection(payload, requested_axis=view.axis_1d.label, allow_cake=False, slice_enabled=False,
+                             slice_center=0.0, slice_width=1.0, norm_channel="monitor")
+    assert trace is not None and trace.norm_divisor == 2.0
+    np.testing.assert_allclose(trace.intensity, view.intensity_1d / 2.0)
+    background = np.asarray(view.intensity_1d, dtype=np.float64) * 0.25
+    owner = _active_1d_owner(background, np.asarray(view.axis_1d.values, dtype=np.float64),
+                             unit=f"{view.axis_1d.label}\0{view.axis_1d.unit}")
+    follow = following_trace_values(owner.trace_values, (payload,))
+    np.testing.assert_allclose(follow(trace), (view.intensity_1d - background) / 2.0)
 
 
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:

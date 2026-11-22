@@ -19,7 +19,6 @@ from xrd_tools.io.viewer_2d import (
     Viewer2DArtifactCatalog, Viewer2DFrame, Viewer2DSourceKind,
 )
 from xrd_tools.core.energy import WavelengthUnit, canonical_wavelength_m
-from xrd_tools.core.metadata import resolve_monitor_norm
 from xrd_tools.session.hydration import (
     HydrationPurpose, HydrationReadKey, HydrationScope, HydrationToken,
 )
@@ -41,7 +40,6 @@ from .display_values import (
 )
 from .display_runtime import browse_publication_needs_hydration
 from .events import RunIdentity
-from .scientific_axes import resolve_norm_presentation
 from .shell_projection import (
     ScientificPreferences, build_browser_projection,
     build_run_strip_projection, build_scientific_projection,
@@ -86,12 +84,13 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
-def following_trace_values(trace_values, payloads, norm_channel: str = ""):
+def following_trace_values(trace_values, payloads):
     """The per-pattern hook ``apply_presentation_background`` takes for a 1-D background that follows every
     pattern drawn (LIVE-1218-VIEWER2D-BG; his words: "the whole idea is to apply it across frames"): for a trace,
     the background owner's ``trace_values`` on the native pattern of the payload it was drawn from (matched by
-    the frame key itself, never a bare id), with that payload's own normalization divisor, as ``promote`` takes
-    it for the patterns the background was set on. None when ``trace_values`` is not callable."""
+    the frame key itself, never a bare id), with the divisor the trace was normalized by (``norm_divisor``, the
+    one E6-NORM-N2 resolution), as ``promote`` takes it for the patterns the background was set on. None when
+    ``trace_values`` is not callable."""
     if not callable(trace_values):
         return None
     by_id = {id(payload.frame_key): payload for payload in payloads}
@@ -102,13 +101,8 @@ def following_trace_values(trace_values, payloads, norm_channel: str = ""):
         axis = None if view is None else view.axis_1d
         if axis is None or type(view.intensity_1d) is not np.ndarray:
             return None
-        divisor = 1.0
-        if norm_channel:
-            resolved = resolve_monitor_norm(view.metadata_numeric, norm_channel)
-            if resolved is None:
-                return None
-            divisor = float(resolved)
-        return trace_values(view.intensity_1d, axis.values, f"{axis.label}\0{axis.unit}", divisor)
+        return trace_values(view.intensity_1d, axis.values, f"{axis.label}\0{axis.unit}",
+                            getattr(trace, "norm_divisor", 1.0))
     return values
 
 
@@ -614,11 +608,10 @@ class ContextProjection:
                 norm_aggregate=norm_aggregate,
                 # an Int 1D (XYE) Run writes .xye files, no NeXus output to name
                 names_output=intent.processing_mode != "Int 1D (XYE)"))
-        # a 1-D background follows every pattern drawn, each by its own normalization, as Set BG divides it
+        # a 1-D background follows every pattern drawn, each by the divisor it was normalized by
         scientific = apply_presentation_background(
             scientific, presentation_background, presentation_background_frame_values,
-            following_trace_values(presentation_background_trace_values, payloads, resolve_norm_presentation(
-                norm_aggregate, preferences.norm_channel, navigation.selected)[2]))
+            following_trace_values(presentation_background_trace_values, payloads))
         scientific = replace(scientific, acquisition_selected=(
             selection is not None and selection.kind is ContextKind.ACQUISITION))
         if not viewer_selected and selection is not None and selection.kind is ContextKind.BROWSE:
