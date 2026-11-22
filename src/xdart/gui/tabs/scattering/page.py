@@ -7139,7 +7139,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         """A detector-mode change (Thumbnail or Full Raw, also the raw pop-up opening and closing) changes only the
         raw image: it lets a raw background go, and keeps Int's 1-D and 2-D ones, whose values it does not touch
         (LIVE-1218-VIEWER2D-BG; his words: "If it is dropped on selection change what is the point of it at all?")."""
-        background = self._background_owner.projection()
+        owner = getattr(self, "_background_owner", None)
+        background = None if owner is None else owner.projection()
         if background is not None and background[0] == "raw":
             self._release_display_background()
 
@@ -7151,7 +7152,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             )
             if self._preferences.detector_mode != mode:
                 self._retire_batch_presentation()
-            if self._preferences.detector_mode != mode: self._release_raw_display_background()
+            if self._preferences.detector_mode != mode: ScatteringWorkspace._release_raw_display_background(self)
             if not terminal_was_waiting:
                 self._context_controller.clear_full_raw()
             self._detector_demand_frame = None
@@ -7173,7 +7174,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return False
         if self._preferences.detector_mode != mode:
             self._retire_batch_presentation()
-        if self._preferences.detector_mode != mode: self._release_raw_display_background()
+        if self._preferences.detector_mode != mode: ScatteringWorkspace._release_raw_display_background(self)
         self._detector_demand_frame = None
         self._preferences = replace(
             self._preferences, detector_mode=mode,
