@@ -719,6 +719,9 @@ def test_clear_1d_cancels_a_staged_background(qapp, tmp_path):
     processed, _raw = _write_processed(tmp_path, labels=(1,), two_d=False)
     with _page(qapp, RunIntent(processing_mode="Int 1D", project_root=str(tmp_path))) as (page, view, _events):
         _reopen(qapp, page, processed)
+        # Set BG takes the patterns the selection drew: a click before the first paint is refused ("wait for the
+        # selection to draw"), which a loaded runner hit (CI 45066196476).
+        assert _pump(qapp, lambda: bool(view.curve.listDataItems())), "the browsed frame never drew"
         view.background.click()
         worker = page._workspace_operations._slot._worker
         assert worker is not None
