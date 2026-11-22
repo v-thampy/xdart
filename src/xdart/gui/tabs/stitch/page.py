@@ -3307,6 +3307,7 @@ class StitchPage(QtWidgets.QWidget):
         from xrd_tools.analysis.fit_snapshot import FitInputKey
         payload = self._payloads.get(path)
         selection = dict(self._fit_selection())
+        background_active = self._background.active_key is not None
         frame = self._result_keys.get(path)
         projection = self._fit_projection
         matches = () if projection is None else tuple(trace for trace in projection.traces if trace.frame is frame)
@@ -3316,9 +3317,7 @@ class StitchPage(QtWidgets.QWidget):
             projection = replace(projection, traces=followed)
         else:
             projection = None
-            active_key = self._background.active_key
-            # An uncaptured batch result may need the active 1-D background. Require its displayed trace first.
-            projected_background = active_key is not None and active_key[2] == "integrated_1d"
+            projected_background = False
         background = "presentation" if projected_background else "none"
         if not projected_background:
             selection["background_sources"] = ()
@@ -3334,6 +3333,7 @@ class StitchPage(QtWidgets.QWidget):
         captured = payload if current else None
         reference = None
         if (payload is not None and native and background == "none"
+                and (current or not background_active)
                 and (coordinate not in _CUT_AXES or coordinate in dict(payload.gi))):
             from xrd_tools.notebooks.inputs import SourceReference
             source_path = Path(path)
@@ -3357,7 +3357,7 @@ class StitchPage(QtWidgets.QWidget):
                 raise ValueError("FIT_RESULT_CHANGED_REOPEN_REQUIRED: reopen the replaced result")
             admitted = replace(key, fingerprint=source.result_fingerprint)
             if projection is None:
-                if (background == "presentation" or not native
+                if (background_active or not native
                         or (coordinate in _CUT_AXES and coordinate not in dict(source.gi))):
                     raise ValueError("FIT_BATCH_SELECTION_UNAVAILABLE: select this result in Overlay to "
                                      "capture its displayed slice/background")
