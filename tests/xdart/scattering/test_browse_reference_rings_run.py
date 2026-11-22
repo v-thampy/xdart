@@ -914,6 +914,14 @@ def test_set_bg_on_a_two_frame_browse_selection_takes_the_detached_patterns(qapp
         for values in drawn:
             finite = np.isfinite(values)
             np.testing.assert_allclose(values[finite], 0.0, atol=1e-4 * float(np.nanmax(np.abs(background))))
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Set 1D BG")
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 3, ("waterfall", "start")))
+        assert _pump(qapp, lambda: "waterfall options selected no rows" in page._notice_text)
+        assert view.background.isEnabled()
+        view.background.click()
+        assert page._background_owner.phase == "RELEASED"
+        assert page._background_identity is None
 
 
 def test_a_refused_browse_average_draws_nothing_beside_its_notice(qapp, tmp_path, monkeypatch):

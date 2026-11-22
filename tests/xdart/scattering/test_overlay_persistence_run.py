@@ -7,7 +7,9 @@ it makes sense that they can't be plotted together. otherwise they should be ove
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import os
+import weakref
 
 import numpy as np
 import pytest
@@ -21,7 +23,8 @@ from xdart.gui.tabs.scattering.events import RunIdentity
 from xdart.gui.tabs.scattering.page import ScatteringWorkspaceShell
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
-    AxisProjection, FrameNavigationProjection, ScientificProjection, ShellCommand, ShellCommandKind, TraceProjection,
+    AxisProjection, BrowseTraceSnapshot, FrameNavigationProjection, ScientificProjection, ShellCommand,
+    ShellCommandKind, TraceProjection,
 )
 
 
@@ -226,6 +229,14 @@ def test_average_and_sum_fold_the_curves_kept_from_earlier_scans(qapp, tmp_path,
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
         assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 3)
         assert _rows(page) == shown
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG")
+        background = np.mean(curves[1:], axis=0)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, mode))
+        (corrected,) = view.curve.listDataItems()
+        np.testing.assert_allclose(corrected.yData, expected - background * (3 if mode == "Sum" else 1),
+                                   atol=1e-5 * np.max(np.abs(expected)))
+        assert "3 curves, 1 kept" in corrected.name()
 
 
 @pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
@@ -271,6 +282,92 @@ def _gi_run_view(artifact, scan, labels):
     state = ScientificProjection(traces=tuple(traces), processing_mode="Int 1D", plot_mode="Overlay",
                                  measurement_mode="GI", gi_mode_1d="q_total", acquisition_selected=True)
     return state, FrameNavigationProjection(frames, frames[-1], frames)
+
+
+def test_browse_average_includes_a_frame_previously_excluded_by_overlay(qapp):
+    path = "/out/scan_int1d.nexus"
+    state, navigation = _gi_run_view(path, "scan", (1, 2))
+    first, second = state.traces
+    second = replace(second, axis=AxisProjection(second.axis.values + 0.25, "Q", "Å⁻¹"))
+    state = replace(state, acquisition_selected=False, browse_artifact=path, traces=(first, second))
+    frames = navigation.frames
+
+    def snapshot(mode):
+        projection = replace(state, plot_mode=mode)
+        receipt = BrowseTraceSnapshot(frames, frames, (1, 2), plot_mode=mode,
+                                      stacked_options_applied=mode == "Overlay",
+                                      science_contract=projection.browse_science_contract)
+        return replace(projection, browse_trace_snapshot=receipt)
+
+    view = ScientificView()
+    try:
+        view.reconcile(snapshot("Overlay"), navigation, completed=2, total=2, detail="")
+        assert view.excluded_trace_keys == (first.frame,)
+        view.reconcile(snapshot("Average"), navigation, completed=2, total=2, detail="")
+        assert view.excluded_trace_keys == ()
+        assert view.trace_history_keys == frames
+        (item,) = view.curve.listDataItems()
+        axis, values = item.getData()
+        projected = [np.interp(axis, trace.axis.values, trace.intensity, left=np.nan, right=np.nan)
+                     for trace in (first, second)]
+        np.testing.assert_allclose(values, np.nanmean(projected, axis=0))
+    finally:
+        view.close()
+
+
+def test_an_incompatible_kept_axis_is_not_labelled_as_a_successful_fold(qapp):
+    first, first_navigation = _gi_run_view("/out/first.nxs", "first", (1,))
+    second, second_navigation = _gi_run_view("/out/second.nxs", "second", (2,))
+    current, = second.traces
+    current = replace(current, axis=AxisProjection(current.axis.values, "2θ", "°"))
+    view = ScientificView()
+    try:
+        view.reconcile(first, first_navigation, completed=1, total=1, detail="")
+        view.reconcile(replace(second, plot_mode="Sum", traces=(current,)), second_navigation,
+                       completed=2, total=2, detail="")
+        (item,) = view.curve.listDataItems()
+        np.testing.assert_array_equal(item.yData, first.traces[0].intensity)
+        assert item.name() == first.traces[0].title
+    finally:
+        view.close()
+
+
+def test_clearing_the_scientific_view_releases_the_named_fold(qapp):
+    first, first_navigation = _gi_run_view("/out/first.nxs", "first", (1,))
+    second, second_navigation = _gi_run_view("/out/second.nxs", "second", (2,))
+    view = ScientificView()
+    try:
+        view.reconcile(first, first_navigation, completed=1, total=1, detail="")
+        view.reconcile(replace(second, plot_mode="Average"), second_navigation,
+                       completed=2, total=2, detail="")
+        assert view.curve.listDataItems()[0].name() == "Average · 2 curves, 1 kept"
+        intensity = weakref.ref(view._named_aggregate[2].intensity)
+        assert view.clear_workspace()
+        assert intensity() is None
+    finally:
+        view.close()
+
+
+def test_the_detached_budget_keeps_all_currently_selected_aggregate_rows(qapp, monkeypatch):
+    from xdart.gui.tabs.scattering import browse_1d_display
+
+    kept, kept_navigation = _gi_run_view("/out/kept.nxs", "kept", (1,))
+    first, first_navigation = _gi_run_view("/out/first.nxs", "first", (2,))
+    second, second_navigation = _gi_run_view("/out/second.nxs", "second", (3,))
+    frames = (*first_navigation.frames, *second_navigation.frames)
+    selected = FrameNavigationProjection(frames, frames[-1], frames)
+    aggregate = replace(first, plot_mode="Sum", traces=(*first.traces, *second.traces))
+    monkeypatch.setattr(browse_1d_display, "MAX_BROWSE_1D_DETACHED_BYTES", 512)
+    view = ScientificView()
+    try:
+        view.reconcile(kept, kept_navigation, completed=1, total=1, detail="")
+        view.reconcile(aggregate, selected, completed=3, total=3, detail="")
+        assert view.trace_history_keys == frames
+        (item,) = view.curve.listDataItems()
+        np.testing.assert_allclose(item.yData, first.traces[0].intensity + second.traces[0].intensity)
+        assert "detached display budget" in view.browse_comparison_notice
+    finally:
+        view.close()
 
 
 def test_a_gi_overlay_keeps_its_curves_through_a_new_runs_first_empty_state(qapp):

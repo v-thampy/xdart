@@ -68,6 +68,19 @@ _CONVERTIBLE_RADIAL_AXIS_KEYS = frozenset({"q_A^-1", "2th_deg"})
 DERIVED_Q_CHI = "q_chi_derived"
 #: A standard (non-GI) result's maps, as its image selector offers them.
 _STANDARD_IMAGE_AXES = ("Q-Chi", "2Th-Chi")
+
+
+def same_sampled_bins(values: np.ndarray, reference: np.ndarray) -> bool:
+    """Match stored rounding without treating shifted native bins as equivalent."""
+    if values.shape != reference.shape:
+        return False
+    if np.array_equal(values, reference):
+        return True
+    allowance = np.finfo(np.float32).eps * float(np.max(np.abs(reference)))
+    if reference.size > 1:
+        spacing = float(np.min(np.abs(np.diff(reference))))
+        allowance = min(allowance, 0.25 * spacing)
+    return bool(np.allclose(values, reference, rtol=0.0, atol=allowance))
 _SHARE_PLOT_AXIS_BY_IMAGE = {
     "Q-Chi": "Q",
     "2Th-Chi": "2theta",

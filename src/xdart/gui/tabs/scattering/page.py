@@ -23,7 +23,7 @@ from xdart.modules.display_context import (
     Viewer2DContext,
     Viewer2DState,
 )
-from xrd_tools.core import TwoDKind
+from xrd_tools.core import FrameView, TwoDKind
 from xrd_tools.core.scan import SourceSpec
 from xrd_tools.session.intent_store import (
     IntentCommitAccepted,
@@ -83,6 +83,7 @@ from .browse_1d_projection import (
     Browse1DBorrowBundle,
     Browse1DProjectionStatus,
 )
+from .browse_1d_target_plan import Browse1DTargetPlan
 from .browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
@@ -701,8 +702,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._scientific_repaint_pending = False
         self._waterfall_candidate_count = 0
         self._browse_1d_release_debt: Browse1DBorrowBundle | None = None
-        #: the last Browse 1-D display's detached payloads and their context token (_background_contributors)
-        self._browse_1d_detached: tuple[object, tuple] | None = None
+        #: Native patterns from the last accepted Browse 1-D paint, with its exact plan.
+        self._browse_1d_detached: tuple[Browse1DTargetPlan, tuple[StandardDisplayPayload, ...]] | None = None
         self._browse_1d_refusal_notice = ""
         self._quartile_refresh_identity: RunIdentity | None = None
         self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
@@ -2314,7 +2315,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return None
         return selection.context_token, frame.source_scan, frame.artifact
 
-    def _background_contributors(self):
+    def _background_contributors(self, domain):
         """The payloads Set BG averages: the selected frames' (and pins'), as the context projects them; in Browse a
         selected frame the cache drew but the context holds no payload for takes the detached copy the last Browse
         1-D display adopted (his pick "In 1.2.18" for "Set BG refuses a two-frame Browse selection right after a Live
@@ -2324,10 +2325,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         payloads = controller.project_background_contributors(self._preferences.slice_pins)
         held = getattr(self, "_browse_1d_detached", None)
         selection = getattr(controller, "selection", None)
-        if (payloads or held is None or selection is None or selection.kind is not ContextKind.BROWSE
-                or held[0] != selection.context_token or self._preferences.slice_pins):
+        if (payloads or domain != "integrated_1d" or held is None or selection is None
+                or selection.kind is not ContextKind.BROWSE or self._preferences.slice_pins):
             return payloads
-        by_id = {id(payload.frame_key): payload for payload in held[1]}
+        plan, detached = held
+        if controller.browse_pending or not controller.browse_1d_plan_is_current(plan):
+            return ()
+        by_id = {id(payload.frame_key): payload for payload in detached}
         contributors = []
         for frame in controller.navigation.selected:
             payload = by_id.get(id(frame))
@@ -2364,7 +2368,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         mode = self._intents.snapshot().thaw().processing_mode
         domain = self._background_domain(mode)
         controller = self._context_controller; selected = controller.navigation.selected
-        payloads = ScatteringWorkspace._background_contributors(self)
+        payloads = ScatteringWorkspace._background_contributors(self, domain)
         norm_channel = resolve_norm_presentation(
             controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = None if domain is None else prepare_background_plan(
@@ -2414,7 +2418,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         norm_channel = resolve_norm_presentation(
             controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = prepare_background_plan(
-            ScatteringWorkspace._background_contributors(self),
+            ScatteringWorkspace._background_contributors(self, receipt.domain),
             receipt.domain, controller.navigation.current,
             contributor_count=len(selected), norm_channel=norm_channel,
             image_axis=self._preferences.image_axis)
@@ -7541,8 +7545,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             # the 1-D cache holds the native pattern only: an Average or Sum of cake cuts (a χ axis) stays refused
             and not (self._preferences.plot_mode in {"Average", "Sum"} and cake_axis_requested)
         )
-        if not browse_selected:
-            self._browse_1d_detached = None  # its copies only serve a Browse selection (_background_contributors)
+        held = getattr(self, "_browse_1d_detached", None)
+        if held is not None and (not browse_cache_supported or controller.browse_pending
+                or held[0].selection is not selection):
+            self._browse_1d_detached = None
         browse_slices = bool(
             browse_selected
             and intent.processing_mode == "Int 2D"
@@ -7650,10 +7656,6 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 if refusal and self._notice_text == refusal:
                     self._notice("")  # an earlier Browse refusal no longer holds
                 self._browse_1d_refusal_notice = ""
-                # the detached copies Set BG may average (_background_contributors), for this Browse context only
-                selection_now = self._context_controller.selection
-                self._browse_1d_detached = (
-                    None if selection_now is None else selection_now.context_token, adopted.payloads)
                 cache_trace_snapshot = adopted.trace_snapshot
                 cache_plan = adopted.plan
                 current = navigation.current
@@ -7841,6 +7843,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 projection.scientific.browse_science_contract,
             )
             if cache_terminal_diagnostic or not retention_compatible:
+                self._browse_1d_detached = None
                 if (cache_retry_needed and not cache_terminal_diagnostic
                         and prior is not None and (prior.traces or prior.heavy is not None)):
                     # Keep only the existing capped, labeled screen raster;
@@ -7958,6 +7961,17 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if (not preserve_display and not preserve_scientific
                     and not self._shell.browser.frame_selection_pending):
                 heavy = projection.scientific.heavy
+                if (cache_plan is not None and intent.processing_mode == "Int 1D"
+                        and not controller.browse_pending and controller.browse_1d_plan_is_current(cache_plan)):
+                    # Keep the detached native patterns and their monitor metadata after paint. Images and
+                    # angular support stay in their existing owners.
+                    self._browse_1d_detached = (cache_plan, tuple(
+                        replace(payload, view=FrameView(
+                            payload.view.label, axis_1d=payload.view.axis_1d,
+                            intensity_1d=payload.view.intensity_1d,
+                            metadata_numeric=payload.view.metadata_numeric), extra_views_2d={})
+                        for payload in adopted.payloads
+                    ))
                 ScatteringWorkspace._stamp_click_perf(
                     self,
                     cache_trace_snapshot is not None and bool(projection.scientific.traces),
@@ -8021,6 +8035,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             _LOG.exception("Passive shell render failed")
             self._shell.scientific.drop_viewer_loading_snapshot()
             if cache_trace_snapshot is not None:
+                self._browse_1d_detached = None
                 self._last_scientific_projection = None
                 self._scientific_repaint_pending = True
                 self._ensure_timer()

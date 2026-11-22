@@ -11,7 +11,7 @@ from xrd_tools.reduction.background import (
     DisplayBackgroundPlan, DisplayBackgroundResult, run_display_background,
 )
 from .operation_values import OperationContextStamp
-from .scientific_axes import heavy_projection, present_gi_map, requested_image_axis
+from .scientific_axes import heavy_projection, present_gi_map, requested_image_axis, same_sampled_bins
 
 _CAPACITY = 536_870_912
 _BLOCK = 65_536
@@ -31,22 +31,6 @@ def _same_grid(shown, reference) -> bool:
                 != (getattr(right, "label", None), getattr(right, "unit", None), getattr(right, "edges", None))):
             return False
     return True
-
-
-def _same_bins(axis, reference) -> bool:
-    """Whether a 1-D curve's bins are the background's: the same count at the same positions to display (float32)
-    precision. Two scans integrated alike can differ in their stored axes by a rounding, which would otherwise take
-    the interpolation path and lose an edge bin to NaN."""
-    if axis.shape != reference.shape:
-        return False
-    if np.array_equal(axis, reference):
-        return True
-    scale = float(np.max(np.abs(reference)))
-    allowance = np.finfo(np.float32).eps * scale
-    if reference.size > 1:
-        # Even a shift smaller than the display precision can move a bin on a dense grid.
-        allowance = min(allowance, 0.25 * float(np.min(np.diff(reference))))
-    return bool(np.allclose(axis, reference, rtol=0.0, atol=allowance))
 
 
 def _immutable_copy(array: np.ndarray) -> np.ndarray:
@@ -421,7 +405,7 @@ class PresentationBackgroundOwner:
                     # I/m - <I_bg/m_bg> (his pick "Each by its own monitor"): the contributors were divided by their
                     # own monitors before the mean
                     np.divide(source, divisor, out=owner, casting="unsafe")
-                    if not _same_bins(target[1], result.axes[0]):
+                    if not same_sampled_bins(target[1], result.axes[0]):
                         for start in range(0, flat.size, _BLOCK):
                             stop = min(flat.size, start + _BLOCK)
                             flat[start:stop] -= np.interp(target[1][start:stop], result.axes[0],
@@ -556,7 +540,7 @@ class PresentationBackgroundOwner:
                 return "This curve exceeds the display background allowance, so it is drawn as it is."
         try:
             displayed = np.empty(intensity.shape, dtype=np.float64)
-            if _same_bins(axis, result.axes[0]):
+            if same_sampled_bins(axis, result.axes[0]):
                 np.subtract(intensity, result.values, out=displayed, casting="unsafe")
             else:
                 for start in range(0, displayed.size, _BLOCK):

@@ -32,6 +32,7 @@ from .controls_readiness import (
 )
 from .detector_projection import detector_calibration_ready
 from .display_values import DisplayFrameKey
+from .scientific_axes import same_sampled_bins
 from .shell_values import AxisProjection, TraceProjection
 from .scientific_curves import add_curve_item, add_text_item, reference_entry
 from xdart.gui.widgets.scientific_plot import HOVER_PX, HoverTooltip
@@ -1428,18 +1429,19 @@ def same_grid(values: np.ndarray, reference: np.ndarray) -> bool:
 
 
 def overlay_grid_compatible(values: np.ndarray, reference: np.ndarray) -> bool:
-    """Curves one Overlay may draw together: the same points to floating jitter (canonical_grid_overlay.md, with
-    OV-6's tolerance). Looser than ``same_grid``, which folds Average and Sum: a saved output keeps its radial axis
-    in float32, so a scan's saved curve and its Run curve sit up to about 6e-8 apart and are still one grid."""
+    """Curves one Overlay may draw together, using its display admission tolerance."""
     return values.shape == reference.shape and bool(np.allclose(values, reference, rtol=1e-5, atol=1e-8))
 
 
+def same_fold_axis(axis: AxisProjection, reference: AxisProjection) -> bool:
+    """Whether two axes of a fold use the same physical coordinates and sampled bins."""
+    return ((axis.label, axis.unit) == (reference.label, reference.unit)
+            and same_sampled_bins(axis.values, reference.values))
+
+
 def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
-    """The traces share the first's grid, as an Overlay draws them together (``overlay_grid_compatible``): a saved
-    curve's float32 axis and another scan's are one grid, folded point by point, not interpolated onto a union grid
-    (since 1.2.18 Average and Sum fold an Overlay's kept curves, his pick "In 1.2.18")."""
-    first = traces[0].axis.values
-    return all(overlay_grid_compatible(trace.axis.values, first) for trace in traces)
+    first = traces[0].axis
+    return all(same_fold_axis(trace.axis, first) for trace in traces)
 
 
 def _fold_grid(traces: tuple[TraceProjection, ...]) -> np.ndarray | None:

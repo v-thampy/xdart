@@ -73,7 +73,7 @@ from .shell_widgets import (
     SLICE_TIPS,
     log_toggle,
     overlay_grid_compatible,
-    same_grid,
+    same_fold_axis,
     ScientificImagePane,
     scrollable_toolbar,
     set_combo,
@@ -707,6 +707,7 @@ class ScientificView(QtWidgets.QFrame):
         self._trace_history_by_identity: dict[int, TraceProjection] = {}
         self.browse_comparison_notice = ""
         self._trace_aggregate_fold: _TraceAggregateCache | None = None
+        self._named_aggregate = None
         self._pinned_trace_scope: tuple[object, ...] | None = None
         self._pinned_trace_by_id: dict[
             tuple[object, ...], TraceProjection
@@ -2518,7 +2519,7 @@ class ScientificView(QtWidgets.QFrame):
             ("_rendered_detector_source", "none"),
             ("_selected_keys", ()),
             ("_trace_selection_keys", ()), ("_trace_history_keys", ()), ("_rendered_trace_keys", ()),
-            ("_trace_aggregate_fold", None),
+            ("_trace_aggregate_fold", None), ("_named_aggregate", None),
             ("_curve_mounted_keys", ()), ("_curve_items_by_key", {}),
             ("_curve_item_contracts", {}), ("_rendered_axis_labels", None),
             ("_trace_row_count", 0),
@@ -2951,6 +2952,7 @@ class ScientificView(QtWidgets.QFrame):
 
     def _clear_trace_aggregate_fold(self) -> None:
         self._trace_aggregate_fold = None
+        self._named_aggregate = None
 
     def _name_kept_in_aggregate(self, traces, rows, navigation):
         """An Average or Sum that folds curves kept from other files, scans or Runs says so in its name ("Average ·
@@ -2961,9 +2963,10 @@ class ScientificView(QtWidgets.QFrame):
         selected = {id(frame) for frame in navigation.selected}
         kept = sum(1 for _key, trace in rows if id(trace.frame) not in selected)
         if not kept:
+            self._named_aggregate = None
             return traces
         (folded,) = traces
-        cached = getattr(self, "_named_aggregate", None)
+        cached = self._named_aggregate
         if cached is not None and cached[0] is folded and cached[1] == (len(rows), kept):
             return (cached[2],)
         named = replace(folded, title=f"{folded.title} · {len(rows)} curves, {kept} kept")
@@ -2986,13 +2989,12 @@ class ScientificView(QtWidgets.QFrame):
     @staticmethod
     def _aggregate_rows_are_cacheable(
         rows: tuple[tuple[tuple[object, ...], TraceProjection], ...],
-        reference: np.ndarray,
+        reference: AxisProjection,
     ) -> bool:
         return all(
             _is_readonly_array(trace.axis.values)
             and _is_readonly_array(trace.intensity)
-            # one grid as an Overlay draws it, as aggregate_traces folds it
-            and overlay_grid_compatible(trace.axis.values, reference)
+            and same_fold_axis(trace.axis, reference)
             for _key, trace in rows
         )
 
@@ -3032,13 +3034,13 @@ class ScientificView(QtWidgets.QFrame):
         *,
         intensity_scale: str,
         mode: str,
-    ) -> tuple[TraceProjection, ...]:
-        """Fold one exact immutable append prefix without restacking history."""
+    ) -> tuple[tuple[TraceProjection, ...], bool]:
+        """Return the displayed rows and whether they are a successful fold."""
 
         if not rows:
             self._clear_trace_aggregate_fold()
-            return ()
-        reference = rows[0][1].axis.values
+            return (), False
+        reference = rows[0][1].axis
         prior = self._trace_aggregate_fold
         if (
             prior is not None
@@ -3047,7 +3049,7 @@ class ScientificView(QtWidgets.QFrame):
         ):
             suffix = rows[len(prior.rows):]
             if not suffix:
-                return (self._aggregate_projection(prior, mode),)
+                return (self._aggregate_projection(prior, mode),), True
             if self._aggregate_rows_are_cacheable(suffix, reference):
                 scaled = tuple(
                     _scaled_intensity(trace.intensity, intensity_scale)
@@ -3064,7 +3066,7 @@ class ScientificView(QtWidgets.QFrame):
                     if size > capacity:
                         capacity = 1 << (size - 1).bit_length()
                         values = np.empty(
-                            (capacity, reference.size),
+                            (capacity, reference.values.size),
                             dtype=prior.values.dtype,
                         )
                         values[:len(prior.rows)] = prior.values[
@@ -3079,7 +3081,7 @@ class ScientificView(QtWidgets.QFrame):
                     )
                     projection = self._aggregate_projection(fold, mode)
                     self._trace_aggregate_fold = fold
-                    return (projection,)
+                    return (projection,), True
 
         scaled_traces = tuple(
             replace(
@@ -3093,7 +3095,8 @@ class ScientificView(QtWidgets.QFrame):
         )
         if not self._aggregate_rows_are_cacheable(rows, reference):
             self._clear_trace_aggregate_fold()
-            return aggregate_traces(scaled_traces, mode)
+            displayed = aggregate_traces(scaled_traces, mode)
+            return displayed, displayed[0] is not scaled_traces[0]
         stacked = np.stack(tuple(
             trace.intensity for trace in scaled_traces
         ))
@@ -3105,7 +3108,7 @@ class ScientificView(QtWidgets.QFrame):
         )
         projection = self._aggregate_projection(fold, mode)
         self._trace_aggregate_fold = fold
-        return (projection,)
+        return (projection,), True
 
     def _render_traces(
         self,
@@ -3175,7 +3178,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._trace_history_by_identity.clear()
                 self._browse_comparison_scope = None
                 self._reset_comparison_admission()
-            self._trace_aggregate_fold = None
+            self._clear_trace_aggregate_fold()
             if not compatible_single:
                 self._rendered_trace_keys = ()
                 self._rendered_plot_mode = ""
@@ -3272,12 +3275,15 @@ class ScientificView(QtWidgets.QFrame):
         self._phase_wavelengths = tuple(sorted({getattr(trace, "wavelength_m", None)
             for _, trace in rows}, key=lambda value: -1. if value is None else value))
         if state.plot_mode in {"Average", "Sum"}:
-            traces = self._aggregate_trace_rows(
+            traces, folded = self._aggregate_trace_rows(
                 rows,
                 intensity_scale=state.plot_options.intensity_scale,
                 mode=state.plot_mode,
             )
-            traces = self._name_kept_in_aggregate(traces, rows, navigation)
+            if folded:
+                traces = self._name_kept_in_aggregate(traces, rows, navigation)
+            elif traces and not self.browse_comparison_notice:
+                self.browse_comparison_notice = f"{state.plot_mode} needs compatible axes. Showing {traces[0].title}."
             keys = (("aggregate",),) if traces else ()
         else:
             rows = tuple(
@@ -3844,16 +3850,14 @@ class ScientificView(QtWidgets.QFrame):
         out silently until the overlay starts again. An unattended Run never stops for it."""
         from . import browse_1d_display
 
-        if on_show is None:
-            return retained, current
         if aggregate:
-            # Average and Sum fold curves on different grids of one axis onto a common grid (aggregate_traces): no
-            # curve leaves for its grid (his pick "In 1.2.18"); the detached budget still applies, with its notice
-            if _detached_root_bytes((*retained, *current)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
-                shown = self._trace_row(on_show.frame)[0]
-                retained = tuple(trace for trace in retained if self._trace_row(trace.frame)[0] == shown)
-                current = tuple(trace for trace in current if self._trace_row(trace.frame)[0] == shown)
-                self.browse_comparison_notice = "The fold keeps this file's curves only: detached display budget reached."
+            # An aggregate folds the selection even if Overlay previously excluded some of its grids.
+            self._reset_comparison_admission()
+            if retained and _detached_root_bytes((*retained, *current)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+                retained = ()
+                self.browse_comparison_notice = "The detached display budget was reached. The fold uses the current selection only."
+            return retained, current
+        if on_show is None:
             return retained, current
         refused, notice = self._comparison_refused, ""
         key = self._axis_key(on_show.axis) or (on_show.axis.label, on_show.axis.unit)
@@ -3977,7 +3981,7 @@ class ScientificView(QtWidgets.QFrame):
         self._browse_comparison_scope = comparison
         if not same_scope:
             self._trace_history_by_identity.clear()
-            self._trace_aggregate_fold = None
+            self._clear_trace_aggregate_fold()
             self._rendered_trace_keys = ()
             self._rendered_plot_mode = ""
             self._rendered_plot_options = None

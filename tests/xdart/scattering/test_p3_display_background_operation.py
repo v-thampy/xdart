@@ -1460,7 +1460,7 @@ def test_ast_has_one_public_runner_edge_and_no_hot_path_or_peer_worker() -> None
     # one contributor authority (_background_contributors, since 1.2.18 with the Browse detached fallback), used by
     # the Set and its adoption alone, never by a refresh
     assert page.count("project_background_contributors(") == 1
-    assert page.count("ScatteringWorkspace._background_contributors(self)") == 2
+    assert page.count("ScatteringWorkspace._background_contributors(self,") == 2
     tree = ast.parse(page)
     refresh = next(node for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "_refresh_shell")

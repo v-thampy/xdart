@@ -44,6 +44,15 @@ def test_one_grid_folds_point_by_point_as_before():
     np.testing.assert_array_equal(average.intensity, (np.arange(11.) + 1) / 2)
 
 
+def test_close_grids_interpolate_when_shifted_by_a_native_bin():
+    axis = 1.0 + np.arange(4) * 2e-7
+    rows = (_trace(1, axis, [1., 5., 20., 50.]),
+            _trace(2, axis + 2e-7, [60., 15., 5., 2.]))
+    (summed,) = aggregate_traces(rows, "Sum")
+    assert summed.axis.values[[0, -1]].tolist() == [axis[0], rows[-1].axis.values[-1]]
+    np.testing.assert_allclose(summed.intensity, _expected(rows, summed.axis.values, "Sum"))
+
+
 @pytest.mark.parametrize("mode", ("Sum", "Average"))
 def test_curves_on_different_grids_fold_on_one_grid_spanning_them(mode):
     """Two scans' ranges overlapping on 2-3, one with other Pts: below 2 and above 3 each is shown as it is,
@@ -86,6 +95,8 @@ def test_curves_on_different_axes_show_the_first():
     q = _trace(1, np.linspace(1., 2., 11), np.ones(11))
     two_theta = _trace(2, np.linspace(10., 20., 11), np.ones(11), label="2θ", unit="°")
     assert not foldable((q, two_theta)) and aggregate_traces((q, two_theta), "Sum") == (q,)
+    same_numbers = _trace(2, q.axis.values, np.ones(11), label="2θ", unit="°")
+    assert not foldable((q, same_numbers)) and aggregate_traces((q, same_numbers), "Sum") == (q,)
     unordered = _trace(3, [1., 1.5, 1.2, 2.], np.ones(4))  # not monotonic: no grid to put it on
     assert not foldable((q, unordered)) and aggregate_traces((q, unordered), "Sum") == (q,)
     assert foldable((q, _trace(4, np.linspace(0., 3., 7), np.ones(7)))) and foldable(())
