@@ -695,6 +695,26 @@ def test_plot_mode_can_drop_a_slice_pin_without_clearing_a_1d_background(qapp, t
         assert page._background_owner.active_key == active
 
 
+def test_clear_1d_cancels_a_staged_background(qapp, tmp_path):
+    from xrd_tools.session.run_configuration import RunIntent
+    from tests.xdart.scattering.test_e4_preview_transport import _write_processed
+
+    processed, _raw = _write_processed(tmp_path, labels=(1,), two_d=False)
+    with _page(qapp, RunIntent(processing_mode="Int 1D", project_root=str(tmp_path))) as (page, view, _events):
+        _reopen(qapp, page, processed)
+        view.background.click()
+        worker = page._workspace_operations._slot._worker
+        assert worker is not None
+        worker.join(3)
+        owner = page._background_owner
+        assert owner.phase == "STAGED"
+        view.clear.click()
+        page._drain_executor()
+        assert owner.phase == "RELEASED"
+        assert owner.active_bytes == 0
+        assert view.background.text() == "Set 1D BG"
+
+
 def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_path):
     """A real Int 1D Set BG on a finished Run's Browse context (Codex's review row), then another frame chosen:
     the background stays through idle ticks and is subtracted from the frame shown (its image is the first's

@@ -8653,6 +8653,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if (background is not None and background[0] == "integrated_1d"
                     and not self._release_display_background()):
                 return False
+            if (background is None
+                    and getattr(self, "_background_identity", None) is not None
+                    and self._background_domain(self._intents.snapshot().thaw().processing_mode)
+                    == "integrated_1d"):
+                # Cancel a pending Set before it can promote against the same frame after Clear.
+                self._release_display_background()
             if viewer_1d or getattr(controller, "viewer_1d_owned", False):
                 return self._clear_viewer_1d_renderer(close=True)
             self._shell.browser.cancel_pending_frame_selection()
