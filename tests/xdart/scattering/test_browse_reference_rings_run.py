@@ -669,6 +669,32 @@ def test_live_background_follows_the_next_frame_and_scan(qapp, tmp_path, next_sc
         assert page._background_owner.phase == "RELEASED"
 
 
+def test_plot_mode_can_drop_a_slice_pin_without_clearing_a_1d_background(qapp, tmp_path):
+    from xrd_tools.session.run_configuration import RunIntent
+    from xdart.gui.tabs.scattering.shell_values import ShellCommand, ShellCommandKind
+    from tests.xdart.scattering.test_e4_preview_transport import _write_processed
+
+    processed, _raw = _write_processed(tmp_path)
+    with _page(qapp, RunIntent(processing_mode="Int 2D", project_root=str(tmp_path))) as (page, view, _events):
+        _reopen(qapp, page, processed)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_SLICE_ENABLED, True))
+        assert _pump(qapp, lambda: page._last_scientific_projection is not None
+                     and page._last_scientific_projection.slice_enabled
+                     and page._last_scientific_projection.heavy is not None
+                     and page._last_scientific_projection.heavy.cake is not None)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.PIN_SLICE))
+        assert page._preferences.slice_pins
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D"))
+        assert page._preferences.slice_pins
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG")
+        active = page._background_owner.active_key
+        view.plot_mode.setCurrentText("Single")
+        assert not page._preferences.slice_pins
+        assert page._background_owner.active_key == active
+
+
 def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_path):
     """A real Int 1D Set BG on a finished Run's Browse context (Codex's review row), then another frame chosen:
     the background stays through idle ticks and is subtracted from the frame shown (its image is the first's

@@ -310,11 +310,11 @@ _UNSAFE_UNFUNDED_STAGING_KEY = (
 _NEXUS_ONLY_PERFORMANCE_KEYS = PROCESS_PRIVATE_RUN_OPTIONS
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
 #: The display preferences whose edit lets an Int background go, since they change what its values mean: a 1-D
-#: one's normalization (the quantity drawn) and slice pins (as before 1.2.18), a 2-D one's image axis (the map's
-#: axes). Every other edit keeps it, as a frame, scan or file choice does: it follows each frame and pattern drawn,
-#: subtracted on the pattern's own native bins, so another plot axis of one quantity keeps it (LIVE-1218-VIEWER2D-BG).
+#: one's normalization (the quantity drawn), a 2-D one's image axis (the map's axes). Explicitly pinning a slice
+#: also clears a 1-D background. Every other edit keeps it, as a frame, scan or file choice does. It follows each
+#: pattern on its native bins, so another plot axis of one quantity keeps it (LIVE-1218-VIEWER2D-BG).
 _BACKGROUND_GRID_FIELDS = {
-    "integrated_1d": frozenset({"norm_channel", "slice_pins"}),
+    "integrated_1d": frozenset({"norm_channel"}),
     "integrated_2d": frozenset({"image_axis"}),
 }
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
@@ -8675,7 +8675,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         domain = None if background is None else background[0]
         if domain is None and getattr(self, "_background_identity", None) is not None:
             domain = self._background_domain(self._intents.snapshot().thaw().processing_mode)
-        if any(
+        if (domain == "integrated_1d" and kind is ShellCommandKind.PIN_SLICE) or any(
                 key in updates and updates[key] != getattr(self._preferences, key)
                 for key in _BACKGROUND_GRID_FIELDS.get(domain, ())):
             self._release_display_background()

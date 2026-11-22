@@ -464,23 +464,26 @@ class PresentationBackgroundOwner:
             if (self._phase != "ACTIVE" or self._result is None or self._plan is None
                     or self._plan.domain != "integrated_1d"):
                 return None
+            if (type(intensity) is not np.ndarray or type(axis) is not np.ndarray or intensity.ndim != 1
+                    or axis.shape != intensity.shape or type(divisor) is not float
+                    or not np.isfinite(divisor) or divisor <= 0.0):
+                return None
             result, reservation = self._result, self._reservation
-            units = self._plan.axis_units[0] if self._plan.axis_units else ()
+            units = result.axis_units
+            if (unit_key,) != units:
+                def named(key):
+                    label, _, unit = str(key).partition("\0")
+                    return f"{label} ({unit})" if unit else label
+                return (f"The background is on {named(units[0])}; this pattern is on "
+                        f"{named(unit_key)}, so it is drawn as it is.")
             entry = self._followed.get(id(intensity))
             if (entry is not None and entry[0]() is intensity and entry[1]() is axis
                     and entry[2] == divisor):
                 self._followed.move_to_end(id(intensity))
                 return entry[3]
-        if (type(intensity) is not np.ndarray or type(axis) is not np.ndarray or intensity.ndim != 1
-                or axis.shape != intensity.shape or type(divisor) is not float
-                or not np.isfinite(divisor) or divisor <= 0.0):
-            return None
-        if (unit_key,) != tuple(units):
-            def named(key):
-                label, _, unit = str(key).partition("\0")
-                return f"{label} ({unit})" if unit else label
-            return (f"The background is on {named(units[0]) if units else 'another axis'}; this pattern is on "
-                    f"{named(unit_key)}, so it is drawn as it is.")
+            base = self._active_bytes - self._followed_bytes
+            if base + intensity.size * np.dtype(np.float64).itemsize > self._capacity:
+                return "This pattern exceeds the display background allowance, so it is drawn as it is."
         try:
             displayed = np.empty(intensity.shape, dtype=np.float64)
             if axis.shape == result.axes[0].shape and np.array_equal(axis, result.axes[0]):

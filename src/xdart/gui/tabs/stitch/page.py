@@ -3237,8 +3237,8 @@ class StitchPage(QtWidgets.QWidget):
     def _fit_selection(self):
         state = self._fit_projection
         coordinate = self._view.plot_axis if state is None else state.plot_axis
-        background_sources = (tuple((str(path), payload.result_fingerprint) for path, payload in self._selected())
-                              if self._background.phase == "ACTIVE" else ())
+        background_key = self._background.active_key
+        background_sources = () if background_key is None else background_key[-1]
         return tuple(sorted(dict(coordinate=coordinate, requested_coordinate=self._view.plot_axis,
                                  diagnostic=self._diagnostic, mode=self._mode,
                                  image_axis=self._view.image_axis, slice_enabled=self._view.slice_enabled,
@@ -3430,8 +3430,9 @@ class StitchPage(QtWidgets.QWidget):
             return
         map_mode = self._mode == "Stitch 2D"
         domain = "integrated_2d" if map_mode else "integrated_1d"
-        keys, navigation = self._navigation()
-        payloads = tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in self._selected())
+        _keys, navigation = self._navigation()
+        selected = self._selected()
+        payloads = tuple(self._display_payload(path, payload, with_map=map_mode) for path, payload in selected)
         # a map taken as Int's page takes it, through the map the view draws, so its axes are known at Set and
         # every map shown after it on those axes is subtracted (LIVE-1218-VIEWER2D-BG)
         prepared = (None if not payloads or navigation.current is None else
@@ -3442,9 +3443,10 @@ class StitchPage(QtWidgets.QWidget):
                          + (" (maps of one shape, the current among them)" if map_mode else ""))
             return
         plan, contributors, projection_keys, targets, facts = prepared
+        sources = tuple((str(path), payload.result_fingerprint) for path, payload in selected)
         reservation = owner.reserve(plan, contributors, stamp=OperationContextStamp(self._revision),
                                     active_key=("stitch-background", self._view_revision, domain,
-                                                plan.contributor_ids, facts),
+                                                plan.contributor_ids, facts, sources),
                                     projection_keys=projection_keys,
                                     projection_shapes=tuple(target[0].shape for target in targets))
         if reservation is None:

@@ -1404,12 +1404,17 @@ def test_background_does_not_show_old_values_when_the_same_output_is_replaced(qa
         page.scientific.background.click()
         assert page._background.phase == "ACTIVE"
         np.testing.assert_allclose(page.curve.listDataItems()[0].yData, 0., atol=1e-12)
+        before = dict(page._fit_target(str(path), "peak", current=True).load().key.selection)
+        assert before["background_sources"] == ((str(path), original.result_fingerprint),)
         replaced_path, replacement = _published(replace(form, polarization_factor=.75))
         assert replaced_path == path
         assert not np.array_equal(original.intensity, replacement.intensity, equal_nan=True)
         page.open_result(path)
         _wait(page, qapp)
         assert page._background.phase == "ACTIVE"
+        target = page._fit_target(str(path), "peak", current=True).load()
+        assert target.key.fingerprint == replacement.result_fingerprint
+        assert dict(target.key.selection)["background_sources"] == before["background_sources"]
         np.testing.assert_allclose(page.curve.listDataItems()[0].yData,
                                    np.asarray(replacement.intensity, np.float64)
                                    - np.asarray(original.intensity, np.float64), rtol=0, atol=1e-9, equal_nan=True)

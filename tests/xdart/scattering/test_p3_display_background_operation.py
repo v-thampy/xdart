@@ -879,6 +879,8 @@ def test_trace_values_follow_every_pattern_drawn_as_promote_does() -> None:
     drawn = owner.trace_values(pattern, axis, "q\0A^-1", 2.0)
     np.testing.assert_allclose(drawn, (pattern - background) / 2.0)
     assert owner.trace_values(pattern, axis, "q\0A^-1", 2.0) is drawn
+    note = owner.trace_values(pattern, axis, "2th\0deg", 2.0)
+    assert type(note) is str and "2th (deg)" in note
     assert not drawn.flags.writeable
     shifted = np.array([0.5, 1.5, 2.5, 3.5])
     np.testing.assert_allclose(owner.trace_values(pattern, shifted, "q\0A^-1", 1.0),
@@ -889,6 +891,17 @@ def test_trace_values_follow_every_pattern_drawn_as_promote_does() -> None:
     np.testing.assert_allclose(owner.trace_values(other, axis, "q\0A^-1", 1.0), other - background)
     assert owner.trace_values(pattern, axis, "q\0A^-1", float("nan")) is None
     assert owner.frame_values(11, pattern) is None  # a 1-D background follows patterns, not images
+
+
+def test_a_single_following_pattern_must_fit_the_background_grant() -> None:
+    axis = np.arange(1024.0)
+    owner = _active_1d_owner(np.zeros_like(axis), axis)
+    active = owner.active_key
+    base = owner.active_bytes
+    owner._capacity = base + axis.nbytes - 1
+    result = owner.trace_values(np.ones_like(axis), axis, "q\0A^-1")
+    assert type(result) is str and "allowance" in result
+    assert owner.active_key == active and owner.active_bytes == base
 
 
 def test_trace_values_charge_the_grant_and_go_with_the_background() -> None:
