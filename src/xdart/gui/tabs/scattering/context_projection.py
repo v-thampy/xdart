@@ -84,6 +84,20 @@ class ProjectionRequest:
             raise TypeError("context projection request is invalid")
 
 
+def followed_traces(traces, follow):
+    """``traces`` minus a 1-D display background, as the view draws them (``follow``: the owner's ``follow_trace``),
+    for a consumer that reads the curves themselves, not the view: a fit window's display input takes the curve as
+    shown (LIVE-1218-VIEWER2D-BG). A curve the background does not fit, or no follow, stays as it is."""
+    if not callable(follow):
+        return tuple(traces)
+    out = []
+    for trace in traces:
+        value = follow(trace)
+        out.append(replace(trace, intensity=value)
+                   if type(value) is np.ndarray and value.shape == trace.intensity.shape else trace)
+    return tuple(out)
+
+
 def apply_presentation_background(
     state: ScientificProjection, projection, frame_values=None, *, view_follows_traces: bool = False,
 ) -> ScientificProjection:
@@ -942,4 +956,5 @@ def _browse_wavelength(context: BrowseContext) -> float | None:
     return canonical_wavelength_m(value, WavelengthUnit.METRE)
 
 
-__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings"]
+__all__ = ["ContextProjection", "ProjectionRequest", "apply_presentation_background", "attach_saved_rings",
+           "followed_traces"]

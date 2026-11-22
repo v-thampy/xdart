@@ -1356,6 +1356,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         current = self._context_controller.navigation.current
         projection = self._last_scientific_projection
         if current is None or projection is None: return None, None
+        if projection.background_set:  # the curve as shown: the view subtracts a 1-D background as it draws
+            from .context_projection import followed_traces
+            projection = replace(projection, traces=followed_traces(
+                projection.traces, getattr(self._background_owner, "follow_trace", None)))
         try: trace = displayed_trace_input(projection, current)
         except (TypeError, ValueError): return None, None
         generation = self._analysis_generation_for(kind)

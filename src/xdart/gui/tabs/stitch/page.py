@@ -3201,7 +3201,7 @@ class StitchPage(QtWidgets.QWidget):
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=label or "Current", status=status)
-        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
+        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background, followed_traces
         # the background follows every result drawn, as Int's (LIVE-1218-VIEWER2D-BG): a map here, a pattern in the
         # view, which subtracts it from every curve it draws
         state = apply_presentation_background(
@@ -3213,7 +3213,9 @@ class StitchPage(QtWidgets.QWidget):
             if payload is not None and payload[1].kind is AnalysisArtifactKind.STITCH_2D:
                 state = replace(state, heavy=replace(state.heavy, cake_coverage=payload[1].coverage.T))
         self._last_map_state = state if map_mode else None
-        fit_traces = state.traces
+        # the fit takes each curve as shown: the view subtracts a 1-D background as it draws
+        fit_traces = followed_traces(state.traces, self._background.follow_trace) if state.background_set \
+            else state.traces
         # Int removes an identical live slice from the overlay when it is already pinned. That pin is
         # still the current displayed slice; a different pinned slice must never stand in for it.
         from xdart.gui.tabs.scattering.scientific_axes import shown_slice_pin

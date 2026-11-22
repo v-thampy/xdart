@@ -765,6 +765,9 @@ def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_pa
         finite = np.isfinite(background) & np.isfinite(shown)
         assert finite.any() and np.abs(background[finite]).max() > 0
         np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
+        fitted, _anchor = page._capture_analysis_trace("peak")  # a fit window's display input: the curve as shown
+        assert fitted is not None
+        np.testing.assert_allclose(fitted.intensity[finite], background[finite], rtol=1e-4)
 
 
 @pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
