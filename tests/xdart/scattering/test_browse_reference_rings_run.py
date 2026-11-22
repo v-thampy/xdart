@@ -591,6 +591,57 @@ def test_g4_a_stopped_live_run_browses_with_the_energies_live_published(qapp, tm
             assert _same(browse[key.local_frame_label], _curves(view.raw))
 
 
+@pytest.mark.parametrize("next_scan", (False, True), ids=("paced-same-scan", "new-scan"))
+def test_live_background_follows_its_scan_only(qapp, tmp_path, next_scan):
+    intent = _directory(tmp_path, live=True, mode="Int 2D")
+    raw = tmp_path / "raw"
+    _frame(raw, "scan", 1, 16)
+    with _page(qapp, intent) as (page, view, _observed):
+        if next_scan:
+            view.plot_mode.setCurrentText("Overlay")  # direct Live selection, without the Single pacer
+        controller = page._context_controller
+
+        def drawn():
+            state = page._last_scientific_projection
+            return (state is not None and state.heavy is not None and state.heavy.cake is not None
+                    and state.heavy.frame is controller.navigation.current)
+
+        page._shell.run_controls.startButton.click()
+        assert _pump(qapp, drawn)
+        first = controller.navigation.current
+        token = controller.selection.context_token
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 2D BG")
+        active = page._background_owner.active_key
+
+        _frame(raw, "other" if next_scan else "scan", 1 if next_scan else 2, 16)
+        assert _pump(qapp, lambda: controller.navigation.current is not first and drawn(), seconds=20)
+        assert controller.selection.context_token == token
+        assert (controller.navigation.current.source_scan != first.source_scan) is next_scan
+        if next_scan:
+            assert page._background_owner.active_key is None
+            assert view.background.text() == "Set 2D BG"
+        else:
+            assert page._background_owner.active_key == active
+            assert view.background.text() == "Clear 2D BG"
+
+
+def test_int_1d_browse_background_survives_idle_ticks(qapp, tmp_path):
+    with _page(qapp, _series(tmp_path, (16,), mode="Int 1D")) as (page, view, observed):
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+        assert _pump(qapp, lambda: bool(view.curve.listDataItems()))
+        view.background.click()
+        assert page._background_identity is not None, page._notice_text
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG")
+        active = page._background_owner.active_key
+        assert active is not None
+        for _tick in range(5):
+            page._drain_executor()
+            assert page._background_owner.active_key == active
+        assert view.background.text() == "Clear 1D BG"
+
+
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):
     with _page(qapp, _series(tmp_path, (16, 16))) as (page, view, observed):
         _run(qapp, page, observed)

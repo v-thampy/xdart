@@ -97,15 +97,13 @@ def _renderer_roles(view) -> tuple[tuple[str, object], ...]:
     return tuple(roles)
 
 
-def _active_page_background(mode="Int 2D"):
+def _active_page_background():
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
         intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
         sources=FilesystemSourceAdapter())
     identity, acquisition = _acquisition()
     page._context_controller._runtime.adopt_acquisition(identity, acquisition)
-    if mode != "Int 2D":
-        page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, mode)
     page._refresh_shell()
     page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
     worker = page._workspace_operations._slot._worker
@@ -414,6 +412,19 @@ def test_active_background_survives_idle_drain_ticks() -> None:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
+def test_idle_orphan_release_repaints_the_background_control() -> None:
+    qapp, page, _acquisition_context = _active_page_background()
+    controller = page._context_controller
+    try:
+        assert page._shell.scientific.background.text() == "Clear 2D BG"
+        assert controller.release_acquisition(controller.run_identity)
+        page._drain_executor()
+        _assert_background_released(page._background_owner)
+        assert page._shell.scientific.background.text() == "Set 2D BG"
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
 @pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
 def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: str) -> None:
     """With the idle tick no longer releasing every background, an Int background whose frames were replaced
@@ -429,7 +440,6 @@ def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: st
         assert controller.release_acquisition(controller.run_identity)
         identity, replacement = _acquisition()
         controller._runtime.adopt_acquisition(identity, replacement)
-        page._refresh_shell()
     else:
         qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         page = ScatteringWorkspace(
@@ -477,6 +487,28 @@ def test_active_2d_background_revokes_on_an_image_axis_edit() -> None:
         assert owner.phase == "ACTIVE"
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "2Th-Chi"))
         _assert_background_released(owner)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_an_image_axis_edit_cancels_a_staged_background() -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    identity, acquisition = _acquisition()
+    page._context_controller._runtime.adopt_acquisition(identity, acquisition)
+    page._refresh_shell()
+    try:
+        page._shell.scientific.background.click()
+        worker = page._workspace_operations._slot._worker
+        assert worker is not None
+        worker.join(3)
+        assert page._background_owner.phase == "STAGED"
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "2Th-Chi"))
+        page._drain_executor()
+        _assert_background_released(page._background_owner)
+        assert page._shell.scientific.background.text() == "Set 2D BG"
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -567,6 +599,10 @@ def test_2d_background_draws_a_map_on_other_axes_or_shape_as_it_is() -> None:
     own = shown(heavy)
     np.testing.assert_allclose(own.heavy.cake, np.zeros_like(heavy.cake), atol=1e-12)
     assert shown(heavy).heavy.cake is own.heavy.cake  # the same frame: the same array
+    same_image_other_grid = replace(
+        heavy, cake_x=replace(heavy.cake_x, values=heavy.cake_x.values * 2.0))
+    skipped = shown(same_image_other_grid)
+    assert skipped.heavy.cake is heavy.cake and "map axes differ" in skipped.background_note
     same_grid = shown(replace(heavy, frame=frames[0], cake=heavy.cake + 5.0))
     np.testing.assert_allclose(same_grid.heavy.cake, np.full(heavy.cake.shape, 5.0))
     assert same_grid.background_set and not same_grid.background_note

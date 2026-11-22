@@ -101,16 +101,18 @@ def apply_presentation_background(
     except (TypeError, ValueError):
         return replace(state, background_set=False)
     heavy = state.heavy
-    if domain in {"raw", "integrated_2d"} and callable(frame_values) and heavy is not None:
-        source = heavy.raw if domain == "raw" else heavy.cake
-        if type(source) is np.ndarray:
-            value = frame_values(id(heavy.frame), source,
-                                 () if domain == "raw" else (heavy.cake_y, heavy.cake_x))
-            if type(value) is np.ndarray:
-                return replace(state, heavy=(replace(heavy, raw=value) if domain == "raw"
-                                             else replace(heavy, cake=value)), background_set=True)
-            if type(value) is str:
-                return replace(state, background_set=True, background_note=value)
+    if domain in {"raw", "integrated_2d"} and callable(frame_values):
+        if heavy is not None:
+            source = heavy.raw if domain == "raw" else heavy.cake
+            if type(source) is np.ndarray:
+                value = frame_values(id(heavy.frame), source,
+                                     () if domain == "raw" else (heavy.cake_y, heavy.cake_x))
+                if type(value) is np.ndarray:
+                    image = replace(heavy, raw=value) if domain == "raw" else replace(heavy, cake=value)
+                    return replace(state, heavy=image, background_set=True)
+                if type(value) is str:
+                    return replace(state, background_set=True, background_note=value)
+        return replace(state, background_set=True)
     if domain == "integrated_1d":
         def substitute(trace):
             value = values.get(id(trace.frame))

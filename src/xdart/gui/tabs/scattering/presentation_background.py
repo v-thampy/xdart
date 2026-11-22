@@ -10,6 +10,7 @@ from xrd_tools.reduction.background import (
     DisplayBackgroundPlan, DisplayBackgroundResult, run_display_background,
 )
 from .operation_values import OperationContextStamp
+from .scientific_axes import heavy_projection, present_gi_map, requested_image_axis
 
 _CAPACITY = 536_870_912
 _BLOCK = 65_536
@@ -38,7 +39,8 @@ def _immutable_copy(array: np.ndarray) -> np.ndarray:
 
 
 def prepare_background_plan(payloads, domain: str, current, *,
-                            contributor_count=None, norm_channel: str = ""):
+                            contributor_count=None, norm_channel: str = "",
+                            image_axis: str | None = None):
     """Freeze contributors separately from every exact renderer target."""
     if (domain not in {"raw", "integrated_1d", "integrated_2d"} or not payloads
             or type(norm_channel) is not str):
@@ -47,7 +49,8 @@ def prepare_background_plan(payloads, domain: str, current, *,
     if type(count) is not int or not 1 <= count <= len(payloads):
         return None
     items, units, identities = [], [], []
-    for payload in payloads:
+    grids = {}
+    for index, payload in enumerate(payloads):
         view, frame = payload.view, payload.frame_key
         if domain == "raw":
             item, row_units = (view.raw,), ()
@@ -55,6 +58,15 @@ def prepare_background_plan(payloads, domain: str, current, *,
             axis = view.axis_1d
             item = (view.intensity_1d, None if axis is None else axis.values)
             row_units = (() if axis is None else (f"{axis.label}\0{axis.unit}",))
+        elif image_axis is not None:
+            shown = present_gi_map(payload, image_axis)
+            heavy = heavy_projection(shown, requested_axis=requested_image_axis(shown, image_axis))
+            if heavy is None or heavy.cake is None:
+                items.append(None); units.append(()); identities.append(""); continue
+            y_axis, x_axis = heavy.cake_y, heavy.cake_x
+            grids[index] = (y_axis, x_axis)
+            item = (heavy.cake, y_axis.values, x_axis.values)
+            row_units = (f"{y_axis.label}\0{y_axis.unit}", f"{x_axis.label}\0{x_axis.unit}")
         else:
             y_axis, x_axis = view.axis_2d_y, view.axis_2d_x
             item = (view.intensity_2d,
@@ -102,8 +114,9 @@ def prepare_background_plan(payloads, domain: str, current, *,
         if domain == "integrated_1d" and units[index] != plan.axis_units[0]:
             return None
         frame = payloads[index].frame_key
-        keys.append(id(frame)); targets.append(
-            (*item, divisor) if domain == "integrated_1d" else item)
+        keys.append(id(frame))
+        targets.append((*item, divisor) if domain == "integrated_1d" else
+                       (*item, grids[index]) if index in grids else item)
         facts.append((id(frame), item[0].shape,
                       tuple(axis.shape for axis in item[1:]), units[index], divisor))
     if not targets:
@@ -164,7 +177,7 @@ class PresentationBackgroundOwner:
         #: a following background's drawn frame (``frame_values``): a weak reference to the image its displayed
         #: values were taken from, so the same image gives the same array and the owner never keeps a frame alive
         self._shown_source: weakref.ref | None = None
-        #: a 2-D background's presented map axes, as first drawn on the frame it was set on (``frame_values``)
+        #: the presented map grid captured for a following 2-D background
         self._shown_grid: tuple | None = None
 
     @property
@@ -329,8 +342,9 @@ class PresentationBackgroundOwner:
                     or receipt.result_identity != self._result.result_identity
                     or len(targets) != len(self._projection_shapes)):
                 return False
-            result, shapes = self._result, self._projection_shapes
+            result, shapes, plan = self._result, self._projection_shapes, self._plan
         displayed: list[np.ndarray] = []
+        grid = None
         try:
             for target, shape in zip(targets, shapes, strict=True):
                 source = target[0]
@@ -340,6 +354,13 @@ class PresentationBackgroundOwner:
                         and (type(divisor) is not float or not np.isfinite(divisor)
                              or divisor <= 0.0)):
                     raise ValueError("display target changed shape")
+                if result.domain == "integrated_2d" and len(target) == 4:
+                    grid = target[3]
+                    if (not _same_grid(grid, grid) or plan is None
+                            or tuple(f"{axis.label}\0{axis.unit}" for axis in grid) != plan.axis_units[0]
+                            or any(not np.array_equal(axis.values, reference)
+                                   for axis, reference in zip(grid, result.axes, strict=True))):
+                        return False
                 owner = np.empty(shape, dtype=np.float64)
                 flat = owner.reshape(-1)
                 if result.domain == "integrated_1d" and not np.array_equal(
@@ -362,6 +383,7 @@ class PresentationBackgroundOwner:
             self._display_values = tuple(displayed)
             if result.domain in _FOLLOWING and len(targets) == 1:
                 self._shown_source = weakref.ref(targets[0][0])
+                self._shown_grid = grid
             self._phase = "ACTIVE"
             self._active_bytes = receipt.retained_bytes + sum(x.nbytes for x in displayed)
         return True
@@ -380,7 +402,7 @@ class PresentationBackgroundOwner:
         is drawn; a note (a str) when the background does not fit ``source``, which is drawn as it is (his word: "if
         the shapes don't match the BG should be ignored. No need to throw an error"); None when no such background
         is active. A 2-D background fits a map of its shape whose presented axes (``grid``: the shown map's y and x
-        axes) equal those of its first draw after Set (the frame it was set on). The values replace the frame displayed
+        axes) equal the grid captured at Set. The values replace the frame displayed
         before, in the one displayed frame this background's reservation charged, so its memory stays as
         reserved."""
         with self._lock:
@@ -388,22 +410,22 @@ class PresentationBackgroundOwner:
                     or self._plan.domain not in _FOLLOWING or len(self._display_values) != 1):
                 return None
             result, reservation, domain = self._result, self._reservation, self._plan.domain
-            # the image drawn, held weakly, never a bare frame id: the background outlives the frames it was drawn
-            # on, so an id can come back as another frame's
-            if self._shown_source is not None and self._shown_source() is source:
-                if domain == "integrated_2d" and grid and self._shown_grid is None:
-                    self._shown_grid = tuple(grid)
+            same_image = self._shown_source is not None and self._shown_source() is source
+            if domain == "integrated_2d":
+                if self._shown_grid is None and same_image and _same_grid(grid, grid):
+                    self._shown_grid = grid
+                if self._shown_grid is None:
+                    return "The background's original map grid is unavailable, so this frame is drawn as it is."
+                if type(source) is np.ndarray and source.shape == result.values.shape:
+                    if not _same_grid(grid, self._shown_grid):
+                        return "The background's map axes differ from this frame's, which is drawn as it is."
+            if same_image:
                 return self._display_values[0]
-            reference = self._shown_grid
         shape = tuple(result.values.shape)
         if type(source) is not np.ndarray or source.shape != shape:
             frame = " × ".join(map(str, getattr(source, "shape", ())))
             return (f"The background ({' × '.join(map(str, shape))}) does not fit this frame ({frame}), "
                     "which is drawn as it is.")
-        if domain == "integrated_2d" and reference is not None and not _same_grid(grid, reference):
-            return "The background's map axes differ from this frame's, which is drawn as it is."
-        if domain == "integrated_2d" and not _same_grid(grid, grid):
-            return "This frame's map has no axes to match the background's, so it is drawn as it is."
         try:
             displayed = np.empty(shape, dtype=np.float64)
             np.subtract(source, result.values, out=displayed, casting="unsafe")
@@ -417,8 +439,6 @@ class PresentationBackgroundOwner:
                 return None
             self._display_values, self._projection_keys = (displayed,), (frame_key,)
             self._shown_source = followed
-            if domain == "integrated_2d" and self._shown_grid is None:
-                self._shown_grid = tuple(grid)  # the first draw after Set: the frame it was set on
         return displayed
 
     def release(self, receipt: DisplayBackgroundRendererReleaseReceipt | None = None) -> bool:

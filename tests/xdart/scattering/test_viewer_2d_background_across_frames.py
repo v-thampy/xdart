@@ -116,6 +116,25 @@ def _no_refusal(page) -> None:
     assert not any(word in shown for word in ("refus", "error", "mismatch", "does not fit")), shown
 
 
+@pytest.mark.parametrize("control", ("show_all", "auto_last", "plot_mode"))
+def test_raw_background_survives_viewer_navigation_controls(viewer, control):
+    page, app, root, stacks = viewer
+    view = page._shell.scientific
+    _open(page, app, root / "a.h5")
+    view.background.click()
+    _wait(page, app, lambda: view.background.text() == "Clear Raw BG")
+    key = page._background_owner.active_key
+    if control == "plot_mode":
+        view.plot_mode.setCurrentText("Overlay")
+    else:
+        getattr(page._shell.browser, control).click()
+    app.processEvents()
+    assert page._background_owner.active_key == key
+    _step(page, app, 1)
+    background = stacks["a.h5"][0].astype(np.float64)
+    _settle_drawn(page, app, stacks["a.h5"][1] - background)
+
+
 def test_raw_background_stays_across_frames_and_files_and_skips_other_shapes(viewer):
     page, app, root, stacks = viewer
     view, owner = page._shell.scientific, page._background_owner

@@ -2297,7 +2297,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _background_key(self, plan, stamp, mode: str, target_facts) -> tuple[object, ...]:
         return (stamp.context_token, stamp.display_generation, plan.domain, mode,
                 "raw" if plan.domain == "raw" else "integrated",
-                plan.contributor_ids, plan.value_shapes, plan.axis_shapes, target_facts)
+                plan.contributor_ids, plan.value_shapes, plan.axis_shapes, target_facts,
+                self._background_scan_scope() if plan.domain == "integrated_2d" else None)
+
+    def _background_scan_scope(self):
+        controller = self._context_controller
+        selection, frame = controller.selection, controller.navigation.current
+        if selection is None or frame is None:
+            return None
+        return selection.context_token, frame.source_scan, frame.artifact
 
     def _background_action(self) -> None:
         owner, operations = self._background_owner, self._workspace_operations
@@ -2332,7 +2340,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = None if domain is None else prepare_background_plan(
             payloads, domain, controller.navigation.current,
-            contributor_count=len(selected), norm_channel=norm_channel)
+            contributor_count=len(selected), norm_channel=norm_channel,
+            image_axis=self._preferences.image_axis)
         if prepared is None:
             self._notice("Select at least one display frame before setting background.")
             self._refresh_shell(); return
@@ -2372,7 +2381,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         prepared = prepare_background_plan(
             controller.project_background_contributors(self._preferences.slice_pins),
             receipt.domain, controller.navigation.current,
-            contributor_count=len(selected), norm_channel=norm_channel)
+            contributor_count=len(selected), norm_channel=norm_channel,
+            image_axis=self._preferences.image_axis)
         valid = prepared is not None and self._background_key(
             prepared[0], self._operation_context_stamp(), mode, prepared[4]) == receipt.active_key
         targets = () if not valid else prepared[3]
@@ -5247,17 +5257,13 @@ class ScatteringWorkspace(QtWidgets.QWidget):
     def _queue_presentation_target(
             self, identity: RunIdentity, frame: DisplayFrameKey) -> None:
         if self._presentation_run_identity is not identity:
-            self._clear_presentation_targets()
+            self._clear_presentation_targets(keep_backgrounds=("integrated_2d",))
             self._presentation_run_identity = identity
         self._presentation_targets.append(frame)
 
     def _advance_presentation_target(self) -> bool:
         identity = getattr(self, "_presentation_run_identity", None)
         if identity is None:
-            # Nothing paced, nothing to clear. Every drain tick passes here, so the clear (and the display
-            # background release in it) is left to the Run's own boundaries (LIVE-1218-VIEWER2D-BG); an Int
-            # background none of whose frames is shown any more still goes.
-            ScatteringWorkspace._release_orphaned_background(self)
             return False
         if not self._presentation_pacing_active(identity):
             self._clear_presentation_targets()
@@ -5271,25 +5277,21 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._clear_presentation_targets()
         return False
 
-    def _release_orphaned_background(self) -> None:
-        """Release an Int background whose frames were replaced without a frame or scan choice (a Reintegrate, a
-        Refresh or a Run): a 1-D one once none of the frames it was set on is shown, a 2-D one (which follows the
-        frames of its scan) once the context it was set on is no longer shown. Every idle tick released every
-        background before LIVE-1218-VIEWER2D-BG; the 2D Viewer's raw background follows every frame and file."""
+    def _release_orphaned_background(self, *, scan_only: bool = False) -> bool:
+        """Release Int 2D at a displayed scan boundary, and Int 1D once its target frames leave."""
         owner = getattr(self, "_background_owner", None)
         background = None if owner is None else owner.projection()
         if background is None or background[0] == "raw":
-            return
+            return False
         if background[0] == "integrated_2d":
-            selection = self._context_controller.selection
-            token = None if selection is None else selection.context_token
-            if not background[2] or background[2][0] != token:
-                self._release_display_background()
-            return
+            scope = self._background_scan_scope()
+            return bool(scope != background[2][-1] and self._release_display_background())
+        if scan_only:
+            return False
         navigation = self._context_controller.navigation
         shown = {id(frame) for frame in (*navigation.selected, navigation.current) if frame is not None}
-        if not shown.intersection(key for key, _values in background[1]):
-            self._release_display_background()
+        return bool(not shown.intersection(key for key, _values in background[1])
+                    and self._release_display_background())
 
     def _flush_presentation_target(self) -> bool:
         identity = getattr(self, "_presentation_run_identity", None)
@@ -5449,7 +5451,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         holds, through the navigation owner, with no paint of its own (the caller refreshes)."""
         self._retire_batch_presentation()
         self._retain_outgoing_display = False
-        ScatteringWorkspace._clear_presentation_targets(self)
+        ScatteringWorkspace._clear_presentation_targets(self, keep_backgrounds=("raw", "integrated_2d"))
         self._shell.browser.cancel_pending_frame_selection()
         navigation = self._context_controller.navigation
         return bool(navigation.frames) and self._context_controller.select_navigation(
@@ -6194,6 +6196,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         if advanced_presentation:
             changed = True
             frame_presentation_changed = True
+        if ScatteringWorkspace._release_orphaned_background(self):
+            changed = True
+            force_scientific = True
         if self._scientific_repaint_pending:
             last_plot = self._last_live_plot_at
             if (
@@ -7324,6 +7329,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 preserve_scientific = False
                 skip_scientific_projection = False
                 rebind_scientific_navigation = False
+        ScatteringWorkspace._release_orphaned_background(self, scan_only=True)
         if explicit_preserve_display or explicit_preserve_scientific:
             preserve_scientific = True
             skip_scientific_projection = True
@@ -8597,7 +8603,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if value != prior_mode:
                 self._retire_batch_presentation()
             if not viewer_1d:
-                ScatteringWorkspace._clear_presentation_targets(self)
+                ScatteringWorkspace._clear_presentation_targets(self, keep_backgrounds=("raw",))
             updates.update(shared)
             if value == "Single" and prior_mode != "Single" and not viewer_1d:
                 self._shell.browser.cancel_pending_frame_selection()
@@ -8645,7 +8651,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             requested = bool(value)
             if self._processed_browser.set_auto_last(requested):
                 self._retire_batch_presentation()
-            ScatteringWorkspace._clear_presentation_targets(self)
+            ScatteringWorkspace._clear_presentation_targets(self, keep_backgrounds=("raw", "integrated_2d"))
             if self._processed_browser.auto_last:
                 self._context_controller.select_latest_navigation(
                     plot_mode=self._preferences.plot_mode
@@ -8677,9 +8683,12 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:
             return False
         background = self._background_owner.projection()
-        if background is not None and any(
+        domain = None if background is None else background[0]
+        if domain is None and getattr(self, "_background_identity", None) is not None:
+            domain = self._background_domain(self._intents.snapshot().thaw().processing_mode)
+        if any(
                 key in updates and updates[key] != getattr(self._preferences, key)
-                for key in _BACKGROUND_GRID_FIELDS.get(background[0], ())):
+                for key in _BACKGROUND_GRID_FIELDS.get(domain, ())):
             self._release_display_background()
         if (selection is not None and selection.kind is ContextKind.BROWSE
                 and any(key in updates and updates[key] != getattr(self._preferences, key)

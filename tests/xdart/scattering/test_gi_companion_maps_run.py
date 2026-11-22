@@ -83,6 +83,38 @@ def _close(page):
     QtWidgets.QApplication.instance().processEvents()
 
 
+def test_set_background_uses_the_shown_companion_map_and_follows_browse_frames(tmp_path):
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page, artifact = _page(tmp_path, "Q-χ + Qip-Qoop")
+    try:
+        _run(page)
+        view = page._shell.scientific
+        _wait(page, lambda: view.image_axis.findData("q_chi") >= 0)
+        index = view.image_axis.findData("q_chi")
+        view.image_axis.setCurrentIndex(index)
+        view.image_axis.activated.emit(index)
+        _wait(page, lambda: view.rendered_image_axis == "q_chi")
+        controller = page._context_controller
+        first = controller.navigation.current
+        background = read_frame_record(artifact, first.local_frame_label).view_2d("q_chi").intensity_2d
+        view.background.click()
+        _wait(page, lambda: view.background.text() == "Clear 2D BG")
+        drawn = page._last_scientific_projection.heavy.cake
+        assert np.isfinite(drawn).any()
+        np.testing.assert_allclose(drawn, background - background)
+
+        second = next(frame for frame in controller.navigation.frames if frame is not first)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=second, frames=(second,)))
+        _wait(page, lambda: page._last_scientific_projection is not None
+              and page._last_scientific_projection.heavy is not None
+              and page._last_scientific_projection.heavy.frame is second)
+        current = read_frame_record(artifact, second.local_frame_label).view_2d("q_chi").intensity_2d
+        assert view.background.text() == "Clear 2D BG"
+        np.testing.assert_allclose(page._last_scientific_projection.heavy.cake, current - background)
+    finally:
+        _close(page)
+
+
 @pytest.mark.parametrize(("choice", "primary", "stored", "offered"), (
     ("Qip-Qoop", "qip_qoop", ("qip_qoop",), ("qip_qoop", DERIVED_Q_CHI)),
     ("Q-χ", "q_chi", ("q_chi",), ("q_chi",)),
