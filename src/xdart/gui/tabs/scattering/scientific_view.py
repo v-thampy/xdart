@@ -745,6 +745,7 @@ class ScientificView(QtWidgets.QFrame):
         self._background_follow = None
         self._followed_curves: dict[int, tuple[object, object]] = {}
         self._background_tip = ("", "")
+        self._background_follow_note = ""
         self.raw_popup_dialog = None
         self.raw_popup_image = None
         #: True while a host page (Stitch) owns the raw pop-up; Int's own (its Raw button, Int 1D) when False
@@ -1024,6 +1025,7 @@ class ScientificView(QtWidgets.QFrame):
         _overlay_debug("clear", history=_frames_text(self._trace_history_keys))
         self._trace_history_by_identity.clear()
         self._followed_curves = {}
+        self._background_follow_note = ""
         self._trace_history_keys = ()
         self._trace_history_scope = None
         self._browse_comparison_scope = None
@@ -1132,6 +1134,7 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_browse_science_contract = None
             self._clear_trace_aggregate_fold()
             self._followed_curves = {}
+            self._background_follow_note = ""
         self._expected_background_key = key
         if key is None:
             self._background_follow = None
@@ -1148,6 +1151,7 @@ class ScientificView(QtWidgets.QFrame):
             self._rendered_browse_science_contract = None
             self._clear_trace_aggregate_fold()
             self._followed_curves = {}
+            self._background_follow_note = ""
         self._background_follow = follow
 
     def _follow_background(self, rows):
@@ -1169,14 +1173,14 @@ class ScientificView(QtWidgets.QFrame):
                     corrected = replace(trace, intensity=value)
                 elif type(value) is str:
                     notes.append(value)
-            kept[id(trace)] = (trace, corrected)
+            if corrected is not trace:
+                kept[id(trace)] = (trace, corrected)
             out.append((row_key, corrected))
         self._followed_curves = kept
         tip, note = self._background_tip
-        if notes and tip:
-            count = f"{len(notes)} of the {len(rows)} curves are drawn as they are: " if len(rows) > 1 else ""
-            extra = count + notes[0]
-            self.background.setToolTip("\n\n".join(part for part in (tip, note, extra) if part))
+        count = f"{len(notes)} of the {len(rows)} curves are drawn as they are: " if len(rows) > 1 else ""
+        self._background_follow_note = count + notes[0] if notes else ""
+        self.background.setToolTip("\n\n".join(part for part in (tip, note, self._background_follow_note) if part))
         return tuple(out)
 
     def release_display_background(self, active_key):
@@ -1187,6 +1191,7 @@ class ScientificView(QtWidgets.QFrame):
             if released:
                 self._expected_background_key = None
                 self._background_follow = None; self._followed_curves = {}
+                self._background_follow_note = ""
             return DisplayBackgroundRendererReleaseReceipt(active_key, released)
         if active_key != self._rendered_background_key:
             return DisplayBackgroundRendererReleaseReceipt(active_key, False)
@@ -1207,6 +1212,7 @@ class ScientificView(QtWidgets.QFrame):
                 # the history holds the curves as they are (the follow corrects them as drawn): only what was drawn
                 # with the background goes, so Clear BG brings every curve back, the kept ones too
                 self.curve.clear(); self.waterfall.clear()
+                self._clear_angular_support()
                 self._rendered_trace_keys = self._waterfall_source_keys = ()
                 self._waterfall_render_contract = None
                 self._curve_mounted_keys = ()
@@ -1228,6 +1234,7 @@ class ScientificView(QtWidgets.QFrame):
                 self._rendered_browse_science_contract = None
             self._rendered_background_key = self._expected_background_key = None
             self._background_follow = None; self._followed_curves = {}
+            self._background_follow_note = ""
         except Exception: return DisplayBackgroundRendererReleaseReceipt(active_key, False)
         return DisplayBackgroundRendererReleaseReceipt(active_key, True)
 
@@ -2058,7 +2065,8 @@ class ScientificView(QtWidgets.QFrame):
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
         tip = RAW_BACKGROUND_TOOLTIP if state.processing_mode == "2D Viewer" else BACKGROUND_TOOLTIP
         note = getattr(state, "background_note", "")
-        self.background.setToolTip(f"{tip}\n\n{note}" if note else tip)
+        follow_note = self._background_follow_note if state.background_set else ""
+        self.background.setToolTip("\n\n".join(part for part in (tip, note, follow_note) if part))
         self._background_tip = (tip, note)
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
@@ -2437,6 +2445,7 @@ class ScientificView(QtWidgets.QFrame):
         """Release scientific buffers; navigation need not dismantle the layout."""
         self._clear_phase_overlays()
         self._followed_curves = {}  # the curves a display background corrected hold the payload's arrays too
+        self._background_follow_note = ""
         cleared, canonical = True, self._viewer_2d_payload
         def scrub(target, name, value=None, *, read=False):
             nonlocal cleared
@@ -3170,17 +3179,6 @@ class ScientificView(QtWidgets.QFrame):
             *((("pin", *pin_id), trace) for pin_id, trace in pinned),
             *((("live", id(trace.frame)), trace) for trace in live_traces),
         )
-        if state.background_set:
-            # one correction site, after both history merges: the kept curves of other scans too
-            rows = self._follow_background(rows)
-        fold = self._trace_aggregate_fold
-        if (
-            fold is not None
-            and not self._aggregate_rows_are_an_exact_prefix(fold.rows, rows)
-        ):
-            self._clear_trace_aggregate_fold()
-        if state.plot_mode not in {"Average", "Sum"}:
-            self._clear_trace_aggregate_fold()
         if browse_snapshot is None:
             self._trace_row_count = len(rows)
             presented_by_id = {
@@ -3245,6 +3243,13 @@ class ScientificView(QtWidgets.QFrame):
                 return
             if browse_snapshot is None:
                 rows = self._bounded_waterfall_rows(rows)
+        if state.background_set:
+            # Correct the rows actually drawn, including kept curves. Waterfall selects them before doing work.
+            rows = self._follow_background(rows)
+        fold = self._trace_aggregate_fold
+        if (state.plot_mode not in {"Average", "Sum"}
+                or fold is not None and not self._aggregate_rows_are_an_exact_prefix(fold.rows, rows)):
+            self._clear_trace_aggregate_fold()
         self._phase_wavelengths = tuple(sorted({getattr(trace, "wavelength_m", None)
             for _, trace in rows}, key=lambda value: -1. if value is None else value))
         if state.plot_mode in {"Average", "Sum"}:

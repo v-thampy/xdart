@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import weakref
 from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from threading import Event
@@ -958,6 +959,17 @@ def test_follow_trace_takes_the_curves_own_basis_and_channel() -> None:
     assert owner.follow_trace(shown) is None
 
 
+def test_following_a_dense_grid_shift_interpolates_instead_of_matching_bin_indices() -> None:
+    axis = 1.0 + 2e-7 * np.arange(4)
+    shifted = axis + 2e-7
+    background = np.array([1.0, 10.0, 50.0, 100.0])
+    owner = _active_1d_owner(background, axis)
+    pattern = np.full(4, 100.0)
+    np.testing.assert_allclose(
+        owner.trace_values(pattern, shifted, "q\0A^-1"),
+        pattern - np.interp(shifted, axis, background, left=np.nan, right=np.nan))
+
+
 def test_a_single_following_pattern_must_fit_the_background_grant() -> None:
     axis = np.arange(1024.0)
     owner = _active_1d_owner(np.zeros_like(axis), axis)
@@ -1087,6 +1099,70 @@ def test_the_detached_budget_counts_a_curves_native_basis_once() -> None:
     assert _detached_root_bytes((same,)) == plain
 
 
+def test_the_view_keeps_the_background_refusal_note_on_an_idle_redraw() -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shell = make_shell_projection(frame_count=1, selected_index=0, plot_mode="Single")
+    trace, = shell.scientific.traces
+    trace = replace(trace, background_basis=(trace.axis.values, "q_oop\0A^-1", ""))
+    state = replace(shell.scientific, processing_mode="Int 1D", traces=(trace,))
+    owner = _active_1d_owner(trace.intensity, trace.axis.values, unit="q_ip\0A^-1")
+    view = ScientificView()
+    try:
+        view.expect_display_background(owner.active_key)
+        view.follow_display_background(owner.follow_trace)
+        active = apply_presentation_background(state, owner.projection(), view_follows_traces=True)
+        for _ in range(2):
+            view.reconcile(active, shell.navigation, completed=1, total=1, detail="Ready")
+            assert "q_oop (A^-1)" in view.background.toolTip()
+    finally:
+        view.close(); qapp.processEvents()
+
+
+def test_the_view_releases_followed_angular_support_inputs_without_losing_history() -> None:
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shell = make_shell_projection(frame_count=1, selected_index=0)
+    trace, = shell.scientific.traces
+    trace = replace(trace, background_basis=(trace.axis.values, "q\0A^-1", ""))
+    state = replace(shell.scientific, processing_mode="Int 1D", traces=(trace,))
+    owner = _active_1d_owner(trace.intensity, trace.axis.values)
+    view = ScientificView()
+    try:
+        view.expect_display_background(owner.active_key)
+        view.follow_display_background(owner.follow_trace)
+        active = apply_presentation_background(state, owner.projection(), view_follows_traces=True)
+        view.reconcile(active, shell.navigation, completed=1, total=1, detail="Ready")
+        followed = weakref.ref(owner.follow_trace(trace))
+        assert view.trace_history_projections == (trace,)
+        assert owner.release(view.release_display_background(owner.active_key))
+        assert view.trace_history_projections == (trace,)
+        assert followed() is None
+    finally:
+        view.close(); qapp.processEvents()
+
+
+def test_the_view_only_corrects_waterfall_rows_it_draws() -> None:
+    from xdart.gui.tabs.scattering.scientific_view import MAX_WATERFALL_DISPLAY_ROWS
+
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    count = MAX_WATERFALL_DISPLAY_ROWS + 2
+    shell = make_shell_projection(frame_count=count, selected_index=count - 1, plot_mode="Waterfall")
+    traces = tuple(replace(trace, background_basis=(trace.axis.values, "q\0A^-1", ""))
+                   for trace in shell.scientific.traces)
+    state = replace(shell.scientific, processing_mode="Int 1D", traces=traces)
+    owner = _active_1d_owner(traces[0].intensity, traces[0].axis.values)
+    view = ScientificView()
+    try:
+        view.expect_display_background(owner.active_key)
+        view.follow_display_background(owner.follow_trace)
+        active = apply_presentation_background(state, owner.projection(), view_follows_traces=True)
+        view.reconcile(active, shell.navigation, completed=count, total=count, detail="Ready")
+        assert view.waterfall.image.image.shape[1] == MAX_WATERFALL_DISPLAY_ROWS
+        assert len(view.trace_history_projections) == count
+        assert len(owner._followed) == MAX_WATERFALL_DISPLAY_ROWS
+    finally:
+        view.close(); qapp.processEvents()
+
+
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
     """His pick, 2026-11-22, "Each by its own monitor" (the question's formula I_frame/monitor_frame -
     <I_bg/monitor_bg>): the contributors are each divided by their own monitor before the mean, and a frame is
@@ -1118,7 +1194,18 @@ def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -
         contributor_count=1, norm_channel="monitor")
     assert prepared is not None
     assert prepared[3][0][2] == 2.0
-    np.testing.assert_allclose(prepared[1][0][0], view.intensity_1d / 2.0)  # the contributor, by its own monitor
+    assert prepared[1][0][0] is view.intensity_1d
+    plan, contributors, keys, targets, _facts = prepared
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reserve_kwargs = dict(stamp=OperationContextStamp(0), active_key=("background",),
+                          projection_keys=keys, projection_shapes=tuple(target[0].shape for target in targets),
+                          norm_channel="monitor", contributor_divisors=(targets[0][2],))
+    reservation = owner.reserve(plan, contributors, **reserve_kwargs)
+    assert reservation is not None
+    np.testing.assert_allclose(owner._contributors[0][0], view.intensity_1d / 2.0)
+    too_small = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    too_small._capacity = owner.reserved_bytes - 1
+    assert too_small.reserve(plan, contributors, **reserve_kwargs) is None
     assert prepared[4] == ("monitor", ((id(monitored.frame_key), (2,), ((2,),),
                                         ("q\0A^-1",), 2.0),))
     assert prepare_background_plan(

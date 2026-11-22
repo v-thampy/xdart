@@ -2354,7 +2354,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         active_key = self._background_key(plan, stamp, mode, target_facts)
         reservation = owner.reserve(plan, contributors, stamp=stamp,
             active_key=active_key, projection_keys=keys,
-            projection_shapes=tuple(target[0].shape for target in targets), norm_channel=norm_channel)
+            projection_shapes=tuple(target[0].shape for target in targets), norm_channel=norm_channel,
+            contributor_divisors=(tuple(target[2] for target in targets[:len(contributors)])
+                                  if domain == "integrated_1d" and norm_channel else ()))
         if reservation is None:
             self._notice("Display background exceeds its standalone 512 MiB workspace.")
             self._refresh_shell(); return

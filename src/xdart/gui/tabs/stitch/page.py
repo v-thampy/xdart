@@ -3201,7 +3201,7 @@ class StitchPage(QtWidgets.QWidget):
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=label or "Current", status=status)
-        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background, followed_traces
+        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
         # the background follows every result drawn, as Int's (LIVE-1218-VIEWER2D-BG): a map here, a pattern in the
         # view, which subtracts it from every curve it draws
         state = apply_presentation_background(
@@ -3213,9 +3213,7 @@ class StitchPage(QtWidgets.QWidget):
             if payload is not None and payload[1].kind is AnalysisArtifactKind.STITCH_2D:
                 state = replace(state, heavy=replace(state.heavy, cake_coverage=payload[1].coverage.T))
         self._last_map_state = state if map_mode else None
-        # the fit takes each curve as shown: the view subtracts a 1-D background as it draws
-        fit_traces = followed_traces(state.traces, self._background.follow_trace) if state.background_set \
-            else state.traces
+        fit_traces = state.traces
         # Int removes an identical live slice from the overlay when it is already pinned. That pin is
         # still the current displayed slice; a different pinned slice must never stand in for it.
         from xdart.gui.tabs.scattering.scientific_axes import shown_slice_pin
@@ -3304,15 +3302,26 @@ class StitchPage(QtWidgets.QWidget):
         """Capture immutable selectors/references now; copies, source reads and trend means run in the host."""
         from xdart.gui.analysis.snapshot_fit_host import FitTarget
         from xdart.gui.tabs.scattering.analysis_mount import displayed_trace_input
+        from xdart.gui.tabs.scattering.context_projection import followed_traces
         from xdart.gui.tabs.scattering.scientific_axes import plot_axis_choice
         from xrd_tools.analysis.fit_snapshot import FitInputKey
         payload = self._payloads.get(path)
         selection = dict(self._fit_selection())
-        background = "presentation" if self._background.phase == "ACTIVE" else "none"
         frame = self._result_keys.get(path)
         projection = self._fit_projection
         matches = () if projection is None else tuple(trace for trace in projection.traces if trace.frame is frame)
-        projection = (replace(projection, traces=matches) if len(matches) == 1 else None)
+        if len(matches) == 1:
+            followed = followed_traces(matches, self._background.follow_trace)
+            projected_background = followed[0] is not matches[0]
+            projection = replace(projection, traces=followed)
+        else:
+            projection = None
+            active_key = self._background.active_key
+            # An uncaptured batch result may need the active 1-D background. Require its displayed trace first.
+            projected_background = active_key is not None and active_key[2] == "integrated_1d"
+        background = "presentation" if projected_background else "none"
+        if not projected_background:
+            selection["background_sources"] = ()
         coordinate = plot_axis_choice(matches, selection["coordinate"])
         selection.update(coordinate=coordinate, meaning="radial" if coordinate in {"Q", "2theta"} else coordinate,
                          phase=kind == "phase")

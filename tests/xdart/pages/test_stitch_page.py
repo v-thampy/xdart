@@ -1497,6 +1497,12 @@ def test_a_gi_cut_background_draws_another_cut_as_it_is(qapp, tmp_path):
         assert page._background.active_key == key and button.text() == "Clear 1D BG"
         np.testing.assert_array_equal(y(), np.asarray(cuts["q_oop"].intensity, dtype=np.float64))
         assert "drawn as it is" in button.toolTip()
+        target = page._fit_target(str(request.module.output.target), "peak", current=True)
+        snapshot = target.load()
+        np.testing.assert_array_equal(snapshot.values, cuts["q_oop"].intensity)
+        assert snapshot.key.background == "none"
+        assert dict(snapshot.key.selection)["background_sources"] == ()
+        assert target.reference is not None
         axis.setCurrentIndex(axis.findData("q_ip"))
         _wait(page, qapp)
         zeros()

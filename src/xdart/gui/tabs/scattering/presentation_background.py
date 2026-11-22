@@ -39,8 +39,14 @@ def _same_bins(axis, reference) -> bool:
     the interpolation path and lose an edge bin to NaN."""
     if axis.shape != reference.shape:
         return False
-    scale = float(np.nanmax(np.abs(reference))) if reference.size else 0.0
-    return bool(np.allclose(axis, reference, rtol=1e-6, atol=1e-6 * scale, equal_nan=False))
+    if np.array_equal(axis, reference):
+        return True
+    scale = float(np.max(np.abs(reference)))
+    allowance = np.finfo(np.float32).eps * scale
+    if reference.size > 1:
+        # Even a shift smaller than the display precision can move a bin on a dense grid.
+        allowance = min(allowance, 0.25 * float(np.min(np.diff(reference))))
+    return bool(np.allclose(axis, reference, rtol=0.0, atol=allowance))
 
 
 def _immutable_copy(array: np.ndarray) -> np.ndarray:
@@ -109,7 +115,7 @@ def prepare_background_plan(payloads, domain: str, current, *,
     except (TypeError, ValueError):
         return None
     indices = tuple(range(len(items))) if domain == "integrated_1d" else (current_index,)
-    keys, targets, facts, divisors = [], [], [], {}
+    keys, targets, facts = [], [], []
     for index in indices:
         item = items[index]
         if item is None:
@@ -122,7 +128,6 @@ def prepare_background_plan(payloads, domain: str, current, *,
                 if index < count: return None
                 continue
             divisor = float(resolved)
-        divisors[index] = divisor
         if domain == "integrated_1d" and units[index] != plan.axis_units[0]:
             return None
         frame = payloads[index].frame_key
@@ -133,11 +138,6 @@ def prepare_background_plan(payloads, domain: str, current, *,
                       tuple(axis.shape for axis in item[1:]), units[index], divisor))
     if not targets:
         return None
-    if domain == "integrated_1d" and norm_channel:
-        # his pick, 2026-11-22, "Each by its own monitor": the background is the mean of the contributors each divided
-        # by its own monitor, so a frame of another flux compares fairly (I/m - <I_bg/m_bg>)
-        contributors = [(np.divide(item[0], divisors[index], dtype=np.float64), *item[1:])
-                        for index, item in enumerate(contributors)]
     return (plan, tuple(contributors), tuple(keys), tuple(targets),
             (norm_channel, tuple(facts)))
 
@@ -238,6 +238,7 @@ class PresentationBackgroundOwner:
         *, stamp: OperationContextStamp, active_key: tuple[object, ...],
         projection_keys: tuple[int, ...], projection_indices: tuple[int, ...] = (),
         projection_shapes: tuple[tuple[int, ...], ...] = (), norm_channel: str = "",
+        contributor_divisors: tuple[float, ...] = (),
     ) -> int | None:
         if (type(plan) is not DisplayBackgroundPlan
                 or type(stamp) is not OperationContextStamp
@@ -260,14 +261,21 @@ class PresentationBackgroundOwner:
             plan.__post_init__(); stamp.__post_init__()
             if type(contributors) is not tuple or len(contributors) != len(plan.contributor_ids):
                 return None
+            if type(contributor_divisors) is not tuple or contributor_divisors and (
+                    plan.domain != "integrated_1d" or len(contributor_divisors) != len(contributors)
+                    or any(type(divisor) is not float or not np.isfinite(divisor) or divisor <= 0.0
+                           for divisor in contributor_divisors)):
+                return None
             arrays = tuple(array for item in contributors for array in item)
             if any(type(array) is not np.ndarray for array in arrays):
                 return None
+            normalized_bytes = tuple(8 * item[0].size for item in contributors) if contributor_divisors else ()
             if plan.differing_grid_1d and any(
                     array.dtype != np.dtype(np.float64) or not array.flags.c_contiguous
-                    for array in arrays):
+                    for item in contributors for array in (item[1:] if normalized_bytes else item)):
                 return None
-            c_bytes = sum(array.nbytes for array in arrays)
+            c_bytes = (sum(normalized_bytes) + sum(array.nbytes for item in contributors for array in item[1:])
+                       if normalized_bytes else sum(array.nbytes for array in arrays))
             shape = plan.value_shapes[0]
             v = int(np.prod(shape))
             x = (0 if plan.domain == "raw" else
@@ -277,7 +285,8 @@ class PresentationBackgroundOwner:
                 projection_shapes = tuple(plan.value_shapes[index]
                                           for index in projection_indices)
             d_bytes = 8 * sum(int(np.prod(item)) for item in projection_shapes)
-            q = c_bytes + (32 + 8 * int(plan.differing_grid_1d)) * v + x + d_bytes + 589_824
+            stage_bytes = (32 + 8 * int(plan.differing_grid_1d)) * v + x + d_bytes + 589_824
+            q = c_bytes + max(stage_bytes, max(normalized_bytes, default=0))
         except (TypeError, ValueError, OverflowError):
             return None
         with self._lock:
@@ -294,8 +303,17 @@ class PresentationBackgroundOwner:
             self._reserved_bytes = q
             self._norm_channel = norm_channel if type(norm_channel) is str else ""
         try:
-            copied = tuple(tuple(_immutable_copy(array) for array in item)
-                           for item in contributors)
+            if contributor_divisors:
+                # Normalize one contributor at a time, inside the copy grant. Use its own monitor before averaging.
+                scaled_rows = zip(contributors, contributor_divisors, strict=True)
+                copied = tuple(
+                    (_immutable_copy(np.divide(item[0], divisor, dtype=np.float64)),
+                     *(_immutable_copy(axis) for axis in item[1:]))
+                    for item, divisor in scaled_rows
+                )
+            else:
+                copied = tuple(tuple(_immutable_copy(array) for array in item)
+                               for item in contributors)
         except BaseException:
             self.abort(reservation, "COPY_FAILED")
             return None
