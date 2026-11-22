@@ -309,6 +309,14 @@ _UNSAFE_UNFUNDED_STAGING_KEY = (
 #: Config ▸ Performance Diagnostics' private Run options (the profile codec never writes them)
 _NEXUS_ONLY_PERFORMANCE_KEYS = PROCESS_PRIVATE_RUN_OPTIONS
 _BROWSER_CATALOG_REFRESH_INTERVAL_MS = 1500
+#: The display preferences that change what an Int background's frames show: a 1-D background holds the traces of
+#: one normalization, axis and slice, a 2-D one the map of one image axis. Changing one lets the background go
+#: (LIVE-1218-VIEWER2D-BG: an idle tick no longer releases it). A raw background (the 2D Viewer's) follows the frame.
+_BACKGROUND_GRID_FIELDS = {
+    "integrated_1d": frozenset({"norm_channel", "slice_pins", "plot_axis", "slice_enabled",
+                                "slice_center", "slice_width"}),
+    "integrated_2d": frozenset({"norm_channel", "image_axis"}),
+}
 _DEFERRED_DELETE_RETRY_INTERVAL_MS = 25
 # A failed Run whose cleanup was still pending at its end is closed again this often (_settle_failed_cleanup), and
 # given up once its retries have failed this long (_give_up_failed_cleanup).
@@ -5245,7 +5253,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         identity = getattr(self, "_presentation_run_identity", None)
         if identity is None:
             # Nothing paced, nothing to clear. Every drain tick passes here, so the clear (and the display
-            # background release in it) is left to the Run's own boundaries (LIVE-1218-VIEWER2D-BG).
+            # background release in it) is left to the Run's own boundaries (LIVE-1218-VIEWER2D-BG); an Int
+            # background none of whose frames is shown any more still goes.
+            ScatteringWorkspace._release_orphaned_background(self)
             return False
         if not self._presentation_pacing_active(identity):
             self._clear_presentation_targets()
@@ -5258,6 +5268,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 return True
         self._clear_presentation_targets()
         return False
+
+    def _release_orphaned_background(self) -> None:
+        """Release an Int background (1-D or 2-D) once none of the frames it was set on is shown: a Reintegrate, a
+        Refresh or a Run's frames replaced them without a frame or scan choice. Every idle tick released every
+        background before LIVE-1218-VIEWER2D-BG; a raw background (the 2D Viewer's) follows the frame and stays."""
+        owner = getattr(self, "_background_owner", None)
+        background = None if owner is None else owner.projection()
+        if background is None or background[0] == "raw":
+            return
+        navigation = self._context_controller.navigation
+        shown = {id(frame) for frame in (*navigation.selected, navigation.current) if frame is not None}
+        if not shown.intersection(key for key, _values in background[1]):
+            self._release_display_background()
 
     def _flush_presentation_target(self) -> bool:
         identity = getattr(self, "_presentation_run_identity", None)
@@ -8645,11 +8668,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         else:
             return False
         background = self._background_owner.projection()
-        if (background is not None and background[0] == "integrated_1d"
-                and (updates.get("norm_channel", self._preferences.norm_channel)
-                     != self._preferences.norm_channel
-                     or updates.get("slice_pins", self._preferences.slice_pins)
-                     != self._preferences.slice_pins)):
+        if background is not None and any(
+                key in updates and updates[key] != getattr(self._preferences, key)
+                for key in _BACKGROUND_GRID_FIELDS.get(background[0], ())):
             self._release_display_background()
         if (selection is not None and selection.kind is ContextKind.BROWSE
                 and any(key in updates and updates[key] != getattr(self._preferences, key)

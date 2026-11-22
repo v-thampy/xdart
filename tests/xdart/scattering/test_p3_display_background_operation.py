@@ -397,27 +397,84 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
-@pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
-def test_active_background_survives_idle_drain_ticks(mode: str) -> None:
+def test_active_background_survives_idle_drain_ticks() -> None:
     """LIVE-1218-VIEWER2D-BG: every idle drain tick released an adopted background once the view had drawn it."""
-    if mode == "Int 2D":
-        qapp, page, _acquisition_context = _active_page_background()
-        owner = page._background_owner
-    else:  # the acquisition helper gives no 1-D contributors; seed the 1-D background as the 1-D rows do
-        qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        page = ScatteringWorkspace(
-            intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
-            sources=FilesystemSourceAdapter())
-        page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
-        owner = _seed_page_1d_background(page)
-    label = {"Int 2D": "Clear 2D BG", "Int 1D": "Clear 1D BG"}[mode]
+    qapp, page, _acquisition_context = _active_page_background()
+    owner = page._background_owner
     try:
         key = owner.active_key
         assert owner.phase == "ACTIVE" and key is not None
         for _tick in range(5):
             page._drain_executor(); qapp.processEvents(); page._refresh_shell()
             assert owner.phase == "ACTIVE" and owner.active_key == key
-            assert page._shell.scientific.background.text() == label
+            assert page._shell.scientific.background.text() == "Clear 2D BG"
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+@pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
+def test_int_background_goes_on_a_tick_once_none_of_its_frames_is_shown(mode: str) -> None:
+    """With the idle tick no longer releasing every background, an Int background whose frames were replaced
+    without a frame or scan choice (here the acquisition released and another adopted; a seeded 1-D background on
+    frames the page does not show) still goes on the next tick, as before; the 2D Viewer's raw background follows
+    frames instead."""
+    if mode == "Int 2D":
+        qapp, page, _acquisition_context = _active_page_background()
+        owner = page._background_owner
+        page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+        assert owner.phase == "ACTIVE"
+        controller = page._context_controller
+        assert controller.release_acquisition(controller.run_identity)
+        identity, replacement = _acquisition()
+        controller._runtime.adopt_acquisition(identity, replacement)
+        page._refresh_shell()
+    else:
+        qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        page = ScatteringWorkspace(
+            intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+            sources=FilesystemSourceAdapter())
+        page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
+        owner = _seed_page_1d_background(page)
+    try:
+        assert owner.phase == "ACTIVE"
+        for _tick in range(3):
+            page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+        _assert_background_released(owner)
+        assert page._shell.scientific.background.text().startswith("Set ")
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+@pytest.mark.parametrize(("kind", "value"), (
+    (ShellCommandKind.SET_PLOT_AXIS, "2Th"),
+    (ShellCommandKind.SET_SLICE_ENABLED, True),
+    (ShellCommandKind.SET_SLICE_CENTER, 5.0),
+    (ShellCommandKind.SET_SLICE_WIDTH, 3.0),
+))
+def test_active_1d_background_revokes_on_axis_and_slice_edits(kind, value) -> None:
+    """The traces a 1-D background was set on change with the plot axis and the slice: it goes, as on a
+    normalization edit (an idle tick no longer releases it)."""
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    owner = _seed_page_1d_background(page)
+    try:
+        page._handle_shell_command(ShellCommand(kind, value))
+        _assert_background_released(owner)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_active_2d_background_revokes_on_an_image_axis_edit() -> None:
+    """A 2-D background holds one image axis's map: another axis (or map) lets it go."""
+    qapp, page, _acquisition_context = _active_page_background()
+    owner = page._background_owner
+    try:
+        page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+        assert owner.phase == "ACTIVE"
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "2Th-Chi"))
+        _assert_background_released(owner)
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
