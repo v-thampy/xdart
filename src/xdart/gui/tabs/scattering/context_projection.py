@@ -90,9 +90,9 @@ def apply_presentation_background(
     """A projection with the presentation background's values in place of its traces' (1-D) or its
     image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's.
 
-    ``frame_values``: the background owner's ``frame_values``, given by the 2D Viewer's host, so a raw
-    background follows the frame drawn, any frame or file (LIVE-1218-VIEWER2D-BG); a frame of another shape
-    is drawn as it is, the button's tip saying why, with no refusal."""
+    ``frame_values``: the background owner's ``frame_values``, given by Int's host, so a raw background (the 2D
+    Viewer's) or a 2-D one follows the frame drawn (LIVE-1218-VIEWER2D-BG); a frame it does not fit (another
+    shape; for a 2-D one other map axes) is drawn as it is, the button's tip saying why, with no refusal."""
     if projection is None:
         return replace(state, background_set=False)
     try:
@@ -101,15 +101,16 @@ def apply_presentation_background(
     except (TypeError, ValueError):
         return replace(state, background_set=False)
     heavy = state.heavy
-    if (domain == "raw" and callable(frame_values) and heavy is not None
-            and type(heavy.raw) is np.ndarray):
-        value = frame_values(id(heavy.frame), heavy.raw)
-        if type(value) is np.ndarray:
-            return replace(state, heavy=replace(heavy, raw=value), background_set=True)
-        if type(value) is tuple:
-            return replace(state, background_set=True, background_note=(
-                f"The background ({' × '.join(map(str, value))}) does not fit this frame "
-                f"({' × '.join(map(str, heavy.raw.shape))}), which is drawn as it is."))
+    if domain in {"raw", "integrated_2d"} and callable(frame_values) and heavy is not None:
+        source = heavy.raw if domain == "raw" else heavy.cake
+        if type(source) is np.ndarray:
+            value = frame_values(id(heavy.frame), source,
+                                 () if domain == "raw" else (heavy.cake_y, heavy.cake_x))
+            if type(value) is np.ndarray:
+                return replace(state, heavy=(replace(heavy, raw=value) if domain == "raw"
+                                             else replace(heavy, cake=value)), background_set=True)
+            if type(value) is str:
+                return replace(state, background_set=True, background_note=value)
     if domain == "integrated_1d":
         def substitute(trace):
             value = values.get(id(trace.frame))

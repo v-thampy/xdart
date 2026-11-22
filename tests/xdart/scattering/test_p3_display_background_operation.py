@@ -366,8 +366,10 @@ def test_pre_adoption_context_membership_and_shape_drift_release_exact_roots(
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
-@pytest.mark.parametrize("entry", ("selection", "context", "mode", "detector", "close"))
+@pytest.mark.parametrize("entry", ("context", "mode", "detector", "close"))
 def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: str) -> None:
+    """An Int 2D background goes at a scan, mode or detector change and at close. A frame choice keeps it since
+    1.2.18 (his pick "Int 2D follows frames too"): test_int_2d_background_follows_the_frames_of_its_scan."""
     qapp, page, _acquisition_context = _active_page_background()
     delegated = []
     try:
@@ -474,6 +476,123 @@ def test_active_2d_background_revokes_on_an_image_axis_edit() -> None:
         page._drain_executor(); qapp.processEvents(); page._refresh_shell()
         assert owner.phase == "ACTIVE"
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_IMAGE_AXIS, "2Th-Chi"))
+        _assert_background_released(owner)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_int_2d_background_follows_the_frames_of_its_scan() -> None:
+    """His pick, 2026-11-21: "Int 2D follows frames too". A 2-D background stays across frame choices and is
+    subtracted from every frame whose map has its axes, until Clear 2D BG."""
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    identity, acquisition = _acquisition(frames=2)
+    page._context_controller._runtime.adopt_acquisition(identity, acquisition)
+    page._refresh_shell()
+    controller, view, owner = page._context_controller, page._shell.scientific, page._background_owner
+
+    def cake_of_selection():
+        return controller.project_background_contributors()[0].view.intensity_2d
+
+    def drawn():
+        return np.asarray(view.cake.image.image, dtype=np.float64).T
+
+    def settle():
+        for _tick in range(3):
+            page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+
+    try:
+        frames = controller.navigation.frames
+        assert len(frames) == 2
+        first = controller.navigation.current
+        second = next(frame for frame in frames if frame is not first)
+        background = np.asarray(cake_of_selection(), dtype=np.float64)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
+        worker = page._workspace_operations._slot._worker
+        assert worker is not None; worker.join(3); assert not worker.is_alive()
+        page._drain_executor(); qapp.processEvents(); settle()
+        assert owner.phase == "ACTIVE" and view.background.text() == "Clear 2D BG"
+        np.testing.assert_allclose(drawn(), np.zeros_like(background))
+        charged = owner.active_bytes
+
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_FRAME, frame=second, frames=(second,)))
+        settle()
+        assert controller.navigation.current is second
+        assert owner.phase == "ACTIVE" and view.background.text() == "Clear 2D BG"
+        np.testing.assert_allclose(drawn(), cake_of_selection() - background)
+        assert not np.allclose(cake_of_selection(), background) and owner.active_bytes == charged
+        assert "differ" not in view.background.toolTip()
+
+        page._handle_shell_command(ShellCommand(
+            ShellCommandKind.SELECT_FRAME, frame=first, frames=(first,)))
+        settle()
+        np.testing.assert_allclose(drawn(), np.zeros_like(background))
+
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
+        settle()
+        _assert_background_released(owner)
+        assert view.background.text() == "Set 2D BG"
+        np.testing.assert_allclose(drawn(), background)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_2d_background_draws_a_map_on_other_axes_or_shape_as_it_is() -> None:
+    """A 2-D background fits a map of its shape whose presented axes equal those of the frame it was set on; any
+    other map is drawn as it is, the tip saying why, with no refusal (his design word)."""
+    shell = make_shell_projection(frame_count=3, selected_index=2, heavy_indices=(2,), plot_mode="Single")
+    heavy = shell.scientific.heavy; assert heavy is not None
+    contributors = ((heavy.cake, heavy.cake_y.values, heavy.cake_x.values),)
+    plan = DisplayBackgroundPlan(
+        "integrated_2d", ("image",), (heavy.cake.shape,),
+        ((heavy.cake_y.values.shape, heavy.cake_x.values.shape),),
+        ((f"{heavy.cake_y.label}\0{heavy.cake_y.unit}", f"{heavy.cake_x.label}\0{heavy.cake_x.unit}"),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = owner.reserve(
+        plan, contributors, stamp=OperationContextStamp(0, "context", 1),
+        active_key=("context", 1, "integrated_2d", "Int 2D"),
+        projection_keys=(id(heavy.frame),), projection_indices=(0,))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, contributors)
+    state = replace(shell.scientific, processing_mode="Int 2D")
+    frames = shell.navigation.frames
+
+    def shown(new_heavy):
+        return apply_presentation_background(replace(state, heavy=new_heavy), owner.projection(),
+                                             owner.frame_values)
+
+    own = shown(heavy)
+    np.testing.assert_allclose(own.heavy.cake, np.zeros_like(heavy.cake), atol=1e-12)
+    assert shown(heavy).heavy.cake is own.heavy.cake  # the same frame: the same array
+    same_grid = shown(replace(heavy, frame=frames[0], cake=heavy.cake + 5.0))
+    np.testing.assert_allclose(same_grid.heavy.cake, np.full(heavy.cake.shape, 5.0))
+    assert same_grid.background_set and not same_grid.background_note
+    other_axes = replace(heavy, frame=frames[1], cake=heavy.cake + 7.0,
+                         cake_x=replace(heavy.cake_x, values=heavy.cake_x.values * 2.0))
+    skipped = shown(other_axes)
+    assert skipped.heavy.cake is other_axes.cake and skipped.background_set
+    assert "map axes differ" in skipped.background_note
+    other_shape = shown(replace(heavy, frame=frames[1], cake=np.ones((1, heavy.cake.shape[1])),
+                                cake_y=replace(heavy.cake_y, values=heavy.cake_y.values[:1])))
+    assert "does not fit this frame" in other_shape.background_note
+    assert owner.active_bytes == receipt.retained_bytes + heavy.cake.size * 8
+
+
+def test_active_1d_background_still_revokes_on_a_frame_choice(monkeypatch) -> None:
+    """A 1-D background holds the traces it was set on: a frame choice lets it go, as before."""
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+        sources=FilesystemSourceAdapter())
+    page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
+    owner = _seed_page_1d_background(page)
+    frame = make_shell_projection(frame_count=2, selected_index=1).navigation.frames[0]
+    monkeypatch.setattr(page, "_select_frames", lambda _command: None)
+    try:
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,)))
         _assert_background_released(owner)
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()

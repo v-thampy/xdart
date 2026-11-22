@@ -13,6 +13,22 @@ from .operation_values import OperationContextStamp
 
 _CAPACITY = 536_870_912
 _BLOCK = 65_536
+#: the backgrounds that follow the frame drawn (``frame_values``): the 2D Viewer's raw one and Int's 2-D one
+_FOLLOWING = frozenset({"raw", "integrated_2d"})
+
+
+def _same_grid(shown, reference) -> bool:
+    """Whether two presented map grids (y and x axes: values, label, unit, edges) are the same."""
+    if type(shown) is not tuple or type(reference) is not tuple or len(shown) != 2 or len(reference) != 2:
+        return False
+    for left, right in zip(shown, reference, strict=True):
+        values, other = getattr(left, "values", None), getattr(right, "values", None)
+        if (type(values) is not np.ndarray or type(other) is not np.ndarray or values.shape != other.shape
+                or not np.array_equal(values, other)
+                or (getattr(left, "label", None), getattr(left, "unit", None), getattr(left, "edges", None))
+                != (getattr(right, "label", None), getattr(right, "unit", None), getattr(right, "edges", None))):
+            return False
+    return True
 
 
 def _immutable_copy(array: np.ndarray) -> np.ndarray:
@@ -145,9 +161,11 @@ class PresentationBackgroundOwner:
         #: a keyed layout's background (``activate_keyed``): its page's own immutable source, re-sliced at
         #: every draw, so it outlives slice steps and a change of the result shown
         self._keyed_source: object | None = None
-        #: a raw background's drawn frame (``frame_values``): a weak reference to the image its displayed values
-        #: were taken from, so the same image gives the same array and the owner never keeps a frame alive
+        #: a following background's drawn frame (``frame_values``): a weak reference to the image its displayed
+        #: values were taken from, so the same image gives the same array and the owner never keeps a frame alive
         self._shown_source: weakref.ref | None = None
+        #: a 2-D background's presented map axes, as first drawn on the frame it was set on (``frame_values``)
+        self._shown_grid: tuple | None = None
 
     @property
     def capacity_bytes(self) -> int:
@@ -342,7 +360,7 @@ class PresentationBackgroundOwner:
             if self._reservation != receipt.reservation or self._phase != "STAGED":
                 return False
             self._display_values = tuple(displayed)
-            if result.domain == "raw" and len(targets) == 1:
+            if result.domain in _FOLLOWING and len(targets) == 1:
                 self._shown_source = weakref.ref(targets[0][0])
             self._phase = "ACTIVE"
             self._active_bytes = receipt.retained_bytes + sum(x.nbytes for x in displayed)
@@ -356,37 +374,48 @@ class PresentationBackgroundOwner:
                     tuple(zip(self._projection_keys, self._display_values, strict=True)),
                     self._active_key)
 
-    def frame_values(self, frame_key: int, source):
-        """A raw background (the 2D Viewer's) subtracted from the frame drawn now, any frame or file
-        (LIVE-1218-VIEWER2D-BG): the displayed values for ``source``, the same array while ``source`` is the same
-        image; the background's shape (a tuple) when ``source`` has another shape, which is drawn as it is (his
-        word: "if the shapes don't match the BG should be ignored. No need to throw an error"); None when no raw
-        background is active. The values replace the frame displayed before, in the one displayed frame this
-        background's reservation charged, so its memory stays as reserved."""
+    def frame_values(self, frame_key: int, source, grid=()):
+        """A raw background (the 2D Viewer's) or an Int 2-D one subtracted from the frame drawn now
+        (LIVE-1218-VIEWER2D-BG): the displayed values for ``source``, the same array while the same frame or image
+        is drawn; a note (a str) when the background does not fit ``source``, which is drawn as it is (his word: "if
+        the shapes don't match the BG should be ignored. No need to throw an error"); None when no such background
+        is active. A 2-D background fits a map of its shape whose presented axes (``grid``: the shown map's y and x
+        axes) equal those of the frame it was set on, as first drawn. The values replace the frame displayed
+        before, in the one displayed frame this background's reservation charged, so its memory stays as
+        reserved."""
         with self._lock:
             if (self._phase != "ACTIVE" or self._result is None or self._plan is None
-                    or self._plan.domain != "raw"):
+                    or self._plan.domain not in _FOLLOWING or len(self._display_values) != 1):
                 return None
-            result, reservation = self._result, self._reservation
-            if (self._display_values and self._shown_source is not None
-                    and self._shown_source() is source):
-                return self._display_values[0]
+            result, reservation, domain = self._result, self._reservation, self._plan.domain
+            shown = self._display_values[0]
+            if ((self._shown_source is not None and self._shown_source() is source)
+                    or (self._projection_keys and self._projection_keys[0] == frame_key
+                        and type(source) is np.ndarray and source.shape == shown.shape)):
+                if domain == "integrated_2d" and grid:
+                    self._shown_grid = tuple(grid)
+                return shown
+            reference = self._shown_grid
         shape = tuple(result.values.shape)
         if type(source) is not np.ndarray or source.shape != shape:
-            return shape
+            frame = " × ".join(map(str, getattr(source, "shape", ())))
+            return (f"The background ({' × '.join(map(str, shape))}) does not fit this frame ({frame}), "
+                    "which is drawn as it is.")
+        if domain == "integrated_2d" and not _same_grid(grid, reference):
+            return "The background's map axes differ from this frame's, which is drawn as it is."
         try:
             displayed = np.empty(shape, dtype=np.float64)
             np.subtract(source, result.values, out=displayed, casting="unsafe")
             displayed.setflags(write=False)
-            shown = weakref.ref(source)
+            followed = weakref.ref(source)
         except (TypeError, ValueError):
-            return shape
+            return None
         with self._lock:
             if (self._reservation != reservation or self._phase != "ACTIVE"
                     or len(self._display_values) != 1):
                 return None
             self._display_values, self._projection_keys = (displayed,), (frame_key,)
-            self._shown_source = shown
+            self._shown_source = followed
         return displayed
 
     def release(self, receipt: DisplayBackgroundRendererReleaseReceipt | None = None) -> bool:
@@ -424,7 +453,7 @@ class PresentationBackgroundOwner:
 
     def _drop_locked(self) -> None:
         self._keyed_source = None
-        self._shown_source = None
+        self._shown_source = self._shown_grid = None
         self._contributors = (); self._result = None; self._display_values = ()
         self._plan = None; self._stamp = None; self._active_key = None
         self._projection_keys = (); self._projection_indices = (); self._projection_shapes = ()

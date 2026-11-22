@@ -3936,9 +3936,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             mode = self._intents.snapshot().thaw().processing_mode
             tool = tool_from_mode_text(mode)
             ScatteringWorkspace._clear_presentation_targets(
-                self, keep_raw_background=(  # a 2D Viewer file open: its raw background follows the new file
-                    tool is Tool.IMAGE_VIEWER and type(value) is str and bool(value)
-                    and command.path in {(), ("artifact",)}))
+                self, keep_backgrounds=(  # a 2D Viewer file open: its raw background follows the new file
+                    ("raw",) if tool is Tool.IMAGE_VIEWER and type(value) is str and bool(value)
+                    and command.path in {(), ("artifact",)} else ()))
             if command.path not in {(), ("artifact",)}:
                 return
             if (type(value) is str and value and (
@@ -3991,8 +3991,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 selection is None
                 or selection.kind is not ContextKind.VIEWER_1D
             ):
-                # a raw background (the 2D Viewer's) follows the frame selected; Int's are released
-                ScatteringWorkspace._clear_presentation_targets(self, keep_raw_background=True)
+                # the 2D Viewer's raw background and Int's 2-D one follow the frame selected; a 1-D one goes
+                ScatteringWorkspace._clear_presentation_targets(
+                    self, keep_backgrounds=("raw", "integrated_2d"))
             if kind is not ShellCommandKind.SELECT_BROWSER_FRAMES:
                 self._shell.browser.cancel_pending_frame_selection()
             self._select_frames(command)
@@ -5204,14 +5205,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._retain_outgoing_display = retained
         return completed
 
-    def _clear_presentation_targets(self, *, keep_raw_background: bool = False) -> None:
-        """Clear the Run's paced targets and release the display background; ``keep_raw_background``: an active raw
-        background (the 2D Viewer's) stays, since it follows every frame and file drawn (LIVE-1218-VIEWER2D-BG)."""
+    def _clear_presentation_targets(self, *, keep_backgrounds: tuple[str, ...] = ()) -> None:
+        """Clear the Run's paced targets and release the display background; ``keep_backgrounds``: the domains of an
+        active background that stays, since it follows the frame drawn (LIVE-1218-VIEWER2D-BG): the 2D Viewer's
+        raw one across frames and files, Int's 2-D one across the frames of its scan."""
         getattr(self, "_presentation_targets", []).clear()
         self._presentation_run_identity = None
         if hasattr(self, "_background_owner"):
-            background = self._background_owner.projection() if keep_raw_background else None
-            if background is None or background[0] != "raw":
+            background = self._background_owner.projection() if keep_backgrounds else None
+            if background is None or background[0] not in keep_backgrounds:
                 self._release_display_background()
 
     def _presentation_pacing_active(self, identity: RunIdentity) -> bool:
@@ -5270,12 +5272,19 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         return False
 
     def _release_orphaned_background(self) -> None:
-        """Release an Int background (1-D or 2-D) once none of the frames it was set on is shown: a Reintegrate, a
-        Refresh or a Run's frames replaced them without a frame or scan choice. Every idle tick released every
-        background before LIVE-1218-VIEWER2D-BG; a raw background (the 2D Viewer's) follows the frame and stays."""
+        """Release an Int background whose frames were replaced without a frame or scan choice (a Reintegrate, a
+        Refresh or a Run): a 1-D one once none of the frames it was set on is shown, a 2-D one (which follows the
+        frames of its scan) once the context it was set on is no longer shown. Every idle tick released every
+        background before LIVE-1218-VIEWER2D-BG; the 2D Viewer's raw background follows every frame and file."""
         owner = getattr(self, "_background_owner", None)
         background = None if owner is None else owner.projection()
         if background is None or background[0] == "raw":
+            return
+        if background[0] == "integrated_2d":
+            selection = self._context_controller.selection
+            token = None if selection is None else selection.context_token
+            if not background[2] or background[2][0] != token:
+                self._release_display_background()
             return
         navigation = self._context_controller.navigation
         shown = {id(frame) for frame in (*navigation.selected, navigation.current) if frame is not None}

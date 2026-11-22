@@ -115,6 +115,7 @@ def _display(
     scan_key: str,
     value: float,
     gi: bool = False,
+    frames: int = 1,
 ) -> RunDisplayState:
     display = RunDisplayState(identity, max_payload_items=4)
     display.set_factories(FrameRecordStore, PublicationStore)
@@ -130,38 +131,39 @@ def _display(
         gi_mode_1d="qip" if gi else "",
         gi_mode_2d="qip_qoop" if gi else "",
     )
-    view = _view(1, value, gi=gi)
-    record = FrameRecord.from_view(view)
-    publication = FramePublication(
-        view,
-        record=record,
-        source_identity=f"{view.source_path}#1",
-        scan_key=scan_key,
-    )
-    key = display.append_navigation(
-        scan_key, artifact, 1
-    ).appended
-    display.retain_frame(
-        owner,
-        key,
-        record,
-        publication,
-        source_identity=publication.source_identity,
-        frame_mask_qualified=False,
-    )
-    display.put_payload(
-        StandardDisplayPayload(
-            0,
-            key,
-            f"{'GI' if gi else 'Standard'} · {scan_key} · frame 1",
+    for label in range(1, frames + 1):  # frames of one grid, each its own value
+        view = _view(label, value + label - 1, gi=gi)
+        record = FrameRecord.from_view(view)
+        publication = FramePublication(
             view,
-            measurement_mode="GI" if gi else "Standard",
-            gi_incidence_motor="samth" if gi else "",
-            gi_resolved_motor="samth" if gi else "",
-            gi_mode_1d="qip" if gi else "",
-            gi_mode_2d="qip_qoop" if gi else "",
+            record=record,
+            source_identity=f"{view.source_path}#{label}",
+            scan_key=scan_key,
         )
-    )
+        key = display.append_navigation(
+            scan_key, artifact, label
+        ).appended
+        display.retain_frame(
+            owner,
+            key,
+            record,
+            publication,
+            source_identity=publication.source_identity,
+            frame_mask_qualified=False,
+        )
+        display.put_payload(
+            StandardDisplayPayload(
+                label - 1,
+                key,
+                f"{'GI' if gi else 'Standard'} · {scan_key} · frame {label}",
+                view,
+                measurement_mode="GI" if gi else "Standard",
+                gi_incidence_motor="samth" if gi else "",
+                gi_resolved_motor="samth" if gi else "",
+                gi_mode_1d="qip" if gi else "",
+                gi_mode_2d="qip_qoop" if gi else "",
+            )
+        )
     return display
 
 
@@ -170,6 +172,7 @@ def _acquisition(
     gi: bool = False,
     configuration=None,
     identity: RunIdentity | None = None,
+    frames: int = 1,
 ):
     configuration = configuration or _configuration(gi=gi)
     identity = identity or RunIdentity.from_configuration(configuration)
@@ -180,6 +183,7 @@ def _acquisition(
         scan_key="run.a",
         value=1.0,
         gi=gi,
+        frames=frames,
     )
     context = AcquisitionContext(
         context_token=new_context_token(ContextKind.ACQUISITION),
