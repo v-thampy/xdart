@@ -5235,7 +5235,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
 
     def _advance_presentation_target(self) -> bool:
         identity = getattr(self, "_presentation_run_identity", None)
-        if identity is None or not self._presentation_pacing_active(identity):
+        if identity is None:
+            # Nothing paced, nothing to clear. Every drain tick passes here, so the clear (and the display
+            # background release in it) is left to the Run's own boundaries (LIVE-1218-VIEWER2D-BG).
+            return False
+        if not self._presentation_pacing_active(identity):
             self._clear_presentation_targets()
             return False
         while self._presentation_targets:

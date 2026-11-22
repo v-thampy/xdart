@@ -397,6 +397,31 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
+@pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
+def test_active_background_survives_idle_drain_ticks(mode: str) -> None:
+    """LIVE-1218-VIEWER2D-BG: every idle drain tick released an adopted background once the view had drawn it."""
+    if mode == "Int 2D":
+        qapp, page, _acquisition_context = _active_page_background()
+        owner = page._background_owner
+    else:  # the acquisition helper gives no 1-D contributors; seed the 1-D background as the 1-D rows do
+        qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        page = ScatteringWorkspace(
+            intents=RunIntentStore(RunIntent()), lifecycle=ScatteringCoordinator(),
+            sources=FilesystemSourceAdapter())
+        page._edit_run_strip(ShellCommandKind.SET_PROCESSING_MODE, "Int 1D")
+        owner = _seed_page_1d_background(page)
+    label = {"Int 2D": "Clear 2D BG", "Int 1D": "Clear 1D BG"}[mode]
+    try:
+        key = owner.active_key
+        assert owner.phase == "ACTIVE" and key is not None
+        for _tick in range(5):
+            page._drain_executor(); qapp.processEvents(); page._refresh_shell()
+            assert owner.phase == "ACTIVE" and owner.active_key == key
+            assert page._shell.scientific.background.text() == label
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
 def test_active_1d_background_revokes_on_normalization_edit() -> None:
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     page = ScatteringWorkspace(
