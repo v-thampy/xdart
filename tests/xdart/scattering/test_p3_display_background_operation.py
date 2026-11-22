@@ -1163,6 +1163,27 @@ def test_the_view_only_corrects_waterfall_rows_it_draws() -> None:
         view.close(); qapp.processEvents()
 
 
+def test_differing_grid_float32_contributors_are_taken_as_float64() -> None:
+    """A Browse selection's detached patterns are float32 display copies: on two grids the background (an
+    interpolated mean, which runs in float64) copies them as float64, charged at 8 bytes a value, instead of
+    refusing the Set (his pick "In 1.2.18" for the two-frame Browse Set BG)."""
+    first_axis, second_axis = np.arange(4.0), np.arange(4.0) + 0.5
+    first = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    second = np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float32)
+    plan = DisplayBackgroundPlan("integrated_1d", ("a", "b"), ((4,), (4,)), (((4,),), ((4,),)),
+                                 (("q\0A^-1",), ("q\0A^-1",)), True)
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = _reserve(owner, plan, ((first, first_axis.astype(np.float32)), (second, second_axis)),
+                           keys=(11, 12), indices=(0, 1))
+    assert reservation is not None
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, ((np.asarray(first, np.float64), first_axis, 1.0),
+                                   (np.asarray(second, np.float64), second_axis, 1.0)))
+    values = owner._result.values
+    # the mean on the first's grid: the second interpolated there (NaN where it does not reach)
+    np.testing.assert_allclose(values, [1.0, 2.75, 3.75, 4.75], equal_nan=True)
+
+
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
     """His pick, 2026-11-22, "Each by its own monitor" (the question's formula I_frame/monitor_frame -
     <I_bg/monitor_bg>): the contributors are each divided by their own monitor before the mean, and a frame is
@@ -1409,11 +1430,15 @@ def test_ast_has_one_public_runner_edge_and_no_hot_path_or_peer_worker() -> None
         "FrameRecordStore", "integrate_1d", "integrate_2d"))
     assert all(name not in owner for name in ("Thread(", "Queue(", "Timer(", "cache"))
     assert page.count("PresentationBackgroundOwner(capacity_bytes=536_870_912)") == 1
-    assert page.count("project_background_contributors(") == 2
+    # one contributor authority (_background_contributors, since 1.2.18 with the Browse detached fallback), used by
+    # the Set and its adoption alone, never by a refresh
+    assert page.count("project_background_contributors(") == 1
+    assert page.count("ScatteringWorkspace._background_contributors(self)") == 2
     tree = ast.parse(page)
     refresh = next(node for node in ast.walk(tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "_refresh_shell")
     assert "project_background_contributors" not in ast.unparse(refresh)
+    assert "_background_contributors" not in ast.unparse(refresh)
     owner_tree = ast.parse(owner)
     promote = next(node for node in ast.walk(owner_tree)
                    if isinstance(node, ast.FunctionDef) and node.name == "promote")

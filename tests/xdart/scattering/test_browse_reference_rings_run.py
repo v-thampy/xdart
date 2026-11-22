@@ -886,6 +886,36 @@ def test_browse_average_and_sum_fold_the_frames_chosen_after_single_visits(qapp,
         assert not page._notice_text.startswith("Browse cache display is unavailable")
 
 
+def test_set_bg_on_a_two_frame_browse_selection_takes_the_detached_patterns(qapp, tmp_path):
+    """His pick, 2026-11-22 ("In 1.2.18" for the two-frame Set BG refusal in Browse): Set BG on two browsed frames
+    averages the Browse display's detached patterns, which carry each frame's monitor: frame 2 has twice the image
+    and twice I0, so with I0 chosen both are I, the mean (each by its own monitor) is I and both are drawn as zero
+    (the owner row test_differing_grid_float32_contributors_are_taken_as_float64 covers two grids)."""
+    _scaled(tmp_path, "escan", 1, 16, 1, 1)
+    _scaled(tmp_path, "escan", 2, 16, 2, 2)
+    intent = _series(tmp_path, (16, 16), mode="Int 1D")
+    with _page(qapp, intent) as (page, view, observed):
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+        controller = page._context_controller
+        first, second = controller.navigation.frames[:2]
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_NORM_CHANNEL, "I0"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=second, frames=(first, second)))
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 2
+                     and {id(f) for f in controller.navigation.selected} == {id(first), id(second)})
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG"), page._notice_text
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 2)
+        background = np.asarray(page._background_owner._result.values, dtype=np.float64)
+        drawn = [np.asarray(item.yData, np.float64) for item in view.curve.listDataItems()]
+        assert all(np.isfinite(values).any() for values in drawn)
+        for values in drawn:
+            finite = np.isfinite(values)
+            np.testing.assert_allclose(values[finite], 0.0, atol=1e-4 * float(np.nanmax(np.abs(background))))
+
+
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):
     with _page(qapp, _series(tmp_path, (16, 16))) as (page, view, observed):
         _run(qapp, page, observed)

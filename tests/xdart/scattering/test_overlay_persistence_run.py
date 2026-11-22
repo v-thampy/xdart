@@ -228,6 +228,29 @@ def test_average_and_sum_fold_the_curves_kept_from_earlier_scans(qapp, tmp_path,
         assert _rows(page) == shown
 
 
+def test_set_bg_on_a_two_frame_browse_selection_after_a_live_handoff(qapp, tmp_path):
+    """His pick, 2026-11-22 ("In 1.2.18" for "Set BG refuses a two-frame Browse selection right after a Live Run"):
+    a one-scan Live Overlay Run (frames 1 and 2, unequal) ends into Browse with both selected; Set BG takes their
+    mean from the Browse display's detached patterns (frame 1 has no context payload there), and each is drawn
+    minus it: equal and opposite. Before, it refused ("Select at least one display frame")."""
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    with _page(qapp, intent) as (page, view, events):
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("a", 2)], "int1d")
+        assert len(page._context_controller.navigation.selected) == 2
+        first, second = (np.asarray(item.yData, np.float64) for item in view.curve.listDataItems())
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG"), page._notice_text
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 2)
+        mean = (first + second) / 2
+        corrected = [np.asarray(item.yData, np.float64) for item in view.curve.listDataItems()]
+        scale = 1e-5 * float(np.nanmax(np.abs(mean)))
+        np.testing.assert_allclose(corrected[0], first - mean, atol=scale)
+        np.testing.assert_allclose(corrected[1], second - mean, atol=scale)
+        assert np.nanmax(np.abs(corrected[0])) > 100 * scale
+
+
 def _gi_run_view(artifact, scan, labels):
     """A GI Run's view of one scan: its frames, all selected, a q curve each, as its payloads name them."""
     frames = tuple(DisplayFrameKey(RunIdentity(7, "overlay-persist"), scan, artifact, label, label) for label in labels)

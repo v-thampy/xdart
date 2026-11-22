@@ -701,6 +701,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._scientific_repaint_pending = False
         self._waterfall_candidate_count = 0
         self._browse_1d_release_debt: Browse1DBorrowBundle | None = None
+        #: the last Browse 1-D display's detached payloads and their context token (_background_contributors)
+        self._browse_1d_detached: tuple[object, tuple] | None = None
         self._quartile_refresh_identity: RunIdentity | None = None
         self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
         self._browser_directory_chooser = (
@@ -2311,6 +2313,28 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             return None
         return selection.context_token, frame.source_scan, frame.artifact
 
+    def _background_contributors(self):
+        """The payloads Set BG averages: the selected frames' (and pins'), as the context projects them; in Browse a
+        selected frame the cache drew but the context holds no payload for takes the detached copy the last Browse
+        1-D display adopted (his pick "In 1.2.18" for "Set BG refuses a two-frame Browse selection right after a Live
+        Run"), matched by the frame key itself and only within that Browse context. () when a selected frame has
+        neither. One authority for the Set and its adoption, so their keys match."""
+        controller = self._context_controller
+        payloads = controller.project_background_contributors(self._preferences.slice_pins)
+        held = getattr(self, "_browse_1d_detached", None)
+        selection = getattr(controller, "selection", None)
+        if (payloads or held is None or selection is None or selection.kind is not ContextKind.BROWSE
+                or held[0] != selection.context_token or self._preferences.slice_pins):
+            return payloads
+        by_id = {id(payload.frame_key): payload for payload in held[1]}
+        contributors = []
+        for frame in controller.navigation.selected:
+            payload = by_id.get(id(frame))
+            if payload is None or payload.frame_key is not frame:
+                return ()
+            contributors.append(payload)
+        return tuple(contributors)
+
     def _background_action(self) -> None:
         owner, operations = self._background_owner, self._workspace_operations
         if self._analysis_operation_busy():
@@ -2339,7 +2363,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         mode = self._intents.snapshot().thaw().processing_mode
         domain = self._background_domain(mode)
         controller = self._context_controller; selected = controller.navigation.selected
-        payloads = controller.project_background_contributors(self._preferences.slice_pins)
+        payloads = ScatteringWorkspace._background_contributors(self)
         norm_channel = resolve_norm_presentation(
             controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = None if domain is None else prepare_background_plan(
@@ -2347,7 +2371,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             contributor_count=len(selected), norm_channel=norm_channel,
             image_axis=self._preferences.image_axis)
         if prepared is None:
-            self._notice("Select at least one display frame before setting background.")
+            self._notice("Select at least one display frame before setting background." if not selected else
+                         "Display background needs every selected frame's pattern: show the selection once, or "
+                         "select fewer frames.")
             self._refresh_shell(); return
         plan, contributors, keys, targets, target_facts = prepared
         stamp = self._operation_context_stamp()
@@ -2385,7 +2411,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         norm_channel = resolve_norm_presentation(
             controller.norm_aggregate, self._preferences.norm_channel, selected)[2]
         prepared = prepare_background_plan(
-            controller.project_background_contributors(self._preferences.slice_pins),
+            ScatteringWorkspace._background_contributors(self),
             receipt.domain, controller.navigation.current,
             contributor_count=len(selected), norm_channel=norm_channel,
             image_axis=self._preferences.image_axis)
@@ -3450,6 +3476,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ScatteringWorkspace._clear_presentation_targets(self)
             if hasattr(self, "_background_owner"):
                 self._release_display_background()  # the page closing lets its display background go
+            self._browse_1d_detached = None
             self._source_selection.begin_close()
             self._shell.browser.cancel_pending_frame_selection()
             self._run_timer.stop()
@@ -7607,6 +7634,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._ensure_timer()
             else:
                 payloads = adopted.payloads
+                # the detached copies Set BG may average (_background_contributors), for this Browse context only
+                selection_now = self._context_controller.selection
+                self._browse_1d_detached = (
+                    None if selection_now is None else selection_now.context_token, adopted.payloads)
                 cache_trace_snapshot = adopted.trace_snapshot
                 cache_plan = adopted.plan
                 current = navigation.current
@@ -8338,6 +8369,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 release_outgoing_display = True
                 self._retain_outgoing_display = False
                 self._release_display_background()
+                self._browse_1d_detached = None
             candidate.processing_mode = value
             if target_tool is not Tool.IMAGE_VIEWER:
                 self._pending_viewer_2d_path = None
@@ -8657,6 +8689,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 )
             return True
         elif kind is ShellCommandKind.CLEAR_1D:
+            self._browse_1d_detached = None
             self._retire_batch_presentation()
             self._retain_outgoing_display = False
             background = self._background_owner.projection()

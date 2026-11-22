@@ -270,12 +270,15 @@ class PresentationBackgroundOwner:
             if any(type(array) is not np.ndarray for array in arrays):
                 return None
             normalized_bytes = tuple(8 * item[0].size for item in contributors) if contributor_divisors else ()
-            if plan.differing_grid_1d and any(
-                    array.dtype != np.dtype(np.float64) or not array.flags.c_contiguous
-                    for item in contributors for array in (item[1:] if normalized_bytes else item)):
-                return None
-            c_bytes = (sum(normalized_bytes) + sum(array.nbytes for item in contributors for array in item[1:])
-                       if normalized_bytes else sum(array.nbytes for array in arrays))
+            # Contributors on different grids are interpolated in float64 (run_display_background): a display
+            # copy's float32 rows (a Browse selection's detached ones, his pick "In 1.2.18") are copied as float64
+            # here, charged at 8 bytes a value, instead of refusing the Set
+            widen = plan.differing_grid_1d
+            def copied_bytes(array):
+                return 8 * array.size if widen else array.nbytes
+            c_bytes = (sum(normalized_bytes) + sum(copied_bytes(array) for item in contributors for array in item[1:])
+                       if normalized_bytes else sum(copied_bytes(array) for array in arrays))
+            widen_bytes = max((8 * array.size for array in arrays), default=0) if widen else 0
             shape = plan.value_shapes[0]
             v = int(np.prod(shape))
             x = (0 if plan.domain == "raw" else
@@ -286,7 +289,7 @@ class PresentationBackgroundOwner:
                                           for index in projection_indices)
             d_bytes = 8 * sum(int(np.prod(item)) for item in projection_shapes)
             stage_bytes = (32 + 8 * int(plan.differing_grid_1d)) * v + x + d_bytes + 589_824
-            q = c_bytes + max(stage_bytes, max(normalized_bytes, default=0))
+            q = c_bytes + max(stage_bytes, max(normalized_bytes, default=0), widen_bytes)
         except (TypeError, ValueError, OverflowError):
             return None
         with self._lock:
@@ -308,9 +311,13 @@ class PresentationBackgroundOwner:
                 scaled_rows = zip(contributors, contributor_divisors, strict=True)
                 copied = tuple(
                     (_immutable_copy(np.divide(item[0], divisor, dtype=np.float64)),
-                     *(_immutable_copy(axis) for axis in item[1:]))
+                     *(_immutable_copy(np.ascontiguousarray(axis, dtype=np.float64) if widen else axis)
+                       for axis in item[1:]))
                     for item, divisor in scaled_rows
                 )
+            elif widen:
+                copied = tuple(tuple(_immutable_copy(np.ascontiguousarray(array, dtype=np.float64)) for array in item)
+                               for item in contributors)
             else:
                 copied = tuple(tuple(_immutable_copy(array) for array in item)
                                for item in contributors)
