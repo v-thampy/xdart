@@ -2952,6 +2952,24 @@ class ScientificView(QtWidgets.QFrame):
     def _clear_trace_aggregate_fold(self) -> None:
         self._trace_aggregate_fold = None
 
+    def _name_kept_in_aggregate(self, traces, rows, navigation):
+        """An Average or Sum that folds curves kept from other files, scans or Runs says so in its name ("Average ·
+        3 curves, 1 kept"), since the browser shows only the current context's selection; the same fold keeps the
+        same named curve."""
+        if not traces:
+            return traces
+        selected = {id(frame) for frame in navigation.selected}
+        kept = sum(1 for _key, trace in rows if id(trace.frame) not in selected)
+        if not kept:
+            return traces
+        (folded,) = traces
+        cached = getattr(self, "_named_aggregate", None)
+        if cached is not None and cached[0] is folded and cached[1] == (len(rows), kept):
+            return (cached[2],)
+        named = replace(folded, title=f"{folded.title} · {len(rows)} curves, {kept} kept")
+        self._named_aggregate = (folded, (len(rows), kept), named)
+        return (named,)
+
     @staticmethod
     def _aggregate_rows_are_an_exact_prefix(
         prior: tuple[tuple[tuple[object, ...], TraceProjection], ...],
@@ -2973,8 +2991,8 @@ class ScientificView(QtWidgets.QFrame):
         return all(
             _is_readonly_array(trace.axis.values)
             and _is_readonly_array(trace.intensity)
-            # a grid equal to rounding is the same grid, as aggregate_traces folds it
-            and same_grid(trace.axis.values, reference)
+            # one grid as an Overlay draws it, as aggregate_traces folds it
+            and overlay_grid_compatible(trace.axis.values, reference)
             for _key, trace in rows
         )
 
@@ -3113,7 +3131,8 @@ class ScientificView(QtWidgets.QFrame):
             ))
             and all(trace.frame.artifact == state.browse_artifact for trace in state.traces)
             and state.processing_mode in {"Int 1D", "Int 2D"}
-            and state.plot_mode in {"Overlay", "Waterfall"}
+            # Average and Sum keep and fold the comparison's curves too (since 1.2.18, his pick "In 1.2.18")
+            and state.plot_mode in {"Overlay", "Waterfall", "Average", "Sum"}
             and not state.slice_enabled
         )
         if (comparison and browse_snapshot is None and not state.traces
@@ -3258,6 +3277,7 @@ class ScientificView(QtWidgets.QFrame):
                 intensity_scale=state.plot_options.intensity_scale,
                 mode=state.plot_mode,
             )
+            traces = self._name_kept_in_aggregate(traces, rows, navigation)
             keys = (("aggregate",),) if traces else ()
         else:
             rows = tuple(
@@ -3747,6 +3767,14 @@ class ScientificView(QtWidgets.QFrame):
             raise ValueError("Browse comparison display budget exceeded")
         on_show = next((trace for trace in incoming if trace.frame is current), incoming[0] if incoming else None)
         retained, incoming = self._admit_comparison(retained, incoming, on_show)
+        aggregate = state.plot_mode in {"Average", "Sum"}
+        if aggregate and retained and len(retained) + len(incoming) > MAX_WATERFALL_DISPLAY_ROWS:
+            # a mean is of exactly the curves it says, never a display sample: past the display's rows the kept
+            # curves leave whole, and the notice says so (his pick "In 1.2.18")
+            retained = ()
+            self.browse_comparison_notice = (
+                f"{state.plot_mode} folds this file's curves only: with the kept ones it would pass "
+                f"{MAX_WATERFALL_DISPLAY_ROWS}.")
         kept = {id(trace.frame) for trace in retained}
         foreign = tuple(frame for frame in foreign if id(frame) in kept)
         # The file's own rows on another grid leave the display; navigation still names them (selection authority).
@@ -3756,7 +3784,7 @@ class ScientificView(QtWidgets.QFrame):
         epochs = (None if foreign or snapshot.logical_epochs is None
                   else tuple(snapshot.logical_epochs[index] for index in own))
         all_rows = tuple((("live", id(trace.frame)), trace) for trace in (*retained, *incoming))
-        rows = self._bounded_waterfall_rows(all_rows)
+        rows = all_rows if aggregate else self._bounded_waterfall_rows(all_rows)
         current_row = next((row for row in all_rows if row[1].frame is current), None)
         if current_row is not None and not any(row[1].frame is current for row in rows):
             wanted = {id(row[1].frame) for row in (*rows[:-1], current_row)}
@@ -3785,8 +3813,11 @@ class ScientificView(QtWidgets.QFrame):
     @staticmethod
     def _comparison_scope(state: ScientificProjection) -> tuple[object, ...] | None:
         """The science kept curves of other files, scans or Runs share with the current ones; None when the mode
-        keeps none (canonical_grid_overlay.md: Overlay and Waterfall persist; Single and slicing do not)."""
-        if (state.processing_mode not in {"Int 1D", "Int 2D"} or state.plot_mode not in {"Overlay", "Waterfall"}
+        keeps none (canonical_grid_overlay.md: Overlay and Waterfall persist; Single and slicing do not; since 1.2.18
+        Average and Sum persist too and fold the kept curves, his pick "In 1.2.18" for "Average/Sum drops the Overlay
+        curves kept from earlier scans")."""
+        if (state.processing_mode not in {"Int 1D", "Int 2D"}
+                or state.plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}
                 or state.slice_enabled):
             return None
         return ("comparison", state.processing_mode, state.measurement_mode,

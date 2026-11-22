@@ -396,10 +396,16 @@ def plan_browse_1d_targets(
         )
         # Single replaces on an ordinary click, but explicit modifier
         # membership is still authoritative, just as in acquisition display.
-        if plot_mode in {"Single", "Overlay", "Waterfall"}:
-            logical = stacked
-        else:
-            logical = (navigation.current,)
+        # Average and Sum fold every selected frame (his pick "In 1.2.18" for
+        # "Browse Average after picking frames one by one draws nothing"): a
+        # mean is of exactly the frames chosen, so they are never sampled, and
+        # more than the display holds is refused, not thinned.
+        logical = stacked
+        if plot_mode in {"Average", "Sum"} and len(logical) > MAX_BROWSE_1D_DISPLAY_TARGETS:
+            raise _Refused(
+                f"Browse {plot_mode} folds at most {MAX_BROWSE_1D_DISPLAY_TARGETS} frames; "
+                f"{len(logical)} are selected"
+            )
         candidates = logical
         positions = tuple(range(1, len(logical) + 1))
         stacked_options_applied = (

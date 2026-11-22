@@ -288,8 +288,8 @@ class FrameNavigationProjection:
 
 
 #: The plot modes All frames acts in (ALL-FRAMES-128). Single draws a multi-frame selection together, as Show All did
-#: there (maintainer, 2026-10-30: "Same as Overlay (Recommended)"); Browse draws nothing in Average and Sum (the page's
-#: "Browse cache display is unavailable for Average/Sum" refusal).
+#: there (maintainer, 2026-10-30: "Same as Overlay (Recommended)"). Since 1.2.18 Browse folds the selected frames in
+#: Average and Sum (at most the display's 256, else it refuses); All frames still acts only in these three.
 ALL_FRAMES_PLOT_MODES = frozenset({"Single", "Overlay", "Waterfall"})
 
 
@@ -591,7 +591,8 @@ class BrowseTraceSnapshot:
                     for value in self.logical_epochs
                 )
             )
-            or self.plot_mode not in {"Single", "Overlay", "Waterfall"}
+            # Average and Sum fold the planned rows (since 1.2.18, his pick "In 1.2.18")
+            or self.plot_mode not in {"Single", "Overlay", "Waterfall", "Average", "Sum"}
             or type(self.waterfall_active) is not bool
             or type(self.stacked_options_applied) is not bool
             or self.stacked_options_applied

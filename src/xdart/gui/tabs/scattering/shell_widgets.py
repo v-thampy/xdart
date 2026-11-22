@@ -1435,9 +1435,11 @@ def overlay_grid_compatible(values: np.ndarray, reference: np.ndarray) -> bool:
 
 
 def _on_one_grid(traces: tuple[TraceProjection, ...]) -> bool:
-    """The traces share the first's grid (``same_grid``)."""
+    """The traces share the first's grid, as an Overlay draws them together (``overlay_grid_compatible``): a saved
+    curve's float32 axis and another scan's are one grid, folded point by point, not interpolated onto a union grid
+    (since 1.2.18 Average and Sum fold an Overlay's kept curves, his pick "In 1.2.18")."""
     first = traces[0].axis.values
-    return all(same_grid(trace.axis.values, first) for trace in traces)
+    return all(overlay_grid_compatible(trace.axis.values, first) for trace in traces)
 
 
 def _fold_grid(traces: tuple[TraceProjection, ...]) -> np.ndarray | None:

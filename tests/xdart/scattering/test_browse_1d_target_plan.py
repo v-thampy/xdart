@@ -275,8 +275,9 @@ def test_below_threshold_stacked_modes_slice_exact_selected_order_once(
         ("Single", 15, False, False, 15),
         ("Single", 16, False, True, 16),
         ("Single", 8, True, True, 8),
-        ("Average", 16, True, False, 1),
-        ("Sum", 16, True, False, 1),
+        # Since 1.2.18 Average and Sum fold every selected frame, never a sample (his pick "In 1.2.18")
+        ("Average", 16, True, False, 16),
+        ("Sum", 16, True, False, 16),
     ),
 )
 def test_mode_thresholds_do_not_broaden_nonstacked_targets(
@@ -299,6 +300,29 @@ def test_mode_thresholds_do_not_broaden_nonstacked_targets(
     assert len(outcome.plan.display_targets) == expected_count
     if expected_count == 1:
         assert outcome.plan.display_targets == (rig[1].navigation.current,)
+    _close(rig)
+
+
+@pytest.mark.parametrize("mode", ("Average", "Sum"))
+def test_average_and_sum_past_the_display_limit_are_refused_not_sampled(tmp_path, mode) -> None:
+    """A mean is of exactly the frames chosen: Average or Sum of more frames than the Browse display holds is refused
+    with a notice that says so, never folded from a sample (LIVE-1218-VIEWER2D-BG follow-up, his pick "In 1.2.18")."""
+    from xdart.gui.tabs.scattering.browse_1d_target_plan import (
+        MAX_BROWSE_1D_DISPLAY_TARGETS, Browse1DTargetPlanStatus,
+    )
+    from xdart.gui.tabs.scattering.shell_projection import ScientificPreferences
+
+    rig = _rig(tmp_path, MAX_BROWSE_1D_DISPLAY_TARGETS + 1)
+    outcome = _plan(rig, ScientificPreferences(plot_mode=mode))
+    assert outcome.status is Browse1DTargetPlanStatus.REFUSED
+    assert f"folds at most {MAX_BROWSE_1D_DISPLAY_TARGETS} frames" in outcome.diagnostic
+    _close(rig)
+    (tmp_path / "at").mkdir()
+    rig = _rig(tmp_path / "at", MAX_BROWSE_1D_DISPLAY_TARGETS)
+    outcome = _plan(rig, ScientificPreferences(plot_mode=mode))
+    assert outcome.status is Browse1DTargetPlanStatus.PLANNED
+    assert len(outcome.plan.display_targets) == MAX_BROWSE_1D_DISPLAY_TARGETS
+    assert outcome.plan.display_targets == tuple(rig[1].navigation.selected)
     _close(rig)
 
 

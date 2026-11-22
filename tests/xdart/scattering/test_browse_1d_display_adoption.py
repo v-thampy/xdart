@@ -492,13 +492,13 @@ def test_page_fail_closes_terminal_and_incompatible_browse_cache_misses(
         mount_prior_waterfall()
         page._preferences = replace(page._preferences, plot_mode="Average")
         page._refresh_shell()
+        # Since 1.2.18 Average and Sum fold the selected frames through the same cache (his pick "In 1.2.18" for
+        # "Browse Average after picking frames one by one draws nothing"): an incomplete cache waits, as Single does
         assert view.presentation_plot_mode == "Average"
         assert view.trace_history_keys == ()
         assert not view.bottom_waterfall_active
-        assert not page._scientific_repaint_pending
-        assert page._notice_text.startswith(
-            "Browse cache display is unavailable for Average/Sum"
-        )
+        assert page._scientific_repaint_pending
+        assert not page._notice_text.startswith("Browse cache display is unavailable")
     finally:
         _close_page(page, app)
 

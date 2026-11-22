@@ -850,6 +850,42 @@ def test_int_1d_normalized_background_takes_each_frame_by_its_own_monitor(qapp, 
         assert page._background_owner.phase == "ACTIVE" and view.background.text() == "Clear 1D BG"
 
 
+@pytest.mark.parametrize("mode", ("Average", "Sum"))
+def test_browse_average_and_sum_fold_the_frames_chosen_after_single_visits(qapp, tmp_path, mode):
+    """His pick, 2026-11-22 ("In 1.2.18" for "Browse Average after picking frames one by one draws nothing"): in
+    Browse, after visiting frames one at a time, Average or Sum of frames 1 and 3 (images 1x and 3x) draws one
+    curve, their exact mean or sum. Before, Browse refused Average and Sum ("Browse cache display is unavailable")."""
+    for index, scale in ((1, 1), (2, 2), (3, 3)):
+        _scaled(tmp_path, "escan", index, 16, scale, 1)
+    with _page(qapp, _series(tmp_path, (16, 16, 16), mode="Int 1D")) as (page, view, observed):
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+        controller = page._context_controller
+        first, second, third = controller.navigation.frames[:3]
+        drawn = {}
+        for frame in (first, second, third):
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,)))
+            assert _pump(qapp, lambda: page._last_scientific_projection.traces
+                         and page._last_scientific_projection.traces[-1].frame is frame
+                         and bool(view.curve.listDataItems()))
+            drawn[id(frame)] = np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, mode))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=third, frames=(first, third)))
+        expected = drawn[id(first)] + drawn[id(third)]
+        if mode == "Average":
+            expected = expected / 2
+
+        def folded():
+            items = view.curve.listDataItems()
+            if len(items) != 1 or {id(f) for f in controller.navigation.selected} != {id(first), id(third)}:
+                return None
+            values = np.asarray(items[0].yData, dtype=np.float64)
+            return values if values.shape == expected.shape and np.allclose(values, expected, rtol=1e-5) else None
+        assert _pump(qapp, lambda: folded() is not None, 20.), (
+            page._notice_text, len(view.curve.listDataItems()))
+        assert not page._notice_text.startswith("Browse cache display is unavailable")
+
+
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):
     with _page(qapp, _series(tmp_path, (16, 16))) as (page, view, observed):
         _run(qapp, page, observed)

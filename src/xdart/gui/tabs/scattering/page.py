@@ -7504,7 +7504,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             browse_selected
             and intent.processing_mode in {"Int 1D", "Int 2D"}
             and self._preferences.plot_mode in {
-                "Single", "Overlay", "Waterfall",
+                "Single", "Overlay", "Waterfall", "Average", "Sum",
             }
             and not self._preferences.slice_enabled
             and not self._preferences.slice_pins

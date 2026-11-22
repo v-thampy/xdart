@@ -202,6 +202,32 @@ def test_a_background_set_after_the_browse_handoff_corrects_every_kept_curve(qap
             np.testing.assert_allclose(got[finite], want[finite], atol=4 * scale + 1e-6 * float(np.nanmax(np.abs(raw))))
 
 
+@pytest.mark.parametrize("mode", ("Average", "Sum"))
+def test_average_and_sum_fold_the_curves_kept_from_earlier_scans(qapp, tmp_path, mode):
+    """His pick, 2026-11-22 ("In 1.2.18" for "Average/Sum drops the Overlay curves kept from earlier scans"): an
+    Overlay of two scans (unequal curves on one grid) switched to Average or Sum folds every curve, the earlier
+    scan's kept curve too, and its name says so; back in Overlay all are drawn again. Before, the kept curve left
+    the fold."""
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    with _page(qapp, intent) as (page, view, events):
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("b", 1), ("b", 2)], "int1d")
+        shown = [("a_int1d.nexus", 1), ("b_int1d.nexus", 1), ("b_int1d.nexus", 2)]
+        assert _rows(page) == shown
+        curves = [np.asarray(item.yData, np.float64) for item in view.curve.listDataItems()]
+        assert len(curves) == 3 and not np.allclose(curves[1], curves[2])
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, mode))
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 1)
+        (folded,) = view.curve.listDataItems()
+        expected = np.mean(curves, axis=0) if mode == "Average" else np.sum(curves, axis=0)
+        np.testing.assert_allclose(np.asarray(folded.yData, np.float64), expected, rtol=1e-5)
+        assert "3 curves, 1 kept" in folded.name()
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 3)
+        assert _rows(page) == shown
+
+
 def _gi_run_view(artifact, scan, labels):
     """A GI Run's view of one scan: its frames, all selected, a q curve each, as its payloads name them."""
     frames = tuple(DisplayFrameKey(RunIdentity(7, "overlay-persist"), scan, artifact, label, label) for label in labels)
