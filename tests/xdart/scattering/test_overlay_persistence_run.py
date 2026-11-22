@@ -348,6 +348,24 @@ def test_clearing_the_scientific_view_releases_the_named_fold(qapp):
         view.close()
 
 
+def test_waterfall_options_do_not_remove_kept_rows_from_average(qapp):
+    first, first_navigation = _gi_run_view("/out/first.nxs", "first", (1,))
+    second, second_navigation = _gi_run_view("/out/second.nxs", "second", (2,))
+    average = replace(second, plot_mode="Average")
+    expected = (first.traces[0].intensity + second.traces[0].intensity) / 2
+    view = ScientificView()
+    try:
+        view.reconcile(first, first_navigation, completed=1, total=1, detail="")
+        view.reconcile(average, second_navigation, completed=2, total=2, detail="")
+        np.testing.assert_allclose(view.curve.listDataItems()[0].yData, expected)
+        filtered = replace(average, plot_options=replace(average.plot_options, waterfall_start=2, waterfall_step=2))
+        view.reconcile(filtered, second_navigation, completed=2, total=2, detail="")
+        np.testing.assert_allclose(view.curve.listDataItems()[0].yData, expected)
+        assert view.trace_history_keys == (*first_navigation.frames, *second_navigation.frames)
+    finally:
+        view.close()
+
+
 def test_the_detached_budget_keeps_all_currently_selected_aggregate_rows(qapp, monkeypatch):
     from xdart.gui.tabs.scattering import browse_1d_display
 

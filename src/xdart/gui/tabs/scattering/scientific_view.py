@@ -3817,8 +3817,7 @@ class ScientificView(QtWidgets.QFrame):
         """A curve's row in any context: its file, case-folded as Windows compares it, and its frame label."""
         return os.path.normcase(str(frame.artifact)), int(frame.local_frame_label)
 
-    @staticmethod
-    def _comparison_scope(state: ScientificProjection) -> tuple[object, ...] | None:
+    def _comparison_scope(self, state: ScientificProjection) -> tuple[object, ...] | None:
         """The science kept curves of other files, scans or Runs share with the current ones; None when the mode
         keeps none (canonical_grid_overlay.md: Overlay and Waterfall persist; Single and slicing do not; since 1.2.18
         Average and Sum persist too and fold the kept curves, his pick "In 1.2.18" for "Average/Sum drops the Overlay
@@ -3827,12 +3826,16 @@ class ScientificView(QtWidgets.QFrame):
                 or state.plot_mode not in {"Overlay", "Waterfall", "Average", "Sum"}
                 or state.slice_enabled):
             return None
-        return ("comparison", state.processing_mode, state.measurement_mode,
-                state.gi_mode_1d, state.plot_axis, state.slice_enabled,
-                state.slice_center, state.slice_width,
-                trace_normalization_scope(None, state.norm_channel)[1],
-                state.plot_options.waterfall_start, state.plot_options.waterfall_stop,
-                state.plot_options.waterfall_step)
+        science = ("comparison", state.processing_mode, state.measurement_mode,
+                   state.gi_mode_1d, state.plot_axis, state.slice_enabled,
+                   state.slice_center, state.slice_width,
+                   trace_normalization_scope(None, state.norm_channel)[1])
+        previous = self._browse_comparison_scope
+        if state.plot_mode in {"Average", "Sum"} and previous is not None and previous[0] == science:
+            # A stacked-row filter takes effect when returning to a stacked plot.
+            return previous
+        return science, (state.plot_options.waterfall_start, state.plot_options.waterfall_stop,
+                         state.plot_options.waterfall_step)
 
     def _admit_comparison(
         self,
