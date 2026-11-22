@@ -656,6 +656,14 @@ def test_live_background_follows_the_next_frame_and_scan(qapp, tmp_path, next_sc
         finite = np.isfinite(background) & np.isfinite(shown)
         assert finite.any() and np.abs(background[finite]).max() > 0
         np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
+        if mode == "Int 1D":  # the raw pop-up's detector-mode change (thumbnail, Full Raw, thumbnail) keeps it
+            assert controller.full_raw_availability()[0], controller.full_raw_availability()
+            view._open_raw_popup()
+            assert _pump(qapp, lambda: page._preferences.detector_mode == "full")
+            view.raw_popup_dialog.close()
+            assert _pump(qapp, lambda: page._preferences.detector_mode == "thumbnail")
+            page._refresh_shell(); qapp.processEvents()
+            assert page._background_owner.active_key == active and view.background.text() == label
         view.background.click()  # Clear BG while the Run watches on
         assert _pump(qapp, lambda: view.background.text().startswith("Set "))
         assert page._background_owner.phase == "RELEASED"
@@ -696,6 +704,51 @@ def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_pa
         np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
         drawn = np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
         np.testing.assert_allclose(drawn[np.isfinite(drawn)], shown[np.isfinite(shown)], rtol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
+def test_browse_background_follows_into_another_scan(qapp, tmp_path, mode):
+    """His pick "Any scan or file" (LIVE-1218-VIEWER2D-BG): a real Set BG on one browsed scan, then another
+    processed scan opened in Browse: its frames are drawn minus the background (its images are the first's
+    doubled, on the same grid, so they show the background itself), through idle ticks, until Clear BG."""
+    other = tmp_path / "other"
+    other.mkdir(parents=True)
+    for index in (1, 2):
+        _doubled(other, "escan", index, 16)
+    executor, identity, _events = _run_to_terminal(_series(other, (16, 16), mode=mode), request_value=9623)
+    executor.close(identity)
+    label = "Clear 2D BG" if mode == "Int 2D" else "Clear 1D BG"
+    with _page(qapp, _series(tmp_path / "first", (16, 16), mode=mode)) as (page, view, observed):
+        _run(qapp, page, observed)
+        first_context = _browsing(qapp, page)
+        controller = page._context_controller
+
+        def drawn():
+            state = page._last_scientific_projection
+            if state is None or controller.navigation.current is None:
+                return False
+            if mode == "Int 2D":
+                return (state.heavy is not None and state.heavy.cake is not None
+                        and state.heavy.frame is controller.navigation.current)
+            return bool(state.traces) and state.traces[-1].frame is controller.navigation.current
+
+        assert _pump(qapp, drawn)
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == label), page._notice_text
+        active = page._background_owner.active_key
+        second_context = _reopen(qapp, page, written(other / "run.nexus", mode))
+        assert second_context is not first_context
+        assert _pump(qapp, lambda: drawn() and page._last_scientific_projection.background_set)
+        for _tick in range(5):
+            page._drain_executor(); qapp.processEvents()
+        assert page._background_owner.active_key == active and view.background.text() == label
+        assert not page._last_scientific_projection.background_note
+        shown, background = _shown_minus_background(page, mode)
+        finite = np.isfinite(background) & np.isfinite(shown)
+        assert finite.any() and np.abs(background[finite]).max() > 0
+        np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text().startswith("Set "))
 
 
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):

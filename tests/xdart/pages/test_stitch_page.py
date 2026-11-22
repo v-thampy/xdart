@@ -1459,6 +1459,46 @@ def test_a_stitch_2d_background_follows_every_map_of_its_grid(qapp, tmp_path):
         _dispose(page, qapp)
 
 
+def test_a_gi_cut_background_draws_another_cut_as_it_is(qapp, tmp_path):
+    """A Stitch background follows a plot-axis change since 1.2.18, so a GI result's other cut (another quantity of
+    the same length) must not take it: Set BG on q_ip, then q_oop is drawn as it is, the button's tip saying why;
+    back on q_ip it is subtracted again (LIVE-1218-VIEWER2D-BG)."""
+    from xrd_tools.integrate.stitch_gi import StitchGI
+    from xdart.gui.tools.stitch_values import prepare_stitch_tool
+    from tests.xdart.tools.test_stitch_native_gi import _SAMPLE, _gi_form
+
+    request = prepare_stitch_tool(_gi_form(tmp_path, "multigeometry", StitchGI(
+        ("q_ip", "q_oop"), incidence_motor="eta", sample_motors=_SAMPLE))).request
+    assert run_stitch_operation(request).terminal.disposition is ModuleDisposition.COMMITTED
+    cuts = dict(read_analysis_artifact(request.module.output.target).gi)
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.open_result(request.module.output.target)
+        _wait(page, qapp)
+        axis, button = page.scientific.plot_axis, page.scientific.background
+        assert axis.currentData() == "q_ip"
+        button.click()
+        assert button.text() == "Clear 1D BG"
+        key = page._background.active_key
+        y = lambda: np.asarray(page.curve.listDataItems()[0].yData, dtype=np.float64)  # noqa: E731
+
+        def zeros():
+            values = y()
+            assert np.isfinite(values).any()
+            np.testing.assert_allclose(values[np.isfinite(values)], 0.0, atol=1e-9)
+        zeros()
+        axis.setCurrentIndex(axis.findData("q_oop"))
+        _wait(page, qapp)
+        assert page._background.active_key == key and button.text() == "Clear 1D BG"
+        np.testing.assert_array_equal(y(), np.asarray(cuts["q_oop"].intensity, dtype=np.float64))
+        assert "drawn as it is" in button.toolTip()
+        axis.setCurrentIndex(axis.findData("q_ip"))
+        _wait(page, qapp)
+        zeros()
+    finally:
+        _dispose(page, qapp)
+
+
 def test_clean_shutdown_releases_the_background(qapp, tmp_path):
     """Codex's round-2 review F2 reproduction: a CLEAN shutdown releases the display background."""
     from tests.xdart.tools.test_stitch_native_values import _native_form

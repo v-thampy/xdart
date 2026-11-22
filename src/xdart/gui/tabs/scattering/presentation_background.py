@@ -1,6 +1,6 @@
 """Workspace-local bounded custody for presentation-only backgrounds."""
 from __future__ import annotations
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from threading import Lock
 import weakref
@@ -185,6 +185,9 @@ class PresentationBackgroundOwner:
         #: another pattern's), the divisor and the values; charged to this owner's grant, the oldest dropped first
         self._followed: OrderedDict[int, tuple] = OrderedDict()
         self._followed_bytes = 0
+        #: the patterns gone since (their weak references' callbacks, which only append, never lock): their values
+        #: are dropped at the next ``trace_values``, so a long Run's patterns do not stay held up to the grant
+        self._followed_gone: deque = deque()
 
     @property
     def capacity_bytes(self) -> int:
@@ -457,6 +460,7 @@ class PresentationBackgroundOwner:
         another quantity or unit, so it is drawn as it is; None when no 1-D background is active or the pattern is
         not one. The same pattern drawn again gets the same array."""
         with self._lock:
+            self._drop_gone_patterns_locked()
             if (self._phase != "ACTIVE" or self._result is None or self._plan is None
                     or self._plan.domain != "integrated_1d"):
                 return None
@@ -489,16 +493,18 @@ class PresentationBackgroundOwner:
                     np.subtract(intensity[start:stop], background, out=displayed[start:stop])
             np.divide(displayed, divisor, out=displayed)
             displayed.setflags(write=False)
-            held = (weakref.ref(intensity), weakref.ref(axis), divisor, displayed)
+            gone = self._followed_gone
+            held = (weakref.ref(intensity, lambda ref, key=id(intensity): gone.append((key, ref))),
+                    weakref.ref(axis), divisor, displayed)
         except (TypeError, ValueError):
             return None
         with self._lock:
             if self._reservation != reservation or self._phase != "ACTIVE":
                 return None
+            base = self._active_bytes - self._followed_bytes  # what the background holds besides these values
             prior = self._followed.pop(id(intensity), None)
             if prior is not None:
                 self._followed_bytes -= prior[3].nbytes
-            base = self._active_bytes - self._followed_bytes
             while self._followed and base + self._followed_bytes + displayed.nbytes > self._capacity:
                 _key, oldest = self._followed.popitem(last=False)
                 self._followed_bytes -= oldest[3].nbytes
@@ -507,6 +513,15 @@ class PresentationBackgroundOwner:
                 self._followed_bytes += displayed.nbytes
             self._active_bytes = base + self._followed_bytes
         return displayed
+
+    def _drop_gone_patterns_locked(self) -> None:
+        while self._followed_gone:
+            key, ref = self._followed_gone.popleft()
+            entry = self._followed.get(key)
+            if entry is not None and entry[0] is ref:
+                del self._followed[key]
+                self._followed_bytes -= entry[3].nbytes
+                self._active_bytes -= entry[3].nbytes
 
     def release(self, receipt: DisplayBackgroundRendererReleaseReceipt | None = None) -> bool:
         with self._lock:
@@ -544,7 +559,7 @@ class PresentationBackgroundOwner:
     def _drop_locked(self) -> None:
         self._keyed_source = None
         self._shown_source = self._shown_grid = None
-        self._followed.clear(); self._followed_bytes = 0
+        self._followed.clear(); self._followed_bytes = 0; self._followed_gone.clear()
         self._contributors = (); self._result = None; self._display_values = ()
         self._plan = None; self._stamp = None; self._active_key = None
         self._projection_keys = (); self._projection_indices = (); self._projection_shapes = ()

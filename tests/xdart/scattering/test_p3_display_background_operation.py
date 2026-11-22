@@ -365,11 +365,12 @@ def test_pre_adoption_context_membership_and_shape_drift_release_exact_roots(
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
 
-@pytest.mark.parametrize("entry", ("context", "mode", "detector", "close"))
+@pytest.mark.parametrize("entry", ("context", "mode", "close"))
 def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: str) -> None:
-    """An Int 2D background goes at a mode or detector change and at close. Since 1.2.18 a scan or file choice
-    keeps it, as a frame choice does (his picks "Int 2D follows frames too" and "Any scan or file"; his words:
-    "If it is dropped on selection change what is the point of it at all?")."""
+    """An Int 2D background goes at a mode change and at close. Since 1.2.18 a scan or file choice keeps it, as a
+    frame choice does (his picks "Int 2D follows frames too" and "Any scan or file"; his words: "If it is dropped on
+    selection change what is the point of it at all?"), and so does a detector-mode change, which changes only the
+    raw image (test_a_detector_mode_change_keeps_an_int_background)."""
     qapp, page, _acquisition_context = _active_page_background()
     delegated = []
     try:
@@ -397,6 +398,21 @@ def test_active_background_revokes_at_every_page_boundary(monkeypatch, entry: st
             assert delegated == ["ACTIVE"] and page._background_owner.phase == "ACTIVE"
             return
         _assert_background_released(page._background_owner)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_a_detector_mode_change_keeps_an_int_background() -> None:
+    """Full Raw or Thumbnail, also the raw pop-up's (thumbnail, then full, then thumbnail), changes only the raw
+    image: an Int 2D background stays (before 1.2.18 it went). Int 1D's raw pop-up on a real browsed frame:
+    test_int_1d_browse_background_follows_frames_through_idle_ticks."""
+    qapp, page, _acquisition_context = _active_page_background()
+    owner = page._background_owner
+    try:
+        key = owner.active_key
+        for value, path in (("full", ()), ("thumbnail", ("popup",)), ("full", ("popup",)), ("thumbnail", ("popup",))):
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SET_DETECTOR_MODE, value, path))
+            assert owner.phase == "ACTIVE" and owner.active_key == key, (value, path)
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -892,6 +908,24 @@ def test_trace_values_charge_the_grant_and_go_with_the_background() -> None:
     assert owner.release(DisplayBackgroundRendererReleaseReceipt(owner.active_key, True))
     _assert_background_released(owner)
     assert owner._followed == {} and owner.trace_values(patterns[0], axis, "q\0A^-1", 1.0) is None
+
+
+def test_trace_values_let_go_of_patterns_no_longer_drawn() -> None:
+    """A long Run with a background set draws a new pattern per frame: the values of a pattern that is gone are
+    dropped at the next draw, so the owner holds only the patterns still alive, and the same pattern drawn again
+    with another divisor replaces its own values without double counting."""
+    import gc
+    axis = np.arange(1024.0)
+    owner = _active_1d_owner(np.zeros(1024), axis)
+    base = owner.active_bytes
+    for index in range(50):
+        owner.trace_values(np.full(1024, float(index)), axis, "q\0A^-1", 1.0)  # each gone once drawn
+    gc.collect()
+    kept = np.ones(1024)
+    owner.trace_values(kept, axis, "q\0A^-1", 1.0)
+    assert owner.active_bytes == base + 1024 * 8 and len(owner._followed) == 1
+    owner.trace_values(kept, axis, "q\0A^-1", 2.0)  # the same pattern, normalized otherwise
+    assert owner.active_bytes == base + 1024 * 8 and len(owner._followed) == 1
 
 
 def test_following_trace_values_take_each_payloads_native_pattern_and_divisor() -> None:

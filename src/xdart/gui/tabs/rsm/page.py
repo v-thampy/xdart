@@ -2645,10 +2645,6 @@ class RSMPage(QtWidgets.QWidget):
         return rsm_keyed_projection(values, model.snapshot(values, h_index=indices[0], k_index=indices[1],
             l_index=indices[2], projection=snapshot.state.projection, coordinate_ranges=bounds))
 
-    def _background_path(self):
-        source = self._background.keyed_source()
-        return None if source is None else source[0]
-
     def _toggle_background(self):
         """Int's Set BG and Clear BG, display only, for the six panels: Set BG takes the result shown as the
         background, and every result shown is then drawn minus it, panel by panel (each slice minus the
