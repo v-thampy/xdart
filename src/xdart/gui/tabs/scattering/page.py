@@ -2350,7 +2350,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         active_key = self._background_key(plan, stamp, mode, target_facts)
         reservation = owner.reserve(plan, contributors, stamp=stamp,
             active_key=active_key, projection_keys=keys,
-            projection_shapes=tuple(target[0].shape for target in targets))
+            projection_shapes=tuple(target[0].shape for target in targets), norm_channel=norm_channel)
         if reservation is None:
             self._notice("Display background exceeds its standalone 512 MiB workspace.")
             self._refresh_shell(); return
@@ -2390,6 +2390,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._background_owner.abort(receipt.reservation, "ADOPTION_FAILED")
             self._notice("Display background context changed before adoption."); return True
         self._shell.scientific.expect_display_background(receipt.active_key)
+        self._shell.scientific.follow_display_background(self._background_owner.follow_trace)
         self._context_controller.reseed_background_projection()
         self._notice("Display background set."); return True
 
@@ -7719,7 +7720,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
             presentation_background_frame_values=getattr(self._background_owner, "frame_values", None),
-            presentation_background_trace_values=getattr(self._background_owner, "trace_values", None),
+            presentation_background_follows_in_view=True,  # the view subtracts a 1-D one from every curve
         )
         if (controller.selection is not None
                 and controller.selection.kind is ContextKind.BROWSE
@@ -7894,6 +7895,9 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 apply_options["replace_scientific_on_failure"] = True
             self._shell.scientific.expect_display_background(
                 self._background_owner.active_key)
+            follow = getattr(self._shell.scientific, "follow_display_background", None)
+            if callable(follow):  # a 1-D background: the view subtracts it from every curve it draws
+                follow(getattr(self._background_owner, "follow_trace", None))
             self._shell.apply_state(projection, **apply_options)
             # A resident preview can precede the sparse rows, or a pending browser
             # gesture can preserve outgoing paint. Only stamp the projection the

@@ -605,10 +605,26 @@ def _doubled(directory, stem, index, energy_keV):
     return target
 
 
+def _scaled(directory, stem, index, energy_keV, scale, monitor):
+    """``_frame``'s image times ``scale``, with I0 = ``monitor`` in its sidecar."""
+    target = directory / f'{stem}_{index:04d}.tif'
+    target.with_suffix('.txt').write_text(f'# Counters\nI0 = {monitor}\n# Motors\nenergy = {energy_keV}\n'
+                                          'User: energy, time: Mon Jan 15 10:30:00 2024  # Temp\n')
+    rows, columns = np.mgrid[:SHAPE[0], :SHAPE[1]]
+    partial = directory / f'{stem}_{index:04d}.part'
+    fabio.tifimage.TifImage(data=(scale * (100 + (rows + 2 * columns) % 97)).astype(np.uint16)).write(str(partial))
+    partial.replace(target)
+    return target
+
+
 def _shown_minus_background(page, mode):
-    """The values drawn for the current frame, and the background's own (the frame it was set on, drawn once)."""
+    """The values drawn for the current frame (the map, or the curve the view mounted: the view subtracts a 1-D
+    background as it draws), and the background's own (the frame it was set on, drawn once)."""
     state, owner = page._last_scientific_projection, page._background_owner
-    drawn = state.heavy.cake if mode == "Int 2D" else state.traces[-1].intensity
+    if mode == "Int 2D":
+        drawn = state.heavy.cake
+    else:
+        drawn = page._shell.scientific.curve.listDataItems()[-1].yData
     return np.asarray(drawn, dtype=np.float64), np.asarray(owner._result.values, dtype=np.float64)
 
 
@@ -626,6 +642,7 @@ def test_live_background_follows_the_next_frame_and_scan(qapp, tmp_path, next_sc
     with _page(qapp, intent) as (page, view, _observed):
         if next_scan:
             view.plot_mode.setCurrentText("Overlay")  # direct Live selection, without the Single pacer
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
         controller = page._context_controller
 
         def drawn():
@@ -748,8 +765,6 @@ def test_int_1d_browse_background_follows_frames_through_idle_ticks(qapp, tmp_pa
         finite = np.isfinite(background) & np.isfinite(shown)
         assert finite.any() and np.abs(background[finite]).max() > 0
         np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
-        drawn = np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
-        np.testing.assert_allclose(drawn[np.isfinite(drawn)], shown[np.isfinite(shown)], rtol=1e-6)
 
 
 @pytest.mark.parametrize("mode", ("Int 2D", "Int 1D"))
@@ -795,6 +810,41 @@ def test_browse_background_follows_into_another_scan(qapp, tmp_path, mode):
         np.testing.assert_allclose(shown[finite], background[finite], rtol=1e-4)
         view.background.click()
         assert _pump(qapp, lambda: view.background.text().startswith("Set "))
+
+
+def test_int_1d_normalized_background_takes_each_frame_by_its_own_monitor(qapp, tmp_path):
+    """His pick, 2026-11-22, "Each by its own monitor" (I_frame/monitor_frame - <I_bg/monitor_bg>): with I0 chosen,
+    a background set on frame 1 (I0 = 1) is subtracted from frame 2 (its image doubled, I0 = 2) as zero, where the
+    1.2.17 formula (I - B)/m gave half the background, and from frame 3 (image tripled, I0 = 1) as twice it."""
+    _scaled(tmp_path, "escan", 1, 16, 1, 1)
+    _scaled(tmp_path, "escan", 2, 16, 2, 2)
+    _scaled(tmp_path, "escan", 3, 16, 3, 1)
+    with _page(qapp, _series(tmp_path, (16, 16, 16), mode="Int 1D")) as (page, view, observed):
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+        controller = page._context_controller
+        first, second, third = controller.navigation.frames[:3]
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_NORM_CHANNEL, "I0"))
+
+        def show(*frames):
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[-1], frames=frames))
+            assert _pump(qapp, lambda: {id(t.frame) for t in page._last_scientific_projection.traces}
+                         == {id(frame) for frame in frames} and bool(view.curve.listDataItems()))
+            page._refresh_shell(); qapp.processEvents()
+            return np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
+
+        show(first)
+        assert page._last_scientific_projection.norm_channel.casefold() == "i0"
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG"), page._notice_text
+        background = np.asarray(page._background_owner._result.values, dtype=np.float64)
+        finite = np.isfinite(background)
+        assert finite.any() and np.abs(background[finite]).max() > 0
+        drawn = show(second)  # 2I / 2 - I / 1 = 0 (the 1.2.17 formula gave (2I - I) / 2 = I / 2)
+        np.testing.assert_allclose(drawn[finite], 0.0, atol=1e-4 * np.abs(background[finite]).max())
+        drawn = show(third)  # 3I / 1 - I / 1 = 2I
+        np.testing.assert_allclose(drawn[finite], 2.0 * background[finite], rtol=1e-4)
+        assert page._background_owner.phase == "ACTIVE" and view.background.text() == "Clear 1D BG"
 
 
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):

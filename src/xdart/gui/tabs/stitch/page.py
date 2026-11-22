@@ -3201,12 +3201,11 @@ class StitchPage(QtWidgets.QWidget):
                         pinned_traces=tuple(replace(pinned, trace=named(pinned.trace)) for pinned in state.pinned_traces),
                         gi_modes_1d=("q_total", *cuts) if state.measurement_mode == "GI" else (),
                         title=label or "Current", status=status)
-        from xdart.gui.tabs.scattering.context_projection import (
-            apply_presentation_background, following_trace_values)
-        # the background follows every result drawn, as Int's (LIVE-1218-VIEWER2D-BG)
+        from xdart.gui.tabs.scattering.context_projection import apply_presentation_background
+        # the background follows every result drawn, as Int's (LIVE-1218-VIEWER2D-BG): a map here, a pattern in the
+        # view, which subtracts it from every curve it draws
         state = apply_presentation_background(
-            state, self._background.projection(), self._background.frame_values,
-            following_trace_values(self._background.trace_values, shown))
+            state, self._background.projection(), self._background.frame_values, view_follows_traces=True)
         if (state.heavy is not None and map_mode and self._diagnostic == "Intensity"
                 and state.image_axis in {"Q-Chi", "q_chi"} and not state.derived_2d):
             # Stored counts already have the result's (q, chi) axes; Int renders (chi, q).
@@ -3230,6 +3229,7 @@ class StitchPage(QtWidgets.QWidget):
             for host in self._fit_hosts.values():
                 host.invalidate()
         self.scientific.expect_display_background(self._background.active_key)
+        self.scientific.follow_display_background(self._background.follow_trace)
         self.scientific.reconcile(state, navigation, completed=self.browser.current_result_row() + 1,
                                   total=len(keys), detail="")
         self._sync_fit_tools()

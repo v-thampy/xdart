@@ -27,7 +27,7 @@ from xdart.gui.tabs.scattering.presentation_background import (
 )
 from xdart.gui.tabs.scattering.scientific_view import ScientificView
 from xdart.gui.tabs.scattering.shell_values import (
-    FrameNavigationProjection, ShellCommand, ShellCommandKind, SlicePin,
+    AxisProjection, FrameNavigationProjection, ShellCommand, ShellCommandKind, SlicePin, TraceProjection,
 )
 from xrd_tools.reduction import DisplayBackgroundPlan
 from xrd_tools.session.intent_store import RunIntentStore
@@ -413,6 +413,51 @@ def test_a_detector_mode_change_keeps_an_int_background() -> None:
         for value, path in (("full", ()), ("thumbnail", ("popup",)), ("full", ("popup",)), ("thumbnail", ("popup",))):
             page._handle_shell_command(ShellCommand(ShellCommandKind.SET_DETECTOR_MODE, value, path))
             assert owner.phase == "ACTIVE" and owner.active_key == key, (value, path)
+    finally:
+        page.close_workspace(); page.deleteLater(); qapp.processEvents()
+
+
+def test_a_1d_viewer_background_follows_into_another_file(tmp_path) -> None:
+    """His pick "Any scan or file" in the 1D Viewer (LIVE-1218-VIEWER2D-BG): a real Set BG on one .xye file, then
+    another opened: it is drawn minus the background (twice the first on the same axis: it shows the first)."""
+    from tests.xdart.scattering.test_p2b1_viewer_context_page import _await_ready, _write_xye
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    x = np.linspace(1.0, 5.0, 9)
+    first = _write_xye(tmp_path / "first.xye", x, 10.0 + x ** 2)
+    second = _write_xye(tmp_path / "second.xye", x, 2.0 * (10.0 + x ** 2))
+    chosen = [(str(first),)]
+    page = ScatteringWorkspace(
+        intents=RunIntentStore(RunIntent(processing_mode="1D Viewer", project_root=str(tmp_path))),
+        lifecycle=ScatteringCoordinator(), sources=FilesystemSourceAdapter(),
+        viewer_1d_file_chooser=lambda _start: chosen.pop(0))
+
+    def settle():
+        _await_ready(page._context_controller)
+        for _tick in range(3):
+            page._drain_executor(); page._refresh_shell(); qapp.processEvents()
+
+    def drawn():  # the curve the view mounted (it subtracts a 1-D background as it draws)
+        items = page._shell.scientific.curve.listDataItems()
+        return None if not items else np.asarray(items[-1].yData, np.float64)
+
+    try:
+        page._run_action(); settle()
+        view = page._shell.scientific
+        assert view.background.text() == "Set 1D BG"
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_BACKGROUND))
+        for _tick in range(50):
+            page._drain_executor(); qapp.processEvents()
+            if page._background_owner.phase == "ACTIVE":
+                break
+        page._refresh_shell(); qapp.processEvents()
+        assert page._background_owner.phase == "ACTIVE", page._notice_text
+        key = page._background_owner.active_key
+        np.testing.assert_allclose(drawn(), 0.0, atol=1e-12)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_SCAN, str(second)))  # the browser's open
+        settle()
+        assert page._context_controller.viewer_1d_context.paths == (str(second),)
+        assert page._background_owner.active_key == key and view.background.text() == "Clear 1D BG"
+        np.testing.assert_allclose(drawn(), 10.0 + x ** 2)
     finally:
         page.close_workspace(); page.deleteLater(); qapp.processEvents()
 
@@ -856,41 +901,61 @@ def test_1d_renderer_uses_reused_d_with_baseline_role_parity(plot_mode: str) -> 
         view.close(); qapp.processEvents()
 
 
-def _active_1d_owner(background, axis, *, unit="q\0A^-1"):
+def _active_1d_owner(background, axis, *, unit="q\0A^-1", channel=""):
     plan = DisplayBackgroundPlan("integrated_1d", ("background",), (background.shape,), ((axis.shape,),),
                                  ((unit,),))
     owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
-    reservation = _reserve(owner, plan, ((background, axis),), keys=(11,), indices=(0,))
+    reservation = owner.reserve(
+        plan, ((background, axis),), stamp=OperationContextStamp(0, "context", 1),
+        active_key=("context", 1, plan.domain, "Int 1D", "integrated"), projection_keys=(11,),
+        projection_indices=(0,), norm_channel=channel)
     receipt = owner.run_and_stage(reservation, lambda: False)
     assert owner.promote(receipt, ((background, axis, 1.0),))
     return owner
 
 
-def test_trace_values_follow_every_pattern_drawn_as_promote_does() -> None:
-    """LIVE-1218-VIEWER2D-BG (his words: "the whole idea is to apply it across frames"): a 1-D background gives
-    each pattern drawn (intensity - background) / divisor, as ``promote`` does for the patterns it was set on;
-    on another grid the background is taken at the pattern's axis (NaN outside its range); another quantity or
-    unit is a note, the pattern drawn as it is; the same pattern drawn again gets the same array, another pattern
-    under a reused id its own values."""
+def test_trace_values_follow_every_curve_drawn() -> None:
+    """LIVE-1218-VIEWER2D-BG (his words: "the whole idea is to apply it across frames"): a 1-D background gives each
+    curve drawn its drawn intensity minus the background; on another grid the background is taken at the curve's
+    axis (NaN outside its range), on the same bins to display precision directly; another quantity or unit is a
+    note, the curve drawn as it is; the same curve drawn again gets the same array, another curve under a reused
+    id its own values."""
     axis = np.arange(4.0)
     background = np.array([1.0, 2.0, 3.0, 4.0])
     owner = _active_1d_owner(background, axis)
     pattern = np.array([10.0, 20.0, 30.0, 40.0])
-    drawn = owner.trace_values(pattern, axis, "q\0A^-1", 2.0)
-    np.testing.assert_allclose(drawn, (pattern - background) / 2.0)
-    assert owner.trace_values(pattern, axis, "q\0A^-1", 2.0) is drawn
-    note = owner.trace_values(pattern, axis, "2th\0deg", 2.0)
-    assert type(note) is str and "2th (deg)" in note
+    drawn = owner.trace_values(pattern, axis, "q\0A^-1")
+    np.testing.assert_allclose(drawn, pattern - background)
+    assert owner.trace_values(pattern, axis, "q\0A^-1") is drawn
     assert not drawn.flags.writeable
-    shifted = np.array([0.5, 1.5, 2.5, 3.5])
-    np.testing.assert_allclose(owner.trace_values(pattern, shifted, "q\0A^-1", 1.0),
-                               [8.5, 17.5, 26.5, np.nan], equal_nan=True)
-    note = owner.trace_values(pattern, axis, "2th\0deg", 1.0)
+    note = owner.trace_values(pattern, axis, "2th\0deg")
     assert type(note) is str and "q (A^-1)" in note and "2th (deg)" in note
+    shifted = np.array([0.5, 1.5, 2.5, 3.5])
+    np.testing.assert_allclose(owner.trace_values(pattern, shifted, "q\0A^-1"),
+                               [8.5, 17.5, 26.5, np.nan], equal_nan=True)
+    rounded = (axis + 1e-8).astype(np.float32).astype(np.float64)  # the same bins stored otherwise
+    np.testing.assert_allclose(owner.trace_values(pattern.copy(), rounded, "q\0A^-1"), pattern - background)
     other = pattern + 1.0
-    np.testing.assert_allclose(owner.trace_values(other, axis, "q\0A^-1", 1.0), other - background)
-    assert owner.trace_values(pattern, axis, "q\0A^-1", float("nan")) is None
-    assert owner.frame_values(11, pattern) is None  # a 1-D background follows patterns, not images
+    np.testing.assert_allclose(owner.trace_values(other, axis, "q\0A^-1"), other - background)
+    assert owner.frame_values(11, pattern) is None  # a 1-D background follows curves, not images
+
+
+def test_follow_trace_takes_the_curves_own_basis_and_channel() -> None:
+    """The view's follow corrects a curve from what it carries (its native axis, quantity and unit, and channel),
+    so a kept curve whose frame is gone is corrected as the current one; a curve without a basis, or normalized by
+    another channel than the background was set under, is a note (his pick "Each by its own monitor": the
+    background is of contributors each divided by its own monitor, so a curve under another channel does not fit)."""
+    axis = np.arange(4.0)
+    owner = _active_1d_owner(np.array([1.0, 2.0, 3.0, 4.0]), axis, channel="I0")
+    frame = make_shell_projection(frame_count=1, selected_index=0).navigation.frames[0]
+    shown = TraceProjection(frame, AxisProjection(axis * 2.0, "2θ", "deg"), np.array([5.0, 6.0, 7.0, 8.0]),
+                            background_basis=(axis, "q\0A^-1", "I0"))
+    np.testing.assert_allclose(owner.follow_trace(shown), [4.0, 4.0, 4.0, 4.0])
+    assert "no native axis" in owner.follow_trace(replace(shown, background_basis=None))
+    note = owner.follow_trace(replace(shown, background_basis=(axis, "q\0A^-1", "")))
+    assert "normalized by I0" in note and "not normalized" in note
+    assert owner.release(DisplayBackgroundRendererReleaseReceipt(owner.active_key, True))
+    assert owner.follow_trace(shown) is None
 
 
 def test_a_single_following_pattern_must_fit_the_background_grant() -> None:
@@ -912,66 +977,107 @@ def test_trace_values_charge_the_grant_and_go_with_the_background() -> None:
     base = owner.active_bytes
     patterns = [np.full(1024, float(index)) for index in range(4)]
     for pattern in patterns:
-        owner.trace_values(pattern, axis, "q\0A^-1", 1.0)
+        owner.trace_values(pattern, axis, "q\0A^-1")
     assert owner.active_bytes == base + 4 * 1024 * 8
     owner._capacity = base + 2 * 1024 * 8  # a tight grant: only the two newest stay held
-    owner.trace_values(np.ones(1024), axis, "q\0A^-1", 1.0)
+    owner.trace_values(np.ones(1024), axis, "q\0A^-1")
     assert owner.active_bytes <= owner._capacity and len(owner._followed) == 2
     owner._capacity = 536_870_912
     assert owner.release(DisplayBackgroundRendererReleaseReceipt(owner.active_key, True))
     _assert_background_released(owner)
-    assert owner._followed == {} and owner.trace_values(patterns[0], axis, "q\0A^-1", 1.0) is None
+    assert owner._followed == {} and owner.trace_values(patterns[0], axis, "q\0A^-1") is None
 
 
 def test_trace_values_let_go_of_patterns_no_longer_drawn() -> None:
     """A long Run with a background set draws a new pattern per frame: the values of a pattern that is gone are
     dropped at the next draw, so the owner holds only the patterns still alive, and the same pattern drawn again
-    with another divisor replaces its own values without double counting."""
+    on another axis array replaces its own values without double counting."""
     import gc
     axis = np.arange(1024.0)
     owner = _active_1d_owner(np.zeros(1024), axis)
     base = owner.active_bytes
     for index in range(50):
-        owner.trace_values(np.full(1024, float(index)), axis, "q\0A^-1", 1.0)  # each gone once drawn
+        owner.trace_values(np.full(1024, float(index)), axis, "q\0A^-1")  # each gone once drawn
     gc.collect()
     kept = np.ones(1024)
-    owner.trace_values(kept, axis, "q\0A^-1", 1.0)
+    owner.trace_values(kept, axis, "q\0A^-1")
     assert owner.active_bytes == base + 1024 * 8 and len(owner._followed) == 1
-    owner.trace_values(kept, axis, "q\0A^-1", 2.0)  # the same pattern, normalized otherwise
+    owner.trace_values(kept, axis[::-1].copy()[::-1].copy(), "q\0A^-1")  # the same pattern on a new axis array
     assert owner.active_bytes == base + 1024 * 8 and len(owner._followed) == 1
 
 
-def test_following_trace_values_take_each_payloads_native_pattern_and_divisor() -> None:
-    """The page's hook gives the owner the native pattern of the payload a trace was drawn from, matched by the
-    frame key itself, with the divisor the trace was normalized by (its ``norm_divisor``, the one E6-NORM-N2
-    resolution): a normalized pattern drawn after Set shows (I - B) / d, as ``promote`` gives."""
-    from xdart.gui.tabs.scattering.context_projection import following_trace_values
+def test_a_trace_carries_its_native_basis_and_channel() -> None:
+    """trace_projection gives a native curve its background basis: its native axis, quantity and unit, and the one
+    effective channel it was divided by (E6-NORM-N2's one resolution); a curve without a native row has none."""
     from xdart.gui.tabs.scattering.scientific_axes import trace_projection
     controller, _lifecycle, _executor, _loader, _acquisition_context = _running_controller()
     frame = controller.navigation.current; assert frame is not None
     view = replace(_view(1, 3.0), metadata_numeric={"monitor": 2.0})
     payload = StandardDisplayPayload(0, frame, "monitored", view)
-    calls = []
-    hook = following_trace_values(lambda *args: calls.append(args) or "seen", (payload,))
-    assert hook(SimpleNamespace(frame=frame, norm_divisor=2.0)) == "seen"
-    ((intensity, axis, unit, divisor),) = calls
-    assert intensity is view.intensity_1d and axis is view.axis_1d.values
-    assert unit == f"{view.axis_1d.label}\0{view.axis_1d.unit}" and divisor == 2.0
-    assert hook(SimpleNamespace(frame=replace(frame))) is None  # another key under no payload
-    assert following_trace_values(None, (payload,)) is None
-
     trace = trace_projection(payload, requested_axis=view.axis_1d.label, allow_cake=False, slice_enabled=False,
                              slice_center=0.0, slice_width=1.0, norm_channel="monitor")
-    assert trace is not None and trace.norm_divisor == 2.0
+    assert trace is not None
     np.testing.assert_allclose(trace.intensity, view.intensity_1d / 2.0)
-    background = np.asarray(view.intensity_1d, dtype=np.float64) * 0.25
-    owner = _active_1d_owner(background, np.asarray(view.axis_1d.values, dtype=np.float64),
-                             unit=f"{view.axis_1d.label}\0{view.axis_1d.unit}")
-    follow = following_trace_values(owner.trace_values, (payload,))
-    np.testing.assert_allclose(follow(trace), (view.intensity_1d - background) / 2.0)
+    axis, unit, channel = trace.background_basis
+    assert axis is view.axis_1d.values and unit == f"{view.axis_1d.label}\0{view.axis_1d.unit}"
+    assert channel == "monitor"
+    plain = trace_projection(payload, requested_axis=view.axis_1d.label, allow_cake=False, slice_enabled=False,
+                             slice_center=0.0, slice_width=1.0)
+    assert plain.background_basis[2] == ""
+
+
+@pytest.mark.parametrize("plot_mode", ("Overlay", "Average", "Sum", "Waterfall"))
+def test_the_view_subtracts_a_1d_background_from_every_curve_it_draws(plot_mode: str) -> None:
+    """Codex's event-2 HOLD: the view subtracts a 1-D background at its one rows point, after the history merges,
+    so every curve it draws is corrected before Overlay offsets, the Average and Sum folds and the Waterfall image;
+    the history keeps the curves as they are, and the release brings them back."""
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shell = make_shell_projection(frame_count=4, selected_index=3, heavy_indices=(3,), plot_mode=plot_mode)
+    traces = tuple(replace(trace, background_basis=(trace.axis.values, f"{trace.axis.label}\0{trace.axis.unit}", ""))
+                   for trace in shell.scientific.traces)
+    state = replace(shell.scientific, processing_mode="Int 1D", traces=traces,
+                    plot_options=replace(shell.scientific.plot_options, overlay_offset=0.0))
+    axis = traces[0].axis
+    background = np.asarray(traces[0].intensity, dtype=np.float64) * 0.5
+    owner = _active_1d_owner(background, np.asarray(axis.values, dtype=np.float64),
+                             unit=f"{axis.label}\0{axis.unit}")
+    corrected = [np.asarray(trace.intensity, np.float64) - background for trace in traces
+                 if any(trace.frame is frame for frame in shell.navigation.selected)]
+    view = ScientificView()
+    try:
+        view.expect_display_background(owner.active_key)
+        view.follow_display_background(owner.follow_trace)
+        active = apply_presentation_background(state, owner.projection(), view_follows_traces=True)
+        assert active.traces is state.traces and active.background_set
+        view.reconcile(active, shell.navigation, completed=4, total=4, detail="Ready")
+        if plot_mode == "Waterfall":
+            np.testing.assert_allclose(view.waterfall.image.image.T, np.stack(corrected), rtol=1e-5, equal_nan=True)
+        elif plot_mode in {"Average", "Sum"}:
+            (item,) = view.curve.listDataItems()
+            fold = np.nanmean if plot_mode == "Average" else np.nansum
+            np.testing.assert_allclose(item.getData()[1], fold(np.stack(corrected), axis=0), rtol=1e-5)
+        else:
+            drawn = [item.getData()[1] for item in view.curve.listDataItems()]
+            assert len(drawn) == len(corrected)
+            for got, want in zip(drawn, corrected, strict=True):
+                np.testing.assert_allclose(got, want, rtol=1e-5, equal_nan=True)
+        assert all(trace in traces for trace in view.trace_history_projections)  # kept as they are
+        receipt = view.release_display_background(owner.active_key)
+        assert receipt.released and owner.release(receipt)
+        view.reconcile(replace(state, background_set=False), shell.navigation, completed=4, total=4, detail="Ready")
+        if plot_mode == "Overlay":
+            drawn = [item.getData()[1] for item in view.curve.listDataItems()]
+            selected = [t for t in traces if any(t.frame is frame for frame in shell.navigation.selected)]
+            for got, trace in zip(drawn, selected, strict=True):
+                np.testing.assert_allclose(got, trace.intensity, rtol=1e-6)
+    finally:
+        view.close(); qapp.processEvents()
 
 
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
+    """His pick, 2026-11-22, "Each by its own monitor" (the question's formula I_frame/monitor_frame -
+    <I_bg/monitor_bg>): the contributors are each divided by their own monitor before the mean, and a frame is
+    drawn as its own normalized values minus that (before 1.2.18: (I - B) / m with B in raw counts)."""
     axis = np.arange(3.0)
     background = np.array([2.0, 4.0, 6.0])
     source = np.array([10.0, 20.0, 30.0])
@@ -983,7 +1089,7 @@ def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -
     receipt = owner.run_and_stage(reservation, lambda: False)
     assert owner.promote(receipt, ((source, axis, 2.0),))
     displayed = owner.projection()[1][0][1]
-    np.testing.assert_allclose(displayed, (source - background) / 2.0)
+    np.testing.assert_allclose(displayed, source / 2.0 - background)
 
     refused = PresentationBackgroundOwner(capacity_bytes=536_870_912)
     reservation = _reserve(refused, plan, ((background, axis),), keys=(11,), indices=(0,))
@@ -999,6 +1105,7 @@ def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -
         contributor_count=1, norm_channel="monitor")
     assert prepared is not None
     assert prepared[3][0][2] == 2.0
+    np.testing.assert_allclose(prepared[1][0][0], view.intensity_1d / 2.0)  # the contributor, by its own monitor
     assert prepared[4] == ("monitor", ((id(monitored.frame_key), (2,), ((2,),),
                                         ("q\0A^-1",), 2.0),))
     assert prepare_background_plan(

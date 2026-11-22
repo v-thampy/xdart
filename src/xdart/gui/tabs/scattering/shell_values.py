@@ -520,20 +520,23 @@ class TraceProjection:
     #: This native profile's angular coverage, or the reason it has none (COVERAGE-SUPPORT-20261013); None when its
     #: producer carries none. A display conversion of the axis keeps the profile, each bin's own result.
     angular_support: AngularSupportProfile | None = None
-    #: the normalization divisor this trace's intensity was divided by (E6-NORM-N2: its payload's own kernel value,
-    #: resolved once in ``trace_projection``); 1.0 for none. A 1-D display background takes it for each pattern
-    #: drawn (LIVE-1218-VIEWER2D-BG), never resolving the channel again.
-    norm_divisor: float = 1.0
+    #: what a 1-D display background needs to subtract itself from this curve wherever it is drawn, also once its
+    #: frame is gone from the view (an Overlay's kept curve; LIVE-1218-VIEWER2D-BG): the native axis values its
+    #: intensity bins sit on, that axis's "label\0unit", and the normalization channel it was divided by ("" for
+    #: none). None for a curve that is not its frame's native pattern (a cake slice).
+    background_basis: tuple[np.ndarray, str, str] | None = None
 
     def __post_init__(self) -> None:
+        basis = self.background_basis
         if (
             type(self.frame) is not DisplayFrameKey
             or type(self.intensity) is not np.ndarray
             or self.intensity.ndim != 1
             or self.intensity.shape != self.axis.values.shape
-            or type(self.norm_divisor) is not float
-            or not math.isfinite(self.norm_divisor)
-            or self.norm_divisor <= 0.0
+            or basis is not None and (
+                type(basis) is not tuple or len(basis) != 3
+                or type(basis[0]) is not np.ndarray or basis[0].shape != self.intensity.shape
+                or type(basis[1]) is not str or type(basis[2]) is not str)
         ):
             raise TypeError("trace projection is invalid")
         if self.angular_support is not None and (

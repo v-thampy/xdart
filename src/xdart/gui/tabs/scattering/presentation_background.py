@@ -33,6 +33,16 @@ def _same_grid(shown, reference) -> bool:
     return True
 
 
+def _same_bins(axis, reference) -> bool:
+    """Whether a 1-D curve's bins are the background's: the same count at the same positions to display (float32)
+    precision. Two scans integrated alike can differ in their stored axes by a rounding, which would otherwise take
+    the interpolation path and lose an edge bin to NaN."""
+    if axis.shape != reference.shape:
+        return False
+    scale = float(np.nanmax(np.abs(reference))) if reference.size else 0.0
+    return bool(np.allclose(axis, reference, rtol=1e-6, atol=1e-6 * scale, equal_nan=False))
+
+
 def _immutable_copy(array: np.ndarray) -> np.ndarray:
     copied = np.frombuffer(array.tobytes(order="C"), dtype=array.dtype).reshape(array.shape)
     copied.setflags(write=False)
@@ -99,7 +109,7 @@ def prepare_background_plan(payloads, domain: str, current, *,
     except (TypeError, ValueError):
         return None
     indices = tuple(range(len(items))) if domain == "integrated_1d" else (current_index,)
-    keys, targets, facts = [], [], []
+    keys, targets, facts, divisors = [], [], [], {}
     for index in indices:
         item = items[index]
         if item is None:
@@ -112,6 +122,7 @@ def prepare_background_plan(payloads, domain: str, current, *,
                 if index < count: return None
                 continue
             divisor = float(resolved)
+        divisors[index] = divisor
         if domain == "integrated_1d" and units[index] != plan.axis_units[0]:
             return None
         frame = payloads[index].frame_key
@@ -122,6 +133,11 @@ def prepare_background_plan(payloads, domain: str, current, *,
                       tuple(axis.shape for axis in item[1:]), units[index], divisor))
     if not targets:
         return None
+    if domain == "integrated_1d" and norm_channel:
+        # his pick, 2026-11-22, "Each by its own monitor": the background is the mean of the contributors each divided
+        # by its own monitor, so a frame of another flux compares fairly (I/m - <I_bg/m_bg>)
+        contributors = [(np.divide(item[0], divisors[index], dtype=np.float64), *item[1:])
+                        for index, item in enumerate(contributors)]
     return (plan, tuple(contributors), tuple(keys), tuple(targets),
             (norm_channel, tuple(facts)))
 
@@ -188,6 +204,9 @@ class PresentationBackgroundOwner:
         #: the patterns gone since (their weak references' callbacks, which only append, never lock): their values
         #: are dropped at the next ``trace_values``, so a long Run's patterns do not stay held up to the grant
         self._followed_gone: deque = deque()
+        #: the normalization channel a 1-D background was set under ("" for none): its mean is of the contributors
+        #: each divided by its own monitor, so a curve normalized otherwise does not fit it (``follow_trace``)
+        self._norm_channel = ""
 
     @property
     def capacity_bytes(self) -> int:
@@ -218,7 +237,7 @@ class PresentationBackgroundOwner:
         contributors: tuple[tuple[np.ndarray, ...], ...],
         *, stamp: OperationContextStamp, active_key: tuple[object, ...],
         projection_keys: tuple[int, ...], projection_indices: tuple[int, ...] = (),
-        projection_shapes: tuple[tuple[int, ...], ...] = (),
+        projection_shapes: tuple[tuple[int, ...], ...] = (), norm_channel: str = "",
     ) -> int | None:
         if (type(plan) is not DisplayBackgroundPlan
                 or type(stamp) is not OperationContextStamp
@@ -273,6 +292,7 @@ class PresentationBackgroundOwner:
             self._projection_indices = projection_indices
             self._projection_shapes = projection_shapes
             self._reserved_bytes = q
+            self._norm_channel = norm_channel if type(norm_channel) is str else ""
         try:
             copied = tuple(tuple(_immutable_copy(array) for array in item)
                            for item in contributors)
@@ -372,17 +392,19 @@ class PresentationBackgroundOwner:
                         return False
                 owner = np.empty(shape, dtype=np.float64)
                 flat = owner.reshape(-1)
-                if result.domain == "integrated_1d" and not np.array_equal(
-                        target[1], result.axes[0]):
-                    for start in range(0, flat.size, _BLOCK):
-                        stop = min(flat.size, start + _BLOCK)
-                        background = np.interp(target[1][start:stop], result.axes[0],
-                                               result.values, left=np.nan, right=np.nan)
-                        np.subtract(source[start:stop], background, out=flat[start:stop])
+                if result.domain == "integrated_1d":
+                    # I/m - <I_bg/m_bg> (his pick "Each by its own monitor"): the contributors were divided by their
+                    # own monitors before the mean
+                    np.divide(source, divisor, out=owner, casting="unsafe")
+                    if not _same_bins(target[1], result.axes[0]):
+                        for start in range(0, flat.size, _BLOCK):
+                            stop = min(flat.size, start + _BLOCK)
+                            flat[start:stop] -= np.interp(target[1][start:stop], result.axes[0],
+                                                          result.values, left=np.nan, right=np.nan)
+                    else:
+                        np.subtract(owner, result.values, out=owner)
                 else:
                     np.subtract(source, result.values, out=owner, casting="unsafe")
-                if result.domain == "integrated_1d":
-                    np.divide(owner, divisor, out=owner)
                 owner.setflags(write=False); displayed.append(owner)
         except BaseException:
             return False
@@ -450,23 +472,46 @@ class PresentationBackgroundOwner:
             self._shown_source = followed
         return displayed
 
-    def trace_values(self, intensity, axis, unit_key: str, divisor: float = 1.0):
-        """An Int 1-D background (Int 1D's, the 1D Viewer's, Stitch 1D's) subtracted from a pattern drawn now, as
-        ``promote`` does for the patterns it was set on (his words: "the whole idea is to apply it across frames";
-        "If it is dropped on selection change what is the point of it at all?"). ``intensity`` and ``axis`` are the
-        pattern's own native values, ``unit_key`` its axis "label\\0unit" and ``divisor`` its normalization (1.0
-        for none): the values are (intensity - background) / divisor, the background taken at the pattern's axis
-        when its grid differs (NaN outside the background's range). A note (a str) when the pattern's axis is on
-        another quantity or unit, so it is drawn as it is; None when no 1-D background is active or the pattern is
-        not one. The same pattern drawn again gets the same array."""
+    def follow_trace(self, trace):
+        """The view's follow (``ScientificView.expect_display_background``): an Int 1-D background (Int 1D's, the 1D
+        Viewer's, Stitch 1D's) subtracted from a curve as it is drawn, any curve, also an Overlay's kept curve whose
+        frame is gone (his words: "the whole idea is to apply it across frames"; Codex's event-2 HOLD). The curve
+        carries what it takes (``TraceProjection.background_basis``): its native axis, that axis's quantity and
+        unit, and the channel it was normalized by. The values are its drawn intensity minus the background at its
+        axis (``trace_values``). A note (a str) when it does not fit (no basis, another channel, another quantity or
+        unit), so it is drawn as it is; None when no 1-D background is active."""
+        with self._lock:
+            if (self._phase != "ACTIVE" or self._result is None or self._plan is None
+                    or self._plan.domain != "integrated_1d"):
+                return None
+            channel = self._norm_channel
+        basis = getattr(trace, "background_basis", None)
+        if basis is None:
+            return "This curve has no native axis to match the background's, so it is drawn as it is."
+        axis, unit_key, drawn_channel = basis
+        if drawn_channel != channel:
+            def named(value):
+                return f"normalized by {value}" if value else "not normalized"
+            return (f"The background is {named(channel)}; this curve is {named(drawn_channel)}, so it is drawn as "
+                    "it is.")
+        return self.trace_values(trace.intensity, axis, unit_key)
+
+    def trace_values(self, intensity, axis, unit_key: str):
+        """An Int 1-D background subtracted from a curve drawn now: ``intensity`` is the curve's drawn values (already
+        divided by its own monitor when normalized), on ``axis``, its native bins, whose quantity and unit are
+        ``unit_key`` ("label\\0unit"). The values are intensity - background, the background taken at the curve's
+        axis when its grid differs (NaN outside the background's range): with the background the mean of its
+        contributors each divided by its own monitor, I/m - <I_bg/m_bg> (his pick "Each by its own monitor"). A note
+        (a str) when the axis is on another quantity or unit, or the values would exceed the grant, so it is drawn as
+        it is; None when no 1-D background is active or the curve is not one. The same curve drawn again gets the
+        same array."""
         with self._lock:
             self._drop_gone_patterns_locked()
             if (self._phase != "ACTIVE" or self._result is None or self._plan is None
                     or self._plan.domain != "integrated_1d"):
                 return None
             if (type(intensity) is not np.ndarray or type(axis) is not np.ndarray or intensity.ndim != 1
-                    or axis.shape != intensity.shape or type(divisor) is not float
-                    or not np.isfinite(divisor) or divisor <= 0.0):
+                    or axis.shape != intensity.shape or type(unit_key) is not str):
                 return None
             result, reservation = self._result, self._reservation
             units = result.axis_units
@@ -474,19 +519,19 @@ class PresentationBackgroundOwner:
                 def named(key):
                     label, _, unit = str(key).partition("\0")
                     return f"{label} ({unit})" if unit else label
-                return (f"The background is on {named(units[0])}; this pattern is on "
+                return (f"The background is on {named(units[0])}; this curve is on "
                         f"{named(unit_key)}, so it is drawn as it is.")
             entry = self._followed.get(id(intensity))
             if (entry is not None and entry[0]() is intensity and entry[1]() is axis
-                    and entry[2] == divisor):
+                    and entry[2] == unit_key):
                 self._followed.move_to_end(id(intensity))
                 return entry[3]
             base = self._active_bytes - self._followed_bytes
             if base + intensity.size * np.dtype(np.float64).itemsize > self._capacity:
-                return "This pattern exceeds the display background allowance, so it is drawn as it is."
+                return "This curve exceeds the display background allowance, so it is drawn as it is."
         try:
             displayed = np.empty(intensity.shape, dtype=np.float64)
-            if axis.shape == result.axes[0].shape and np.array_equal(axis, result.axes[0]):
+            if _same_bins(axis, result.axes[0]):
                 np.subtract(intensity, result.values, out=displayed, casting="unsafe")
             else:
                 for start in range(0, displayed.size, _BLOCK):
@@ -494,11 +539,10 @@ class PresentationBackgroundOwner:
                     background = np.interp(axis[start:stop], result.axes[0], result.values,
                                            left=np.nan, right=np.nan)
                     np.subtract(intensity[start:stop], background, out=displayed[start:stop])
-            np.divide(displayed, divisor, out=displayed)
             displayed.setflags(write=False)
             gone = self._followed_gone
             held = (weakref.ref(intensity, lambda ref, key=id(intensity): gone.append((key, ref))),
-                    weakref.ref(axis), divisor, displayed)
+                    weakref.ref(axis), unit_key, displayed)
         except (TypeError, ValueError):
             return None
         with self._lock:
@@ -562,7 +606,7 @@ class PresentationBackgroundOwner:
     def _drop_locked(self) -> None:
         self._keyed_source = None
         self._shown_source = self._shown_grid = None
-        self._followed.clear(); self._followed_bytes = 0; self._followed_gone.clear()
+        self._followed.clear(); self._followed_bytes = 0; self._followed_gone.clear(); self._norm_channel = ""
         self._contributors = (); self._result = None; self._display_values = ()
         self._plan = None; self._stamp = None; self._active_key = None
         self._projection_keys = (); self._projection_indices = (); self._projection_shapes = ()

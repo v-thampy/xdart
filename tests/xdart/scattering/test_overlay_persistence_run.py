@@ -127,6 +127,34 @@ def test_overlay_starts_new_when_the_next_run_samples_another_grid(qapp, tmp_pat
             "Started a new overlay: sampled axes do not match."]
 
 
+def test_setting_background_updates_every_retained_overlay_curve(qapp, tmp_path):
+    """Codex's event-2 HOLD (LIVE-1218-VIEWER2D-BG): Set BG in Int 1D Overlay corrects every curve shown, the kept
+    curve of the earlier scan too; Clear BG brings each back as it was."""
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    with _page(qapp, intent) as (page, view, events):
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
+        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("b", 1)], "int1d")
+        assert _rows(page) == [("a_int1d.nexus", 1), ("b_int1d.nexus", 1)]
+        first, second = (item.yData.copy() for item in view.curve.listDataItems())
+        assert np.isfinite(second).any() and np.nanmax(second) > 0
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG")
+        assert _rows(page) == [("a_int1d.nexus", 1), ("b_int1d.nexus", 1)]
+        corrected_first, corrected_second = (item.yData for item in view.curve.listDataItems())
+        scale = 1e-6 * float(np.nanmax(np.abs(second)))  # the drawn copies are float32 (display precision)
+        np.testing.assert_allclose(corrected_second, second - second, atol=scale)
+        np.testing.assert_allclose(corrected_first, first - second, atol=scale)
+        # Clear BG brings every curve back as it was, the kept one too (it used to wipe the kept curves)
+        view.background.click()
+        assert _pump(qapp, lambda: view.background.text() == "Set 1D BG")
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 2)
+        assert _rows(page) == [("a_int1d.nexus", 1), ("b_int1d.nexus", 1)]
+        restored_first, restored_second = (item.yData for item in view.curve.listDataItems())
+        np.testing.assert_allclose(restored_first, first, atol=scale)
+        np.testing.assert_allclose(restored_second, second, atol=scale)
+
+
 def _gi_run_view(artifact, scan, labels):
     """A GI Run's view of one scan: its frames, all selected, a q curve each, as its payloads name them."""
     frames = tuple(DisplayFrameKey(RunIdentity(7, "overlay-persist"), scan, artifact, label, label) for label in labels)
