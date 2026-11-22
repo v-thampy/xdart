@@ -380,7 +380,7 @@ class PresentationBackgroundOwner:
         is drawn; a note (a str) when the background does not fit ``source``, which is drawn as it is (his word: "if
         the shapes don't match the BG should be ignored. No need to throw an error"); None when no such background
         is active. A 2-D background fits a map of its shape whose presented axes (``grid``: the shown map's y and x
-        axes) equal those of the frame it was set on, as first drawn. The values replace the frame displayed
+        axes) equal those of its first draw after Set (the frame it was set on). The values replace the frame displayed
         before, in the one displayed frame this background's reservation charged, so its memory stays as
         reserved."""
         with self._lock:
@@ -388,21 +388,22 @@ class PresentationBackgroundOwner:
                     or self._plan.domain not in _FOLLOWING or len(self._display_values) != 1):
                 return None
             result, reservation, domain = self._result, self._reservation, self._plan.domain
-            shown = self._display_values[0]
-            if ((self._shown_source is not None and self._shown_source() is source)
-                    or (self._projection_keys and self._projection_keys[0] == frame_key
-                        and type(source) is np.ndarray and source.shape == shown.shape)):
-                if domain == "integrated_2d" and grid:
+            # the image drawn, held weakly, never a bare frame id: the background outlives the frames it was drawn
+            # on, so an id can come back as another frame's
+            if self._shown_source is not None and self._shown_source() is source:
+                if domain == "integrated_2d" and grid and self._shown_grid is None:
                     self._shown_grid = tuple(grid)
-                return shown
+                return self._display_values[0]
             reference = self._shown_grid
         shape = tuple(result.values.shape)
         if type(source) is not np.ndarray or source.shape != shape:
             frame = " × ".join(map(str, getattr(source, "shape", ())))
             return (f"The background ({' × '.join(map(str, shape))}) does not fit this frame ({frame}), "
                     "which is drawn as it is.")
-        if domain == "integrated_2d" and not _same_grid(grid, reference):
+        if domain == "integrated_2d" and reference is not None and not _same_grid(grid, reference):
             return "The background's map axes differ from this frame's, which is drawn as it is."
+        if domain == "integrated_2d" and not _same_grid(grid, grid):
+            return "This frame's map has no axes to match the background's, so it is drawn as it is."
         try:
             displayed = np.empty(shape, dtype=np.float64)
             np.subtract(source, result.values, out=displayed, casting="unsafe")
@@ -416,6 +417,8 @@ class PresentationBackgroundOwner:
                 return None
             self._display_values, self._projection_keys = (displayed,), (frame_key,)
             self._shown_source = followed
+            if domain == "integrated_2d" and self._shown_grid is None:
+                self._shown_grid = tuple(grid)  # the first draw after Set: the frame it was set on
         return displayed
 
     def release(self, receipt: DisplayBackgroundRendererReleaseReceipt | None = None) -> bool:

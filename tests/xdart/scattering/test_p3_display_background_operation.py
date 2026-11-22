@@ -581,6 +581,29 @@ def test_2d_background_draws_a_map_on_other_axes_or_shape_as_it_is() -> None:
     assert owner.active_bytes == receipt.retained_bytes + heavy.cake.size * 8
 
 
+def test_following_background_matches_the_image_not_a_reused_frame_id() -> None:
+    """A following background outlives the frames it was drawn on, so a frame's id can be reused by another frame:
+    the values follow the image drawn (held weakly), never a bare id, and a 2-D background takes its axes from its
+    first draw after Set."""
+    shell = make_shell_projection(frame_count=3, selected_index=2, heavy_indices=(2,), plot_mode="Single")
+    heavy = shell.scientific.heavy; assert heavy is not None
+    raw = np.asarray(heavy.raw, dtype=np.float64)
+    plan = DisplayBackgroundPlan("raw", ("image",), (raw.shape,), ((),), ((),))
+    owner = PresentationBackgroundOwner(capacity_bytes=536_870_912)
+    reservation = owner.reserve(
+        plan, ((raw,),), stamp=OperationContextStamp(0, "context", 1),
+        active_key=("context", 1, "raw", "2D Viewer"), projection_keys=(id(heavy.frame),),
+        projection_indices=(0,))
+    receipt = owner.run_and_stage(reservation, lambda: False)
+    assert owner.promote(receipt, ((raw,),))
+    key = owner.projection()[1][0][0]
+    np.testing.assert_allclose(owner.frame_values(key, raw), np.zeros_like(raw))
+    other = raw + 3.0  # another frame's image under the same (reused) id and shape
+    np.testing.assert_allclose(owner.frame_values(key, other), np.full(raw.shape, 3.0))
+    again = owner.frame_values(key, other)
+    assert again is owner.frame_values(key, other)  # the same image keeps the same array
+
+
 def test_active_1d_background_still_revokes_on_a_frame_choice(monkeypatch) -> None:
     """A 1-D background holds the traces it was set on: a frame choice lets it go, as before."""
     qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
