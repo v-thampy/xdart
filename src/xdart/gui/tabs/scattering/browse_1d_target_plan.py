@@ -208,8 +208,13 @@ class _Refused(RuntimeError):
     pass
 
 
+class _TooManyToFold(_Refused):
+    """An Average or Sum of more frames than the Browse display holds: its message is the user's notice."""
+
+
 def _diagnostic(error: BaseException | str) -> str:
-    text = error if type(error) is str else f"{type(error).__name__}: {error}"
+    text = (error if type(error) is str else str(error) if isinstance(error, _TooManyToFold)
+            else f"{type(error).__name__}: {error}")
     return str(text)[:_MAX_DIAGNOSTIC_CHARS]
 
 
@@ -402,9 +407,9 @@ def plan_browse_1d_targets(
         # more than the display holds is refused, not thinned.
         logical = stacked
         if plot_mode in {"Average", "Sum"} and len(logical) > MAX_BROWSE_1D_DISPLAY_TARGETS:
-            raise _Refused(
+            raise _TooManyToFold(
                 f"Browse {plot_mode} folds at most {MAX_BROWSE_1D_DISPLAY_TARGETS} frames; "
-                f"{len(logical)} are selected"
+                f"{len(logical)} are selected, so nothing is folded"
             )
         candidates = logical
         positions = tuple(range(1, len(logical) + 1))

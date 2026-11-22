@@ -3766,7 +3766,8 @@ class ScientificView(QtWidgets.QFrame):
         if _detached_root_bytes(incoming) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
             raise ValueError("Browse comparison display budget exceeded")
         on_show = next((trace for trace in incoming if trace.frame is current), incoming[0] if incoming else None)
-        retained, incoming = self._admit_comparison(retained, incoming, on_show)
+        retained, incoming = self._admit_comparison(retained, incoming, on_show,
+                                                    aggregate=state.plot_mode in {"Average", "Sum"})
         aggregate = state.plot_mode in {"Average", "Sum"}
         if aggregate and retained and len(retained) + len(incoming) > MAX_WATERFALL_DISPLAY_ROWS:
             # a mean is of exactly the curves it says, never a display sample: past the display's rows the kept
@@ -3832,6 +3833,8 @@ class ScientificView(QtWidgets.QFrame):
         retained: tuple[TraceProjection, ...],
         current: tuple[TraceProjection, ...],
         on_show: TraceProjection | None,
+        *,
+        aggregate: bool = False,
     ) -> tuple[tuple[TraceProjection, ...], tuple[TraceProjection, ...]]:
         """The curves an Overlay draws with ``on_show``, the one on show, as (retained, current): those on the
         comparison's grid, the same axis kind and unit and sampled values to floating jitter (canonical_grid_overlay.md).
@@ -3842,6 +3845,15 @@ class ScientificView(QtWidgets.QFrame):
         from . import browse_1d_display
 
         if on_show is None:
+            return retained, current
+        if aggregate:
+            # Average and Sum fold curves on different grids of one axis onto a common grid (aggregate_traces): no
+            # curve leaves for its grid (his pick "In 1.2.18"); the detached budget still applies, with its notice
+            if _detached_root_bytes((*retained, *current)) > browse_1d_display.MAX_BROWSE_1D_DETACHED_BYTES:
+                shown = self._trace_row(on_show.frame)[0]
+                retained = tuple(trace for trace in retained if self._trace_row(trace.frame)[0] == shown)
+                current = tuple(trace for trace in current if self._trace_row(trace.frame)[0] == shown)
+                self.browse_comparison_notice = "The fold keeps this file's curves only: detached display budget reached."
             return retained, current
         refused, notice = self._comparison_refused, ""
         key = self._axis_key(on_show.axis) or (on_show.axis.label, on_show.axis.unit)
@@ -4048,7 +4060,8 @@ class ScientificView(QtWidgets.QFrame):
             on_show = next((trace for trace in current if trace.frame is navigation.current),
                            current[-1] if current else None)
             count = len(retained) + len(current)
-            retained, current = self._admit_comparison(retained, current, on_show)
+            retained, current = self._admit_comparison(retained, current, on_show,
+                                                       aggregate=state.plot_mode in {"Average", "Sum"})
             if len(retained) + len(current) < count:
                 kept = {id(trace.frame) for trace in (*retained, *current)}
                 self._trace_history_by_identity = {

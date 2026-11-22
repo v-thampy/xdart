@@ -916,6 +916,41 @@ def test_set_bg_on_a_two_frame_browse_selection_takes_the_detached_patterns(qapp
             np.testing.assert_allclose(values[finite], 0.0, atol=1e-4 * float(np.nanmax(np.abs(background))))
 
 
+def test_a_refused_browse_average_draws_nothing_beside_its_notice(qapp, tmp_path, monkeypatch):
+    """A mean is of exactly the frames chosen (his pick "In 1.2.18"): with the display's limit at 2 frames, an
+    Overlay of 3 switched to Average is refused, and nothing is drawn beside the notice (the view held a display
+    sample, which it must not fold); then Average of 2 is their exact mean and the notice is gone; 3 again is refused."""
+    from xdart.gui.tabs.scattering import browse_1d_target_plan as plan_module
+    monkeypatch.setattr(plan_module, "MAX_BROWSE_1D_DISPLAY_TARGETS", 2)
+    for index, scale in ((1, 1), (2, 2), (3, 3)):
+        _scaled(tmp_path, "escan", index, 16, scale, 1)
+    with _page(qapp, _series(tmp_path, (16, 16, 16), mode="Int 1D")) as (page, view, observed):
+        _run(qapp, page, observed)
+        _browsing(qapp, page)
+        controller = page._context_controller
+        frames = tuple(controller.navigation.frames[:3])
+        drawn = {}
+        for frame in frames:
+            page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frame, frames=(frame,)))
+            assert _pump(qapp, lambda: page._last_scientific_projection.traces
+                         and page._last_scientific_projection.traces[-1].frame is frame
+                         and bool(view.curve.listDataItems()))
+            drawn[id(frame)] = np.asarray(view.curve.listDataItems()[-1].yData, dtype=np.float64)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[-1], frames=frames))
+        assert _pump(qapp, lambda: len(controller.navigation.selected) == 3)
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Average"))
+        assert _pump(qapp, lambda: "folds at most 2 frames" in page._notice_text)
+        assert _pump(qapp, lambda: not view.curve.listDataItems())
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[1], frames=frames[:2]))
+        expected = (drawn[id(frames[0])] + drawn[id(frames[1])]) / 2
+        assert _pump(qapp, lambda: len(view.curve.listDataItems()) == 1 and np.allclose(
+            np.asarray(view.curve.listDataItems()[0].yData, np.float64), expected, rtol=1e-5))
+        assert "folds at most" not in page._notice_text
+        page._handle_shell_command(ShellCommand(ShellCommandKind.SELECT_FRAME, frame=frames[-1], frames=frames))
+        assert _pump(qapp, lambda: "folds at most 2 frames" in page._notice_text and not view.curve.listDataItems())
+
+
 def test_g5_same_path_replacement_retires_the_old_basis_and_drops_late_hydration(qapp, tmp_path):
     with _page(qapp, _series(tmp_path, (16, 16))) as (page, view, observed):
         _run(qapp, page, observed)

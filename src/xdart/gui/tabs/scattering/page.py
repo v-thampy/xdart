@@ -703,6 +703,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
         self._browse_1d_release_debt: Browse1DBorrowBundle | None = None
         #: the last Browse 1-D display's detached payloads and their context token (_background_contributors)
         self._browse_1d_detached: tuple[object, tuple] | None = None
+        self._browse_1d_refusal_notice = ""
         self._quartile_refresh_identity: RunIdentity | None = None
         self._quartile_refresh_seconds = [0.0, 0.0, 0.0, 0.0]
         self._browser_directory_chooser = (
@@ -2372,8 +2373,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             image_axis=self._preferences.image_axis)
         if prepared is None:
             self._notice("Select at least one display frame before setting background." if not selected else
-                         "Display background needs every selected frame's pattern: show the selection once, or "
-                         "select fewer frames.")
+                         "Set 2D BG takes the maps of the frames shown with their images: in Browse, select one "
+                         "frame." if domain == "integrated_2d" and len(selected) > 1 else
+                         "Display background needs every selected frame's pattern: wait for the selection to draw, "
+                         "or select fewer frames.")
             self._refresh_shell(); return
         plan, contributors, keys, targets, target_facts = prepared
         stamp = self._operation_context_stamp()
@@ -7535,7 +7538,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             }
             and not self._preferences.slice_enabled
             and not self._preferences.slice_pins
+            # the 1-D cache holds the native pattern only: an Average or Sum of cake cuts (a χ axis) stays refused
+            and not (self._preferences.plot_mode in {"Average", "Sum"} and cake_axis_requested)
         )
+        if not browse_selected:
+            self._browse_1d_detached = None  # its copies only serve a Browse selection (_background_contributors)
         browse_slices = bool(
             browse_selected
             and intent.processing_mode == "Int 2D"
@@ -7625,6 +7632,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                         or "Browse 1-D display was refused."
                     )
                     self._notice(cache_terminal_diagnostic)
+                    self._browse_1d_refusal_notice = cache_terminal_diagnostic
+                    if self._preferences.plot_mode in {"Average", "Sum"}:
+                        # an Average or Sum refused draws nothing: the view must not fold the curves it holds (a
+                        # display sample, or an earlier selection) beside the notice
+                        self._shell.scientific.clear_trace_history()
                 # Compatibility is checked against the fully projected
                 # presentation contract below.  Until then, do not expose a
                 # payload-free projection that could retain a stale hybrid.
@@ -7634,6 +7646,10 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                     self._ensure_timer()
             else:
                 payloads = adopted.payloads
+                refusal = getattr(self, "_browse_1d_refusal_notice", "")
+                if refusal and self._notice_text == refusal:
+                    self._notice("")  # an earlier Browse refusal no longer holds
+                self._browse_1d_refusal_notice = ""
                 # the detached copies Set BG may average (_background_contributors), for this Browse context only
                 selection_now = self._context_controller.selection
                 self._browse_1d_detached = (

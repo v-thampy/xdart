@@ -1184,6 +1184,33 @@ def test_differing_grid_float32_contributors_are_taken_as_float64() -> None:
     np.testing.assert_allclose(values, [1.0, 2.75, 3.75, 4.75], equal_nan=True)
 
 
+@pytest.mark.parametrize("mode", ("Average", "Sum"))
+def test_an_average_of_curves_on_two_grids_folds_both_during_a_run(mode: str) -> None:
+    """Since 1.2.18 Average and Sum keep the comparison (his pick "In 1.2.18"); during a Run (acquisition selected)
+    two selected curves on different grids of one axis must still both reach the fold, on the common grid, as before,
+    never one left out by the Overlay's grid admission."""
+    qapp = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shell = make_shell_projection(frame_count=2, selected_index=1, plot_mode=mode)
+    first, second = shell.scientific.traces[:2]
+    axis = first.axis
+    shifted = replace(second, axis=AxisProjection(np.asarray(axis.values) + 0.37 * float(np.diff(axis.values)[0]),
+                                                  axis.label, axis.unit))
+    state = replace(shell.scientific, processing_mode="Int 1D", traces=(first, shifted), acquisition_selected=True)
+    view = ScientificView()
+    try:
+        view.reconcile(state, shell.navigation, completed=2, total=2, detail="Ready")
+        (item,) = view.curve.listDataItems()
+        x, y = item.getData()
+        assert x.size > axis.values.size  # the common grid of both, not either one's alone
+        reached_only_first = (x < float(np.min(shifted.axis.values)))
+        inside = (x > float(np.min(shifted.axis.values))) & (x < float(np.max(axis.values)))
+        assert inside.any() and np.isfinite(y[inside]).all()
+        assert not np.allclose(y[inside], np.interp(x[inside], axis.values, first.intensity) * (2 if mode == "Sum" else 1))
+        del reached_only_first
+    finally:
+        view.close(); qapp.processEvents()
+
+
 def test_1d_background_keeps_exact_normalization_and_fails_closed_without_it() -> None:
     """His pick, 2026-11-22, "Each by its own monitor" (the question's formula I_frame/monitor_frame -
     <I_bg/monitor_bg>): the contributors are each divided by their own monitor before the mean, and a frame is

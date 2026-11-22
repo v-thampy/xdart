@@ -228,17 +228,24 @@ def test_average_and_sum_fold_the_curves_kept_from_earlier_scans(qapp, tmp_path,
         assert _rows(page) == shown
 
 
-def test_set_bg_on_a_two_frame_browse_selection_after_a_live_handoff(qapp, tmp_path):
+@pytest.mark.parametrize("mode", ("Int 1D", "Int 2D"))
+def test_set_bg_on_a_two_frame_browse_selection_after_a_live_handoff(qapp, tmp_path, mode):
     """His pick, 2026-11-22 ("In 1.2.18" for "Set BG refuses a two-frame Browse selection right after a Live Run"):
     a one-scan Live Overlay Run (frames 1 and 2, unequal) ends into Browse with both selected; Set BG takes their
     mean from the Browse display's detached patterns (frame 1 has no context payload there), and each is drawn
-    minus it: equal and opposite. Before, it refused ("Select at least one display frame")."""
-    intent = _directory(tmp_path, live=True, output_mode="Append", mode="Int 1D")
+    minus it: equal and opposite. Before, it refused ("Select at least one display frame"). Int 2D's Set takes maps,
+    which Browse holds for the current frame only: it still refuses a two-frame selection, saying to select one."""
+    intent = _directory(tmp_path, live=True, output_mode="Append", mode=mode)
     with _page(qapp, intent) as (page, view, events):
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_MODE, "Overlay"))
         page._handle_shell_command(ShellCommand(ShellCommandKind.SET_PLOT_OPTION, 0.0, ("overlay", "offset")))
-        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("a", 2)], "int1d")
+        _live_run(qapp, page, events, tmp_path / "raw", [("a", 1), ("a", 2)], "int1d" if mode == "Int 1D" else "int2d")
         assert len(page._context_controller.navigation.selected) == 2
+        if mode == "Int 2D":
+            view.background.click()
+            assert _pump(qapp, lambda: "in Browse, select one frame" in page._notice_text), page._notice_text
+            assert page._background_owner.phase in {"EMPTY", "RELEASED"}
+            return
         first, second = (np.asarray(item.yData, np.float64) for item in view.curve.listDataItems())
         view.background.click()
         assert _pump(qapp, lambda: view.background.text() == "Clear 1D BG"), page._notice_text
