@@ -108,3 +108,72 @@ def test_raw_background_survives_idle_ticks(viewer):
         assert owner.phase == "ACTIVE" and owner.active_key == key
     assert view.background.text() == "Clear Raw BG"
     np.testing.assert_allclose(_shown(page), np.zeros((12, 16)), atol=1e-3)
+
+
+def _no_refusal(page) -> None:
+    shown = " ".join((page._shell.scientific.status.text(), page._context_controller.viewer_2d_diagnostic,
+                      page._notice_text)).lower()
+    assert not any(word in shown for word in ("refus", "error", "mismatch", "does not fit")), shown
+
+
+def test_raw_background_stays_across_frames_and_files_and_skips_other_shapes(viewer):
+    page, app, root, stacks = viewer
+    view, owner = page._shell.scientific, page._background_owner
+    a, c, d = stacks["a.h5"], stacks["c.h5"], stacks["d.h5"]
+    _open(page, app, root / "a.h5")
+    _settle_drawn(page, app, a[0].astype(np.float64))
+    assert view.background.text() == "Set Raw BG" and "every frame and file" in view.background.toolTip()
+
+    QtTest.QTest.mouseClick(view.background, QtCore.Qt.LeftButton)
+    _wait(page, app, lambda: owner.phase == "ACTIVE" and view.background.text() == "Clear Raw BG",
+          "Set Raw BG")
+    background = a[0].astype(np.float64)
+    _settle_drawn(page, app, np.zeros_like(background))
+    charged = owner.active_bytes
+
+    # another frame of the same file: drawn minus the background, which stays set
+    _step(page, app, 1)
+    _settle_drawn(page, app, a[1] - background)
+    assert owner.phase == "ACTIVE" and view.background.text() == "Clear Raw BG"
+    # the same frame keeps the same displayed array (no new upload per refresh), in the one charged frame
+    displayed, drawn = owner.projection()[1][0][1], view.raw.canvas.raw_image
+    page._refresh_shell(); app.processEvents(); page._refresh_shell()
+    assert owner.projection()[1][0][1] is displayed and view.raw.canvas.raw_image is drawn
+    assert owner.active_bytes == charged
+
+    # another file of the same shape: still subtracted
+    _open(page, app, root / "c.h5")
+    _settle_drawn(page, app, c[0] - background)
+    assert owner.phase == "ACTIVE" and view.background.text() == "Clear Raw BG"
+    assert "does not fit" not in view.background.toolTip()
+
+    # a file of another shape: drawn as it is, no refusal, the background stays set
+    _open(page, app, root / "d.h5")
+    _settle_drawn(page, app, d[0].astype(np.float64))
+    assert owner.phase == "ACTIVE" and view.background.text() == "Clear Raw BG"
+    _no_refusal(page)
+    assert "The background (12 × 16) does not fit this frame (10 × 16)" in view.background.toolTip()
+
+    # back to a fitting file: subtracted again
+    _open(page, app, root / "a.h5")
+    _settle_drawn(page, app, a[0] - background)
+    assert "does not fit" not in view.background.toolTip()
+    _step(page, app, 1)
+    _settle_drawn(page, app, a[1] - background)
+    assert owner.active_bytes == charged
+
+    # Clear Raw BG while a frame of another shape is shown: let go of, the frame still drawn as it is
+    _open(page, app, root / "d.h5")
+    _settle_drawn(page, app, d[0].astype(np.float64))
+    QtTest.QTest.mouseClick(view.background, QtCore.Qt.LeftButton)
+    _wait(page, app, lambda: owner.phase == "RELEASED" and view.background.text() == "Set Raw BG",
+          "Clear Raw BG")
+    _settle_drawn(page, app, d[0].astype(np.float64))
+    assert owner.active_bytes == 0 and owner.projection() is None
+    assert "does not fit" not in view.background.toolTip()
+    _no_refusal(page)
+
+    # and the fitting file is drawn as it is again
+    _open(page, app, root / "a.h5")
+    _settle_drawn(page, app, a[0].astype(np.float64))
+    assert view.background.text() == "Set Raw BG"

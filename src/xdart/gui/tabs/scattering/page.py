@@ -3925,11 +3925,14 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 ScatteringWorkspace._recheck_scan(self, value)
                 return
             self._retain_outgoing_display = False
-            ScatteringWorkspace._clear_presentation_targets(self)
-            if command.path not in {(), ("artifact",)}:
-                return
             mode = self._intents.snapshot().thaw().processing_mode
             tool = tool_from_mode_text(mode)
+            ScatteringWorkspace._clear_presentation_targets(
+                self, keep_raw_background=(  # a 2D Viewer file open: its raw background follows the new file
+                    tool is Tool.IMAGE_VIEWER and type(value) is str and bool(value)
+                    and command.path in {(), ("artifact",)}))
+            if command.path not in {(), ("artifact",)}:
+                return
             if (type(value) is str and value and (
                     tool is Tool.XYE_VIEWER
                     or mode == "Int 1D (XYE)" and value.lower().endswith(".xye"))):
@@ -3980,7 +3983,8 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 selection is None
                 or selection.kind is not ContextKind.VIEWER_1D
             ):
-                ScatteringWorkspace._clear_presentation_targets(self)
+                # a raw background (the 2D Viewer's) follows the frame selected; Int's are released
+                ScatteringWorkspace._clear_presentation_targets(self, keep_raw_background=True)
             if kind is not ShellCommandKind.SELECT_BROWSER_FRAMES:
                 self._shell.browser.cancel_pending_frame_selection()
             self._select_frames(command)
@@ -5192,11 +5196,15 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             self._retain_outgoing_display = retained
         return completed
 
-    def _clear_presentation_targets(self) -> None:
+    def _clear_presentation_targets(self, *, keep_raw_background: bool = False) -> None:
+        """Clear the Run's paced targets and release the display background; ``keep_raw_background``: an active raw
+        background (the 2D Viewer's) stays, since it follows every frame and file drawn (LIVE-1218-VIEWER2D-BG)."""
         getattr(self, "_presentation_targets", []).clear()
         self._presentation_run_identity = None
         if hasattr(self, "_background_owner"):
-            self._release_display_background()
+            background = self._background_owner.projection() if keep_raw_background else None
+            if background is None or background[0] != "raw":
+                self._release_display_background()
 
     def _presentation_pacing_active(self, identity: RunIdentity) -> bool:
         controller = self._context_controller
@@ -7684,6 +7692,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             ),
             norm_aggregate=self._context_controller.norm_aggregate,
             presentation_background=self._background_owner.projection(),
+            presentation_background_frame_values=getattr(self._background_owner, "frame_values", None),
         )
         if (controller.selection is not None
                 and controller.selection.kind is ContextKind.BROWSE

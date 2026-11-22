@@ -85,10 +85,14 @@ class ProjectionRequest:
 
 
 def apply_presentation_background(
-    state: ScientificProjection, projection,
+    state: ScientificProjection, projection, frame_values=None,
 ) -> ScientificProjection:
     """A projection with the presentation background's values in place of its traces' (1-D) or its
-    image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's."""
+    image's (raw, 2-D), for the frames the background was promoted for; Int's pages and Stitch's.
+
+    ``frame_values``: the background owner's ``frame_values``, given by the 2D Viewer's host, so a raw
+    background follows the frame drawn, any frame or file (LIVE-1218-VIEWER2D-BG); a frame of another shape
+    is drawn as it is, the button's tip saying why, with no refusal."""
     if projection is None:
         return replace(state, background_set=False)
     try:
@@ -96,6 +100,16 @@ def apply_presentation_background(
         values = dict(rows)
     except (TypeError, ValueError):
         return replace(state, background_set=False)
+    heavy = state.heavy
+    if (domain == "raw" and callable(frame_values) and heavy is not None
+            and type(heavy.raw) is np.ndarray):
+        value = frame_values(id(heavy.frame), heavy.raw)
+        if type(value) is np.ndarray:
+            return replace(state, heavy=replace(heavy, raw=value), background_set=True)
+        if type(value) is tuple:
+            return replace(state, background_set=True, background_note=(
+                f"The background ({' × '.join(map(str, value))}) does not fit this frame "
+                f"({' × '.join(map(str, heavy.raw.shape))}), which is drawn as it is."))
     if domain == "integrated_1d":
         def substitute(trace):
             value = values.get(id(trace.frame))
@@ -442,6 +456,7 @@ class ContextProjection:
         source_count_includes_immediate: bool = False,
         norm_aggregate: object = None,
         presentation_background=None,
+        presentation_background_frame_values=None,
         browse_open: bool = True,
     ) -> ShellProjection:
         """Build the one complete shell value; retain no input or output. ``browse_open``: whether Browse can open
@@ -547,7 +562,7 @@ class ContextProjection:
                 # an Int 1D (XYE) Run writes .xye files, no NeXus output to name
                 names_output=intent.processing_mode != "Int 1D (XYE)"))
         scientific = apply_presentation_background(
-            scientific, presentation_background)
+            scientific, presentation_background, presentation_background_frame_values)
         scientific = replace(scientific, acquisition_selected=(
             selection is not None and selection.kind is ContextKind.ACQUISITION))
         if not viewer_selected and selection is not None and selection.kind is ContextKind.BROWSE:

@@ -147,6 +147,13 @@ PHASES_TOOLTIP = ("Switch every reference phase listed in the Phase Analysis win
                   "each phase's include check and every minimum intensity are kept. Display only: the fit still "
                   "uses every included phase.")
 PHASES_NONE_LISTED = "No reference phase is listed: add one in the Tools panel's Phase Analysis window."
+#: the top bar's Set/Clear BG button (LIVE-1218-VIEWER2D-BG): Int's background, and the 2D Viewer's raw one, which
+#: follows every frame and file
+BACKGROUND_TOOLTIP = ("Set BG subtracts the mean of the selection from what is shown; Clear BG draws it as it is "
+                      "again. Display only: saved results are unchanged.")
+RAW_BACKGROUND_TOOLTIP = ("Set Raw BG subtracts the mean of the selected frames from every frame and file shown "
+                          "after it, until Clear Raw BG. A frame of another shape is drawn as it is. Display only: "
+                          "the files are unchanged.")
 PHASES_OFF_NOTE = ("Reference phases are switched off with the top bar's Phases button; the list, include checks and "
                    "minimums are kept.")
 _STANDARD_PLOT_AXIS_CHOICES = (
@@ -1968,6 +1975,9 @@ class ScientificView(QtWidgets.QFrame):
         if coverage is None or not state.plot_options.show_coverage_holes:
             self.cake.render_coverage(None)
         self.background.setText(("Clear" if state.background_set else "Set") + " " + {"Int 1D": "1D", "1D Viewer": "1D", "Int 2D": "2D", "2D Viewer": "Raw"}.get(state.processing_mode, "BG") + " BG")
+        tip = RAW_BACKGROUND_TOOLTIP if state.processing_mode == "2D Viewer" else BACKGROUND_TOOLTIP
+        note = getattr(state, "background_note", "")
+        self.background.setToolTip(f"{tip}\n\n{note}" if note else tip)
         self._rendered_background_key = self._expected_background_key if state.background_set else None
         if state.processing_mode == "2D Viewer":
             entering_viewer = self._processing_mode != "2D Viewer"

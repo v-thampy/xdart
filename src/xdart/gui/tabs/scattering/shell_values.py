@@ -852,6 +852,9 @@ class ScientificProjection:
     plot_options: ScientificPlotOptions = ScientificPlotOptions()
     background_set: bool = False
     background_enabled: bool = True
+    #: why a set background is not drawn on this frame (a raw background on a frame of another shape), for the
+    #: Set BG button's tip (``apply_presentation_background``); empty otherwise
+    background_note: str = ""
     status: str = ""
     retain_display: bool = False
     live_update: bool = False
