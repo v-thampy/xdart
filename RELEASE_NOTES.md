@@ -11,10 +11,10 @@
   Metadata said "Select a retained frame first.".
 - **A stack without metadata opens straight in the ROI picker:** when the
   loaded table holds only the frame index (an Eiger master without a SPEC
-  file, a TIFF without a sidecar) and its raw frames are reachable, ROI
-  Statistics goes to the Plot ROI picker without a second click, whether
-  the file was browsed or picked in the window. A file with metadata shows
-  its table first, as before.
+  file, a TIFF without a sidecar), ROI Statistics goes to the Plot ROI
+  picker without a second click, whether the file was browsed or picked in
+  the window. A first frame missing on disk is reported there in words. A
+  file with metadata shows its table first, as before.
 
 ## 1.2.18 (2026-11-22)
 

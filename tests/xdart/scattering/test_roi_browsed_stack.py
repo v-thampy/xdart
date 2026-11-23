@@ -205,6 +205,31 @@ def test_a_file_picked_in_the_window_goes_to_the_picker_only_without_metadata(tm
     assert dialog._vnext_table_result.receipt.resolved_kind.value == "eiger_master"
 
 
+def test_a_stack_without_metadata_whose_first_frame_is_missing_says_so_and_plot_roi_retries(tmp_path, qapp, open_page):
+    """The picker step goes by the table's receipt, as Plot ROI's button does: a first raw frame missing on disk is
+    refused in words and mounts no picker. Once the frame arrives, Plot ROI asks (in words) for the source to be read
+    again, as before 1.2.19, and reading it again opens the picker."""
+    _roi_navigation_table(tmp_path, missing_label=3)
+    path = tmp_path / "navigation.nexus"
+    page = open_page("Int 1D")
+    dialog = _roi_statistics(page, qapp)
+    dialog.load_uri(str(path))
+    _until(page, qapp, lambda: dialog._vnext_table_result is not None, "the processed table")
+    _settled(page, qapp, "the refused preview")
+    assert not _picker_shown(dialog) and not dialog._roi_preview_waiting
+    refusal = dialog.status.text()
+    assert refusal and refusal != "OK" and "_" not in refusal.split()[0], refusal  # words, not a bare code
+    assert dialog.roi_btn.isEnabled()
+    import tifffile
+    tifffile.imwrite(tmp_path / "raw_3.tif", np.full((4, 4), 3, dtype=np.uint16))  # the frame arrives
+    dialog.roi_btn.click()
+    _until(page, qapp, lambda: "reload" in dialog.status.text() and _idle(page), "Plot ROI's retry")
+    assert not _picker_shown(dialog)
+    dialog.load_uri(str(path))
+    _until(page, qapp, lambda: _picker_shown(dialog) and _idle(page), "the picker after reading the source again")
+    assert dialog._roi_dialog._image.shape == (4, 4)
+
+
 def test_a_file_picked_before_the_browsed_table_arrives_keeps_its_own_table(tmp_path, qapp, open_page):
     """The browsed Eiger's picker step is dropped when another file is picked in the window first."""
     with_metadata = _processed(tmp_path, metadata=True)
