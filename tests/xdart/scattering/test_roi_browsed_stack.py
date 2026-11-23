@@ -243,3 +243,55 @@ def test_a_file_picked_before_the_browsed_table_arrives_keeps_its_own_table(tmp_
     assert dialog.source_widget.path_edit.text() == str(with_metadata)
     assert dialog._vnext_table_result.labels == (3, 7, 11) and "i0" in dialog._columns
     assert dialog._roi_dialog is None
+
+
+def test_a_browsed_detector_image_with_sidecar_keeps_the_metadata_table(tmp_path, qapp, open_page):
+    from fabio.edfimage import EdfImage
+
+    path = tmp_path / "frame.edf"
+    EdfImage(data=np.arange(64, dtype=np.uint16).reshape(8, 8)).write(str(path))
+    path.with_suffix(".edf.metadata").write_text("i0=1234\nmotor_th=2.0\nchi=90\n")
+    page = open_page("2D Viewer")
+    _browse(page, qapp, path, viewer=True)
+    page._shell.browser.metadata.click()
+    _until(page, qapp, lambda: page._metadata_result is not None and _idle(page), "the Metadata window's table")
+    assert "i0" in {column.name for column in page._metadata_result.columns}
+
+    dialog = _roi_statistics(page, qapp)
+    _until(page, qapp, lambda: dialog._vnext_table_result is not None, "the ROI Statistics window's table")
+    _settled(page, qapp, "the ROI Statistics window's table")
+    assert "i0" in dialog._columns and not _picker_shown(dialog)
+
+
+def test_a_browsed_stack_with_text_metadata_does_not_open_the_roi_picker(tmp_path, qapp, open_page):
+    path = _processed(tmp_path, metadata=False)
+    with h5py.File(path, "a") as handle:
+        group = handle["entry"].create_group("scan_data")
+        group.create_dataset("frame_index", data=[3, 7, 11])
+        group.create_dataset("note", data=[b"first", b"second", b"third"])
+    page = open_page("2D Viewer")
+    _browse(page, qapp, path, viewer=True)
+    dialog = _roi_statistics(page, qapp)
+    _until(page, qapp, lambda: dialog._vnext_table_result is not None, "the processed table")
+    _settled(page, qapp, "the processed table")
+    assert any(column.name == "note" and column.kind == "text"
+               for column in dialog._vnext_table_result.columns)
+    assert not _picker_shown(dialog)
+
+
+def test_reopening_with_only_a_retained_table_does_not_start_an_automatic_preview(tmp_path, qapp, open_page):
+    master = _eiger(tmp_path)
+    page = open_page("Int 1D")
+    dialog = _roi_statistics(page, qapp)
+    dialog.load_uri(str(master))
+    _until(page, qapp, lambda: dialog._vnext_table_result is not None, "the selected table")
+    _settled(page, qapp, "the selected table")
+    retained = dialog._vnext_table_result
+    dialog.close()
+    qapp.processEvents()
+
+    reopened = _roi_statistics(page, qapp)
+    _settled(page, qapp, "the reopened window")
+    assert reopened.source_widget.path_edit.text() == ""
+    assert reopened._vnext_table_result is retained
+    assert not _picker_shown(reopened)

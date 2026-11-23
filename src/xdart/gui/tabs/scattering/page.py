@@ -2139,7 +2139,7 @@ class ScatteringWorkspace(QtWidgets.QWidget):
             if self._scan_roi_dialog is not None:
                 self._scan_roi_dialog.clear_vnext_metadata()
         elif captured.target == "scan_roi" and dialog is not None:
-            dialog.set_vnext_metadata(payload)
+            dialog.set_vnext_metadata(payload, auto_open_roi=True)
         self._notice("")
         return self._finish_metadata_refresh(captured.dialog)
 

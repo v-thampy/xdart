@@ -760,7 +760,7 @@ class ScanPlotDialog(QtWidgets.QDialog):
         finally:
             self._vnext_rendering = False
 
-    def set_vnext_metadata(self, result):
+    def set_vnext_metadata(self, result, *, auto_open_roi=False):
         """Render only detached table columns and headless-selected defaults."""
         self._retire_vnext_result()
         self._vnext_table_result = result; self._vnext_rendering = True
@@ -787,9 +787,9 @@ class ScanPlotDialog(QtWidgets.QDialog):
             for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
                 widget.blockSignals(False)
             self._vnext_rendering = False
-        if self._vnext and result.receipt is not None and result.labels and set(table) <= {"frame_index"}:
-            # a stack without metadata goes straight to the Plot ROI picker, once the page has finished adopting its
-            # table (NEXT-1219-ROI-BROWSED-SOURCE; his pick "Any stack w/o metadata (Recommended)")
+        if (self._vnext and auto_open_roi and result.receipt is not None
+                and result.labels and tuple(column.name for column in result.columns) == ("frame_index",)):
+            # Wait until the page has adopted the selected source's table.
             QtCore.QTimer.singleShot(0, self, lambda r=result: self._open_roi_for(r))
 
     def _open_roi_for(self, result):

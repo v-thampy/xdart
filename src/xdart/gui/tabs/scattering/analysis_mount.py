@@ -191,7 +191,10 @@ def metadata_plan_from_syntax(value: object):
     if type(value) is not tuple: return None
     if (len(value) == 2 and value[0] == "exact"
             and isinstance(value[1], (SourceSpec, str, Path)) and str(value[1])):
-        return MetadataTablePlan(value[1])
+        source = value[1]
+        if isinstance(source, SourceSpec):
+            return MetadataTablePlan(source)
+        return MetadataTablePlan(source, metadata_format="auto")
     if (len(value) == 3 and value[0] == "directory"
             and isinstance(value[1], (str, Path)) and str(value[1])
             and type(value[2]) is str and value[2]):
