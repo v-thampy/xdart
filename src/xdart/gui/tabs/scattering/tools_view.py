@@ -22,8 +22,9 @@ PHASE_ANALYSIS_TOOLTIP = ("Phase Analysis: draw reference lines and detector rin
 
 #: The Tools button that opens ROI Statistics (NEXT-1217-EIGER-SOURCES): it opens on the browsed scan.
 ROI_STATISTICS_TOOLTIP = ("ROI Statistics: plot a scan's metadata and rectangular-ROI statistics over its raw frames. "
-                          "It opens on the scan selected in the Data Browser; choose another file or folder in the "
-                          "window.")
+                          "It opens on the scan or file selected in the Data Browser (in the 2D Viewer too: an Eiger "
+                          "master, a NeXus stack or a TIFF); choose another file or folder in the window. A stack "
+                          "without metadata opens straight in the ROI picker.")
 
 
 class ToolsView(QtWidgets.QFrame):

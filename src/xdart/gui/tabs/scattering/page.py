@@ -1051,10 +1051,11 @@ class ScatteringWorkspace(QtWidgets.QWidget):
                 and getattr(frame, "label", None)
                 == current.local_frame_label
                 and canonical_path == original_path
-                and Path(original_path).suffix.casefold()
-                in {".tif", ".tiff"}
             ):
                 return None
+            # any file the 2D Viewer shows, not only a TIFF: the headless selection reads an Eiger master, a NeXus stack
+            # or a processed NeXus and refuses others in words; the Metadata and ROI Statistics windows both follow
+            # (NEXT-1219-ROI-BROWSED-SOURCE; his pick "Both windows follow")
             source = original_path
             metadata_format = "auto"
         return MetadataTablePlan(

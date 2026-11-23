@@ -1,5 +1,21 @@
 # Release notes
 
+## 1.2.19 (unreleased)
+
+### Changes
+
+- **ROI Statistics and Metadata open the file browsed in the 2D Viewer:** an
+  Eiger master, a NeXus stack or a processed NeXus selected in the 2D
+  Viewer's Data Browser now opens in both windows, as a TIFF did. Before,
+  ROI Statistics opened empty ("Choose a source, then Plot ROI.") and
+  Metadata said "Select a retained frame first.".
+- **A stack without metadata opens straight in the ROI picker:** when the
+  loaded table holds only the frame index (an Eiger master without a SPEC
+  file, a TIFF without a sidecar) and its raw frames are reachable, ROI
+  Statistics goes to the Plot ROI picker without a second click, whether
+  the file was browsed or picked in the window. A file with metadata shows
+  its table first, as before.
+
 ## 1.2.18 (2026-11-22)
 
 ### Changes

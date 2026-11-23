@@ -154,7 +154,8 @@ class ScanPlotDialog(QtWidgets.QDialog):
         self.roi_btn.setEnabled(False)
         self.roi_btn.setToolTip(
             "Reduce rectangular ROIs over the scan's raw frames and add each as "
-            "a plotted column (enabled only when the raw frames are reachable)")
+            "a plotted column (enabled only when the raw frames are reachable; "
+            "a stack without metadata opens the picker at once)")
         axes_row.addWidget(self.roi_btn)
         self.save_btn = QtWidgets.QPushButton("Save CSV…")
         self.save_btn.setEnabled(False)
@@ -786,6 +787,17 @@ class ScanPlotDialog(QtWidgets.QDialog):
             for widget in (self.x_combo, self.norm_combo, self.y_list, self.r_list):
                 widget.blockSignals(False)
             self._vnext_rendering = False
+        if self._vnext and result.receipt is not None and result.labels and set(table) <= {"frame_index"}:
+            # a stack without metadata goes straight to the Plot ROI picker, once the page has finished adopting its
+            # table (NEXT-1219-ROI-BROWSED-SOURCE; his pick "Any stack w/o metadata (Recommended)")
+            QtCore.QTimer.singleShot(0, self, lambda r=result: self._open_roi_for(r))
+
+    def _open_roi_for(self, result):
+        """Plot ROI for ``result`` if it is still the window's table and no picker shows a frame yet."""
+        if (self._closing or self._vnext_table_result is not result
+                or self._roi_dialog is not None and self._roi_dialog._image is not None):
+            return
+        self._open_roi_dialog()
 
     def clear_vnext_metadata(self):
         self._retire_vnext_result(); self._vnext_table_result = None
