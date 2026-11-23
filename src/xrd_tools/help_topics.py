@@ -344,6 +344,7 @@ to five rectangular signal ROIs with independent optional background definitions
 
 Steps
 1. Open the scan plot and choose X. Open Plot ROI and position the rectangles.
+   A stack without metadata (frame index only) opens in Plot ROI at once.
 2. For each signal choose mean, sum, max, min or std. For mean/sum, optionally
    add its own background rectangle and choose subtract or divide.
 3. Choose the existing saturation-mask policy, then explicitly Compute/Update.
