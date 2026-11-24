@@ -110,6 +110,21 @@ jobs:
         env:
           XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-rsm-eiger-session.json
           XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-rsm-eiger-settings.ini
+      # RSM and Stitch jobs bind their own SPEC scan (NEXT-1219-SPEC-OCCURRENCE). Windows has no pathname change
+      # token and reports a pathname ctime that is not the descriptor's: 1.2.19's first release CI refused an
+      # untouched scan here only. Runs even when the step above fails, so one run shows both.
+      - name: Bind SPEC scan occurrences on Windows
+        if: ${{ !cancelled() }}
+        run: >-
+          pixi run --locked python scripts/ci_pytest.py
+          tests/core/test_spec_occurrence.py
+          tests/core/test_spec_occurrence_sweep.py
+          tests/core/test_spec_capture_cleanup.py
+          tests/xdart/pages/test_rsm_spec_growth.py
+          -q -ra --timeout=300
+        env:
+          XDART_SESSION_FILE: ${{ runner.temp }}/xdart-pixi-spec-occurrence-session.json
+          XDART_SETTINGS_FILE: ${{ runner.temp }}/xdart-pixi-spec-occurrence-settings.ini
       # Average, Stitch and RSM publication on the runner's local NTFS; SMB needs an actual share.
       - name: Publish and reopen finite results without directory descriptors
         run: >-
