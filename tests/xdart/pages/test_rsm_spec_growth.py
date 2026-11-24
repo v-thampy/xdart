@@ -37,3 +37,40 @@ def test_an_rsm_run_is_saved_while_a_later_scan_is_written_to_its_spec_file(qapp
         assert Path(page.browser.current_result()).name == output.name
     finally:
         _close(page, qapp)
+
+
+def test_a_spec_and_eiger_rsm_run_is_saved_while_the_next_scan_and_its_master_are_written(qapp, tmp_path, monkeypatch):
+    """His beamline shape (BTO_001: SPEC + one DECTRIS master per scan): scan 1 is gridded while scan 4's SPEC rows
+    and its Eiger master and data land in the same folders."""
+    import time
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    from tests.core.test_container_descriptor import _vendor_eiger_master
+    from tests.xdart.pages.test_rsm_eiger_source import _eiger_source, _on_source
+    _eiger_source(tmp_path, (195, 487))
+    spec = tmp_path / "source" / "RSM_synth"
+    images = tmp_path / "source" / "images"
+    page = _page(qapp)
+    try:
+        _on_source(page, qapp, tmp_path, "1")
+        checks = rsm_operation._revalidate_rsm_v2_authorities
+        landed = []
+
+        def growing_check(*args, **kwargs):
+            if not landed:
+                _vendor_eiger_master(images / "RSM_synth_scan004_master.h5", [images / "RSM_synth_scan004_data_000001.h5"],
+                                     per_seg=(2, 195, 487), chunks=(1, 195, 487))
+            with spec.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(f"\n#S {4 + len(landed)} ascan eta 0 1 1 1\n#L eta  Seconds\n0 1\n")
+            landed.append(page._owner.busy)
+            return checks(*args, **kwargs)
+
+        monkeypatch.setattr(rsm_operation, "_revalidate_rsm_v2_authorities", growing_check)
+        page.begin_run()
+        deadline = time.monotonic() + 120
+        while page.active() and time.monotonic() < deadline:
+            qapp.processEvents(); page._poll(); time.sleep(0.005)
+        text = page.run_bar.readinessLabel.full_text()
+        assert landed and all(landed), landed
+        assert text.startswith("Saved "), text
+    finally:
+        _close(page, qapp)

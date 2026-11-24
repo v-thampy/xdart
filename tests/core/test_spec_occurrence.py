@@ -617,3 +617,73 @@ def test_s11_the_proof_from_a_real_capture_takes_the_stat_fast_path_only_when_un
         copy.write_bytes(path.read_bytes())
         copy.replace(path)
     assert spec_occurrence_holds(proof) is holds
+
+
+# --- S6 / S2 mid-Run, under the Run's one capture scope ------------------------------------------------------------
+def _rewrite_first_after(path, marker, old, new):
+    text = Path(path).read_text(encoding="utf-8")
+    at = text.index(old, text.index(marker))
+    Path(path).write_text(text[:at] + new + text[at + len(old):], encoding="utf-8", newline="\n")
+
+
+@pytest.mark.parametrize("backend", ["multigeometry", "xu_hist"])
+@pytest.mark.parametrize("change, committed", [("later scan", True), ("own row", False)])
+def test_s6_stitch_mid_run_growth_commits_and_its_own_scan_changing_refuses(tmp_path, monkeypatch, backend, change,
+                                                                           committed):
+    import xrd_tools.analysis.module_transaction as module_transaction
+    form = _native_form(tmp_path, backend, scans="1")
+    request = prepare_stitch_tool(form).request
+    real, calls = module_transaction._source_requalification, []  # the Run's admission and prepublish re-checks
+
+    def changing(source, **kwargs):
+        if change == "later scan":
+            _append(form.spec_path, f"\n#S {4 + len(calls)} ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n"
+                                    "#L del  nu\n14 -10\n")
+        elif not calls:
+            _rewrite_first_after(form.spec_path, "#S 1", "15 -10", "15 -11")
+        calls.append(change)
+        return real(source, **kwargs)
+
+    monkeypatch.setattr(module_transaction, "_source_requalification", changing)
+    result = run_stitch_operation(request)
+    assert calls, "the Run's re-check never ran"
+    assert (result.terminal.disposition is ModuleDisposition.COMMITTED) is committed, result.terminal
+    if not committed:
+        assert not Path(request.module.output.target).exists()
+
+
+def test_s2_the_v1_rsm_route_refuses_when_its_own_scan_changes_during_science(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    from tests.core.test_rsm_operation import _prepared_rsm, _synthetic_volume
+    request, _frames = _prepared_rsm(tmp_path)
+    spec = tmp_path / "source" / "RSM_synth"
+
+    def changing_science(*_args, **_kwargs):
+        _rewrite(spec, "1 2 20 110", "1 2 20 111")
+        from types import SimpleNamespace
+        return SimpleNamespace(payload=_synthetic_volume(request))
+
+    monkeypatch.setattr(rsm_operation, "run_rsm", changing_science)
+    result = rsm_operation.run_rsm_operation(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED, result.terminal
+    assert not Path(request.module.output.target).exists()
+
+
+def test_s4b_a_map_with_the_new_ub_identity_reads_back_and_replays_its_form(tmp_path, monkeypatch):
+    """An HKL map whose UB comes from a SPEC scan, gridded with the occurrence identity: the artifact reader opens it
+    and its saved form replays as a notebook (the persisted record does not carry the new identity's digests)."""
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind, read_analysis_artifact
+    _runnable(monkeypatch)
+    form, _ub_spec = _hkl(tmp_path)
+    prepared = prepare_rsm_tool_v2(form)
+    assert prepared.request.plan.ub_override.identity()[0] == "ub-override-v2"
+    result = _committed(run_rsm_operation_v2(prepared.request))
+    target = Path(prepared.request.module.output.target)
+    payload = read_analysis_artifact(target, expected_kind=AnalysisArtifactKind.RSM)
+    assert payload.result_fingerprint == result.payload.result_fingerprint
+    from xrd_tools.notebooks.operation_replay import capture_rsm_forms, run_operation_replay
+    replayed, = run_operation_replay("rsm", capture_rsm_forms((form,)), data_root=tmp_path,
+                                     output_root=tmp_path / "replayed")
+    _committed(replayed)
+    assert replayed.request.plan.ub_override.identity() == prepared.request.plan.ub_override.identity()
+    np.testing.assert_array_equal(replayed.payload.intensity, result.payload.intensity)

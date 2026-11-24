@@ -54,7 +54,6 @@ class _SpecCapture:
     def __init__(self, lexical: str, resolved: str):
         self.scratch: Path | None = None
         self._parser = None
-        self._data: bytes | None = None
         descriptor = None
         try:
             descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -89,13 +88,6 @@ class _SpecCapture:
                 os.close(descriptor)
 
     @property
-    def data(self) -> bytes:
-        """The captured bytes (read from the private copy once)."""
-        if self._data is None:
-            self._data = self.scratch.read_bytes()
-        return self._data
-
-    @property
     def parser(self):
         if self._parser is None:
             self._parser = SpecFile(str(self.scratch))
@@ -110,7 +102,7 @@ class _SpecCapture:
                     action()
                 except BaseException as error:  # reported once, after every step ran
                     failure = failure or error
-        self._parser = self._data = None
+        self._parser = None
         return failure
 
     def _unlink(self):
@@ -177,7 +169,7 @@ def spec_occurrence(spec_file: Path | str, key: str):
     capture = _scoped_capture(spec_file)
     if capture is None:
         return None
-    data = capture.data
+    data = capture.scratch.read_bytes()  # transient: a Run keeps only the parser, never the file's bytes
     view = capture.view
     proof = spec_occurrence_from_bytes(data, path=view.lexical, resolved=view.resolved, device=view.device,
                                        inode=view.inode, key=key,
