@@ -1888,11 +1888,12 @@ def _spec_record_segments(stream, cancelled):
         chunk = stream.read(_SPEC_CHUNK)
         if not chunk:
             return
-        lines = chunk.split(b"\n")
-        for line in lines[:-1]:
-            yield line + b"\n"
-        if lines[-1]:
-            yield lines[-1]
+        start = 0
+        while (end := chunk.find(b"\n", start)) >= 0:
+            yield chunk[start:end + 1]
+            start = end + 1
+        if start < len(chunk):
+            yield chunk[start:]
 
 
 def _spec_record_remainder(segments):
@@ -1961,13 +1962,14 @@ def _long_spec_record(head, remainder, block_hash, header_hash):
     )
 
 
-def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancelled=None):
+def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_numbers=None, cancelled=None):
     """Frame the scans in byte order with bounded record buffers.
 
     A complete line belongs to its scan up to the next column-zero #S or #F.
     Trailing blank lines are excluded. A recognizable later marker closes the
     previous scan even while that marker is being written. With a limit, finish
-    at the first decision about the last protected byte's boundary.
+    at the first decision about the last protected byte's boundary. Live
+    verification tracks ordinals and hashes only for its requested scan numbers.
     """
     seen: dict[int, int] = {}
     spans: list[tuple[int, int]] = []
@@ -2020,6 +2022,9 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancel
                     header, header_digest = tuple(spans), header_hash.hexdigest()
                     header_open = False
                 number = int(match[1])
+                if scan_numbers is not None and number not in scan_numbers:
+                    offset += size
+                    continue
                 ordinal = seen[number] = seen.get(number, 0) + 1
                 start, start_line, end = offset, line_number, offset
                 complete, active, mca, rows = line_complete, True, False, 0
@@ -2077,25 +2082,6 @@ def spec_occurrence_from_bytes(data: bytes, *, path: str, resolved: str, device:
                           header, header_digest, block_end, block_digest, rows, captured)
 
 
-def _spec_occurrence_boundary_holds(proof: SpecOccurrence, data: bytes, start: int = 0) -> bool:
-    """Skip blank separators while preserving the column of the next record."""
-    while start < len(data):
-        end = data.find(b"\n", start)
-        line = data[start:] if end < 0 else data[start:end + 1]
-        if line.strip():
-            if _SPEC_RECORD_LINE.match(line):
-                return True
-            if end < 0:
-                raise SpecOccurrenceUnsettled(
-                    f"SPEC {proof.path}: a line after scan {proof.key} is still being written"
-                )
-            return False
-        if end < 0:
-            break
-        start = end + 1
-    return True
-
-
 def _spec_descriptor_revision(status):
     return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
 
@@ -2122,6 +2108,7 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
     # cannot distinguish a concurrent selected rewrite from unrelated growth.
     stop_after = max(proof.block_end for proof in proofs)
     keys = {proof.key for proof in proofs}
+    numbers = {proof.number for proof in proofs}
     for attempt in range(2 if retry else 1):
         status = os.fstat(descriptor)
         named = tuple(proof for proof in proofs if _spec_occurrence_name_holds(proof, status))
@@ -2138,7 +2125,7 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
                 return chunk
 
         frames = {frame.key: frame for frame in iter_spec_occurrence_frames(
-            Stream(), stop_after=stop_after, cancelled=cancelled,
+            Stream(), stop_after=stop_after, scan_numbers=numbers, cancelled=cancelled,
         ) if frame.key in keys}
         after = os.fstat(descriptor)
         if _spec_descriptor_revision(after) == _spec_descriptor_revision(status):
