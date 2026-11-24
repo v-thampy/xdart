@@ -14,6 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence
@@ -1921,13 +1922,47 @@ def iter_spec_record_parts(stream, *, cancelled=None):
         yield bytes(head), tail
 
 
-def _spec_occurrence_lines(stream, cancelled):
-    for head, remainder in iter_spec_record_parts(stream, cancelled=cancelled):
-        yield b"".join((head, *remainder))
+_SPEC_FILE_HEADER_LINE = re.compile(rb"#(?:F|E|[Oo]\d+)(?=\s|$)")
+
+
+def _pending_spec_marker(prefix):
+    """Keep the unresolved token only, collapsing whitespace and leading zeros."""
+    if prefix.startswith((b"#S ", b"#S\t")):
+        digits = prefix[2:].lstrip(b" \t")
+        if not digits or digits.isdigit():
+            # silx's scan number is an integer, not an arbitrary precision field.
+            # Keep a leading-zero number exact and an overflowing number recognizable as a boundary.
+            significant = digits.lstrip(b"0") or digits[:1]
+            return b"#S " + significant[:4301]
+    if prefix.startswith((b"#O", b"#o")) and prefix[2:].isdigit():
+        return prefix[:2] + b"0"
+    return None
+
+
+def _long_spec_record(head, remainder, block_hash, header_hash):
+    prefix = head
+    pending = _pending_spec_marker(prefix)
+    first = last = b""
+    size = 0
+    own_hash = hashlib.sha256()
+    block_hash, header_hash = block_hash.copy(), header_hash.copy()
+    for part in chain((head,), remainder):
+        if size and pending is not None:
+            prefix = pending + part
+            pending = _pending_spec_marker(prefix)
+        stripped = part.strip()
+        first = first or stripped[:1]
+        last = stripped[-1:] or last
+        for digest in (own_hash, block_hash, header_hash):
+            digest.update(part)
+        size += len(part)
+    return prefix if pending is None else pending, size, part.endswith(b"\n"), first, last, (
+        own_hash, block_hash, header_hash,
+    )
 
 
 def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancelled=None):
-    """Frame the scans in byte order, keeping only one record and the current section's header.
+    """Frame the scans in byte order with bounded record buffers.
 
     A complete line belongs to its scan up to the next column-zero #S or #F.
     Trailing blank lines are excluded. A recognizable later marker closes the
@@ -1949,9 +1984,27 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancel
         return SpecOccurrenceFrame(number, ordinal, start, start_line, header, header_digest,
                                    end, digest.hexdigest(), rows, complete, boundary_holds)
 
-    for line_number, raw in enumerate(_spec_occurrence_lines(stream, cancelled), 1):
+    for line_number, (raw, remainder) in enumerate(iter_spec_record_parts(stream, cancelled=cancelled), 1):
+        rollover = None
+        if remainder:
+            # A later marker with a delimited number ends the selected span
+            # even if the remainder of its line has not been written yet.
+            match = _SPEC_RECORD_LINE.match(raw)
+            if (stop_after is not None and offset >= stop_after
+                    and match is not None and match.end() < len(raw)):
+                if active:
+                    yield frame(True)
+                return
+            raw, size, line_complete, first, last, rollover = _long_spec_record(
+                raw, remainder, block_hash, header_hash,
+            )
+        else:
+            size = len(raw)
+            line_complete = raw.endswith(b"\n")
+            line = raw.strip()
+            first, last = line[:1], line[-1:]
+
         match = _SPEC_RECORD_LINE.match(raw)
-        size = len(raw)
         if match:
             if active:
                 yield frame(True)
@@ -1969,29 +2022,32 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancel
                 number = int(match[1])
                 ordinal = seen[number] = seen.get(number, 0) + 1
                 start, start_line, end = offset, line_number, offset
-                complete, active, mca, rows = raw.endswith(b"\n"), True, False, 0
+                complete, active, mca, rows = line_complete, True, False, 0
                 block_hash = hashlib.sha256()
                 before_blanks = None
-        if header_open and raw.startswith(b"#"):
-            marker = raw.split(None, 1)[0]
-            if marker in (b"#F", b"#E") or re.fullmatch(rb"#[Oo]\d+", marker):
-                spans.append((offset, size))
+        if header_open and _SPEC_FILE_HEADER_LINE.match(raw):
+            spans.append((offset, size))
+            if rollover is not None:
+                header_hash = rollover[0] if match else rollover[2]
+            else:
                 header_hash.update(raw)
         if active:
-            line = raw.strip()
-            if not raw.endswith(b"\n"):
-                yield frame(not line or not complete)
+            if not line_complete:
+                yield frame(not first or not complete)
                 return
-            if line:
+            if first:
                 end = offset + size
                 before_blanks = None
-                if mca or line.startswith(b"@"):
-                    mca = line.endswith(b"\\")
-                elif not line.startswith(b"#"):
+                if mca or first == b"@":
+                    mca = last == b"\\"
+                elif first != b"#":
                     rows += 1
             elif before_blanks is None:
                 before_blanks = block_hash.copy()
-            block_hash.update(raw)
+            if rollover is not None:
+                block_hash = rollover[0] if match else rollover[1]
+            else:
+                block_hash.update(raw)
             if stop_after is not None and end > stop_after:
                 yield frame(True)
                 return
@@ -2052,63 +2108,118 @@ def _spec_occurrence_name_matches(proof: SpecOccurrence, status) -> bool:
             and os.path.normcase(os.path.realpath(proof.path)) == proof.resolved)
 
 
-def _read_spec_occurrence(proof: SpecOccurrence, descriptor: int) -> bool:
+def _spec_occurrence_name_holds(proof: SpecOccurrence, status) -> bool:
+    try:
+        return _spec_occurrence_name_matches(proof, status)
+    except OSError:
+        return False
+
+
+def _read_spec_occurrences(proofs, descriptor: int, cancelled):
     # Re-observe once if growth overlaps this read. The old prefix alone
     # cannot distinguish a concurrent selected rewrite from unrelated growth.
+    stop_after = max(proof.block_end for proof in proofs)
+    keys = {proof.key for proof in proofs}
     for _ in range(2):
         status = os.fstat(descriptor)
-        if not _spec_occurrence_name_matches(proof, status):
-            return False
+        named = tuple(proof for proof in proofs if _spec_occurrence_name_holds(proof, status))
+        if not named:
+            return {}, None
         os.lseek(descriptor, 0, os.SEEK_SET)
-        chunks, remaining = [], proof.block_end
-        while remaining > 0:
-            chunk = os.read(descriptor, min(1 << 20, remaining))
-            if not chunk:
-                return False
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        prefix = b"".join(chunks)
-        tail = b""
-        while b"\n" not in tail.lstrip(b" \t\r\n"):
-            chunk = os.read(descriptor, 1 << 16)
-            if not chunk:
-                break
-            tail += chunk
-        framed = _frame_spec_occurrence(prefix, proof.number, proof.occurrence)
-        if framed != (proof.offset, proof.header, proof.header_sha256, proof.block_end,
-                      proof.block_sha256, proof.rows):
-            return False
+        remaining = status.st_size
+
+        class Stream:
+            def read(self, size):
+                nonlocal remaining
+                chunk = os.read(descriptor, min(size, remaining)) if remaining else b""
+                remaining -= len(chunk)
+                return chunk
+
+        frames = {frame.key: frame for frame in iter_spec_occurrence_frames(
+            Stream(), stop_after=stop_after, cancelled=cancelled,
+        ) if frame.key in keys}
         after = os.fstat(descriptor)
-        if not _spec_occurrence_name_matches(proof, after):
-            return False
         if _spec_descriptor_revision(after) == _spec_descriptor_revision(status):
-            return _spec_occurrence_boundary_holds(proof, tail)
+            result = {}
+            for proof in named:
+                frame = frames.get(proof.key)
+                if (frame is not None and frame.start_complete
+                        and frame.framed == proof.content[2:]
+                        and _spec_occurrence_name_holds(proof, after)):
+                    result[id(proof)] = True if frame.boundary_holds else None
+            return result, after
         if after.st_size <= status.st_size:
+            return {}, None
+    return {}, None
+
+
+def _verify_spec_occurrences(proofs, cancelled):
+    from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
+
+    for proof in proofs:
+        try:
+            named = os.stat(proof.path)
+            if not _spec_occurrence_name_matches(proof, named):
+                continue
+            if IDENTITY_CARRIES_CTIME and all(
+                _spec_descriptor_revision(named) == member.captured for member in proofs
+            ):
+                return {id(member): True for member in proofs if _spec_occurrence_name_holds(member, named)}, named
+            descriptor = os.open(proof.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except OSError:
+            continue
+        try:
+            return _read_spec_occurrences(proofs, descriptor, cancelled)
+        finally:
+            os.close(descriptor)
+    return {}, None
+
+
+class SpecOccurrenceVerification:
+    """One semantic check's live observations, shared across occurrences of the same file."""
+
+    def __init__(self, proofs, *, cancelled=None):
+        self._proofs = {}
+        for proof in proofs:
+            key = (proof.resolved, proof.device, proof.inode)
+            self._proofs.setdefault(key, {})[id(proof)] = proof
+        self._observed = {}
+        self._cancelled = cancelled
+
+    def holds(self, proof: SpecOccurrence) -> bool:
+        _spec_cancelled(self._cancelled)
+        key = (proof.resolved, proof.device, proof.inode)
+        group = self._proofs.get(key, {})
+        if id(proof) not in group:
             return False
-    return False
+        try:
+            if key not in self._observed:
+                self._observed[key] = _verify_spec_occurrences(tuple(group.values()), self._cancelled)
+            results, observed = self._observed[key]
+            holds = results.get(id(proof), False)
+            if holds is not False:
+                named = os.stat(proof.path)
+                if (not _spec_occurrence_name_matches(proof, observed)
+                        or _spec_descriptor_revision(named) != _spec_descriptor_revision(observed)):
+                    return False
+            if holds is None:
+                raise SpecOccurrenceUnsettled(f"SPEC {proof.path}: a line after scan {proof.key} is still being written")
+            return holds
+        except InterruptedError:
+            _spec_cancelled(self._cancelled)
+            return False
+        except OSError:
+            return False
 
 
 def spec_occurrence_holds(proof: SpecOccurrence) -> bool:
-    """Whether the SPEC file still holds ``proof``'s occurrence: the same filesystem object under its name, the
-    same ``N.M`` occurrence at the same offset with the same header lines and bytes, and nothing of the scan's own
-    after them (what follows is blank, the end, or a complete or starting ``#S``/``#F`` line). One read of the file
-    up to the scan's end and of the lines just after it. False for a missing, replaced or changed file;
-    ``SpecOccurrenceUnsettled`` while a line after the scan is still being written. On POSIX a file whose name
-    still stats as the captured view (device, inode, size, mtime and ctime, which any write moves) holds without a
-    read; win32's pathname ctime is not a change time (``io.stat_identity``), so there it is always read."""
-    from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
-    try:
-        if IDENTITY_CARRIES_CTIME and proof.captured is not None:
-            named = os.stat(proof.path)
-            if _spec_descriptor_revision(named) == proof.captured:
-                return _spec_occurrence_name_matches(proof, named)
-        descriptor = os.open(proof.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-        try:
-            return _read_spec_occurrence(proof, descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:
-        return False
+    """Verify the occurrence at its recorded pathname on the same regular file object.
+
+    The POSIX unchanged-revision fast path needs no reads. Otherwise inspect
+    the structural prefix through the selected boundary, even on platforms
+    whose pathname timestamps cannot distinguish same-size rewrites.
+    """
+    return SpecOccurrenceVerification((proof,)).holds(proof)
 
 
 def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[Path, int, int] | None:

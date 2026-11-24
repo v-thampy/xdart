@@ -1167,11 +1167,11 @@ def _receipt_dependencies(
         (receipt.lexical_root, receipt.resolved_root, receipt.primary_post_state),
         *receipt.dependency_revisions,
     )
-def _occurrence_holds(proof) -> bool:
+def _occurrence_holds(proof, verification=None) -> bool:
     """Whether a SPEC primary's occurrence proof still holds (a line still being written after it: not yet)."""
     from xrd_tools.io.metadata import SpecOccurrenceUnsettled, spec_occurrence_holds
     try:
-        return spec_occurrence_holds(proof)
+        return spec_occurrence_holds(proof) if verification is None else verification.holds(proof)
     except SpecOccurrenceUnsettled:
         return False
 
@@ -1204,6 +1204,7 @@ def _receipt_occurrence_is_bound(receipt: AnalysisSourceReceipt) -> bool:
 
 def _receipt_dependency_holds(
     receipt: AnalysisSourceReceipt, index: int, lexical: Path, resolved: Path, revision: FileRevision | None,
+    *, verification=None,
 ) -> bool:
     """One receipt dependency, as the receipt's role gives it: the primary of a SPEC receipt carrying an occurrence
     proof holds when that occurrence does (the file may have grown after it; NEXT-1219-SPEC-OCCURRENCE); every
@@ -1213,7 +1214,9 @@ def _receipt_dependency_holds(
             resolves = _lexical_absolute(lexical).resolve(strict=False) == resolved
         except OSError:
             return False
-        return resolves and _receipt_occurrence_is_bound(receipt) and _occurrence_holds(receipt.spec_occurrence)
+        return resolves and _receipt_occurrence_is_bound(receipt) and _occurrence_holds(
+            receipt.spec_occurrence, verification,
+        )
     return _dependency_matches(lexical, resolved, revision)
 
 
@@ -1417,12 +1420,10 @@ def _table_fingerprint(source_fingerprint: str, declared, selected, columns) -> 
                           for c in columns)), allow_missing=True)
 
 
-def metadata_table_answers(
+def _matching_metadata_occurrence(
     receipt: AnalysisSourceReceipt, table_fingerprint: str, table: "MetadataTableResult",
-) -> bool:
-    """Whether a table read now answers an admitted receipt and table fingerprint: exactly equal, or (a SPEC
-    primary with an occurrence proof, NEXT-1219-SPEC-OCCURRENCE) the same scan occurrence and every other source
-    fact, the proof still holding, and the same table content under the admitted source fingerprint."""
+):
+    """True for an exact match, False for a mismatch, or the admitted SPEC occurrence awaiting a live check."""
     if type(table) is not MetadataTableResult or table.disposition is not AnalysisDisposition.COMPLETED:
         return False
     current = table.receipt
@@ -1431,12 +1432,33 @@ def metadata_table_answers(
         return False
     if current == receipt and table.table_fingerprint == table_fingerprint:
         return True
-    return (receipt.spec_occurrence is not None and current.spec_occurrence is not None
+    if (receipt.spec_occurrence is not None and current.spec_occurrence is not None
             and receipt.occurrence_fingerprint is not None
             and current.occurrence_fingerprint == receipt.occurrence_fingerprint
-            and _occurrence_holds(receipt.spec_occurrence)
             and _table_fingerprint(receipt.source_fingerprint, table.declared_scanned_positioner,
-                                   table.selected_scanned_positioner, table.columns) == table_fingerprint)
+                                   table.selected_scanned_positioner, table.columns) == table_fingerprint):
+        return receipt.spec_occurrence
+    return False
+
+
+def metadata_table_answers(
+    receipt: AnalysisSourceReceipt, table_fingerprint: str, table: MetadataTableResult,
+) -> bool:
+    """Does this table answer the exact admitted receipt, with the SPEC occurrence exception?"""
+    match = _matching_metadata_occurrence(receipt, table_fingerprint, table)
+    return match if type(match) is bool else _occurrence_holds(match)
+
+
+def metadata_tables_answer(tables) -> bool:
+    """Compare a group of current tables and share the one live observation for each SPEC file."""
+    from xrd_tools.io.metadata import SpecOccurrenceVerification
+
+    matches = tuple(_matching_metadata_occurrence(*values) for values in tables)
+    if any(match is False for match in matches):
+        return False
+    proofs = tuple(match for match in matches if match is not True)
+    verification = SpecOccurrenceVerification(proofs)
+    return all(_occurrence_holds(proof, verification) for proof in proofs)
 
 
 def run_metadata_table_requalification(
@@ -1448,37 +1470,61 @@ def run_metadata_table_requalification(
         return MetadataTableRequalificationResult(
             AnalysisDisposition.REFUSED, "INVALID_REQUALIFICATION_PLAN"
         )
+    return run_metadata_table_group_requalification(
+        (plan,), cancel_token=cancel_token, progress_callback=progress_callback,
+    )
+
+
+def run_metadata_table_group_requalification(
+    plans: tuple[MetadataTableRequalificationPlan, ...], *,
+    cancel_token: threading.Event | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> MetadataTableRequalificationResult:
+    """Keep both custody sweeps while sharing live SPEC verification within each sweep."""
+    from xrd_tools.io.metadata import SpecOccurrenceVerification
+
     if not _valid_cancel(cancel_token):
         return MetadataTableRequalificationResult(
             AnalysisDisposition.REFUSED, "INVALID_CANCEL_TOKEN"
         )
-    receipt = plan.receipt
-    if receipt.schema_version != "analysis-source-v2":
+    if any(plan.receipt.schema_version != "analysis-source-v2" for plan in plans):
         return MetadataTableRequalificationResult(
             AnalysisDisposition.REFUSED, "SOURCE_IDENTITY_MISMATCH"
         )
-    revisions = _receipt_dependencies(receipt)
-    total = 2 * len(revisions)
+    if any(not _receipt_occurrence_is_bound(plan.receipt) for plan in plans):
+        return MetadataTableRequalificationResult(
+            AnalysisDisposition.REFUSED, "SOURCE_REVISION_CHANGED"
+        )
+    dependencies = tuple((plan.receipt, index, dependency)
+                         for plan in plans
+                         for index, dependency in enumerate(_receipt_dependencies(plan.receipt)))
+    proofs = tuple(plan.receipt.spec_occurrence for plan in plans if plan.receipt.spec_occurrence is not None)
+    total = 2 * len(dependencies)
     completed = 0
-    for _sweep in range(2):
-        for index, (lexical, resolved, revision) in enumerate(revisions):
-            if cancel_token is not None and cancel_token.is_set():
-                return MetadataTableRequalificationResult(
-                    AnalysisDisposition.CANCELLED, "CANCELLED"
-                )
-            if not _receipt_dependency_holds(receipt, index, lexical, resolved, revision):
-                return MetadataTableRequalificationResult(
-                    AnalysisDisposition.REFUSED, "SOURCE_REVISION_CHANGED"
-                )
-            completed += 1
-            _notify(progress_callback, completed, total)
-    if cancel_token is not None and cancel_token.is_set():
+    cancelled = None if cancel_token is None else cancel_token.is_set
+    try:
+        for _sweep in range(2):
+            verification = SpecOccurrenceVerification(proofs, cancelled=cancelled)
+            for receipt, index, dependency in dependencies:
+                if cancelled is not None and cancelled():
+                    raise InterruptedError
+                if not _receipt_dependency_holds(receipt, index, *dependency, verification=verification):
+                    return MetadataTableRequalificationResult(
+                        AnalysisDisposition.REFUSED, "SOURCE_REVISION_CHANGED"
+                    )
+                completed += 1
+                _notify(progress_callback, completed, total)
+        if cancelled is not None and cancelled():
+            raise InterruptedError
+    except InterruptedError:
         return MetadataTableRequalificationResult(
             AnalysisDisposition.CANCELLED, "CANCELLED"
         )
     return MetadataTableRequalificationResult(
-        AnalysisDisposition.COMPLETED, "OK", receipt, plan.table_fingerprint,
+        AnalysisDisposition.COMPLETED, "OK", plans[-1].receipt, plans[-1].table_fingerprint,
     )
+
+
 def _numeric_column(table: MetadataTableResult, name: str) -> np.ndarray:
     matches = [column for column in table.columns if column.name == name]
     if len(matches) != 1 or matches[0].kind != "numeric" or matches[0].numeric is None:

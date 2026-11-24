@@ -2464,13 +2464,13 @@ class StitchOperationRequest:
 
 def _admitted_tables(source: ModuleSourceReceipt, tables):
     """Reuse supplied tables that answer the admitted source receipts."""
-    from xrd_tools.analysis.scan_operations import metadata_table_answers
+    from xrd_tools.analysis.scan_operations import metadata_tables_answer
 
     members = _source_members(source)
     values = tables if type(tables) is tuple else (tables,)
-    if len(values) != len(members) or any(
-        not metadata_table_answers(member.analysis, member.table_fingerprint, table)
-        for member, table in zip(members, values)
+    if len(values) != len(members) or not metadata_tables_answer(
+        (member.analysis, member.table_fingerprint, table)
+        for member, table in zip(members, values, strict=True)
     ):
         raise StitchOperationRefused(
             "SOURCE_IDENTITY_MISMATCH", "admitted metadata differs from the source receipt"
@@ -2480,7 +2480,9 @@ def _admitted_tables(source: ModuleSourceReceipt, tables):
 
 def _fresh_table(source: ModuleSourceReceipt):
     if type(source) is ModuleSourceGroupReceipt:
-        return tuple(_fresh_table(member) for member in source.members)
+        tables = tuple(run_metadata_table(MetadataTablePlan(member.analysis.source_spec))
+                       for member in source.members)
+        return _admitted_tables(source, tables)
     table = run_metadata_table(MetadataTablePlan(source.analysis.source_spec))
     from xrd_tools.analysis.scan_operations import metadata_table_answers
     if not metadata_table_answers(source.analysis, source.table_fingerprint, table):

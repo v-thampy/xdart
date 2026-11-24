@@ -24,6 +24,7 @@ from xrd_tools.analysis.scan_operations import (
     MetadataTableRequalificationPlan,
     analysis_canonical_fingerprint,
     run_metadata_table,
+    run_metadata_table_group_requalification,
     run_metadata_table_requalification,
 )
 from xrd_tools.io.analysis_artifact import (
@@ -1087,21 +1088,26 @@ def _source_requalification(
     cancel_token: threading.Event | None = None,
 ):
     if type(source) is ModuleSourceGroupReceipt:
-        result = None
-        for member in source.members:
-            result = _source_requalification(member, cancel_token=cancel_token)
-            if result.disposition is not AnalysisDisposition.COMPLETED:
-                return result
-        return result
-    if type(source) is not ModuleSourceReceipt:
+        if len(source.members) > 1 and any(member.analysis.spec_occurrence is not None for member in source.members):
+            result = run_metadata_table_group_requalification(
+                tuple(MetadataTableRequalificationPlan(member.analysis, member.table_fingerprint)
+                      for member in source.members),
+                cancel_token=cancel_token,
+            )
+            source = source.members[-1]
+        else:
+            for member in source.members:
+                result = _source_requalification(member, cancel_token=cancel_token)
+                if result.disposition is not AnalysisDisposition.COMPLETED:
+                    return result
+            return result
+    elif type(source) is ModuleSourceReceipt:
+        result = run_metadata_table_requalification(
+            MetadataTableRequalificationPlan(source.analysis, source.table_fingerprint),
+            cancel_token=cancel_token,
+        )
+    else:
         raise TypeError("source requalification requires an exact source receipt")
-    result = run_metadata_table_requalification(
-        MetadataTableRequalificationPlan(
-            source.analysis,
-            source.table_fingerprint,
-        ),
-        cancel_token=cancel_token,
-    )
     if (
         result.disposition is AnalysisDisposition.COMPLETED
         and (

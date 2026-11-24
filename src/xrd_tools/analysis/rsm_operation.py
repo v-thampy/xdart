@@ -568,14 +568,14 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
     return RSMBoundUB(override, tuple(float(value) for value in array), receipt, proof)
 
 
-def _revalidate_rsm_ub(bound) -> None:
+def _revalidate_rsm_ub(bound, *, verification=None) -> None:
     """At the run: the SPEC scan the UB came from is unchanged since Preview (its occurrence, when bound with one:
     later scans may be written meanwhile; else the whole file)."""
     if bound is None or bound.spec_receipt is None:
         return
     if bound.spec_occurrence is not None:
         from xrd_tools.analysis.scan_operations import _occurrence_holds
-        if not _occurrence_holds(bound.spec_occurrence):
+        if not _occurrence_holds(bound.spec_occurrence, verification):
             raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "the UB's SPEC scan changed since Preview")
         return
     path = Path(bound.spec_receipt[1])
@@ -1455,7 +1455,7 @@ class RSMPreflightReceipt:
         raise TypeError("RSM preflight receipt is not serializable")
 
 
-def _fresh_table(
+def _read_fresh_table(
     source: ModuleSourceReceipt,
     *,
     cancel_token: threading.Event | None = None,
@@ -1466,6 +1466,15 @@ def _fresh_table(
     )
     if table.disposition is AnalysisDisposition.CANCELLED:
         raise RSMOperationRefused("CANCELLED")
+    return table
+
+
+def _fresh_table(
+    source: ModuleSourceReceipt,
+    *,
+    cancel_token: threading.Event | None = None,
+):
+    table = _read_fresh_table(source, cancel_token=cancel_token)
     from xrd_tools.analysis.scan_operations import metadata_table_answers
     if not metadata_table_answers(source.analysis, source.table_fingerprint, table):
         # exact, or the same SPEC scan occurrence while later scans are written (NEXT-1219-SPEC-OCCURRENCE)
@@ -6055,8 +6064,15 @@ def _revalidate_rsm_v2_authorities(
     *,
     cancel_token: threading.Event | None,
 ) -> None:
+    from xrd_tools.analysis.scan_operations import _matching_metadata_occurrence, _occurrence_holds
+    from xrd_tools.io.metadata import SpecOccurrenceVerification
+
     _revalidate_rsm_v2_geometry(request)
-    _revalidate_rsm_ub(request.plan.ub_override)  # a UB taken from a SPEC file: that file unchanged
+    ub = request.plan.ub_override
+    ub_proof = None if ub is None else ub.spec_occurrence
+    if ub_proof is None:
+        _revalidate_rsm_ub(ub)
+    proofs = []
     for source, member in zip(
         request.module.source.members,
         request.preflight.members,
@@ -6068,7 +6084,24 @@ def _revalidate_rsm_v2_authorities(
             or source.table_fingerprint != member.table_fingerprint
         ):
             raise RSMOperationRefused("RSM_MEMBER_IDENTITY_MISMATCH")
-        _fresh_table(source, cancel_token=cancel_token)
+        match = _matching_metadata_occurrence(
+            source.analysis, source.table_fingerprint, _read_fresh_table(source, cancel_token=cancel_token),
+        )
+        if match is False:
+            raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "source metadata no longer matches its receipt")
+        if match is not True:
+            proofs.append(match)
+    verification = SpecOccurrenceVerification(
+        proofs if ub_proof is None else (*proofs, ub_proof),
+        cancelled=None if cancel_token is None else cancel_token.is_set,
+    )
+    try:
+        if ub_proof is not None:
+            _revalidate_rsm_ub(ub, verification=verification)
+        if not all(_occurrence_holds(proof, verification) for proof in proofs):
+            raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "source metadata no longer matches its receipt")
+    except InterruptedError as error:
+        raise RSMOperationRefused("CANCELLED") from error
     _requalify_project_output(
         request.module.output,
         request.preflight.project_root,
