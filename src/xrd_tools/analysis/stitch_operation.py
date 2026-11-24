@@ -934,8 +934,12 @@ class StitchGroupManifestReceipt:
     member_frames: tuple[tuple[int, int], ...] = field(init=False)
     fingerprint: str = field(init=False)
     _claim: InitVar[object] = None
+    #: NEXT-1219-SPEC-OCCURRENCE: the relative paths of SPEC files that are the primary of members each bound by
+    #: its own scan occurrence; a member admitted before a later scan was written and one admitted after it record
+    #: that shared file's revision differently, and the group keeps the first member's row
+    _occurrence_primaries: InitVar[frozenset] = frozenset()
 
-    def __post_init__(self, _claim):
+    def __post_init__(self, _claim, _occurrence_primaries):
         if (_claim is not _REQUEST_FACTORY or type(self.members) is not tuple
                 or not self.members or any(type(m) is not StitchInputManifestReceipt for m in self.members)
                 or len({m.project_root for m in self.members}) != 1):
@@ -943,12 +947,20 @@ class StitchGroupManifestReceipt:
         _sha256(self.module_source_fingerprint, "group source fingerprint")
         files, contributions, member_frames = [], [], []
         by_path = {}
+
+        def occurrence_primary(member, item):
+            return (member.source_kind == SourceKind.SPEC.value and item.relative_path == member.source_relative_path
+                    and item.relative_path in _occurrence_primaries)
+        primary_rows = set()  # rows recorded as an occurrence-bound SPEC primary of their first member
         for index, member in enumerate(self.members):
             for item in member.files:
                 if item.relative_path not in by_path:
                     by_path[item.relative_path] = len(files)
                     files.append(item)
-                elif files[by_path[item.relative_path]] != item:
+                    if occurrence_primary(member, item):
+                        primary_rows.add(item.relative_path)
+                elif files[by_path[item.relative_path]] != item and not (
+                        item.relative_path in primary_rows and occurrence_primary(member, item)):
                     raise StitchOperationRefused("SOURCE_IDENTITY_MISMATCH")
             for item in member.contributions:
                 contributions.append(replace(item, label=len(contributions), file_ordinal=
@@ -1204,10 +1216,17 @@ def _capture_input_manifest(
     selectors: tuple[MetadataColumnSelector, ...],
 ) -> StitchInputManifestReceipt:
     if type(source) is ModuleSourceGroupReceipt:
-        return StitchGroupManifestReceipt(tuple(
+        manifests = tuple(
             _capture_input_manifest(member, member_table, project_root, selectors)
             for member, member_table in zip(source.members, table, strict=True)
-        ), source.fingerprint, _REQUEST_FACTORY)
+        )
+        proven = {}  # SPEC primary path -> whether every member reading it is bound by its occurrence
+        for member, manifest in zip(source.members, manifests, strict=True):
+            if manifest.source_kind == SourceKind.SPEC.value:
+                path = manifest.source_relative_path
+                proven[path] = proven.get(path, True) and member.analysis.spec_occurrence is not None
+        return StitchGroupManifestReceipt(manifests, source.fingerprint, _REQUEST_FACTORY,
+                                          frozenset(path for path, ok in proven.items() if ok))
     try:
         root = Path(project_root).expanduser().resolve(strict=True)
     except (OSError, TypeError) as error:

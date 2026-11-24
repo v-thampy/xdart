@@ -500,3 +500,34 @@ def test_s2_a_touch_of_the_spec_file_at_publication_leaves_the_job_standing(tmp_
     monkeypatch.setattr(rsm_operation, "write_rsm", write_then_touch)
     _committed(run_rsm_operation_v2(request))
     assert touched == [True]
+
+
+def test_s6_a_stitch_group_of_two_scans_admitted_before_and_after_a_later_scan_commits(tmp_path):
+    """Two members of one SPEC file, each admitted by its own table read, with a later scan written between them:
+    the group's manifest records the shared SPEC file once and each member keeps its own occurrence."""
+    from xrd_tools.analysis.module_transaction import ModuleSourceGroupReceipt, ModuleOutputRequest
+    from xrd_tools.analysis.module_transaction import MetadataColumnSelector
+    from xrd_tools.analysis.stitch_operation import prepare_stitch_operation
+    from xrd_tools.io.analysis_artifact import AnalysisArtifactKind
+    from xrd_tools.io.output_path import resolve_finite_output_target
+    form = _native_form(tmp_path, "multigeometry", scans="[1,2]")
+    planned = prepare_stitch_tool(form).request
+    spec = Path(form.spec_path)
+
+    def member(scan, stem):
+        table = run_metadata_table(MetadataTablePlan(SourceSpec(spec, SourceKind.SPEC, options={
+            "scan": scan, "image_dir": str(form.image_dir), "image_stem": stem, "require_complete_images": True,
+            "read_image_kwargs": {"detector_shape": form.detector_shape, "raw_dtype": form.raw_dtype,
+                                  "raw_header_skip": 0, "rotation": 0}})))
+        assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+        return ModuleSourceReceipt.from_metadata_table(table, kind=ModuleKind.STITCH, resolved_selectors=(
+            MetadataColumnSelector("del"), MetadataColumnSelector("nu")), fresh=True)
+
+    first = member("1.1", "sample_scan1_")
+    _append(spec, "\n#S 4 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n")
+    second = member("2.1", "sample_scan2_")
+    group = ModuleSourceGroupReceipt.from_members((first, second), kind=ModuleKind.STITCH)
+    output = ModuleOutputRequest(resolve_finite_output_target(tmp_path / "output", "group", operation_token="stitch-1d"),
+                                 AnalysisArtifactKind.STITCH_1D, artifact_family="group")
+    request = prepare_stitch_operation(group, output, planned.plan, project_root=tmp_path)
+    _committed(run_stitch_operation(request))
