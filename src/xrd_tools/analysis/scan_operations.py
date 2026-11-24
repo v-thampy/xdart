@@ -1178,7 +1178,11 @@ def _receipt_dependency_holds(
     proof holds when that occurrence does (the file may have grown after it; NEXT-1219-SPEC-OCCURRENCE); every
     other dependency, and every receipt without a proof, keeps its exact file revision."""
     if index == 0 and receipt.spec_occurrence is not None:
-        return _occurrence_holds(receipt.spec_occurrence)
+        try:  # the spelling still resolves where the receipt recorded, as every other dependency must
+            resolves = _lexical_absolute(lexical).resolve(strict=False) == resolved
+        except OSError:
+            return False
+        return resolves and _occurrence_holds(receipt.spec_occurrence)
     return _dependency_matches(lexical, resolved, revision)
 
 

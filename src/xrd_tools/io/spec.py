@@ -182,16 +182,23 @@ def spec_occurrence(spec_file: Path | str, key: str):
     proof = spec_occurrence_from_bytes(data, path=view.lexical, resolved=view.resolved, device=view.device,
                                        inode=view.inode, key=key,
                                        captured=(view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns))
-    counts, indexed, position = {}, [], data.find(b"#S")
+    counts, indexed, unfinished, position = {}, [], None, data.find(b"#S")
     while position >= 0:
         match = _SPEC_SCAN_LINE.match(data, position) if _line_start(data, position) else None
         if match is not None:
             number = int(match[1])
             counts[number] = counts.get(number, 0) + 1
-            indexed.append(f"{number}.{counts[number]}")
+            if data.find(b"\n", position) < 0:  # the last line, still being written
+                unfinished = f"{number}.{counts[number]}"
+            else:
+                indexed.append(f"{number}.{counts[number]}")
         position = data.find(b"#S", position + 2)
     parser = capture.parser
-    if list(parser.keys()) != indexed:
+    keys = list(parser.keys())
+    # silx may list an unfinished last #S line or not, and reads "#S 3" at the very end as a garbage number: every
+    # complete scan must agree, the unfinished one is not looked at
+    if not (keys == indexed or (unfinished is not None and len(keys) == len(indexed) + 1
+                                and keys[:len(indexed)] == indexed)):
         raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser and the file's bytes list different scans")
     if proof is not None:
         table = np.asarray(parser[proof.key].data)

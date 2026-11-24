@@ -557,3 +557,63 @@ def test_s7_a_run_reads_its_spec_file_a_bounded_number_of_times(tmp_path, monkey
     bound = 12 if case.startswith("growing") else 1
     assert live_parsers == 0 and captures == 1 and opens.get(spec, 0) <= bound, (case, {
         "live parser opens": live_parsers, "captured-view parses": captures, "live file opens": opens.get(spec, 0)})
+
+
+@pytest.mark.parametrize("cut", ["#S 3", "#S 3 asc", "#S 3 ascan eta 0 1 1 1\n#L e"])
+def test_s7_a_capture_while_the_next_scans_header_is_being_written_reads_the_earlier_scan(tmp_path, cut):
+    """At a beamline the next scan's #S line is written while a job reads the file: the earlier scan's proof is
+    built whatever silx makes of the unfinished line."""
+    from xrd_tools.io.spec import spec_capture_scope, spec_occurrence
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS + "\n" + cut, encoding="utf-8", newline="\n")
+    with spec_capture_scope():
+        proof = spec_occurrence(path, "2.1")
+    assert proof is not None and proof.rows == 2
+
+
+def test_s11_a_spec_file_reached_through_a_link_repointed_at_an_identical_copy_refuses(tmp_path):
+    """The proof binds the file the spelling resolved to: a link re-pointed at a byte-identical copy is another file
+    (1.2.18 refused it too)."""
+    import os
+    member, _table = _spec_table(tmp_path)
+    original = Path(member.spec_path)
+    target = tmp_path / "data" / "RSM_synth_0"
+    target.parent.mkdir()
+    original.replace(target)
+    os.symlink(target, original)
+    plan = MetadataTablePlan(SourceSpec(original, SourceKind.SPEC, options={
+        "scan": "1.1", "image_dir": str(member.image_dir), "image_stem": member.image_stem}))
+    table = run_metadata_table(plan)
+    assert table.disposition is AnalysisDisposition.COMPLETED and table.receipt.spec_occurrence is not None
+    copy = tmp_path / "data" / "copy"
+    copy.write_bytes(target.read_bytes())
+    original.unlink()
+    os.symlink(copy, original)
+    requalified = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint))
+    assert requalified.disposition is AnalysisDisposition.REFUSED, requalified.code
+
+
+@pytest.mark.parametrize("change, holds", [
+    ("unchanged", True), ("later scan appended", True),
+    ("row appended to the scan", False), ("selected row rewritten", False), ("replaced by a copy", False),
+])
+def test_s11_the_proof_from_a_real_capture_takes_the_stat_fast_path_only_when_unchanged(tmp_path, change, holds):
+    from xrd_tools.io.metadata import spec_occurrence_holds
+    from xrd_tools.io.spec import spec_capture_scope, spec_occurrence
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS, encoding="utf-8", newline="\n")
+    with spec_capture_scope():
+        proof = spec_occurrence(path, "2.1")
+    assert proof.captured is not None
+    if change == "later scan appended":
+        _append(path, "\n#S 3 ascan eta 0 1 1 1\n#L eta  I0\n0 50\n")
+    elif change == "row appended to the scan":
+        _append(path, "2 50\n")
+    elif change == "selected row rewritten":
+        _rewrite(path, "1 40\n", "1 41\n")
+    elif change == "replaced by a copy":
+        copy = tmp_path / "copy"
+        copy.write_bytes(path.read_bytes())
+        copy.replace(path)
+    assert spec_occurrence_holds(proof) is holds

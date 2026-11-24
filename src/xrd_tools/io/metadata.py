@@ -1922,9 +1922,14 @@ def spec_occurrence_holds(proof: SpecOccurrence) -> bool:
     still stats as the captured view (device, inode, size, mtime and ctime, which any write moves) holds without a
     read; win32's pathname ctime is not a change time (``io.stat_identity``), so there it is always read."""
     from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
+    try:  # the spelling still resolves to the file the proof read (a re-pointed link is another file)
+        if os.path.normcase(os.path.realpath(proof.path)) != proof.resolved:
+            return False
+    except OSError:
+        return False
     if IDENTITY_CARRIES_CTIME and proof.captured is not None:
         try:
-            named = os.stat(proof.resolved)
+            named = os.stat(proof.path)
         except OSError:
             return False
         if (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns, named.st_ctime_ns) == proof.captured:
