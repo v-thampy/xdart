@@ -25,8 +25,7 @@ _CAPTURE_CHUNK = 1 << 20
 
 
 class SpecCaptureFailed(OSError):
-    """A SPEC file could not be captured as one immutable view (missing, not a regular file, replaced or truncated
-    while it was read), or its private copy could not be closed or removed."""
+    """A SPEC file could not be captured or qualified as one immutable view."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,21 +102,25 @@ class _SpecCapture:
             self._parser = SpecFile(str(self.scratch))
         return self._parser
 
-    def close(self) -> BaseException | None:
-        failure = None
-        for action in (None if self._parser is None else self._parser.close,
-                       None if self.scratch is None else self._unlink):
-            if action is not None:
-                try:
-                    action()
-                except BaseException as error:  # reported once, after every step ran
-                    failure = failure or error
-        self._parser = None
-        return failure
+    def close(self) -> None:
+        if self._parser is not None:
+            if not self._release("close the parser", self._parser.close):
+                return
+            self._parser = None
+        scratch = self.scratch
+        if scratch is not None and self._release("unlink the spool", lambda: scratch.unlink(missing_ok=True)):
+            self.scratch = None
 
-    def _unlink(self):
-        scratch, self.scratch = self.scratch, None
-        scratch.unlink(missing_ok=True)
+    def _release(self, step: str, action) -> bool:
+        try:
+            action()
+        except BaseException:
+            try:
+                action()
+            except BaseException:
+                logger.exception("SPEC capture cleanup could not %s for private spool %s", step, self.scratch)
+                return False
+        return True
 
 
 def _capture_key(spec_file: Path | str) -> tuple[str, str]:
@@ -130,28 +133,20 @@ def spec_capture_scope():
     """Within this block, each SPEC file this module's readers open is captured once, on first use, as one
     immutable view (one descriptor, the size it had then), and every reader here parses that view: a preparation
     reads each file once however many scans, members or UB lookups it has. Nested blocks share the outermost
-    one's captures. On leaving the outermost block every private copy is closed and removed."""
+    one's captures. The outermost owner retires its copies before control returns to the caller. It retries a
+    failed cleanup step once and reports a remaining failure with the spool path, preserving the operation outcome."""
     captures = _SPEC_CAPTURES.get()
     if captures is not None:
         yield
         return
     captures = {}
     token = _SPEC_CAPTURES.set(captures)
-    primary = None
     try:
         yield
-    except BaseException as error:
-        primary = error
-        raise
     finally:
         _SPEC_CAPTURES.reset(token)
-        failure = None
         for capture in captures.values():
-            failure = capture.close() or failure
-        if failure is not None and primary is None:
-            raise SpecCaptureFailed(f"a SPEC capture could not be closed or removed: {failure}") from failure
-        if failure is not None:
-            logger.warning("SPEC capture cleanup failed after %r: %s", primary, failure)
+            capture.close()
 
 
 def spec_file_view(spec_file: Path | str) -> SpecFileView | None:

@@ -117,6 +117,39 @@ def _finish(slot: OperationSlot, identity: OperationIdentity) -> OperationUpdate
     return update
 
 
+def test_spec_metadata_worker_retries_spool_unlink_before_transferring_result(tmp_path, monkeypatch):
+    from tests.core.test_rsm_operation_r2 import _write_member
+
+    member = _write_member(tmp_path, 0)
+    plan = MetadataTablePlan(SourceSpec(member.spec_path, SourceKind.SPEC, options={
+        "scan": "1.1", "image_dir": str(member.image_dir), "image_stem": member.image_stem,
+    }))
+    real_unlink = Path.unlink
+    spool_attempts = []
+
+    def unlink_once(path, *args, **kwargs):
+        if path.name.startswith("xdart-spec-"):
+            spool_attempts.append(path)
+            if len(spool_attempts) == 1:
+                raise PermissionError("transient private SPEC unlink fault")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_once)
+    slot = OperationSlot()
+    try:
+        identity = slot.begin_metadata(plan, OperationContextStamp(0))
+        update = _finish(slot, identity)
+        assert update.terminal.status is OperationTerminalStatus.RETURNED, update.terminal
+        assert update.terminal.payload.disposition is AnalysisDisposition.COMPLETED
+        assert update.terminal.payload.receipt.spec_occurrence is not None
+        assert not slot.owned
+        assert len(spool_attempts) == 2 and spool_attempts[0] == spool_attempts[1]
+        assert not spool_attempts[0].exists()
+    finally:
+        for path in set(spool_attempts):
+            real_unlink(path, missing_ok=True)
+
+
 def _source(path: str = "/tmp/input.nxs"):
     return SimpleNamespace(
         source=path, selection="exact", kind=None, recursive=False, entry=None,
