@@ -2100,31 +2100,33 @@ def _spec_descriptor_revision(status):
     return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
 
 
-def _spec_occurrence_name_matches(proof: SpecOccurrence, status) -> bool:
+def _spec_occurrence_named_status(proof: SpecOccurrence, status):
     if not stat.S_ISREG(status.st_mode) or (status.st_dev, status.st_ino) != (proof.device, proof.inode):
-        return False
+        return None
     named = os.stat(proof.path)
-    return ((named.st_dev, named.st_ino) == (proof.device, proof.inode)
-            and os.path.normcase(os.path.realpath(proof.path)) == proof.resolved)
+    if ((named.st_dev, named.st_ino) == (proof.device, proof.inode)
+            and os.path.normcase(os.path.realpath(proof.path)) == proof.resolved):
+        return named
+    return None
 
 
 def _spec_occurrence_name_holds(proof: SpecOccurrence, status) -> bool:
     try:
-        return _spec_occurrence_name_matches(proof, status)
+        return _spec_occurrence_named_status(proof, status) is not None
     except OSError:
         return False
 
 
-def _read_spec_occurrences(proofs, descriptor: int, cancelled):
+def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
     # Re-observe once if growth overlaps this read. The old prefix alone
     # cannot distinguish a concurrent selected rewrite from unrelated growth.
     stop_after = max(proof.block_end for proof in proofs)
     keys = {proof.key for proof in proofs}
-    for _ in range(2):
+    for attempt in range(2 if retry else 1):
         status = os.fstat(descriptor)
         named = tuple(proof for proof in proofs if _spec_occurrence_name_holds(proof, status))
         if not named:
-            return {}, None
+            return {}, None, False
         os.lseek(descriptor, 0, os.SEEK_SET)
         remaining = status.st_size
 
@@ -2147,32 +2149,33 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled):
                         and frame.framed == proof.content[2:]
                         and _spec_occurrence_name_holds(proof, after)):
                     result[id(proof)] = True if frame.boundary_holds else None
-            return result, after
+            return result, after, retry and attempt == 0
         if after.st_size <= status.st_size:
-            return {}, None
-    return {}, None
+            return {}, None, False
+    return {}, None, False
 
 
-def _verify_spec_occurrences(proofs, cancelled):
+def _verify_spec_occurrences(proofs, cancelled, retry: bool):
     from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
 
     for proof in proofs:
         try:
             named = os.stat(proof.path)
-            if not _spec_occurrence_name_matches(proof, named):
+            if _spec_occurrence_named_status(proof, named) is None:
                 continue
             if IDENTITY_CARRIES_CTIME and all(
                 _spec_descriptor_revision(named) == member.captured for member in proofs
             ):
-                return {id(member): True for member in proofs if _spec_occurrence_name_holds(member, named)}, named
+                return ({id(member): True for member in proofs if _spec_occurrence_name_holds(member, named)},
+                        named, retry)
             descriptor = os.open(proof.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
         except OSError:
             continue
         try:
-            return _read_spec_occurrences(proofs, descriptor, cancelled)
+            return _read_spec_occurrences(proofs, descriptor, cancelled, retry)
         finally:
             os.close(descriptor)
-    return {}, None
+    return {}, None, False
 
 
 class SpecOccurrenceVerification:
@@ -2184,6 +2187,7 @@ class SpecOccurrenceVerification:
             key = (proof.resolved, proof.device, proof.inode)
             self._proofs.setdefault(key, {})[id(proof)] = proof
         self._observed = {}
+        self._accepted = {}
         self._cancelled = cancelled
 
     def holds(self, proof: SpecOccurrence) -> bool:
@@ -2194,22 +2198,35 @@ class SpecOccurrenceVerification:
             return False
         try:
             if key not in self._observed:
-                self._observed[key] = _verify_spec_occurrences(tuple(group.values()), self._cancelled)
-            results, observed = self._observed[key]
-            holds = results.get(id(proof), False)
-            if holds is not False:
-                named = os.stat(proof.path)
-                if (not _spec_occurrence_name_matches(proof, observed)
-                        or _spec_descriptor_revision(named) != _spec_descriptor_revision(observed)):
+                self._observed[key] = _verify_spec_occurrences(tuple(group.values()), self._cancelled, True)
+            accepted = self._accepted.setdefault(key, set())
+            while True:
+                results, observed, retry = self._observed[key]
+                holds = results.get(id(proof), False)
+                if holds is False:
                     return False
-            if holds is None:
-                raise SpecOccurrenceUnsettled(f"SPEC {proof.path}: a line after scan {proof.key} is still being written")
-            return holds
+                named = _spec_occurrence_named_status(proof, observed)
+                if named is not None and _spec_descriptor_revision(named) == _spec_descriptor_revision(observed):
+                    if holds is None:
+                        raise SpecOccurrenceUnsettled(
+                            f"SPEC {proof.path}: a line after scan {proof.key} is still being written"
+                        )
+                    accepted.add(id(proof))
+                    return True
+                if named is None or not retry or named.st_size <= observed.st_size:
+                    break
+                # The same file grew between members. Reobserve the whole
+                # group's protected ranges and keep earlier obligations.
+                refreshed = _verify_spec_occurrences(tuple(group.values()), self._cancelled, False)
+                if not all(refreshed[0].get(identity) is True for identity in accepted):
+                    break
+                self._observed[key] = refreshed
         except InterruptedError:
             _spec_cancelled(self._cancelled)
-            return False
         except OSError:
-            return False
+            pass
+        self._observed[key] = {}, None, False
+        return False
 
 
 def spec_occurrence_holds(proof: SpecOccurrence) -> bool:

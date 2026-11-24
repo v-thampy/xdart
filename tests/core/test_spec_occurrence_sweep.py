@@ -152,3 +152,47 @@ def test_late_live_verification_does_not_retain_all_earlier_scan_numbers(tmp_pat
         tracemalloc.stop()
     print(f"S7 late live verification: peak Python allocations={peak} bytes")
     assert peak <= 1 << 19
+
+
+@pytest.mark.parametrize("field", [{"header": []}, {"block_end": -1}])
+def test_a_malformed_spec_range_cannot_use_the_unchanged_file_shortcut(tmp_path, field):
+    from dataclasses import replace
+
+    from tests.core.test_spec_occurrence import _spec_table
+    from xrd_tools.analysis.scan_operations import (
+        AnalysisDisposition, MetadataTableRequalificationPlan, run_metadata_table_requalification,
+    )
+
+    _member, table = _spec_table(tmp_path)
+    receipt = table.receipt
+    malformed = replace(receipt, spec_occurrence=replace(receipt.spec_occurrence, **field))
+    result = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(malformed, table.table_fingerprint),
+    )
+    assert result.disposition is AnalysisDisposition.REFUSED
+    assert result.code == "SOURCE_REVISION_CHANGED"
+
+
+@pytest.mark.parametrize("selected_edit", [False, True])
+def test_a_later_append_between_group_members_reobserves_every_protected_scan(tmp_path, selected_edit):
+    from xrd_tools.analysis.scan_operations import (
+        AnalysisDisposition, MetadataTableRequalificationPlan, run_metadata_table_group_requalification,
+    )
+
+    form = _native_form(tmp_path, "multigeometry", scans="[1,2]")
+    request = prepare_stitch_tool(form).request
+    plans = tuple(MetadataTableRequalificationPlan(member.analysis, member.table_fingerprint)
+                  for member in request.module.source.members)
+    _append(form.spec_path, LATER_SCAN.replace("#S 2", "#S 4"))
+    after_first_member = []
+
+    def growing_progress(done, _total):
+        if done == 1:
+            if selected_edit:
+                _rewrite_first_after(form.spec_path, "#S 1", "15 -10", "15 -11")
+            _append(form.spec_path, LATER_SCAN.replace("#S 2", "#S 5"))
+            after_first_member.append(done)
+
+    result = run_metadata_table_group_requalification(plans, progress_callback=growing_progress)
+    assert after_first_member == [1]
+    assert result.disposition is (AnalysisDisposition.REFUSED if selected_edit else AnalysisDisposition.COMPLETED)

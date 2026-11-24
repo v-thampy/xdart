@@ -1195,6 +1195,14 @@ def _receipt_occurrence_is_bound(receipt: AnalysisSourceReceipt) -> bool:
         and type(proof.captured) is tuple
         and len(proof.captured) == 5
         and all(type(value) is int for value in proof.captured)
+        and all(type(value) is int for value in
+                (proof.number, proof.occurrence, proof.offset, proof.block_end, proof.rows))
+        and proof.number >= 0 and proof.occurrence >= 1 and proof.rows >= 0
+        and 0 <= proof.offset < proof.block_end <= proof.captured[2]
+        and type(proof.header) is tuple
+        and all(type(span) is tuple and len(span) == 2
+                and all(type(value) is int for value in span)
+                and 0 <= span[0] < span[0] + span[1] <= proof.offset for span in proof.header)
         and proof.captured[:4] == revision[1:5]
         and identity_ctime_ns(proof.captured[4]) == revision[5]
         and all(type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest)
