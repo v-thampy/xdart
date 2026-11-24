@@ -817,6 +817,37 @@ def test_s11_the_proof_from_a_real_capture_takes_the_stat_fast_path_only_when_un
     assert spec_occurrence_holds(proof) is holds
 
 
+@pytest.mark.parametrize("change, holds", [
+    ("unchanged", True), ("later scan appended", True),
+    ("row appended to the scan", False), ("selected row rewritten", False), ("replaced by a copy", False),
+])
+def test_s11_the_proof_holds_where_pathname_and_descriptor_ctimes_disagree(
+        tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, change, holds):
+    """1.2.19 release CI, windows-pixi-native (run 45461209628): "Preview refused (RSM 1 of 2):
+    SOURCE_REVISION_CHANGED: SPEC source could not be admitted for RSM v2". The check that the name still shows
+    the file it read compared the pathname view's raw ctime with the descriptor view's; on Windows those are the
+    creation and change times, so an untouched scan never held there."""
+    from xrd_tools.io.metadata import spec_occurrence_holds
+    from xrd_tools.io.spec import spec_capture_scope, spec_occurrence
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS, encoding="utf-8", newline="\n")
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)  # Windows: no pathname change token
+    win32_pathname_ctime(path)  # and a pathname ctime that is not the descriptor's (tests/conftest.py)
+    with spec_capture_scope():
+        proof = spec_occurrence(path, "2.1")
+    if change == "later scan appended":
+        _append(path, "\n#S 3 ascan eta 0 1 1 1\n#L eta  I0\n0 50\n")
+    elif change == "row appended to the scan":
+        _append(path, "2 50\n")
+    elif change == "selected row rewritten":
+        _rewrite(path, "1 40\n", "1 41\n")
+    elif change == "replaced by a copy":
+        copy = tmp_path / "copy"
+        copy.write_bytes(path.read_bytes())
+        copy.replace(path)
+    assert spec_occurrence_holds(proof) is holds
+
+
 def _two_scans_with_motor_positions():
     return _TWO_SCANS.replace("#L eta", "#P0 20\n#L eta")
 

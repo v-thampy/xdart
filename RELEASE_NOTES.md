@@ -11,7 +11,7 @@
   only its own scan's lines and the file header in effect for it: later
   scans being written no longer refuse it, and a change to its own scan
   (a row, a UB line, an earlier scan renumbered) still does. Each SPEC
-  file is also read once per Preview or Run instead of about 20 times.
+  file is also parsed once per Preview or Run instead of about 20 times.
 - **HKL maps with a UB taken from a SPEC scan stay current for Append**
   while that SPEC file grows. A map saved before 1.2.19 is gridded once
   more the first time its UB's SPEC file has grown, then stays current.

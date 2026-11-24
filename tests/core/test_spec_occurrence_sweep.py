@@ -12,6 +12,7 @@ from xrd_tools.analysis import module_transaction
 from xrd_tools.analysis.module_transaction import ModuleDisposition
 from xrd_tools.analysis.stitch_operation import run_stitch_operation
 from xrd_tools.analysis.stitch_values import prepare_stitch_tool
+from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
 
 
 @pytest.mark.parametrize("scans, change", [("1", "growth"), ("[1,2]", "growth"), ("[1,2]", "selected rewrite")])
@@ -105,7 +106,10 @@ def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(tmp_p
         monkeypatch.setattr(os, "open", observing_open)
         _revalidate_rsm_v2_authorities(request, cancel_token=None)
     print(f"two same-file RSM members and their UB authority: {len(opened)} verification passes")
-    assert len(opened) == 1
+    if IDENTITY_CARRIES_CTIME:
+        assert len(opened) == 1
+    else:  # no pathname change token (io.stat_identity): each member's fresh proof is reread too, never more
+        assert len(opened) <= 1 + 2
 
 
 def test_a_long_later_scan_header_needs_only_its_structural_marker(tmp_path, monkeypatch):

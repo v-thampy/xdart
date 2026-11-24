@@ -2086,6 +2086,18 @@ def _spec_descriptor_revision(status):
     return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
 
 
+def _spec_name_matches_read(named, observed) -> bool:
+    """Whether the pathname view *named* still shows the file the descriptor view *observed* read.
+
+    A pathname view against a descriptor view: the ctime slot rides the win32 seam (``stat_identity``),
+    because Windows reports the creation time for one and the change time for the other."""
+    from xrd_tools.io.stat_identity import identity_ctime_ns
+
+    return ((named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
+            == (observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns)
+            and identity_ctime_ns(named.st_ctime_ns) == identity_ctime_ns(observed.st_ctime_ns))
+
+
 def _spec_occurrence_named_status(proof: SpecOccurrence, status):
     if not stat.S_ISREG(status.st_mode) or (status.st_dev, status.st_ino) != (proof.device, proof.inode):
         return None
@@ -2193,7 +2205,7 @@ class SpecOccurrenceVerification:
                 if holds is False:
                     return False
                 named = _spec_occurrence_named_status(proof, observed)
-                if named is not None and _spec_descriptor_revision(named) == _spec_descriptor_revision(observed):
+                if named is not None and _spec_name_matches_read(named, observed):
                     if holds is None:
                         raise SpecOccurrenceUnsettled(
                             f"SPEC {proof.path}: a line after scan {proof.key} is still being written"
