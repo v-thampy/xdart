@@ -79,6 +79,7 @@ class _SpecCapture:
         self._strict_checked: set[str] = set()
         self._row_counts_checked: set[str] = set()
         descriptor = None
+        captured = False
         try:
             descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             before = os.fstat(descriptor)
@@ -111,12 +112,19 @@ class _SpecCapture:
                 (before.st_mode, before.st_dev, before.st_ino, before.st_size,
                  before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns)),
             )
+            captured = True
         except BaseException:
             self.close()
             raise
         finally:
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    if captured:
+                        self.close()
+                        raise
+                    logger.exception("SPEC capture could not close the source descriptor for %s", lexical)
 
     @property
     def parser(self):

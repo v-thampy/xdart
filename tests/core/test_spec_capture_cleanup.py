@@ -1,4 +1,5 @@
 """A SPEC capture retires while its operation still owns the terminal."""
+import os
 from pathlib import Path
 
 import pytest
@@ -127,3 +128,49 @@ def test_spec_spool_locator_survives_failed_parser_close(tmp_path, monkeypatch, 
                 parser.close()
         for path in paths:
             path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("source_read_fault", (False, True), ids=("close", "read_and_close"))
+def test_spec_capture_retires_spool_if_original_descriptor_close_fails(
+    tmp_path, monkeypatch, source_read_fault,
+):
+    source = str(_write_member(tmp_path, 0).spec_path)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    monkeypatch.setattr(io_spec.tempfile, "tempdir", str(spool))
+    real_open, real_fstat, real_close = os.open, os.fstat, os.close
+    source_descriptor = None
+    close_faults = []
+
+    def open_source(path, *args, **kwargs):
+        nonlocal source_descriptor
+        descriptor = real_open(path, *args, **kwargs)
+        if path == source:
+            source_descriptor = descriptor
+        return descriptor
+
+    def stat_source(descriptor):
+        if source_read_fault and descriptor == source_descriptor and any(spool.iterdir()):
+            raise OSError("source descriptor stat fault after copying")
+        return real_fstat(descriptor)
+
+    def close_source(descriptor):
+        nonlocal source_descriptor
+        real_close(descriptor)
+        if descriptor == source_descriptor:
+            source_descriptor = None
+            close_faults.append(descriptor)
+            raise OSError("source descriptor close fault")
+
+    monkeypatch.setattr(os, "open", open_source)
+    monkeypatch.setattr(os, "fstat", stat_source)
+    monkeypatch.setattr(os, "close", close_source)
+    expected = "stat fault after copying" if source_read_fault else "close fault"
+    try:
+        with pytest.raises(OSError, match=expected), io_spec.spec_capture_scope():
+            io_spec.list_spec_scans(source)
+        assert len(close_faults) == 1
+        assert not list(spool.iterdir())
+    finally:
+        for path in spool.iterdir():
+            path.unlink()
