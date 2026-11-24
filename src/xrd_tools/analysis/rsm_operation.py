@@ -5792,7 +5792,14 @@ class RSMOperationExecution:
         self._state = "done"
         return value
 
-    def run(
+    def run(self, *args, **kwargs):
+        """The Run as one SPEC capture scope: each SPEC file is parsed once per Run, and every later check reads
+        the live file for its scan occurrence (NEXT-1219-SPEC-OCCURRENCE)."""
+        from xrd_tools.io.spec import spec_capture_scope
+        with spec_capture_scope():
+            return self._run(*args, **kwargs)
+
+    def _run(
         self,
         *,
         cancel_token: threading.Event | None = None,
@@ -6382,7 +6389,14 @@ class RSMOperationExecutionV2:
         self._state = "done"
         return value
 
-    def run(
+    def run(self, *args, **kwargs):
+        """The Run as one SPEC capture scope: each SPEC file is parsed once per Run, and every later check reads
+        the live file for its scan occurrence (NEXT-1219-SPEC-OCCURRENCE)."""
+        from xrd_tools.io.spec import spec_capture_scope
+        with spec_capture_scope():
+            return self._run(*args, **kwargs)
+
+    def _run(
         self,
         *,
         cancel_token: threading.Event | None = None,

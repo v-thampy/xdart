@@ -531,3 +531,29 @@ def test_s6_a_stitch_group_of_two_scans_admitted_before_and_after_a_later_scan_c
                                  AnalysisArtifactKind.STITCH_1D, artifact_family="group")
     request = prepare_stitch_operation(group, output, planned.plan, project_root=tmp_path)
     _committed(run_stitch_operation(request))
+
+
+# --- S7 read bound at the Run -----------------------------------------------------------------------------------------
+_PADDING = "#C " + "x" * 120 + "\n"
+
+
+@pytest.mark.parametrize("case", ["unchanged", "growing, long unrelated suffix", "two members, one file"])
+def test_s7_a_run_reads_its_spec_file_a_bounded_number_of_times(tmp_path, monkeypatch, case):
+    """No parser ever reads the live SPEC file during a Run (every parse is of a captured view), and the live file
+    is opened a bounded number of times however long its unrelated tail grows. Counts are recorded in the
+    assertion message (leaves/spec_readcount_run.txt)."""
+    _runnable(monkeypatch)
+    form = _two_members_one_file(tmp_path) if case == "two members, one file" else _rsm(tmp_path)
+    spec = str(Path(form.members[0].spec_path).resolve())
+    request = prepare_rsm_tool_v2(form).request
+    if case.startswith("growing"):
+        _append(form.members[0].spec_path, "\n#S 7 ascan eta 0 1 1 1\n#L eta  I0\n" + _PADDING * 20000)  # ~2.5 MB
+    parsers, opens = _counting(monkeypatch)
+    _committed(run_rsm_operation_v2(request))
+    live_parsers = parsers.get(spec, 0)
+    captures = sum(count for path, count in parsers.items() if path and Path(path).name.startswith("xdart-spec-"))
+    # measured 2026-11-23 (leaves/spec_readcount_run2.txt): one captured parse per file per Run; the live file opened
+    # once (its capture) when unchanged, and 9 times with a 2.5 MB unrelated tail (each check re-reads the scan's span)
+    bound = 12 if case.startswith("growing") else 1
+    assert live_parsers == 0 and captures == 1 and opens.get(spec, 0) <= bound, (case, {
+        "live parser opens": live_parsers, "captured-view parses": captures, "live file opens": opens.get(spec, 0)})
