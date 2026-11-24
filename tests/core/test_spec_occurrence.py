@@ -613,6 +613,105 @@ def test_s7_a_run_reads_its_spec_file_a_bounded_number_of_times(tmp_path, monkey
         "live parser opens": live_parsers, "captured-view parses": captures, "live file opens": opens.get(spec, 0)})
 
 
+def _private_bytes_read(monkeypatch):
+    """Count Python structural reads of the spool. silx's C parser opens are counted separately."""
+    import io
+
+    counts = {"bytes": 0}
+    open_file = io.open
+
+    class MeasuredReader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __getattr__(self, name):
+            return getattr(self.stream, name)
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *error):
+            return self.stream.__exit__(*error)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return self.count(next(self.stream))
+
+        def read(self, *args):
+            return self.count(self.stream.read(*args))
+
+        def readline(self, *args):
+            return self.count(self.stream.readline(*args))
+
+        def count(self, data):
+            counts["bytes"] += len(data.encode() if isinstance(data, str) else data)
+            return data
+
+    def measured_open(path, mode="r", *args, **kwargs):
+        stream = open_file(path, mode, *args, **kwargs)
+        if isinstance(path, (str, Path)) and Path(path).name.startswith("xdart-spec-") and "r" in mode:
+            return MeasuredReader(stream)
+        return stream
+
+    monkeypatch.setattr(io, "open", measured_open)
+    return counts
+
+
+@pytest.mark.parametrize("case", ["one", "two", "grown-tail", "late-scan"])
+def test_s7_preparation_and_run_read_only_selected_spans_from_the_private_spool(tmp_path, monkeypatch, case):
+    _runnable(monkeypatch)
+    form = _two_members_one_file(tmp_path) if case == "two" else _rsm(tmp_path)
+    spec = Path(form.members[0].spec_path).resolve()
+    if case == "late-scan":
+        header, selected = spec.read_bytes().split(b"#S 1 ", 1)
+        prior = b"#S 9 other\n#L eta  I0\n0 10\n" + _PADDING.encode() * 20000
+        spec.write_bytes(header + prior + b"#S 1 " + selected)
+    parsers, opens = _counting(monkeypatch)
+    reads = _private_bytes_read(monkeypatch)
+    observations = []
+
+    def observe(phase, selection_bytes):
+        observation = (
+            phase,
+            spec.stat().st_size,
+            reads["bytes"],
+            selection_bytes,
+            sum(parsers.values()) - parsers.get(str(spec), 0),
+            parsers.get(str(spec), 0),
+            opens[str(spec)] - 1,  # descriptor opens after subtracting this phase's capture
+        )
+        observations.append(observation)
+        print(f"S7 {case} {phase}: spool={observation[1]}, private reads={observation[2]}, "
+              f"selected spans={selection_bytes}, private parses={observation[4]}, "
+              f"live parses={observation[5]}, verification passes={observation[6]}")
+        parsers.clear()
+        opens.clear()
+        reads["bytes"] = 0
+
+    request = prepare_rsm_tool_v2(form).request
+    receipts = request.module.source.members
+    selected_bytes = sum(
+        receipt.analysis.spec_occurrence.block_end - receipt.analysis.spec_occurrence.offset
+        for receipt in receipts
+    )
+    observe("prepare", selected_bytes)
+    if case == "grown-tail":
+        _append(spec, "\n#S 7 other\n#L eta  I0\n0 10\n" + _PADDING * 20000)
+    _committed(run_rsm_operation_v2(request))
+    observe("run", selected_bytes)
+
+    for phase, spool, private_reads, selected, private_parses, live_parses, passes in observations:
+        assert private_reads == selected, (case, phase, observations)
+        assert private_parses == 1 and live_parses == 0, (case, phase, observations)
+        if case == "grown-tail" and phase == "run":
+            assert 1 <= passes <= 9, observations
+        else:
+            assert passes == 0, observations
+
+
 @pytest.mark.parametrize("cut", ["#S 3", "#S 3 asc", "#S 3 ascan eta 0 1 1 1\n#L e"])
 def test_s7_a_capture_while_the_next_scans_header_is_being_written_reads_the_earlier_scan(tmp_path, cut):
     """At a beamline the next scan's #S line is written while a job reads the file: the earlier scan's proof is
