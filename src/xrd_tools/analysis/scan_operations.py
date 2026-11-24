@@ -45,7 +45,7 @@ from xrd_tools.sources.discover import discover_scans
 from xrd_tools.sources.registry import guess_source_kind, open_source
 from xrd_tools.sources.selection import image_series_spec
 __all__ = [
-    "AnalysisDisposition", "AnalysisSourceLeaseRefused", "AnalysisSourceReceipt",
+    "AnalysisDisposition", "AnalysisSourceLeaseRefused", "AnalysisSourceReceipt", "metadata_table_answers",
     "MetadataColumn", "MetadataTablePlan",
     "MetadataTableResult", "MetadataTableRequalificationPlan",
     "MetadataTableRequalificationResult", "ScanPlotPlan", "ScanPlotResult", "RoiPreviewPlan",
@@ -201,6 +201,11 @@ class AnalysisSourceReceipt:
         tuple[Path, Path, FileRevision | None], ...
     ]
     source_fingerprint: str
+    #: NEXT-1219-SPEC-OCCURRENCE, in memory only (never stored, digested or compared): for a SPEC primary read
+    #: from one captured view, the proof of its scan occurrence (``xrd_tools.io.metadata.SpecOccurrence``), and
+    #: the source's identity with the SPEC file's own revision fields replaced by that occurrence's content
+    spec_occurrence: Any = field(default=None, compare=False)
+    occurrence_fingerprint: str | None = field(default=None, compare=False)
 @dataclass(frozen=True, slots=True)
 class MetadataColumn:
     name: str
@@ -774,6 +779,7 @@ def _snapshot(
     lexical = _lexical_absolute(spec.uri)
     resolved = lexical.resolve(strict=False)
     current = _path_revision(resolved)
+    view = proof = None
     if current is not None and coerce_source_kind(spec.kind) is SourceKind.SPEC:
         # the parser reads the scope's captured view of the SPEC file: its revision is the one this read binds
         from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
@@ -809,6 +815,12 @@ def _snapshot(
         resolved_entry = descriptor.resolved_entry if descriptor is not None else spec.entry
         if resolved_entry != spec.entry or (actual_kind is SourceKind.SPEC and getattr(source, "scan_key", None) != dict(spec.options).get("scan")):
             raise _Refusal("SOURCE_IDENTITY_MISMATCH")
+        if view is not None and actual_kind is SourceKind.SPEC and getattr(source, "scan_key", None):
+            from xrd_tools.io.spec import SpecCaptureFailed, spec_occurrence
+            try:
+                proof = spec_occurrence(resolved, source.scan_key)
+            except SpecCaptureFailed:
+                raise _Refusal("SOURCE_IDENTITY_MISMATCH")
         labels = tuple(
             int(value) for value in islice(iter(source.frame_indices), _MAX_TABLE_ROWS + 1)
         )
@@ -1017,7 +1029,8 @@ def _snapshot(
             else tuple((key, tuple(values)) for key, values in column_values.items())
         )
         post = _path_revision(resolved)
-        if before != post:
+        if before != post and not (proof is not None and _occurrence_holds(proof)):
+            # a SPEC file may grow after its scan (NEXT-1219-SPEC-OCCURRENCE); anything else must hold still
             raise _Refusal("SOURCE_REVISION_CHANGED")
         scanned_value = getattr(source, "scanned_axes", ())
         scanned_value = scanned_value() if callable(scanned_value) else scanned_value
@@ -1027,22 +1040,26 @@ def _snapshot(
         dependency_revisions = _canonical_dependency_revisions(
             lexical,
             resolved,
-            post,
+            None if proof is not None else post,
             tuple(value for value in observed_states
                   if value is not None and value[0] is not None)
             + tuple(discovery_states)
             + tuple(member_states),
         )
-        source_identity = (
-            "analysis-source-v2", source_spec_identity, str(lexical), str(resolved),
-            actual_kind, resolved_entry, dict(spec.options).get("scan"), before, post,
-            labels, catalog, scanned, tuple(modes), tuple(observed_states),
-            tuple(discovery_states),
-            tuple(member_states), tuple(raw_facts), dependency_revisions,
-        )
-        if container_graph is not None:
-            source_identity += (container_graph.stamp.as_dict(), container_graph.dataset_paths)
+        def identity(primary_before, primary_after):
+            value = (
+                "analysis-source-v2", source_spec_identity, str(lexical), str(resolved),
+                actual_kind, resolved_entry, dict(spec.options).get("scan"), primary_before, primary_after,
+                labels, catalog, scanned, tuple(modes), tuple(observed_states),
+                tuple(discovery_states),
+                tuple(member_states), tuple(raw_facts), dependency_revisions,
+            )
+            if container_graph is not None:
+                value += (container_graph.stamp.as_dict(), container_graph.dataset_paths)
+            return value
+        source_identity = identity(before, post)
         fingerprint = _digest(source_identity)
+        occurrence_fingerprint = None if proof is None else _digest(identity(proof.content, proof.content))
         receipt = AnalysisSourceReceipt(
             schema_version="analysis-source-v2", source_spec=spec,
             source_spec_digest=_digest(source_spec_identity), lexical_root=lexical,
@@ -1053,6 +1070,7 @@ def _snapshot(
             catalog_digest=_digest(catalog), metadata_observation_modes=tuple(modes),
             dependency_revisions=dependency_revisions,
             source_fingerprint=fingerprint,
+            spec_occurrence=proof, occurrence_fingerprint=occurrence_fingerprint,
         )
         return _Snapshot(
             source, receipt, catalog, scanned, dependency_revisions,
@@ -1106,7 +1124,9 @@ def _canonical_dependency_revisions(
 ) -> tuple[tuple[Path, Path, FileRevision | None], ...]:
     root_lexical = _lexical_absolute(primary_lexical)
     root_resolved = root_lexical.resolve(strict=False)
-    if root_resolved != primary_resolved or _path_revision(root_resolved) != primary_revision:
+    if root_resolved != primary_resolved or (primary_revision is not None
+                                             and _path_revision(root_resolved) != primary_revision):
+        # ``primary_revision`` None: a SPEC primary whose occurrence proof the snapshot just checked
         raise _Refusal("SOURCE_REVISION_CHANGED")
     seen: dict[Path, tuple[Path, FileRevision | None]] = {
         root_lexical: (root_resolved, primary_revision),
@@ -1142,9 +1162,29 @@ def _receipt_dependencies(
         (receipt.lexical_root, receipt.resolved_root, receipt.primary_post_state),
         *receipt.dependency_revisions,
     )
+def _occurrence_holds(proof) -> bool:
+    """Whether a SPEC primary's occurrence proof still holds (a line still being written after it: not yet)."""
+    from xrd_tools.io.metadata import SpecOccurrenceUnsettled, spec_occurrence_holds
+    try:
+        return spec_occurrence_holds(proof)
+    except SpecOccurrenceUnsettled:
+        return False
+
+
+def _receipt_dependency_holds(
+    receipt: AnalysisSourceReceipt, index: int, lexical: Path, resolved: Path, revision: FileRevision | None,
+) -> bool:
+    """One receipt dependency, as the receipt's role gives it: the primary of a SPEC receipt carrying an occurrence
+    proof holds when that occurrence does (the file may have grown after it; NEXT-1219-SPEC-OCCURRENCE); every
+    other dependency, and every receipt without a proof, keeps its exact file revision."""
+    if index == 0 and receipt.spec_occurrence is not None:
+        return _occurrence_holds(receipt.spec_occurrence)
+    return _dependency_matches(lexical, resolved, revision)
+
+
 def _receipt_fence(receipt: AnalysisSourceReceipt) -> bool:
-    return all(_dependency_matches(*dependency)
-               for dependency in _receipt_dependencies(receipt))
+    return all(_receipt_dependency_holds(receipt, index, *dependency)
+               for index, dependency in enumerate(_receipt_dependencies(receipt)))
 def _metadata_table_storage_value(result: MetadataTableResult) -> tuple[Any, ...]:
     return _table_storage_value(result)
 def _columns(
@@ -1306,9 +1346,7 @@ def _run_metadata_table(
             selected = None
         policy = _digest(("metadata-table-v1", _MAX_TABLE_ROWS, _MAX_TABLE_COLUMNS,
                           _MAX_TABLE_BYTES))
-        table_fp = _digest((snapshot.receipt.source_fingerprint, declared, selected,
-                            tuple((c.name, c.kind, c.numeric if c.numeric is not None else c.text)
-                                  for c in columns)), allow_missing=True)
+        table_fp = _table_fingerprint(snapshot.receipt.source_fingerprint, declared, selected, columns)
         provisional = MetadataTableResult(
             AnalysisDisposition.COMPLETED, "OK", receipt=snapshot.receipt,
             labels=snapshot.receipt.labels, columns=columns,
@@ -1338,6 +1376,32 @@ def _run_metadata_table(
         _close(selected_source)
         if snapshot is not None:
             _close(snapshot.source)
+def _table_fingerprint(source_fingerprint: str, declared, selected, columns) -> str:
+    return _digest((source_fingerprint, declared, selected,
+                    tuple((c.name, c.kind, c.numeric if c.numeric is not None else c.text)
+                          for c in columns)), allow_missing=True)
+
+
+def metadata_table_answers(
+    receipt: AnalysisSourceReceipt, table_fingerprint: str, table: "MetadataTableResult",
+) -> bool:
+    """Whether a table read now answers an admitted receipt and table fingerprint: exactly equal, or (a SPEC
+    primary with an occurrence proof, NEXT-1219-SPEC-OCCURRENCE) the same scan occurrence and every other source
+    fact, the proof still holding, and the same table content under the admitted source fingerprint."""
+    if type(table) is not MetadataTableResult or table.disposition is not AnalysisDisposition.COMPLETED:
+        return False
+    current = table.receipt
+    if type(current) is not AnalysisSourceReceipt or table.labels != receipt.labels:
+        return False
+    if current == receipt and table.table_fingerprint == table_fingerprint:
+        return True
+    return (receipt.occurrence_fingerprint is not None
+            and current.occurrence_fingerprint == receipt.occurrence_fingerprint
+            and _occurrence_holds(receipt.spec_occurrence)
+            and _table_fingerprint(receipt.source_fingerprint, table.declared_scanned_positioner,
+                                   table.selected_scanned_positioner, table.columns) == table_fingerprint)
+
+
 def run_metadata_table_requalification(
     plan: MetadataTableRequalificationPlan, *,
     cancel_token: threading.Event | None = None,
@@ -1360,12 +1424,12 @@ def run_metadata_table_requalification(
     total = 2 * len(revisions)
     completed = 0
     for _sweep in range(2):
-        for lexical, resolved, revision in revisions:
+        for index, (lexical, resolved, revision) in enumerate(revisions):
             if cancel_token is not None and cancel_token.is_set():
                 return MetadataTableRequalificationResult(
                     AnalysisDisposition.CANCELLED, "CANCELLED"
                 )
-            if not _dependency_matches(lexical, resolved, revision):
+            if not _receipt_dependency_holds(receipt, index, lexical, resolved, revision):
                 return MetadataTableRequalificationResult(
                     AnalysisDisposition.REFUSED, "SOURCE_REVISION_CHANGED"
                 )
@@ -1527,7 +1591,13 @@ def _lease_refusal(refusal: _Refusal) -> AnalysisSourceLeaseRefused:
 
 
 def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
-    snapshot = _snapshot(receipt.source_spec)
+    from xrd_tools.io.spec import spec_capture_scope
+    with spec_capture_scope():  # the reopened source reads one view; it keeps what it read after the scope
+        snapshot = _snapshot(receipt.source_spec)
+    if (receipt.occurrence_fingerprint is not None
+            and snapshot.receipt.occurrence_fingerprint == receipt.occurrence_fingerprint
+            and _occurrence_holds(receipt.spec_occurrence)):
+        return snapshot  # the same scan occurrence and everything else exact (NEXT-1219-SPEC-OCCURRENCE)
     exact_fields = (
         "schema_version", "source_spec_digest", "lexical_root", "resolved_root",
         "resolved_kind", "resolved_entry", "resolved_scan", "primary_state",

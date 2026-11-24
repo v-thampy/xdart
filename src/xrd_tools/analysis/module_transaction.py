@@ -259,14 +259,11 @@ class ModuleSourceReceipt:
         if type(fresh) is not bool:
             raise TypeError("fresh must be an exact bool")
         current = table if fresh else run_metadata_table(MetadataTablePlan(table.receipt.source_spec))
-        if (
-            current.disposition is not AnalysisDisposition.COMPLETED
-            or type(current.receipt) is not AnalysisSourceReceipt
-            or current.receipt != table.receipt
-            or current.labels != table.labels
-            or current.table_fingerprint != table.table_fingerprint
-        ):
+        from xrd_tools.analysis.scan_operations import metadata_table_answers
+        if not metadata_table_answers(table.receipt, table.table_fingerprint, current):
+            # exact, or the same SPEC scan occurrence while later scans are written (NEXT-1219-SPEC-OCCURRENCE)
             raise ValueError("metadata table is no longer an exact source fact")
+        current = table  # the admitted table's receipt and fingerprint stay the source's identity
         names = tuple(column.name for column in current.columns)
         if any(
             names.count(selector.name) <= selector.occurrence

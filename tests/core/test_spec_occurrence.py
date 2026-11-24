@@ -92,7 +92,7 @@ def test_s2_rsm_commits_when_later_scans_land_during_gridding_and_before_publica
     loader = SpecSource.load_frame
 
     def growing_frame(self, index):
-        if not landed:
+        if "gridding" not in landed:
             _append(spec, LATER_SCAN.replace("#S 2", "#S 3"))
             landed.append("gridding")
         return loader(self, index)
@@ -107,7 +107,7 @@ def test_s2_rsm_commits_when_later_scans_land_during_gridding_and_before_publica
     monkeypatch.setattr(SpecSource, "load_frame", growing_frame)
     monkeypatch.setattr(rsm_operation, "_revalidate_rsm_v2_authorities", growing_check)
     _committed(run_rsm_operation_v2(request))
-    assert landed[0] == "gridding" and landed.count("authority check") >= 2, landed
+    assert "gridding" in landed and landed.count("authority check") >= 3, landed  # Run start, after science, prepublish
 
 
 def test_s2_the_v1_rsm_route_commits_when_a_later_scan_lands_during_science(tmp_path, monkeypatch):
@@ -341,6 +341,7 @@ def test_s7_a_preparation_reads_each_spec_file_once(tmp_path, monkeypatch, case)
         files.add(str(Path(form.ub.spec_path).resolve()))
     parsers, opens = _counting(monkeypatch)
     prepare_rsm_tool_v2(form)
+    assert sum(parsers.values()) <= len(files), parsers  # one parser per captured file, none of the live file
     for path in files:
         assert parsers.get(path, 0) <= 1 and opens.get(path, 0) <= 2, (
             Path(path).name, {Path(k).name: v for k, v in parsers.items() if k},
@@ -416,3 +417,86 @@ def test_s10_a_repeated_scan_number_binds_its_exact_occurrence(tmp_path, monkeyp
         Path(spec).write_text(text[:first] + "#S 7" + text[first + 4:], encoding="utf-8", newline="\n")
     result = run_rsm_operation_v2(request)
     assert result.terminal.disposition.value.upper() == outcome, (result.terminal.code, result.terminal)
+
+
+# --- S11: the occurrence proof itself (new API) ---------------------------------------------------------------------
+_TWO_SCANS = ("#F f\n#E 1\n#O0 eta\n\n#S 1 ascan eta 0 1 1 1\n#G3 1 0 0 0 1 0 0 0 1\n#L eta  I0\n0 10\n1 20\n\n"
+              "#S 2 ascan eta 0 1 1 1\n#G3 1 0 0 0 1 0 0 0 1\n#L eta  I0\n0 30\n1 40\n")
+
+
+def _proof(path, key):
+    import os
+    from xrd_tools.io.metadata import spec_occurrence_from_bytes
+    status = os.stat(path)
+    return spec_occurrence_from_bytes(Path(path).read_bytes(), path=str(path), resolved=str(Path(path).resolve()),
+                                      device=status.st_dev, inode=status.st_ino, key=key)
+
+
+@pytest.mark.parametrize("key, change, holds", [
+    ("2.1", "later scan appended", True),
+    ("2.1", "blank line appended", True),
+    ("2.1", "next scan starting, unterminated", True),
+    ("1.1", "later scan's row appended", True),
+    ("2.1", "row appended to the scan", False),
+    ("2.1", "trailing #G3 appended to the scan", False),
+    ("2.1", "earlier #S renumbered to 2", False),
+    ("2.1", "selected row rewritten", False),
+    ("2.1", "file header rewritten", False),
+    ("2.1", "earlier row of another scan, same width", True),
+    ("2.1", "replaced by a copy with the same bytes", False),
+])
+def test_s11_the_occurrence_proof_holds_only_for_its_own_unchanged_scan(tmp_path, key, change, holds):
+    from xrd_tools.io.metadata import spec_occurrence_holds
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS, encoding="utf-8", newline="\n")
+    proof = _proof(path, key)
+    assert proof is not None and proof.rows == 2
+    text = path.read_text(encoding="utf-8")
+    if change == "later scan appended":
+        _append(path, "\n#S 3 ascan eta 0 1 1 1\n#L eta  I0\n0 50\n")
+    elif change == "blank line appended":
+        _append(path, "\n")
+    elif change == "next scan starting, unterminated":
+        _append(path, "\n#S 3 asc")
+    elif change == "later scan's row appended":
+        _append(path, "2 50\n")  # row 3 of scan 2: scan 1's proof is untouched
+    elif change == "row appended to the scan":
+        _append(path, "2 50\n")
+    elif change == "trailing #G3 appended to the scan":
+        _append(path, "#G3 2 0 0 0 2 0 0 0 2\n")
+    elif change == "earlier #S renumbered to 2":
+        path.write_text(text.replace("#S 1 ascan", "#S 2 ascan", 1), encoding="utf-8", newline="\n")
+    elif change == "selected row rewritten":
+        _rewrite(path, "1 40\n", "1 41\n")
+    elif change == "file header rewritten":
+        _rewrite(path, "#O0 eta", "#O0 eba")
+    elif change == "earlier row of another scan, same width":
+        _rewrite(path, "0 10\n", "0 11\n")
+    else:
+        copy = tmp_path / "copy"
+        copy.write_bytes(path.read_bytes())
+        copy.replace(path)
+    assert spec_occurrence_holds(proof) is holds
+
+
+def test_s2_a_touch_of_the_spec_file_at_publication_leaves_the_job_standing(tmp_path, monkeypatch):
+    """Only the scan's bytes bind the job: a new mtime with the same bytes (a sync, a backup) does not refuse it.
+    (This replaces the touch that tests/core/test_rsm_operation_r2.py's prepublish row used to refuse.)"""
+    import os
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    _runnable(monkeypatch)
+    form = _rsm(tmp_path)
+    spec = Path(form.members[0].spec_path)
+    request = prepare_rsm_tool_v2(form).request
+    real_write = rsm_operation.write_rsm
+    touched = []
+
+    def write_then_touch(*args, **kwargs):
+        real_write(*args, **kwargs)
+        status = spec.stat()
+        os.utime(spec, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000))
+        touched.append(True)
+
+    monkeypatch.setattr(rsm_operation, "write_rsm", write_then_touch)
+    _committed(run_rsm_operation_v2(request))
+    assert touched == [True]

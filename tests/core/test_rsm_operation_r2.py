@@ -1858,20 +1858,17 @@ def test_v2_prepublish_drift_refuses_without_committing(
     )
     real_write = rsm_operation.write_rsm
     if drift_kind == "source":
+        # the scan's own bytes change (NEXT-1219-SPEC-OCCURRENCE, his word "Bind each scan's bytes"): a touch alone,
+        # or later scans written, leave the job standing (tests/core/test_spec_occurrence.py)
         drift_path = Path(member.spec_path)
-        original = drift_path.stat()
+        original_text = drift_path.read_text(encoding="utf-8")
 
         def drift() -> None:
-            os.utime(
-                drift_path,
-                ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
-            )
+            drift_path.write_text(original_text.replace("1.0 2 20 110", "1.0 2 20 111"), encoding="utf-8",
+                                  newline="\n")
 
         def restore() -> None:
-            os.utime(
-                drift_path,
-                ns=(original.st_atime_ns, original.st_mtime_ns),
-            )
+            drift_path.write_text(original_text, encoding="utf-8", newline="\n")
 
     elif drift_kind == "asset":
         drift_path = tmp_path / CANONICAL_RSM_GEOMETRY_LOCATOR

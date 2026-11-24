@@ -40,6 +40,7 @@ class SpecFileView:
     inode: int
     size: int
     mtime_ns: int
+    ctime_ns: int
     sha256: str
     #: the captured descriptor's revision, as ``scan_operations`` records a file: (mode, device, inode, size, mtime,
     #: identity ctime)
@@ -53,6 +54,7 @@ class _SpecCapture:
     def __init__(self, lexical: str, resolved: str):
         self.scratch: Path | None = None
         self._parser = None
+        self._data: bytes | None = None
         descriptor = None
         try:
             descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -77,7 +79,7 @@ class _SpecCapture:
             from xrd_tools.io.stat_identity import identity_ctime_ns
             self.view = SpecFileView(
                 lexical, resolved, before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-                digest.hexdigest(), (before.st_mode, before.st_dev, before.st_ino, before.st_size,
+                before.st_ctime_ns, digest.hexdigest(), (before.st_mode, before.st_dev, before.st_ino, before.st_size,
                                      before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns)))
         except BaseException:
             self.close()
@@ -85,6 +87,13 @@ class _SpecCapture:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    @property
+    def data(self) -> bytes:
+        """The captured bytes (read from the private copy once)."""
+        if self._data is None:
+            self._data = self.scratch.read_bytes()
+        return self._data
 
     @property
     def parser(self):
@@ -101,7 +110,7 @@ class _SpecCapture:
                     action()
                 except BaseException as error:  # reported once, after every step ran
                     failure = failure or error
-        self._parser = None
+        self._parser = self._data = None
         return failure
 
     def _unlink(self):
@@ -158,6 +167,39 @@ def _scoped_capture(spec_file: Path | str) -> _SpecCapture | None:
     if capture is None:
         capture = captures[key] = _SpecCapture(lexical, key)
     return capture
+
+
+def spec_occurrence(spec_file: Path | str, key: str):
+    """The occurrence proof (``xrd_tools.io.metadata.SpecOccurrence``) of scan ``key`` in the scope's captured view
+    of ``spec_file``: the bytes the parser read. silx and the byte index must agree on the file's scan keys and on
+    the scan's data rows, else ``SpecCaptureFailed``. None outside a scope or when the view has no such scan."""
+    from xrd_tools.io.metadata import _SPEC_SCAN_LINE, _line_start, spec_occurrence_from_bytes
+    capture = _scoped_capture(spec_file)
+    if capture is None:
+        return None
+    data = capture.data
+    view = capture.view
+    proof = spec_occurrence_from_bytes(data, path=view.lexical, resolved=view.resolved, device=view.device,
+                                       inode=view.inode, key=key,
+                                       captured=(view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns))
+    counts, indexed, position = {}, [], data.find(b"#S")
+    while position >= 0:
+        match = _SPEC_SCAN_LINE.match(data, position) if _line_start(data, position) else None
+        if match is not None:
+            number = int(match[1])
+            counts[number] = counts.get(number, 0) + 1
+            indexed.append(f"{number}.{counts[number]}")
+        position = data.find(b"#S", position + 2)
+    parser = capture.parser
+    if list(parser.keys()) != indexed:
+        raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser and the file's bytes list different scans")
+    if proof is not None:
+        table = np.asarray(parser[proof.key].data)
+        rows = int(table.shape[1]) if table.ndim == 2 else 0
+        if rows != proof.rows:
+            raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser read {rows} rows of scan {proof.key}, its "
+                                    f"bytes hold {proof.rows}")
+    return proof
 
 
 def _spec_parser(spec_file: Path | str):

@@ -1433,12 +1433,9 @@ def _fresh_table(
     )
     if table.disposition is AnalysisDisposition.CANCELLED:
         raise RSMOperationRefused("CANCELLED")
-    if (
-        table.disposition is not AnalysisDisposition.COMPLETED
-        or table.receipt != source.analysis
-        or table.table_fingerprint != source.table_fingerprint
-        or table.labels != source.analysis.labels
-    ):
+    from xrd_tools.analysis.scan_operations import metadata_table_answers
+    if not metadata_table_answers(source.analysis, source.table_fingerprint, table):
+        # exact, or the same SPEC scan occurrence while later scans are written (NEXT-1219-SPEC-OCCURRENCE)
         raise RSMOperationRefused(
             "SOURCE_IDENTITY_MISMATCH",
             "source metadata no longer matches its receipt",
