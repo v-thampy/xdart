@@ -129,3 +129,26 @@ def test_a_long_later_scan_header_needs_only_its_structural_marker(tmp_path, mon
     assert spec_occurrence_holds(proof)
     print(f"later giant #S header: {read_bytes} bytes read")
     assert 0 < read_bytes <= 1 << 17
+
+
+def test_late_live_verification_does_not_retain_all_earlier_scan_numbers(tmp_path):
+    import tracemalloc
+
+    from tests.core.test_spec_occurrence import _proof
+    from xrd_tools.io.metadata import spec_occurrence_holds
+
+    path = tmp_path / "late-scan"
+    path.write_bytes(b"#F sample\n" + b"".join(
+        f"#S {number} test\n#N 2\n#L eta  I0\n0 10\n".encode()
+        for number in range(1, 30_001)
+    ))
+    proof = _proof(path, "30000.1")
+    _append(path, "#S 30001 later\n")
+    tracemalloc.start()
+    try:
+        assert spec_occurrence_holds(proof)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    print(f"S7 late live verification: peak Python allocations={peak} bytes")
+    assert peak <= 1 << 19

@@ -823,7 +823,10 @@ def test_s11_a_proof_for_another_scan_cannot_requalify_an_admitted_table(tmp_pat
     assert result.disposition is AnalysisDisposition.REFUSED, result.code
 
 
-@pytest.mark.parametrize("invalid", [{"captured": 1}, {"block_sha256": "invalid"}])
+@pytest.mark.parametrize("invalid", [
+    {"captured": 1}, {"block_sha256": "invalid"}, {"block_end": "invalid"},
+    {"offset": -1}, {"header": [(0, 4)]}, {"header": ((0, 1 << 30),)},
+])
 def test_s11_a_malformed_proof_refuses_without_a_file_change(tmp_path, invalid):
     _member, table = _spec_table(tmp_path)
     receipt = table.receipt
