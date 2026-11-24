@@ -110,6 +110,53 @@ def test_s2_rsm_commits_when_later_scans_land_during_gridding_and_before_publica
     assert landed[0] == "gridding" and landed.count("authority check") >= 2, landed
 
 
+def test_s2_the_v1_rsm_route_commits_when_a_later_scan_lands_during_science(tmp_path, monkeypatch):
+    import xrd_tools.analysis.rsm_operation as rsm_operation
+    from tests.core.test_rsm_operation import _prepared_rsm, _synthetic_volume
+    request, _frames = _prepared_rsm(tmp_path)
+    spec = tmp_path / "source" / "RSM_synth"
+    landed = []
+
+    def growing_science(*_args, **_kwargs):
+        _append(spec)
+        landed.append("science")
+        from types import SimpleNamespace
+        return SimpleNamespace(payload=_synthetic_volume(request))
+
+    monkeypatch.setattr(rsm_operation, "run_rsm", growing_science)
+    result = rsm_operation.run_rsm_operation(request)
+    assert landed == ["science"]
+    assert result.terminal.disposition is ModuleDisposition.COMMITTED, result.terminal
+
+
+# --- S5: a changed detector image still refuses ---------------------------------------------------------------------
+def test_s5_a_changed_image_still_refuses_under_an_unchanged_scan(tmp_path, monkeypatch):
+    _runnable(monkeypatch)
+    form = _rsm(tmp_path)
+    request = prepare_rsm_tool_v2(form).request
+    image = Path(form.members[0].image_dir) / "member0_0000.tif"
+    image.write_bytes(image.read_bytes() + b"drift")
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED, result.terminal
+    assert not Path(request.module.output.target).exists()
+
+
+# --- S9: a SPEC sidecar of another source kind stays exact -----------------------------------------------------------
+def test_s9_a_tiffs_spec_sidecar_keeps_the_exact_rule(tmp_path):
+    spec = tmp_path / "sample"
+    spec.write_text("#F sample\n#E 1\n#O0 theta\n\n#S 1 ascan theta 0 1 1 1\n#P0 5\n#N 2\n#L theta  I0\n"
+                    "5 100\n6 200\n", encoding="utf-8", newline="\n")
+    image = tmp_path / "sample_scan1_0000.tif"
+    tifffile.imwrite(image, np.ones((4, 5), dtype=np.uint16))
+    table = run_metadata_table(MetadataTablePlan(str(image), metadata_format="spec"))
+    assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+    assert "I0" in {column.name for column in table.columns}, [column.name for column in table.columns]
+    _append(spec, "\n#S 2 ascan theta 0 1 1 1\n#P0 5\n#N 2\n#L theta  I0\n5 100\n")
+    requalified = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint))
+    assert requalified.disposition is AnalysisDisposition.REFUSED, requalified.code
+
+
 # --- S3: the job's own scan or its header changed: refused ----------------------------------------------------------
 @pytest.mark.parametrize("change", ["selected row", "file header", "new selected row"])
 def test_s3_rsm_refuses_when_its_own_scan_or_header_changes(tmp_path, monkeypatch, change):
@@ -229,6 +276,75 @@ def test_s7_requalification_refuses_a_rewrite_of_the_scan(tmp_path):
     requalified = run_metadata_table_requalification(
         MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint))
     assert requalified.disposition is AnalysisDisposition.REFUSED
+
+
+# --- S7 read bound: one capture and one parser per distinct SPEC file per preparation ----------------------------
+def _counting(monkeypatch):
+    """Spies (calling through) on every silx open and every Python-level open, by resolved path."""
+    import builtins
+    import os
+    import silx.io.specfile as specfile
+    import xrd_tools.io.spec as io_spec
+    parsers, opens = {}, {}
+    real_specfile, real_open, real_os_open = specfile.SpecFile, builtins.open, os.open
+
+    def key(path):
+        try:
+            return str(Path(os.fsdecode(path)).resolve())
+        except (TypeError, ValueError):
+            return None
+
+    def counted_specfile(path, *args, **kwargs):
+        parsers[key(path)] = parsers.get(key(path), 0) + 1
+        return real_specfile(path, *args, **kwargs)
+
+    def counted_open(path, *args, **kwargs):
+        if isinstance(path, (str, bytes, os.PathLike)):
+            opens[key(path)] = opens.get(key(path), 0) + 1
+        return real_open(path, *args, **kwargs)
+
+    def counted_os_open(path, *args, **kwargs):
+        opens[key(path)] = opens.get(key(path), 0) + 1
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(specfile, "SpecFile", counted_specfile)
+    monkeypatch.setattr(io_spec, "SpecFile", counted_specfile)
+    import io
+    monkeypatch.setattr(builtins, "open", counted_open)
+    monkeypatch.setattr(io, "open", counted_open)  # pathlib opens through io.open
+    monkeypatch.setattr(os, "open", counted_os_open)
+    return parsers, opens
+
+
+def _two_members_one_file(root):
+    member = _write_member(root, 0)
+    spec = Path(member.spec_path)
+    text = spec.read_text(encoding="utf-8")
+    spec.write_text(text + "\n" + text[text.index("#S 1"):].replace("#S 1", "#S 2", 1),
+                    encoding="utf-8", newline="\n")
+    for label in range(2):
+        tifffile.imwrite(Path(member.image_dir) / f"member0b_{label:04d}.tif", np.ones((4, 5), dtype=np.uint16))
+    return _form(root, (member, replace(member, scan="2.1", image_stem="member0b_")))
+
+
+@pytest.mark.parametrize("case", ["one member", "two members, one file", "member and UB file"])
+def test_s7_a_preparation_reads_each_spec_file_once(tmp_path, monkeypatch, case):
+    _runnable(monkeypatch)
+    if case == "one member":
+        form = _rsm(tmp_path)
+    elif case == "two members, one file":
+        form = _two_members_one_file(tmp_path)
+    else:
+        form, _ub = _hkl(tmp_path)
+    files = {str(Path(member.spec_path).resolve()) for member in form.members}
+    if form.ub is not None:
+        files.add(str(Path(form.ub.spec_path).resolve()))
+    parsers, opens = _counting(monkeypatch)
+    prepare_rsm_tool_v2(form)
+    for path in files:
+        assert parsers.get(path, 0) <= 1 and opens.get(path, 0) <= 2, (
+            Path(path).name, {Path(k).name: v for k, v in parsers.items() if k},
+            {Path(k).name: v for k, v in opens.items() if k in files})
 
 
 # --- S10: a repeated scan number -----------------------------------------------------------------------------------
