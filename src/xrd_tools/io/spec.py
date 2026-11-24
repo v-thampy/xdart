@@ -1,8 +1,15 @@
 """SPEC file parsing: scan metadata, energy, UB, angles."""
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import hashlib
 import logging
+import os
 import re
+import stat
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -11,8 +18,162 @@ from silx.io.specfile import SpecFile
 logger = logging.getLogger(__name__)
 
 
+# ---- one immutable view of each SPEC file within a scope (NEXT-1219-SPEC-OCCURRENCE) ------------------------------
+#: Within :func:`spec_capture_scope`, the resolved SPEC path -> its _SpecCapture.
+_SPEC_CAPTURES = contextvars.ContextVar("xdart_spec_captures", default=None)
+_CAPTURE_CHUNK = 1 << 20
+
+
+class SpecCaptureFailed(OSError):
+    """A SPEC file could not be captured as one immutable view (missing, not a regular file, replaced or truncated
+    while it was read), or its private copy could not be closed or removed."""
+
+
+@dataclass(frozen=True, slots=True)
+class SpecFileView:
+    """The SPEC file a scope read: its spelling, resolved path, filesystem object, the size it was captured at, and
+    the SHA-256 of those bytes. In memory only."""
+
+    lexical: str
+    resolved: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    sha256: str
+    #: the captured descriptor's revision, as ``scan_operations`` records a file: (mode, device, inode, size, mtime,
+    #: identity ctime)
+    revision: tuple[int, int, int, int, int, int]
+
+
+class _SpecCapture:
+    """One SPEC file read once through one descriptor up to its size then, copied to a private file in the system's
+    temporary folder, and parsed there by one silx object that this capture owns and closes."""
+
+    def __init__(self, lexical: str, resolved: str):
+        self.scratch: Path | None = None
+        self._parser = None
+        descriptor = None
+        try:
+            descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise SpecCaptureFailed(f"SPEC file {lexical} is not a regular file")
+            named = os.stat(resolved)
+            if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
+                raise SpecCaptureFailed(f"SPEC file {lexical} was replaced while it was opened")
+            digest = hashlib.sha256()
+            handle = tempfile.NamedTemporaryFile(prefix="xdart-spec-", delete=False)
+            self.scratch = Path(handle.name)
+            with handle:
+                remaining = before.st_size
+                while remaining > 0:
+                    chunk = os.read(descriptor, min(_CAPTURE_CHUNK, remaining))
+                    if not chunk:
+                        raise SpecCaptureFailed(f"SPEC file {lexical} became shorter while it was read")
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+            from xrd_tools.io.stat_identity import identity_ctime_ns
+            self.view = SpecFileView(
+                lexical, resolved, before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+                digest.hexdigest(), (before.st_mode, before.st_dev, before.st_ino, before.st_size,
+                                     before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns)))
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @property
+    def parser(self):
+        if self._parser is None:
+            self._parser = SpecFile(str(self.scratch))
+        return self._parser
+
+    def close(self) -> BaseException | None:
+        failure = None
+        for action in (None if self._parser is None else self._parser.close,
+                       None if self.scratch is None else self._unlink):
+            if action is not None:
+                try:
+                    action()
+                except BaseException as error:  # reported once, after every step ran
+                    failure = failure or error
+        self._parser = None
+        return failure
+
+    def _unlink(self):
+        scratch, self.scratch = self.scratch, None
+        scratch.unlink(missing_ok=True)
+
+
+def _capture_key(spec_file: Path | str) -> tuple[str, str]:
+    lexical = os.path.abspath(os.fspath(spec_file))
+    return lexical, os.path.normcase(os.path.realpath(lexical))
+
+
+@contextlib.contextmanager
+def spec_capture_scope():
+    """Within this block, each SPEC file this module's readers open is captured once, on first use, as one
+    immutable view (one descriptor, the size it had then), and every reader here parses that view: a preparation
+    reads each file once however many scans, members or UB lookups it has. Nested blocks share the outermost
+    one's captures. On leaving the outermost block every private copy is closed and removed."""
+    captures = _SPEC_CAPTURES.get()
+    if captures is not None:
+        yield
+        return
+    captures = {}
+    token = _SPEC_CAPTURES.set(captures)
+    primary = None
+    try:
+        yield
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        _SPEC_CAPTURES.reset(token)
+        failure = None
+        for capture in captures.values():
+            failure = capture.close() or failure
+        if failure is not None and primary is None:
+            raise SpecCaptureFailed(f"a SPEC capture could not be closed or removed: {failure}") from failure
+        if failure is not None:
+            logger.warning("SPEC capture cleanup failed after %r: %s", primary, failure)
+
+
+def spec_file_view(spec_file: Path | str) -> SpecFileView | None:
+    """The view the current scope captured of ``spec_file`` (capturing it now), or None outside a scope."""
+    capture = _scoped_capture(spec_file)
+    return None if capture is None else capture.view
+
+
+def _scoped_capture(spec_file: Path | str) -> _SpecCapture | None:
+    captures = _SPEC_CAPTURES.get()
+    if captures is None:
+        return None
+    lexical, key = _capture_key(spec_file)
+    capture = captures.get(key)
+    if capture is None:
+        capture = captures[key] = _SpecCapture(lexical, key)
+    return capture
+
+
+def _spec_parser(spec_file: Path | str):
+    """The silx parser of ``spec_file``: the scope's capture, else a new parser of the file as it is now."""
+    capture = _scoped_capture(spec_file)
+    return SpecFile(str(spec_file)) if capture is None else capture.parser
+
+
+def _spec_text_path(spec_file: Path | str) -> Path:
+    """The bytes the strict row validator reads: the scope's capture, else the file itself."""
+    capture = _scoped_capture(spec_file)
+    return Path(spec_file) if capture is None else capture.scratch
+
+
 def _get_spec_scan(spec_file: Path | str, scan_num: str):
-    return SpecFile(str(spec_file))[scan_num]
+    return _spec_parser(spec_file)[scan_num]
 
 
 #: SPEC control lines the first non-empty line of a SPEC file starts with.
@@ -44,7 +205,7 @@ def is_spec_file(path: Path | str) -> bool:
 
 def list_spec_scans(spec_file: Path | str) -> list[str]:
     """The scan keys (``"1.1"``, ``"2.1"``, …) in a SPEC file, in file order."""
-    return list(SpecFile(str(spec_file)).keys())
+    return list(_spec_parser(spec_file).keys())
 
 
 def read_spec_scan_motor_names(
@@ -52,7 +213,7 @@ def read_spec_scan_motor_names(
 ) -> tuple[str, ...]:
     """One scan's ``#O`` motor names from its header alone (its data table is not
     read); ``scan_num`` None: the file's first scan. KeyError when there is no such scan."""
-    spec = SpecFile(str(spec_file))
+    spec = _spec_parser(spec_file)
     keys = spec.keys()
     if scan_num is None and not len(keys):
         raise KeyError("the SPEC file has no scans")
@@ -66,7 +227,7 @@ def read_spec_scan_counter_names(
     """One scan's ``#L`` columns that are not its ``#O`` motors (its counters, the beam monitors among
     them), from its header alone; ``scan_num`` None: the file's first scan. KeyError when there is no
     such scan."""
-    spec = SpecFile(str(spec_file))
+    spec = _spec_parser(spec_file)
     keys = spec.keys()
     if scan_num is None and not len(keys):
         raise KeyError("the SPEC file has no scans")
@@ -81,7 +242,7 @@ def count_spec_scan_points(
     """Each scan's point count (its data lines), keyed as asked: ``scans`` as a Stitch selection names
     them (``N`` is SPEC's ``N.1`` unless the file has an exact ``N.M`` key), None when the file lacks it;
     ``scans`` None: every scan by its ``N.M`` key. About half a millisecond a scan (silx's parser)."""
-    spec = SpecFile(str(spec_file))
+    spec = _spec_parser(spec_file)
     keys = spec.keys()
     wanted = {key: key for key in keys} if scans is None else {
         scan: scan if scan in keys else f"{scan}.1" for scan in scans}
@@ -152,7 +313,7 @@ def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
     scan_index = -1
     in_table = False
     mca_continuation = False
-    with Path(spec_file).open(encoding="utf-8", errors="replace") as stream:
+    with _spec_text_path(spec_file).open(encoding="utf-8", errors="replace") as stream:
         for physical_row, raw_line in enumerate(stream, 1):
             line = raw_line.strip()
             if raw_line.startswith("#S") and raw_line[2:3].isspace():

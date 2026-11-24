@@ -347,6 +347,41 @@ def test_s7_a_preparation_reads_each_spec_file_once(tmp_path, monkeypatch, case)
             {Path(k).name: v for k, v in opens.items() if k in files})
 
 
+@pytest.mark.parametrize("ending", ["success", "refusal", "exception"])
+def test_s7_captures_live_in_the_temporary_folder_and_none_survives(tmp_path, monkeypatch, ending):
+    """The private copies are made in the system's temporary folder (never the Project or Save Path) and removed
+    when the preparation ends, however it ends."""
+    import tempfile
+    import xrd_tools.io.spec as io_spec
+    _runnable(monkeypatch)
+    spool = tmp_path / "system-temp"
+    spool.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spool))
+    made = []
+    real = tempfile.NamedTemporaryFile
+
+    def recording(*args, **kwargs):
+        handle = real(*args, **kwargs)
+        made.append(Path(handle.name))
+        return handle
+
+    monkeypatch.setattr(io_spec.tempfile, "NamedTemporaryFile", recording)
+    form, ub_spec = _hkl(tmp_path / "project")
+    if ending == "refusal":
+        _rewrite(ub_spec, "#G3 2.0 0.0 0.0 0.0 2.0 0.0 0.0 0.0 2.0", "#X3 2.0 0.0 0.0 0.0 2.0 0.0 0.0 0.0 2.0")
+        from xrd_tools.analysis.rsm_values import RSMToolPreflightRefused
+        with pytest.raises(RSMToolPreflightRefused):
+            prepare_rsm_tool_v2(form)
+    elif ending == "exception":
+        with pytest.raises(RuntimeError, match="stop here"), io_spec.spec_capture_scope():
+            io_spec.list_spec_scans(form.members[0].spec_path)
+            raise RuntimeError("stop here")
+    else:
+        prepare_rsm_tool_v2(form)
+    assert made and all(path.parent == spool for path in made), made
+    assert not any(path.exists() for path in made) and not list(spool.iterdir())
+
+
 # --- S10: a repeated scan number -----------------------------------------------------------------------------------
 def _repeated(root):
     """A member on the second #S 1 (key 1.2)."""

@@ -1357,6 +1357,17 @@ def prepare_rsm_tool(
     *,
     cancel_token: threading.Event | None = None,
 ) -> RSMToolPreflight:
+    """The preparation as one SPEC capture scope (each SPEC file read once; NEXT-1219-SPEC-OCCURRENCE)."""
+    from xrd_tools.io.spec import spec_capture_scope
+    with spec_capture_scope():
+        return _prepare_rsm_tool(form, cancel_token=cancel_token)
+
+
+def _prepare_rsm_tool(
+    form: RSMToolForm,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMToolPreflight:
     """Perform blocking, image-free preflight for one exact operator form."""
 
     if type(form) is not RSMToolForm:
@@ -1865,6 +1876,17 @@ class RSMToolPreflightV2:
 
 
 def prepare_rsm_tool_v2(
+    form: RSMToolFormV2,
+    *,
+    cancel_token: threading.Event | None = None,
+) -> RSMToolPreflightV2:
+    """The preparation as one SPEC capture scope (each SPEC file read once; NEXT-1219-SPEC-OCCURRENCE)."""
+    from xrd_tools.io.spec import spec_capture_scope
+    with spec_capture_scope():
+        return _prepare_rsm_tool_v2(form, cancel_token=cancel_token)
+
+
+def _prepare_rsm_tool_v2(
     form: RSMToolFormV2,
     *,
     cancel_token: threading.Event | None = None,

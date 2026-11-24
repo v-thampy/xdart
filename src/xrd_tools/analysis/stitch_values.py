@@ -931,6 +931,13 @@ def _inside_project(path: str | Path, root: Path, name: str) -> str:
 
 
 def prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
+    """The preparation as one SPEC capture scope (each SPEC file read once; NEXT-1219-SPEC-OCCURRENCE)."""
+    from xrd_tools.io.spec import spec_capture_scope
+    with spec_capture_scope():
+        return _prepare_stitch_tool(form)
+
+
+def _prepare_stitch_tool(form: StitchToolForm) -> StitchToolPreflight:
     """Perform blocking, read-only preflight for one exact operator form."""
 
     if type(form) is not StitchToolForm:

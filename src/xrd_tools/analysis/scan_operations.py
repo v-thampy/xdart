@@ -774,6 +774,18 @@ def _snapshot(
     lexical = _lexical_absolute(spec.uri)
     resolved = lexical.resolve(strict=False)
     current = _path_revision(resolved)
+    if current is not None and coerce_source_kind(spec.kind) is SourceKind.SPEC:
+        # the parser reads the scope's captured view of the SPEC file: its revision is the one this read binds
+        from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
+        try:
+            view = spec_file_view(resolved)
+        except FileNotFoundError:
+            view, current = None, None
+        except SpecCaptureFailed:
+            _close(selected_source)
+            raise _Refusal("SOURCE_REVISION_CHANGED")
+        if view is not None:
+            current = view.revision
     before = current if selected_revision is None else selected_revision
     if before is None:
         _close(selected_source)
@@ -1250,6 +1262,17 @@ def scan_plot_defaults(
 
 
 def run_metadata_table(
+    plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> MetadataTableResult:
+    """One metadata table. A SPEC file is read as one captured view (``spec_capture_scope``; an enclosing
+    preparation's scope is shared, so its members and UB read each file once; NEXT-1219-SPEC-OCCURRENCE)."""
+    from xrd_tools.io.spec import spec_capture_scope
+    with spec_capture_scope():
+        return _run_metadata_table(plan, cancel_token=cancel_token, progress_callback=progress_callback)
+
+
+def _run_metadata_table(
     plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> MetadataTableResult:

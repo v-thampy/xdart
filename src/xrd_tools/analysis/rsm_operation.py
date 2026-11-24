@@ -513,8 +513,13 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
         scan = _rsm_spec_scan_key(override.scan)
         try:
             resolved = Path(override.spec_path).expanduser().resolve(strict=True)
-            before = _rsm_ub_file_state(resolved)
-            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            from xrd_tools.io.spec import spec_file_view
+            view = spec_file_view(resolved)  # inside a preparation: the one captured view the parser reads
+            if view is not None:
+                before, digest = (view.device, view.inode, view.size, view.mtime_ns), view.sha256
+            else:
+                before = _rsm_ub_file_state(resolved)
+                digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
             ub = get_UB(str(resolved), scan)
             if _rsm_ub_file_state(resolved) != before:
                 raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")

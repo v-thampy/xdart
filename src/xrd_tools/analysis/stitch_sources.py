@@ -189,7 +189,8 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs, 
     C-16: ``cancelled()`` is checked before each scan (``SourceSearchCancelled``); ``progress(done, total)`` follows the
     scans searched; each image folder is listed once for the whole search (``shared_image_listings``)."""
     from xrd_tools.io.image import shared_image_listings
-    with shared_image_listings():
+    from xrd_tools.io.spec import spec_capture_scope
+    with shared_image_listings(), spec_capture_scope():  # and each SPEC file read once (NEXT-1219-SPEC-OCCURRENCE)
         return _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress)
 
 
