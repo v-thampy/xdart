@@ -697,6 +697,17 @@ def test_s11_a_proof_for_another_scan_cannot_requalify_an_admitted_table(tmp_pat
     assert result.disposition is AnalysisDisposition.REFUSED, result.code
 
 
+@pytest.mark.parametrize("invalid", [{"captured": 1}, {"block_sha256": "invalid"}])
+def test_s11_a_malformed_proof_refuses_without_a_file_change(tmp_path, invalid):
+    _member, table = _spec_table(tmp_path)
+    receipt = table.receipt
+    wrong = replace(receipt, spec_occurrence=replace(receipt.spec_occurrence, **invalid))
+    result = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(wrong, table.table_fingerprint),
+    )
+    assert result.disposition is AnalysisDisposition.REFUSED, result.code
+
+
 @pytest.mark.parametrize("mutation, holds", [
     ("replacement", False), ("selected edit", False), ("unrelated append", True),
 ])

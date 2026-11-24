@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import math
 import os
+import re
 import threading
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping
@@ -1187,10 +1188,13 @@ def _receipt_occurrence_is_bound(receipt: AnalysisSourceReceipt) -> bool:
         and proof.resolved == os.path.normcase(str(receipt.resolved_root))
         and revision is not None
         and (proof.device, proof.inode) == revision[1:3]
-        and proof.captured is not None
+        and type(proof.captured) is tuple
         and len(proof.captured) == 5
+        and all(type(value) is int for value in proof.captured)
         and proof.captured[:4] == revision[1:5]
         and identity_ctime_ns(proof.captured[4]) == revision[5]
+        and all(type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest)
+                for digest in (proof.header_sha256, proof.block_sha256))
     )
 
 
