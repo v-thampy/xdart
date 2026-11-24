@@ -4,6 +4,18 @@
 
 ### Changes
 
+- **RSM and Stitch run while the next scan is recording:** a Run on a
+  finished scan was refused ("SOURCE_IDENTITY_MISMATCH: source metadata no
+  longer matches its receipt") as soon as another scan wrote a row into the
+  same SPEC file, which at a beamline is every count time. A job now binds
+  only its own scan's lines and the file header in effect for it: later
+  scans being written no longer refuse it, and a change to its own scan
+  (a row, a UB line, an earlier scan renumbered) still does. Each SPEC
+  file is also read once per Preview or Run instead of about 20 times.
+- **HKL maps with a UB taken from a SPEC scan stay current for Append**
+  while that SPEC file grows. A map saved before 1.2.19 is gridded once
+  more the first time its UB's SPEC file has grown, then stays current.
+
 - **ROI Statistics and Metadata open the file browsed in the 2D Viewer:** an
   Eiger master, a NeXus stack or a processed NeXus selected in the 2D
   Viewer's Data Browser now opens in both windows, as a TIFF did. Before,
