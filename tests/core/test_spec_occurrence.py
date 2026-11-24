@@ -617,7 +617,7 @@ def _private_bytes_read(monkeypatch):
     """Count Python structural reads of the spool. silx's C parser opens are counted separately."""
     import io
 
-    counts = {"bytes": 0}
+    counts = {"bytes": 0, "largest": 0}
     open_file = io.open
 
     class MeasuredReader:
@@ -647,7 +647,9 @@ def _private_bytes_read(monkeypatch):
             return self.count(self.stream.readline(*args))
 
         def count(self, data):
-            counts["bytes"] += len(data.encode() if isinstance(data, str) else data)
+            size = len(data.encode() if isinstance(data, str) else data)
+            counts["bytes"] += size
+            counts["largest"] = max(counts["largest"], size)
             return data
 
     def measured_open(path, mode="r", *args, **kwargs):
@@ -712,6 +714,23 @@ def test_s7_preparation_and_run_read_only_selected_spans_from_the_private_spool(
             assert passes == 0, observations
 
 
+def test_s7_strict_validation_does_not_materialize_a_long_selected_comment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from xrd_tools.io.spec import _scoped_capture, spec_capture_scope
+
+    path = tmp_path / "f"
+    comment = "#C " + "x" * (2 << 20) + "\n"
+    path.write_text(_TWO_SCANS.replace("0 30\n", "0 30\n" + comment), encoding="utf-8")
+    reads = _private_bytes_read(monkeypatch)
+    # Exercise the real strict validator on a record larger than silx's native scan loading can handle.
+    with spec_capture_scope():
+        capture = _scoped_capture(path)
+        capture.check_numeric_tokens(path, SimpleNamespace(number=2, order=1), ("eta", "I0"))
+    print(f"S7 selected comment: bytes={reads['bytes']}, largest read={reads['largest']}")
+    assert reads["largest"] <= 1 << 16
+
+
 @pytest.mark.parametrize("cut", ["#S 3", "#S 3 asc", "#S 3 ascan eta 0 1 1 1\n#L e"])
 def test_s7_a_capture_while_the_next_scans_header_is_being_written_reads_the_earlier_scan(tmp_path, cut):
     """At a beamline the next scan's #S line is written while a job reads the file: the earlier scan's proof is
@@ -722,6 +741,14 @@ def test_s7_a_capture_while_the_next_scans_header_is_being_written_reads_the_ear
     with spec_capture_scope():
         proof = spec_occurrence(path, "2.1")
     assert proof is not None and proof.rows == 2
+
+
+def test_s11_metadata_table_refuses_parser_key_disagreement(tmp_path):
+    path = tmp_path / "f"
+    path.write_text(_two_scans_with_motor_positions() + LATER_SCAN.replace("#S 2", "#S -7"), encoding="utf-8")
+    table = run_metadata_table(MetadataTablePlan(SourceSpec(path, SourceKind.SPEC, options={"scan": "2.1"})))
+    assert table.disposition is AnalysisDisposition.REFUSED
+    assert table.code == "SOURCE_IDENTITY_MISMATCH"
 
 
 def test_s11_a_spec_file_reached_through_a_link_repointed_at_an_identical_copy_refuses(tmp_path):
