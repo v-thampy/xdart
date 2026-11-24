@@ -15,6 +15,10 @@
   picker without a second click, whether the file was browsed or picked in
   the window. A first frame missing on disk is reported there in words. A
   file with metadata shows its table first, as before.
+- **ROI Statistics reads metadata sidecars:** an image file or TIFF folder
+  opened in the ROI Statistics window now shows its sidecar metadata
+  columns (for example a TIFF's .txt or .pdi), as the Metadata window
+  does. Before, the window read only the frame index for it.
 
 ## 1.2.18 (2026-11-22)
 
