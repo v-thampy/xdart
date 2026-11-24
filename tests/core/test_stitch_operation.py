@@ -1361,7 +1361,8 @@ def _form(tmp_path, backend):
     spec.write_text(
         "#F sample\n#E 1\n#D today\n#O0 del  nu  energy\n\n"
         "#S 1 ascan del 14 15 1 1\n#D today\n#P0 14 -10 17000.018\n"
-        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n"
+        "#N 3\n#L del  nu  energy\n14 -10 17000.018\n15 -10 17000.018\n",
+        encoding="utf-8", newline="\n",  # a SPEC file: silx misreads CRLF on Windows
     )
     images = source / "images"
     images.mkdir()
@@ -1399,7 +1400,7 @@ def _native_form(tmp_path, backend, *, scans="1,2,[1,2]", unit="q_A^-1"):
         text = text.replace("  energy", "").replace(" 17000.018", "").replace("#N 3", "#N 2")
     second = text[text.index("#S 1"):].replace("#S 1", "#S 2", 1)
     empty = second.replace("#S 2", "#S 3", 1)
-    path.write_text(text + "\n" + second + "\n" + empty)
+    path.write_text(text + "\n" + second + "\n" + empty, encoding="utf-8", newline="\n")
     for source in Path(form.image_dir).glob("*scan1_*"):
         destination = source.with_name(source.name.replace("scan1_", "scan2_"))
         destination.write_bytes(source.read_bytes())

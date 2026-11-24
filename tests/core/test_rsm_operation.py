@@ -134,7 +134,7 @@ def _synthetic_spec_source(
 1 2 20 110
 2 3 40 1010
 """,
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",  # a SPEC file: silx misreads CRLF on Windows
     )
     frames = (
         np.asarray(

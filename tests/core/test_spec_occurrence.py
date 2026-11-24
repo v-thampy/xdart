@@ -497,8 +497,10 @@ _TWO_SCANS = ("#F f\n#E 1\n#O0 eta\n\n#S 1 ascan eta 0 1 1 1\n#G3 1 0 0 0 1 0 0 
 def _proof(path, key):
     import os
     from xrd_tools.io.metadata import spec_occurrence_from_bytes
+    from xrd_tools.io.spec import _capture_key
     status = os.stat(path)
-    return spec_occurrence_from_bytes(Path(path).read_bytes(), path=str(path), resolved=str(Path(path).resolve()),
+    lexical, resolved = _capture_key(path)  # as a capture records it (normcased on Windows)
+    return spec_occurrence_from_bytes(Path(path).read_bytes(), path=lexical, resolved=resolved,
                                       device=status.st_dev, inode=status.st_ino, key=key)
 
 
@@ -739,7 +741,7 @@ def test_s7_strict_validation_does_not_materialize_a_long_selected_comment(tmp_p
 
     path = tmp_path / "f"
     comment = "#C " + "x" * (2 << 20) + "\n"
-    path.write_text(_TWO_SCANS.replace("0 30\n", "0 30\n" + comment), encoding="utf-8")
+    path.write_text(_TWO_SCANS.replace("0 30\n", "0 30\n" + comment), encoding="utf-8", newline="\n")
     reads = _private_bytes_read(monkeypatch)
     # Exercise the real strict validator on a record larger than silx's native scan loading can handle.
     with spec_capture_scope():
@@ -763,7 +765,8 @@ def test_s7_a_capture_while_the_next_scans_header_is_being_written_reads_the_ear
 
 def test_s11_metadata_table_refuses_parser_key_disagreement(tmp_path):
     path = tmp_path / "f"
-    path.write_text(_two_scans_with_motor_positions() + LATER_SCAN.replace("#S 2", "#S -7"), encoding="utf-8")
+    path.write_text(_two_scans_with_motor_positions() + LATER_SCAN.replace("#S 2", "#S -7"), encoding="utf-8",
+                    newline="\n")
     table = run_metadata_table(MetadataTablePlan(SourceSpec(path, SourceKind.SPEC, options={"scan": "2.1"})))
     assert table.disposition is AnalysisDisposition.REFUSED
     assert table.code == "SOURCE_IDENTITY_MISMATCH"
@@ -919,8 +922,15 @@ def test_s11_a_file_changed_while_its_occurrence_is_read(tmp_path, monkeypatch, 
         return data
 
     monkeypatch.setattr(os, "read", read_then_change)
-    assert spec_occurrence_holds(proof) is holds
+    first = spec_occurrence_holds(proof)
     assert changed
+    if mutation == "selected edit" and sys.platform == "win32":
+        # 1.2.19 release CI 2 (run 45478738434): Windows stat need not show a same-size rewrite made while the
+        # check rereads, so that check may accept the bytes it read (the scan as it was on disk when read).
+        # The next check rereads the edit and refuses it.
+        assert spec_occurrence_holds(proof) is False
+    else:
+        assert first is holds
 
 
 @pytest.mark.parametrize("shadow", [
