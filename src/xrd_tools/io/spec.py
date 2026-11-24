@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 # ---- one immutable view of each SPEC file within a scope (NEXT-1219-SPEC-OCCURRENCE) ------------------------------
 #: Within :func:`spec_capture_scope`, the resolved SPEC path -> its _SpecCapture.
 _SPEC_CAPTURES = contextvars.ContextVar("xdart_spec_captures", default=None)
-_CAPTURE_CHUNK = 1 << 20
 
 
 class SpecCaptureFailed(OSError):
@@ -46,13 +45,39 @@ class SpecFileView:
     revision: tuple[int, int, int, int, int, int]
 
 
+class _SpecCaptureStream:
+    """Feed the structural index while writing the descriptor's fixed starting extent to the spool."""
+
+    def __init__(self, descriptor, size, spool, lexical):
+        self.descriptor = descriptor
+        self.remaining = size
+        self.spool = spool
+        self.lexical = lexical
+        self.digest = hashlib.sha256()
+
+    def read(self, size):
+        if self.remaining == 0:
+            return b""
+        data = os.read(self.descriptor, min(size, self.remaining))
+        if not data:
+            raise SpecCaptureFailed(f"SPEC file {self.lexical} became shorter while it was read")
+        self.spool.write(data)
+        self.digest.update(data)
+        self.remaining -= len(data)
+        return data
+
+
 class _SpecCapture:
-    """One SPEC file read once through one descriptor up to its size then, copied to a private file in the system's
-    temporary folder, and parsed there by one silx object that this capture owns and closes."""
+    """One immutable spool, its structural index, and the silx parser that reads it."""
 
     def __init__(self, lexical: str, resolved: str):
+        from xrd_tools.io.metadata import iter_spec_occurrence_frames
+
         self.scratch: Path | None = None
         self._parser = None
+        self._keys_checked = False
+        self._strict_checked: set[str] = set()
+        self._row_counts_checked: set[str] = set()
         descriptor = None
         try:
             descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
@@ -62,18 +87,13 @@ class _SpecCapture:
             named = os.stat(resolved)
             if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
                 raise SpecCaptureFailed(f"SPEC file {lexical} was replaced while it was opened")
-            digest = hashlib.sha256()
             handle = tempfile.NamedTemporaryFile(prefix="xdart-spec-", delete=False)
             self.scratch = Path(handle.name)
             with handle:
-                remaining = before.st_size
-                while remaining > 0:
-                    chunk = os.read(descriptor, min(_CAPTURE_CHUNK, remaining))
-                    if not chunk:
-                        raise SpecCaptureFailed(f"SPEC file {lexical} became shorter while it was read")
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    remaining -= len(chunk)
+                stream = _SpecCaptureStream(descriptor, before.st_size, handle, lexical)
+                self._frames = {frame.key: frame for frame in iter_spec_occurrence_frames(stream)}
+                if stream.remaining:
+                    raise SpecCaptureFailed(f"SPEC {lexical}: the capture did not reach its starting end")
             after = os.fstat(descriptor)
             named = os.stat(lexical)
             if ((named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
@@ -87,8 +107,10 @@ class _SpecCapture:
             from xrd_tools.io.stat_identity import identity_ctime_ns
             self.view = SpecFileView(
                 lexical, resolved, before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-                before.st_ctime_ns, digest.hexdigest(), (before.st_mode, before.st_dev, before.st_ino, before.st_size,
-                                     before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns)))
+                before.st_ctime_ns, stream.digest.hexdigest(),
+                (before.st_mode, before.st_dev, before.st_ino, before.st_size,
+                 before.st_mtime_ns, identity_ctime_ns(before.st_ctime_ns)),
+            )
         except BaseException:
             self.close()
             raise
@@ -101,6 +123,46 @@ class _SpecCapture:
         if self._parser is None:
             self._parser = SpecFile(str(self.scratch))
         return self._parser
+
+    def frame(self, key):
+        if not self._keys_checked:
+            indexed = [frame.key for frame in self._frames.values() if frame.start_complete]
+            keys = list(self.parser.keys())
+            # silx may ignore an unfinished final #S or list it with a garbage scan number.
+            unfinished = len(indexed) < len(self._frames)
+            if not (keys == indexed or (
+                unfinished and len(keys) == len(indexed) + 1 and keys[:-1] == indexed
+            )):
+                raise SpecCaptureFailed(
+                    f"SPEC {self.view.lexical}: the parser and the file's bytes list different scans"
+                )
+            self._keys_checked = True
+        return self._frames.get(key)
+
+    def check_row_count(self, frame):
+        if frame.key in self._row_counts_checked:
+            return
+        table = np.asarray(self.parser[frame.key].data)
+        rows = int(table.shape[1]) if table.ndim == 2 else 0
+        if rows != frame.rows:
+            raise SpecCaptureFailed(
+                f"SPEC {self.view.lexical}: the parser read {rows} rows of scan {frame.key}, "
+                f"its bytes hold {frame.rows}"
+            )
+        self._row_counts_checked.add(frame.key)
+
+    def check_numeric_tokens(self, spec_file, scan_data, labels):
+        key = f"{scan_data.number}.{scan_data.order}"
+        if key in self._strict_checked:
+            return
+        frame = self.frame(key)
+        if frame is None or not frame.start_complete:
+            raise SpecCaptureFailed(f"SPEC {spec_file}: no complete scan header for {key}")
+        with self.scratch.open("rb") as stream:
+            stream.seek(frame.offset)
+            lines = _indexed_spec_lines(stream, frame.block_end - frame.offset)
+            _validate_spec_rows(spec_file, scan_data, labels, enumerate(lines, frame.line_number))
+        self._strict_checked.add(key)
 
     def close(self) -> None:
         if self._parser is not None:
@@ -170,65 +232,31 @@ def spec_occurrence(spec_file: Path | str, key: str):
     """The occurrence proof (``xrd_tools.io.metadata.SpecOccurrence``) of scan ``key`` in the scope's captured view
     of ``spec_file``: the bytes the parser read. silx and the byte index must agree on the file's scan keys and on
     the scan's data rows, else ``SpecCaptureFailed``. None outside a scope or when the view has no such scan."""
-    from xrd_tools.io.metadata import (
-        _SPEC_SCAN_LINE,
-        _line_start,
-        _spec_occurrence_boundary_holds,
-        SpecOccurrenceUnsettled,
-        spec_occurrence_from_bytes,
-    )
+    from xrd_tools.io.metadata import SpecOccurrence, _spec_key
+
     capture = _scoped_capture(spec_file)
     if capture is None:
         return None
-    data = capture.scratch.read_bytes()  # transient: a Run keeps only the parser, never the file's bytes
-    view = capture.view
+    number, occurrence = _spec_key(key)
+    frame = capture.frame(f"{number}.{occurrence}")
+    if frame is None:
+        return None
     lexical = os.path.abspath(os.fspath(spec_file))
-    proof = spec_occurrence_from_bytes(data, path=lexical, resolved=view.resolved, device=view.device,
-                                       inode=view.inode, key=key,
-                                       captured=(view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns))
-    counts, indexed, unfinished, position = {}, [], None, data.find(b"#S")
-    while position >= 0:
-        match = _SPEC_SCAN_LINE.match(data, position) if _line_start(data, position) else None
-        if match is not None:
-            number = int(match[1])
-            counts[number] = counts.get(number, 0) + 1
-            if data.find(b"\n", position) < 0:  # the last line, still being written
-                unfinished = f"{number}.{counts[number]}"
-            else:
-                indexed.append(f"{number}.{counts[number]}")
-        position = data.find(b"#S", position + 2)
-    parser = capture.parser
-    keys = list(parser.keys())
-    # silx may list an unfinished last #S line or not, and reads "#S 3" at the very end as a garbage number: every
-    # complete scan must agree, the unfinished one is not looked at
-    if not (keys == indexed or (unfinished is not None and len(keys) == len(indexed) + 1
-                                and keys[:len(indexed)] == indexed)):
-        raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser and the file's bytes list different scans")
-    if proof is not None:
-        try:
-            complete = _spec_occurrence_boundary_holds(proof, data, proof.block_end)
-        except SpecOccurrenceUnsettled as error:
-            raise SpecCaptureFailed(str(error)) from error
-        if not complete:
-            raise SpecCaptureFailed(f"SPEC {lexical}: scan {proof.key} has an unqualified end")
-        table = np.asarray(parser[proof.key].data)
-        rows = int(table.shape[1]) if table.ndim == 2 else 0
-        if rows != proof.rows:
-            raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser read {rows} rows of scan {proof.key}, its "
-                                    f"bytes hold {proof.rows}")
-    return proof
+    if not frame.start_complete or not frame.boundary_holds:
+        raise SpecCaptureFailed(f"SPEC {lexical}: scan {frame.key} has an unqualified end")
+    capture.check_row_count(frame)
+    view = capture.view
+    return SpecOccurrence(
+        lexical, view.resolved, view.device, view.inode, frame.key, number, occurrence, frame.offset,
+        frame.header, frame.header_sha256, frame.block_end, frame.block_sha256, frame.rows,
+        (view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns),
+    )
 
 
 def _spec_parser(spec_file: Path | str):
     """The silx parser of ``spec_file``: the scope's capture, else a new parser of the file as it is now."""
     capture = _scoped_capture(spec_file)
     return SpecFile(str(spec_file)) if capture is None else capture.parser
-
-
-def _spec_text_path(spec_file: Path | str) -> Path:
-    """The bytes the strict row validator reads: the scope's capture, else the file itself."""
-    capture = _scoped_capture(spec_file)
-    return Path(spec_file) if capture is None else capture.scratch
 
 
 def _get_spec_scan(spec_file: Path | str, scan_num: str):
@@ -361,42 +389,56 @@ def _spec_row_problem(tokens, labels):
     return None
 
 
-def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
-    """Guard silx's permissive conversion using the selected scan's physical rows.
+def _indexed_spec_lines(stream, remaining):
+    while remaining:
+        raw_line = stream.readline(remaining)
+        if not raw_line:
+            raise SpecCaptureFailed("the private SPEC capture became shorter during validation")
+        remaining -= len(raw_line)
+        yield raw_line.decode("utf-8", errors="replace")
 
-    silx remains the format/value reader. It can extract digits from malformed
-    tokens (``np.float64(1.0)`` becomes ``0.641``), so validate complete decimal
-    tokens before requesting its array. Header comments and MCA records, including
-    their backslash continuations, are not table rows.
-    """
+
+def _select_spec_lines(stream, index):
     scan_index = -1
+    for physical_row, raw_line in enumerate(stream, 1):
+        if raw_line.startswith("#S") and raw_line[2:3].isspace():
+            scan_index += 1
+            if scan_index > index:
+                return
+        if scan_index == index:
+            yield physical_row, raw_line
+
+
+def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
+    """Validate the physical rows of a scan opened directly, outside the captured reader."""
+    with Path(spec_file).open(encoding="utf-8", errors="replace") as stream:
+        _validate_spec_rows(spec_file, scan_data, labels, _select_spec_lines(stream, scan_data.index))
+
+
+def _validate_spec_rows(spec_file, scan_data, labels, lines):
+    """Check complete numeric tokens before silx's permissive conversion.
+
+    Header comments and MCA records, including their backslash continuations, are not table rows.
+    """
     in_table = False
     mca_continuation = False
-    with _spec_text_path(spec_file).open(encoding="utf-8", errors="replace") as stream:
-        for physical_row, raw_line in enumerate(stream, 1):
-            line = raw_line.strip()
-            if raw_line.startswith("#S") and raw_line[2:3].isspace():
-                scan_index += 1
-                if scan_index > scan_data.index:
-                    break
-                in_table = False
-            if scan_index != scan_data.index:
-                continue
-            if line.startswith("#L"):
-                in_table = True
-            if not in_table or not line or line.startswith("#"):
-                continue
-            if mca_continuation or line.startswith("@"):
-                mca_continuation = line.endswith("\\")
-                continue
-            problem = _spec_row_problem(line.split(), labels)
-            if problem is not None:
-                index, label, token = problem
-                raise UnusableSpecScan(
-                    f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
-                    f"physical row {physical_row}, column {index + 1} ({label!r}): "
-                    f"expected a complete decimal/scientific numeric token, got {token!r}"
-                )
+    for physical_row, raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("#L"):
+            in_table = True
+        if not in_table or not line or line.startswith("#"):
+            continue
+        if mca_continuation or line.startswith("@"):
+            mca_continuation = line.endswith("\\")
+            continue
+        problem = _spec_row_problem(line.split(), labels)
+        if problem is not None:
+            index, label, token = problem
+            raise UnusableSpecScan(
+                f"SPEC {spec_file}, scan {scan_data.number}.{scan_data.order}, "
+                f"physical row {physical_row}, column {index + 1} ({label!r}): "
+                f"expected a complete decimal/scientific numeric token, got {token!r}"
+            )
 
 
 def read_spec_scan_columns(
@@ -415,9 +457,14 @@ def read_spec_scan_columns(
     :func:`read_spec_scan_table` remains the compatibility mapping view.
     """
 
-    scan_data = _get_spec_scan(spec_file, scan_num)
+    capture = _scoped_capture(spec_file)
+    parser = SpecFile(str(spec_file)) if capture is None else capture.parser
+    scan_data = parser[scan_num]
     labels = tuple(str(label) for label in scan_data.labels)
-    _validate_spec_numeric_tokens(spec_file, scan_data, labels)
+    if capture is None:
+        _validate_spec_numeric_tokens(spec_file, scan_data, labels)
+    else:
+        capture.check_numeric_tokens(spec_file, scan_data, labels)
     data = np.asarray(scan_data.data)
     if data.ndim != 2 or data.shape[0] != len(labels):
         if data.size == 0:  # #L written, no point recorded: the scan was aborted (1.2.9 said "labels do not match")
