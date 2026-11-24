@@ -5,6 +5,7 @@ import calendar
 import configparser
 import functools
 import hashlib
+import io
 import logging
 import os
 import re
@@ -1852,54 +1853,131 @@ def _spec_key(key: str) -> tuple[int, int]:
     return int(number), int(occurrence or 1)
 
 
-def _frame_spec_occurrence(data: bytes, number: int, occurrence: int):
-    """(offset, header spans, header digest, block end, block digest, data rows) of the ``occurrence``-th
-    ``#S number`` line in ``data``, or None. The block runs to the next ``#S``/``#F`` line or the end of ``data``;
-    only complete lines count; it ends after its last complete nonblank line."""
-    seen, offset, position = 0, None, data.find(b"#S")
-    while position >= 0:
-        match = _SPEC_SCAN_LINE.match(data, position) if _line_start(data, position) else None
-        if match is not None and int(match[1]) == number:
-            seen += 1
-            if seen == occurrence:
-                offset = position
-                break
-        position = data.find(b"#S", position + 2)
-    if offset is None:
-        return None
-    header_start = _last_spec_file_header(data, offset)
-    spans, cursor = [], header_start
-    while cursor < offset:
-        end = data.find(b"\n", cursor, offset)
-        end = offset if end < 0 else end + 1
-        line = data[cursor:end]
-        if _SPEC_SCAN_LINE.match(line):
-            break  # silx's file header ends at the first scan in this header block
-        if line.startswith(b"#"):
-            marker = line.split(None, 1)[0]
+@dataclass(frozen=True, slots=True)
+class SpecOccurrenceFrame:
+    """Offsets and parser-relevant identity from one forward scan of a SPEC file."""
+
+    number: int
+    occurrence: int
+    offset: int
+    line_number: int
+    header: tuple[tuple[int, int], ...]
+    header_sha256: str
+    block_end: int
+    block_sha256: str
+    rows: int
+    start_complete: bool
+    boundary_holds: bool
+
+    @property
+    def key(self) -> str:
+        return f"{self.number}.{self.occurrence}"
+
+    @property
+    def framed(self) -> tuple:
+        return self.offset, self.header, self.header_sha256, self.block_end, self.block_sha256, self.rows
+
+
+def _spec_occurrence_lines(stream, cancelled):
+    """Read through one physical record at a time, with bounded read-ahead."""
+    pending = bytearray()
+    while True:
+        _spec_cancelled(cancelled)
+        chunk = stream.read(1 << 16)
+        if not chunk:
+            if pending:
+                yield bytes(pending)
+            return
+        lines = chunk.split(b"\n")
+        if len(lines) == 1:
+            pending.extend(lines[0])
+            continue
+        yield bytes(pending) + lines[0] + b"\n"
+        for line in lines[1:-1]:
+            yield line + b"\n"
+        pending = bytearray(lines[-1])
+
+
+def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancelled=None):
+    """Frame the scans in byte order, keeping only one record and the current section's header.
+
+    A complete line belongs to its scan up to the next column-zero #S or #F.
+    Trailing blank lines are excluded. A recognizable later marker closes the
+    previous scan even while that marker is being written. With a limit, finish
+    at the first decision about the last protected byte's boundary.
+    """
+    seen: dict[int, int] = {}
+    spans: list[tuple[int, int]] = []
+    header_hash = hashlib.sha256()
+    header, header_digest = (), header_hash.hexdigest()
+    header_open = True
+    number = ordinal = start = start_line = end = rows = offset = 0
+    complete = active = mca = False
+    block_hash = hashlib.sha256()
+    before_blanks = None
+
+    def frame(boundary_holds):
+        digest = block_hash if before_blanks is None else before_blanks
+        return SpecOccurrenceFrame(number, ordinal, start, start_line, header, header_digest,
+                                   end, digest.hexdigest(), rows, complete, boundary_holds)
+
+    for line_number, raw in enumerate(_spec_occurrence_lines(stream, cancelled), 1):
+        match = _SPEC_RECORD_LINE.match(raw)
+        size = len(raw)
+        if match:
+            if active:
+                yield frame(True)
+                active = False
+            if stop_after is not None and offset >= stop_after:
+                return
+            if match[1] is None:
+                header_open = True
+                spans = []
+                header_hash = hashlib.sha256()
+            else:
+                if header_open:
+                    header, header_digest = tuple(spans), header_hash.hexdigest()
+                    header_open = False
+                number = int(match[1])
+                ordinal = seen[number] = seen.get(number, 0) + 1
+                start, start_line, end = offset, line_number, offset
+                complete, active, mca, rows = raw.endswith(b"\n"), True, False, 0
+                block_hash = hashlib.sha256()
+                before_blanks = None
+        if header_open and raw.startswith(b"#"):
+            marker = raw.split(None, 1)[0]
             if marker in (b"#F", b"#E") or re.fullmatch(rb"#[Oo]\d+", marker):
-                spans.append((cursor, end - cursor))
-        cursor = end
-    header = tuple(spans)
-    header_digest = hashlib.sha256(b"".join(data[at:at + size] for at, size in header)).hexdigest()
-    block_end, rows, mca, cursor = offset, 0, False, offset
-    while cursor < len(data):
-        end = data.find(b"\n", cursor)
-        if end < 0:
-            break
-        end += 1
-        raw = data[cursor:end]
-        if cursor != offset and _SPEC_RECORD_LINE.match(raw):
-            break
-        line = raw.strip()
-        if line:
-            block_end = end
-            if mca or line.startswith(b"@"):
-                mca = line.endswith(b"\\")
-            elif not line.startswith(b"#"):
-                rows += 1
-        cursor = end
-    return offset, header, header_digest, block_end, hashlib.sha256(data[offset:block_end]).hexdigest(), rows
+                spans.append((offset, size))
+                header_hash.update(raw)
+        if active:
+            line = raw.strip()
+            if not raw.endswith(b"\n"):
+                yield frame(not line or not complete)
+                return
+            if line:
+                end = offset + size
+                before_blanks = None
+                if mca or line.startswith(b"@"):
+                    mca = line.endswith(b"\\")
+                elif not line.startswith(b"#"):
+                    rows += 1
+            elif before_blanks is None:
+                before_blanks = block_hash.copy()
+            block_hash.update(raw)
+            if stop_after is not None and end > stop_after:
+                yield frame(True)
+                return
+        offset += size
+    if active:
+        yield frame(True)
+
+
+def _frame_spec_occurrence(data: bytes, number: int, occurrence: int):
+    """The parser-relevant framing of a scan in one captured set of bytes."""
+    for frame in iter_spec_occurrence_frames(io.BytesIO(data)):
+        if (frame.number, frame.occurrence) == (number, occurrence):
+            return frame.framed
+    return None
 
 
 def spec_occurrence_from_bytes(data: bytes, *, path: str, resolved: str, device: int, inode: int,
