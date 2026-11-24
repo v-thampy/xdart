@@ -263,6 +263,28 @@ def test_a_browsed_detector_image_with_sidecar_keeps_the_metadata_table(tmp_path
     assert "i0" in dialog._columns and not _picker_shown(dialog)
 
 
+def test_a_tiff_folder_with_sidecars_keeps_the_metadata_table(tmp_path, qapp, open_page):
+    import tifffile
+    from xdart.gui.analysis.scan_source_widget import _DIR_KINDS
+
+    for index in range(2):
+        path = tmp_path / f"frame_{index}.tif"
+        tifffile.imwrite(path, np.full((8, 8), index, dtype=np.uint16))
+        path.with_suffix(".tif.metadata").write_text(f"i0={index + 1}\nmotor_th={index}\nchi=90\n")
+    page = open_page("Int 1D")
+    dialog = _roi_statistics(page, qapp)
+    widget = dialog.source_widget
+    widget.dir_check.setChecked(True)
+    widget.dir_kind_combo.setCurrentIndex([kind for _label, kind in _DIR_KINDS].index("tiff_series"))
+    widget.path_edit.setText(str(tmp_path))
+    widget._refresh_candidates()
+    _until(page, qapp, lambda: widget.scan_combo.count() == 2 and _idle(page), "the TIFF folder candidate")
+    widget.scan_combo.setCurrentIndex(1)
+    _until(page, qapp, lambda: dialog._vnext_table_result is not None, "the TIFF folder's table")
+    _settled(page, qapp, "the TIFF folder's table")
+    assert "i0" in dialog._columns and not _picker_shown(dialog)
+
+
 def test_a_browsed_stack_with_text_metadata_does_not_open_the_roi_picker(tmp_path, qapp, open_page):
     path = _processed(tmp_path, metadata=False)
     with h5py.File(path, "a") as handle:

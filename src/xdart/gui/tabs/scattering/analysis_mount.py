@@ -186,7 +186,7 @@ def scan_plot_plan(x: str | None, y: tuple[str, ...], normalization: str | None)
     return ScanPlotPlan(x, tuple(y), normalization)
 def metadata_plan_from_syntax(value: object):
     from xrd_tools.analysis.scan_operations import MetadataTablePlan
-    from xrd_tools.core.scan import SourceSpec
+    from xrd_tools.core.scan import SourceKind, SourceSpec
     if type(value) is SourceSpec: return MetadataTablePlan(value)
     if type(value) is not tuple: return None
     if (len(value) == 2 and value[0] == "exact"
@@ -198,7 +198,10 @@ def metadata_plan_from_syntax(value: object):
     if (len(value) == 3 and value[0] == "directory"
             and isinstance(value[1], (str, Path)) and str(value[1])
             and type(value[2]) is str and value[2]):
-        return MetadataTablePlan(value[1], selection="directory", kind=value[2])
+        metadata_format = "auto" if value[2] == SourceKind.TIFF_SERIES.value else None
+        return MetadataTablePlan(
+            value[1], selection="directory", kind=value[2], metadata_format=metadata_format,
+        )
     return None
 def analysis_request_facts(plan: object, *, table=None, roi=None,
                            render=(), picker=0):
