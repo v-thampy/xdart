@@ -1878,24 +1878,52 @@ class SpecOccurrenceFrame:
         return self.offset, self.header, self.header_sha256, self.block_end, self.block_sha256, self.rows
 
 
-def _spec_occurrence_lines(stream, cancelled):
-    """Read through one physical record at a time, with bounded read-ahead."""
-    pending = bytearray()
+_SPEC_CHUNK = 1 << 16
+
+
+def _spec_record_segments(stream, cancelled):
     while True:
         _spec_cancelled(cancelled)
-        chunk = stream.read(1 << 16)
+        chunk = stream.read(_SPEC_CHUNK)
         if not chunk:
-            if pending:
-                yield bytes(pending)
             return
         lines = chunk.split(b"\n")
-        if len(lines) == 1:
-            pending.extend(lines[0])
-            continue
-        yield bytes(pending) + lines[0] + b"\n"
-        for line in lines[1:-1]:
+        for line in lines[:-1]:
             yield line + b"\n"
-        pending = bytearray(lines[-1])
+        if lines[-1]:
+            yield lines[-1]
+
+
+def _spec_record_remainder(segments):
+    for segment in segments:
+        yield segment
+        if segment.endswith(b"\n"):
+            return
+
+
+def iter_spec_record_parts(stream, *, cancelled=None):
+    """One physical line at a time as a bounded head and remaining pieces.
+
+    Consume the remainder before asking for the next line. A complete line
+    ends with a newline in its head or last piece. Only EOF can leave it open.
+    """
+    segments = _spec_record_segments(stream, cancelled)
+    for segment in segments:
+        if segment.endswith(b"\n"):
+            yield segment, ()
+            continue
+        head = bytearray(segment)
+        for part in segments:
+            head.extend(part)
+            if part.endswith(b"\n") or len(head) >= _SPEC_CHUNK:
+                break
+        tail = _spec_record_remainder(segments) if len(head) >= _SPEC_CHUNK and not head.endswith(b"\n") else ()
+        yield bytes(head), tail
+
+
+def _spec_occurrence_lines(stream, cancelled):
+    for head, remainder in iter_spec_record_parts(stream, cancelled=cancelled):
+        yield b"".join((head, *remainder))
 
 
 def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, cancelled=None):
