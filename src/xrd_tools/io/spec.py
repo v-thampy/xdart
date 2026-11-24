@@ -1,6 +1,7 @@
 """SPEC file parsing: scan metadata, energy, UB, angles."""
 from __future__ import annotations
 
+import codecs
 import contextlib
 import contextvars
 import hashlib
@@ -10,6 +11,7 @@ import re
 import stat
 import tempfile
 from dataclasses import dataclass
+from itertools import chain, islice
 from pathlib import Path
 
 import numpy as np
@@ -168,8 +170,8 @@ class _SpecCapture:
             raise SpecCaptureFailed(f"SPEC {spec_file}: no complete scan header for {key}")
         with self.scratch.open("rb") as stream:
             stream.seek(frame.offset)
-            lines = _indexed_spec_lines(stream, frame.block_end - frame.offset)
-            _validate_spec_rows(spec_file, scan_data, labels, enumerate(lines, frame.line_number))
+            lines = _indexed_spec_lines(stream, frame.block_end - frame.offset, frame.line_number)
+            _validate_spec_rows(spec_file, scan_data, labels, lines)
         self._strict_checked.add(key)
 
     def close(self) -> None:
@@ -397,13 +399,42 @@ def _spec_row_problem(tokens, labels):
     return None
 
 
-def _indexed_spec_lines(stream, remaining):
-    while remaining:
-        raw_line = stream.readline(remaining)
-        if not raw_line:
+class _SpecSpanStream:
+    """A reader limited to one indexed scan, starting at its first byte."""
+
+    def __init__(self, stream, remaining):
+        self.stream = stream
+        self.remaining = remaining
+
+    def read(self, size):
+        if not self.remaining:
+            return b""
+        data = self.stream.read(min(size, self.remaining))
+        if not data:
             raise SpecCaptureFailed("the private SPEC capture became shorter during validation")
-        remaining -= len(raw_line)
-        yield raw_line.decode("utf-8", errors="replace")
+        self.remaining -= len(data)
+        return data
+
+
+def _decode_spec_line_tail(parts, decoder):
+    for part in parts:
+        decoded = decoder.decode(part)
+        if decoded:
+            yield decoded
+    decoded = decoder.decode(b"", final=True)
+    if decoded:
+        yield decoded
+
+
+def _indexed_spec_lines(stream, remaining, start_line):
+    from xrd_tools.io.metadata import iter_spec_record_parts
+
+    for row, (head, tail) in enumerate(iter_spec_record_parts(_SpecSpanStream(stream, remaining)), start_line):
+        if not tail:
+            yield row, head.decode("utf-8", errors="replace"), ()
+        else:
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            yield row, decoder.decode(head), _decode_spec_line_tail(tail, decoder)
 
 
 def _select_spec_lines(stream, index):
@@ -414,13 +445,46 @@ def _select_spec_lines(stream, index):
             if scan_index > index:
                 return
         if scan_index == index:
-            yield physical_row, raw_line
+            yield physical_row, raw_line, ()
 
 
 def _validate_spec_numeric_tokens(spec_file, scan_data, labels):
     """Validate the physical rows of a scan opened directly, outside the captured reader."""
     with Path(spec_file).open(encoding="utf-8", errors="replace") as stream:
         _validate_spec_rows(spec_file, scan_data, labels, _select_spec_lines(stream, scan_data.index))
+
+
+_SPEC_DIGIT_RUN = re.compile(r"[0-9]+")
+_SPEC_TOKEN_PART = re.compile(r"\s+|\S+")
+
+
+def _long_spec_tokens(parts):
+    """For a split row, match decimals without retaining an unbounded token.
+
+    Replacing each nonempty ASCII digit run with one digit preserves _SPEC_NUMBER
+    membership. Its longest compressed valid form is +0.0e+0. Keep a short
+    original prefix for the diagnostic when a long token is invalid.
+    """
+    prefix = signature = ""
+    for part in parts:
+        for match in _SPEC_TOKEN_PART.finditer(part):
+            text = match[0]
+            if text[0].isspace():
+                if prefix:
+                    yield _display_spec_token(prefix, signature)
+                    prefix = signature = ""
+            else:
+                prefix = (prefix + text)[:65]
+                if len(signature) <= 7:
+                    signature = _SPEC_DIGIT_RUN.sub("0", signature + text)[:8]
+    if prefix:
+        yield _display_spec_token(prefix, signature)
+
+
+def _display_spec_token(prefix, signature):
+    if len(prefix) <= 64:
+        return prefix
+    return signature if _SPEC_NUMBER.fullmatch(signature) else prefix[:64] + "…"
 
 
 def _validate_spec_rows(spec_file, scan_data, labels, lines):
@@ -430,16 +494,28 @@ def _validate_spec_rows(spec_file, scan_data, labels, lines):
     """
     in_table = False
     mca_continuation = False
-    for physical_row, raw_line in lines:
-        line = raw_line.strip()
+    for physical_row, head, tail in lines:
+        parts = chain((head,), tail)
+        line = next((text.lstrip() for text in parts if text and not text.isspace()), "")
+        if line == "#":
+            line += next(parts, "")  # the #L marker can cross a physical read boundary
         if line.startswith("#L"):
             in_table = True
         if not in_table or not line or line.startswith("#"):
+            for _ in parts:
+                pass
             continue
         if mca_continuation or line.startswith("@"):
-            mca_continuation = line.endswith("\\")
+            last = ""
+            for text in chain((line,), parts):
+                stripped = text.rstrip()
+                if stripped:
+                    last = stripped[-1]
+            mca_continuation = last == "\\"
             continue
-        problem = _spec_row_problem(line.split(), labels)
+        tokens = (tuple(islice(_long_spec_tokens(chain((line,), parts)), len(labels) + 1))
+                  if tail else line.split())
+        problem = _spec_row_problem(tokens, labels)
         if problem is not None:
             index, label, token = problem
             raise UnusableSpecScan(

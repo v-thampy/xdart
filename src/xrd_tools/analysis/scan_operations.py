@@ -777,13 +777,14 @@ def _snapshot(
     selected_source: Any | None = None,
     selected_revision: FileRevision | None = None,
 ) -> _Snapshot:
+    from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
+
     lexical = _lexical_absolute(spec.uri)
     resolved = lexical.resolve(strict=False)
     current = _path_revision(resolved)
     view = proof = None
     if current is not None and coerce_source_kind(spec.kind) is SourceKind.SPEC:
         # the parser reads the scope's captured view of the SPEC file: its revision is the one this read binds
-        from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
         try:
             view = spec_file_view(lexical)
         except FileNotFoundError:
@@ -800,7 +801,10 @@ def _snapshot(
     if current != before:
         _close(selected_source)
         raise _Refusal("SOURCE_REVISION_CHANGED")
-    source = selected_source if selected_source is not None else open_source(spec)
+    try:
+        source = selected_source if selected_source is not None else open_source(spec)
+    except SpecCaptureFailed as error:
+        raise _Refusal("SOURCE_IDENTITY_MISMATCH") from error
     try:
         from xrd_tools.sources.nexus import NexusStackSource
         if type(source) is NexusStackSource:
@@ -817,7 +821,7 @@ def _snapshot(
         if resolved_entry != spec.entry or (actual_kind is SourceKind.SPEC and getattr(source, "scan_key", None) != dict(spec.options).get("scan")):
             raise _Refusal("SOURCE_IDENTITY_MISMATCH")
         if view is not None and actual_kind is SourceKind.SPEC and getattr(source, "scan_key", None):
-            from xrd_tools.io.spec import SpecCaptureFailed, spec_occurrence
+            from xrd_tools.io.spec import spec_occurrence
             try:
                 proof = spec_occurrence(lexical, source.scan_key)
             except SpecCaptureFailed:
