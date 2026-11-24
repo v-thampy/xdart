@@ -212,6 +212,23 @@ def test_s4_an_hkl_map_refuses_when_its_ub_line_is_rewritten(tmp_path, monkeypat
     assert result.terminal.disposition is ModuleDisposition.REFUSED, result.terminal
 
 
+def test_s4_an_hkl_map_refuses_when_its_ub_alias_is_retargeted(tmp_path, monkeypatch):
+    _runnable(monkeypatch)
+    form, ub_spec = _hkl(tmp_path)
+    alias = tmp_path / "ub_alias"
+    alias.symlink_to(ub_spec)
+    form = replace(form, ub=replace(form.ub, spec_path=str(alias)))
+    request = prepare_rsm_tool_v2(form).request
+    copy = tmp_path / "ub_copy"
+    copy.write_bytes(Path(ub_spec).read_bytes())
+    alias.unlink()
+    alias.symlink_to(copy)
+
+    result = run_rsm_operation_v2(request)
+    assert result.terminal.disposition is ModuleDisposition.REFUSED, result.terminal
+    assert not Path(request.module.output.target).exists()
+
+
 def test_s4b_an_hkl_map_stays_current_for_append_after_its_ub_file_grows(tmp_path, monkeypatch):
     """His "Regrid once": a map made after the fix stays current across unrelated growth; a changed UB matrix
     does not."""
@@ -223,6 +240,28 @@ def test_s4b_an_hkl_map_stays_current_for_append_after_its_ub_file_grows(tmp_pat
     assert prepare_rsm_tool_v2(form).output_current is True
     _rewrite(ub_spec, "#G3 2.0 0.0", "#G3 3.0 0.0")
     assert prepare_rsm_tool_v2(form).output_current is False
+
+
+def test_s4b_malformed_legacy_plan_provenance_is_not_current(tmp_path, monkeypatch):
+    import json
+    import h5py
+    from xrd_tools.analysis.rsm_operation import rsm_output_current
+    from xrd_tools.io.analysis_artifact import rsm_record_identity
+
+    _runnable(monkeypatch)
+    form, _ub_spec = _hkl(tmp_path)
+    request = prepare_rsm_tool_v2(form).request
+    _committed(run_rsm_operation_v2(request))
+    with h5py.File(request.module.output.target, "r+") as handle:
+        entry = handle["entry"]
+        recorded = json.loads(entry["provenance_json"].asstr()[()])
+        recorded["plan"] = ["broken"]
+        entry["provenance_json"][()] = json.dumps(recorded, separators=(",", ":"))
+        entry.attrs.modify("plan_fingerprint", "f" * 64)
+    identity = rsm_record_identity(request.module.output.target)
+    assert identity is not None and identity[0] == "f" * 64
+    assert json.loads(identity[1])["plan"] == ["broken"]
+    assert not rsm_output_current(request)
 
 
 # --- S6: Stitch with a SPEC source ---------------------------------------------------------------------------------
@@ -268,6 +307,21 @@ def test_s7_requalification_and_the_receipt_factory_accept_a_later_scan(tmp_path
     assert requalified.disposition is AnalysisDisposition.COMPLETED, requalified.code
     receipt = ModuleSourceReceipt.from_metadata_table(table, kind=ModuleKind.RSM)
     assert receipt.analysis == table.receipt and receipt.table_fingerprint == table.table_fingerprint
+
+
+def test_s6_stitch_preparation_accepts_a_supplied_table_after_unrelated_growth(tmp_path):
+    from xrd_tools.analysis.stitch_operation import prepare_stitch_operation
+
+    request = prepare_stitch_tool(_native_form(tmp_path, "multigeometry", scans="1")).request
+    source = request.module.source
+    _append(source.analysis.lexical_root)
+    table = run_metadata_table(MetadataTablePlan(source.analysis.source_spec))
+    assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+    rebuilt = prepare_stitch_operation(
+        source, request.module.output, request.plan, project_root=tmp_path, tables=table,
+    )
+    assert rebuilt.module.source is source
+    assert rebuilt.manifest.fingerprint == request.manifest.fingerprint
 
 
 def test_s7_requalification_refuses_a_rewrite_of_the_scan(tmp_path):
@@ -617,6 +671,116 @@ def test_s11_the_proof_from_a_real_capture_takes_the_stat_fast_path_only_when_un
         copy.write_bytes(path.read_bytes())
         copy.replace(path)
     assert spec_occurrence_holds(proof) is holds
+
+
+def _two_scans_with_motor_positions():
+    return _TWO_SCANS.replace("#L eta", "#P0 20\n#L eta")
+
+
+def test_s11_a_proof_for_another_scan_cannot_requalify_an_admitted_table(tmp_path):
+    path = tmp_path / "f"
+    path.write_text(_two_scans_with_motor_positions(), encoding="utf-8", newline="\n")
+
+    def table_for(scan):
+        table = run_metadata_table(MetadataTablePlan(SourceSpec(
+            path, SourceKind.SPEC, options={"scan": scan},
+        )))
+        assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+        return table
+
+    first, second = table_for("1.1"), table_for("2.1")
+    wrong = replace(first.receipt, spec_occurrence=second.receipt.spec_occurrence)
+    _rewrite(path, "0 10\n", "0 11\n")
+    result = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(wrong, first.table_fingerprint),
+    )
+    assert result.disposition is AnalysisDisposition.REFUSED, result.code
+
+
+@pytest.mark.parametrize("mutation, holds", [
+    ("replacement", False), ("selected edit", False), ("unrelated append", True),
+])
+def test_s11_a_file_changed_while_its_occurrence_is_read(tmp_path, monkeypatch, mutation, holds):
+    import os
+    from xrd_tools.io.metadata import spec_occurrence_holds
+    from xrd_tools.io.spec import spec_capture_scope, spec_occurrence
+
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS, encoding="utf-8", newline="\n")
+    with spec_capture_scope():
+        proof = spec_occurrence(path, "2.1")
+    _append(path, "\n#S 3 later\n")
+    copy = tmp_path / "replacement"
+    copy.write_bytes(path.read_bytes())
+    read = os.read
+    changed = []
+
+    def read_then_change(descriptor, size):
+        data = read(descriptor, size)
+        if not changed and os.fstat(descriptor).st_ino == proof.inode:
+            if mutation == "replacement":
+                copy.replace(path)
+            elif mutation == "selected edit":
+                _rewrite(path, "1 40\n", "1 41\n")
+            else:
+                _append(path, "#L eta  I0\n0 50\n")
+            changed.append(True)
+        return data
+
+    monkeypatch.setattr(os, "read", read_then_change)
+    assert spec_occurrence_holds(proof) is holds
+    assert changed
+
+
+@pytest.mark.parametrize("shadow", [
+    b"#O0 motorb\n",
+    b"#S 1 test\n#O0 motorb\n#P0 10\n#L eta  I0\n0 10\n",
+])
+def test_s11_the_effective_file_header_is_bound_even_with_a_shadow_row(tmp_path, shadow):
+    path = tmp_path / "f"
+    path.write_bytes(
+        b"#F file\n#E 1\n#O0 motora\n" + shadow
+        + b"#S 2 test\n#P0 20\n#L eta  I0\n0 30\n1 40\n",
+    )
+    table = run_metadata_table(MetadataTablePlan(SourceSpec(
+        path, SourceKind.SPEC, options={"scan": "2.1"},
+    )))
+    assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+    assert "motora" in {column.name for column in table.columns}
+    _rewrite(path, "#O0 motora", "#O0 motorc")
+    result = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint),
+    )
+    assert result.disposition is AnalysisDisposition.REFUSED, result.code
+
+
+def test_s11_an_unterminated_selected_header_is_not_a_complete_occurrence(tmp_path):
+    path = tmp_path / "f"
+    start, selected = _two_scans_with_motor_positions().rsplit("#S 2", 1)
+    selected = selected.replace("#G3 1 0 0 0 1 0 0 0 1\n", "")
+    path.write_text(
+        start + "#S 2" + selected + "#G3 1 0 0 0 1 0 0 0 1",
+        encoding="utf-8", newline="\n",
+    )
+    table = run_metadata_table(MetadataTablePlan(SourceSpec(
+        path, SourceKind.SPEC, options={"scan": "2.1"},
+    )))
+    assert table.disposition is AnalysisDisposition.REFUSED, table.code
+
+
+@pytest.mark.parametrize("marker", [" #S 3 fake", "\t#F rollover"])
+def test_s11_an_indented_record_does_not_end_the_protected_scan(tmp_path, marker):
+    path = tmp_path / "f"
+    path.write_text(_two_scans_with_motor_positions(), encoding="utf-8", newline="\n")
+    table = run_metadata_table(MetadataTablePlan(SourceSpec(
+        path, SourceKind.SPEC, options={"scan": "2.1"},
+    )))
+    assert table.disposition is AnalysisDisposition.COMPLETED, table.code
+    _append(path, marker + "\n2 99\n")
+    result = run_metadata_table_requalification(
+        MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint),
+    )
+    assert result.disposition is AnalysisDisposition.REFUSED, result.code
 
 
 # --- S6 / S2 mid-Run, under the Run's one capture scope ------------------------------------------------------------

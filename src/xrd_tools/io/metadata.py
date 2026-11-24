@@ -1868,18 +1868,19 @@ def _frame_spec_occurrence(data: bytes, number: int, occurrence: int):
     if offset is None:
         return None
     header_start = _last_spec_file_header(data, offset)
-    spans, cursor = {}, header_start
+    spans, cursor = [], header_start
     while cursor < offset:
         end = data.find(b"\n", cursor, offset)
         end = offset if end < 0 else end + 1
-        line = data[cursor:end].strip()
-        marker = line.split(None, 1)[0] if line else b""
-        if marker == b"#F":
-            spans = {marker: (cursor, end - cursor)}
-        elif marker == b"#E" or re.fullmatch(rb"#[Oo]\d+", marker):
-            spans[marker] = (cursor, end - cursor)
+        line = data[cursor:end]
+        if _SPEC_SCAN_LINE.match(line):
+            break  # silx's file header ends at the first scan in this header block
+        if line.startswith(b"#"):
+            marker = line.split(None, 1)[0]
+            if marker in (b"#F", b"#E") or re.fullmatch(rb"#[Oo]\d+", marker):
+                spans.append((cursor, end - cursor))
         cursor = end
-    header = tuple(spans.values())
+    header = tuple(spans)
     header_digest = hashlib.sha256(b"".join(data[at:at + size] for at, size in header)).hexdigest()
     block_end, rows, mca, cursor = offset, 0, False, offset
     while cursor < len(data):
@@ -1887,9 +1888,10 @@ def _frame_spec_occurrence(data: bytes, number: int, occurrence: int):
         if end < 0:
             break
         end += 1
-        line = data[cursor:end].strip()
-        if cursor != offset and _SPEC_RECORD_LINE.match(line):
+        raw = data[cursor:end]
+        if cursor != offset and _SPEC_RECORD_LINE.match(raw):
             break
+        line = raw.strip()
         if line:
             block_end = end
             if mca or line.startswith(b"@"):
@@ -1913,40 +1915,45 @@ def spec_occurrence_from_bytes(data: bytes, *, path: str, resolved: str, device:
                           header, header_digest, block_end, block_digest, rows, captured)
 
 
-def spec_occurrence_holds(proof: SpecOccurrence) -> bool:
-    """Whether the SPEC file still holds ``proof``'s occurrence: the same filesystem object under its name, the
-    same ``N.M`` occurrence at the same offset with the same header lines and bytes, and nothing of the scan's own
-    after them (what follows is blank, the end, or a complete or starting ``#S``/``#F`` line). One read of the file
-    up to the scan's end and of the lines just after it. False for a missing, replaced or changed file;
-    ``SpecOccurrenceUnsettled`` while a line after the scan is still being written. On POSIX a file whose name
-    still stats as the captured view (device, inode, size, mtime and ctime, which any write moves) holds without a
-    read; win32's pathname ctime is not a change time (``io.stat_identity``), so there it is always read."""
-    from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
-    try:  # the spelling still resolves to the file the proof read (a re-pointed link is another file)
-        if os.path.normcase(os.path.realpath(proof.path)) != proof.resolved:
+def _spec_occurrence_boundary_holds(proof: SpecOccurrence, data: bytes, start: int = 0) -> bool:
+    """Skip blank separators while preserving the column of the next record."""
+    while start < len(data):
+        end = data.find(b"\n", start)
+        line = data[start:] if end < 0 else data[start:end + 1]
+        if line.strip():
+            if _SPEC_RECORD_LINE.match(line):
+                return True
+            if end < 0:
+                raise SpecOccurrenceUnsettled(
+                    f"SPEC {proof.path}: a line after scan {proof.key} is still being written"
+                )
             return False
-    except OSError:
+        if end < 0:
+            break
+        start = end + 1
+    return True
+
+
+def _spec_descriptor_revision(status):
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+def _spec_occurrence_name_matches(proof: SpecOccurrence, status) -> bool:
+    if not stat.S_ISREG(status.st_mode) or (status.st_dev, status.st_ino) != (proof.device, proof.inode):
         return False
-    if IDENTITY_CARRIES_CTIME and proof.captured is not None:
-        try:
-            named = os.stat(proof.path)
-        except OSError:
-            return False
-        if (named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns, named.st_ctime_ns) == proof.captured:
-            return stat.S_ISREG(named.st_mode)
-    try:
-        descriptor = os.open(proof.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    except OSError:
-        return False
-    try:
+    named = os.stat(proof.path)
+    return ((named.st_dev, named.st_ino) == (proof.device, proof.inode)
+            and os.path.normcase(os.path.realpath(proof.path)) == proof.resolved)
+
+
+def _read_spec_occurrence(proof: SpecOccurrence, descriptor: int) -> bool:
+    # Re-observe once if growth overlaps this read. The old prefix alone
+    # cannot distinguish a concurrent selected rewrite from unrelated growth.
+    for _ in range(2):
         status = os.fstat(descriptor)
-        try:
-            named = os.stat(proof.resolved)
-        except OSError:
+        if not _spec_occurrence_name_matches(proof, status):
             return False
-        if (not stat.S_ISREG(status.st_mode) or (status.st_dev, status.st_ino) != (proof.device, proof.inode)
-                or (named.st_dev, named.st_ino) != (proof.device, proof.inode)):
-            return False
+        os.lseek(descriptor, 0, os.SEEK_SET)
         chunks, remaining = [], proof.block_end
         while remaining > 0:
             chunk = os.read(descriptor, min(1 << 20, remaining))
@@ -1956,30 +1963,46 @@ def spec_occurrence_holds(proof: SpecOccurrence) -> bool:
             remaining -= len(chunk)
         prefix = b"".join(chunks)
         tail = b""
-        while True:  # the first nonblank line after the scan, complete or not
-            stripped = tail.lstrip(b" \t\r\n")
-            if b"\n" in stripped:
-                break
+        while b"\n" not in tail.lstrip(b" \t\r\n"):
             chunk = os.read(descriptor, 1 << 16)
             if not chunk:
                 break
             tail += chunk
-    finally:
-        os.close(descriptor)
-    framed = _frame_spec_occurrence(prefix, proof.number, proof.occurrence)
-    if framed is None or framed != (proof.offset, proof.header, proof.header_sha256, proof.block_end,
-                                    proof.block_sha256, proof.rows):
+        framed = _frame_spec_occurrence(prefix, proof.number, proof.occurrence)
+        if framed != (proof.offset, proof.header, proof.header_sha256, proof.block_end,
+                      proof.block_sha256, proof.rows):
+            return False
+        after = os.fstat(descriptor)
+        if not _spec_occurrence_name_matches(proof, after):
+            return False
+        if _spec_descriptor_revision(after) == _spec_descriptor_revision(status):
+            return _spec_occurrence_boundary_holds(proof, tail)
+        if after.st_size <= status.st_size:
+            return False
+    return False
+
+
+def spec_occurrence_holds(proof: SpecOccurrence) -> bool:
+    """Whether the SPEC file still holds ``proof``'s occurrence: the same filesystem object under its name, the
+    same ``N.M`` occurrence at the same offset with the same header lines and bytes, and nothing of the scan's own
+    after them (what follows is blank, the end, or a complete or starting ``#S``/``#F`` line). One read of the file
+    up to the scan's end and of the lines just after it. False for a missing, replaced or changed file;
+    ``SpecOccurrenceUnsettled`` while a line after the scan is still being written. On POSIX a file whose name
+    still stats as the captured view (device, inode, size, mtime and ctime, which any write moves) holds without a
+    read; win32's pathname ctime is not a change time (``io.stat_identity``), so there it is always read."""
+    from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
+    try:
+        if IDENTITY_CARRIES_CTIME and proof.captured is not None:
+            named = os.stat(proof.path)
+            if _spec_descriptor_revision(named) == proof.captured:
+                return _spec_occurrence_name_matches(proof, named)
+        descriptor = os.open(proof.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            return _read_spec_occurrence(proof, descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
         return False
-    following = tail.lstrip(b" \t\r\n")
-    if not following:
-        return True
-    line = following.split(b"\n", 1)[0].strip()
-    complete = b"\n" in following
-    if _SPEC_RECORD_LINE.match(line):  # a later scan or file header, complete or starting
-        return True
-    if not complete:
-        raise SpecOccurrenceUnsettled(f"SPEC {proof.path}: a line after scan {proof.key} is still being written")
-    return False  # a new line of the scan itself (a row, a #G3, ...)
 
 
 def _resolve_spec_image(image_path: Path, meta_dir: Path | str | None) -> tuple[Path, int, int] | None:

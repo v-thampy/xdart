@@ -75,6 +75,16 @@ class _SpecCapture:
                     handle.write(chunk)
                     digest.update(chunk)
                     remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            named = os.stat(lexical)
+            if ((named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+                    or os.path.normcase(os.path.realpath(lexical)) != resolved):
+                raise SpecCaptureFailed(f"SPEC file {lexical} was replaced while it was read")
+            if (after.st_size < before.st_size or (
+                after.st_size == before.st_size
+                and (after.st_mtime_ns, after.st_ctime_ns) != (before.st_mtime_ns, before.st_ctime_ns)
+            )):
+                raise SpecCaptureFailed(f"SPEC file {lexical} was rewritten while it was read")
             from xrd_tools.io.stat_identity import identity_ctime_ns
             self.view = SpecFileView(
                 lexical, resolved, before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
@@ -165,13 +175,20 @@ def spec_occurrence(spec_file: Path | str, key: str):
     """The occurrence proof (``xrd_tools.io.metadata.SpecOccurrence``) of scan ``key`` in the scope's captured view
     of ``spec_file``: the bytes the parser read. silx and the byte index must agree on the file's scan keys and on
     the scan's data rows, else ``SpecCaptureFailed``. None outside a scope or when the view has no such scan."""
-    from xrd_tools.io.metadata import _SPEC_SCAN_LINE, _line_start, spec_occurrence_from_bytes
+    from xrd_tools.io.metadata import (
+        _SPEC_SCAN_LINE,
+        _line_start,
+        _spec_occurrence_boundary_holds,
+        SpecOccurrenceUnsettled,
+        spec_occurrence_from_bytes,
+    )
     capture = _scoped_capture(spec_file)
     if capture is None:
         return None
     data = capture.scratch.read_bytes()  # transient: a Run keeps only the parser, never the file's bytes
     view = capture.view
-    proof = spec_occurrence_from_bytes(data, path=view.lexical, resolved=view.resolved, device=view.device,
+    lexical = os.path.abspath(os.fspath(spec_file))
+    proof = spec_occurrence_from_bytes(data, path=lexical, resolved=view.resolved, device=view.device,
                                        inode=view.inode, key=key,
                                        captured=(view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns))
     counts, indexed, unfinished, position = {}, [], None, data.find(b"#S")
@@ -193,6 +210,12 @@ def spec_occurrence(spec_file: Path | str, key: str):
                                 and keys[:len(indexed)] == indexed)):
         raise SpecCaptureFailed(f"SPEC {view.lexical}: the parser and the file's bytes list different scans")
     if proof is not None:
+        try:
+            complete = _spec_occurrence_boundary_holds(proof, data, proof.block_end)
+        except SpecOccurrenceUnsettled as error:
+            raise SpecCaptureFailed(str(error)) from error
+        if not complete:
+            raise SpecCaptureFailed(f"SPEC {lexical}: scan {proof.key} has an unqualified end")
         table = np.asarray(parser[proof.key].data)
         rows = int(table.shape[1]) if table.ndim == 2 else 0
         if rows != proof.rows:

@@ -55,7 +55,6 @@ from xrd_tools.analysis.scan_operations import (
     AnalysisDisposition,
     AnalysisSourceLeaseRefused,
     MetadataTablePlan,
-    MetadataTableResult,
     requalified_analysis_source,
     run_metadata_table,
 )
@@ -2464,17 +2463,13 @@ class StitchOperationRequest:
 
 
 def _admitted_tables(source: ModuleSourceReceipt, tables):
-    """The metadata tables this preparation already read for ``source``, without reading them again: each
-    must be the exact table its receipt was made from (PERF-STITCH-1). Operations re-verify their sources
-    when they run."""
+    """Reuse supplied tables that answer the admitted source receipts."""
+    from xrd_tools.analysis.scan_operations import metadata_table_answers
+
     members = _source_members(source)
     values = tables if type(tables) is tuple else (tables,)
     if len(values) != len(members) or any(
-        type(table) is not MetadataTableResult
-        or table.disposition is not AnalysisDisposition.COMPLETED
-        or table.receipt != member.analysis
-        or table.table_fingerprint != member.table_fingerprint
-        or table.labels != member.analysis.labels
+        not metadata_table_answers(member.analysis, member.table_fingerprint, table)
         for member, table in zip(members, values)
     ):
         raise StitchOperationRefused(

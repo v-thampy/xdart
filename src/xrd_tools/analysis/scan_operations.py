@@ -784,7 +784,7 @@ def _snapshot(
         # the parser reads the scope's captured view of the SPEC file: its revision is the one this read binds
         from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
         try:
-            view = spec_file_view(resolved)
+            view = spec_file_view(lexical)
         except FileNotFoundError:
             view, current = None, None
         except SpecCaptureFailed:
@@ -818,7 +818,7 @@ def _snapshot(
         if view is not None and actual_kind is SourceKind.SPEC and getattr(source, "scan_key", None):
             from xrd_tools.io.spec import SpecCaptureFailed, spec_occurrence
             try:
-                proof = spec_occurrence(resolved, source.scan_key)
+                proof = spec_occurrence(lexical, source.scan_key)
             except SpecCaptureFailed:
                 raise _Refusal("SOURCE_IDENTITY_MISMATCH")
         labels = tuple(
@@ -1171,6 +1171,29 @@ def _occurrence_holds(proof) -> bool:
         return False
 
 
+def _receipt_occurrence_is_bound(receipt: AnalysisSourceReceipt) -> bool:
+    """Only the proof recorded for this primary object and SPEC key can relax its revision."""
+    proof = receipt.spec_occurrence
+    if proof is None:
+        return True
+    from xrd_tools.io.metadata import SpecOccurrence
+
+    revision = receipt.primary_state
+    return (
+        type(proof) is SpecOccurrence
+        and receipt.resolved_kind is SourceKind.SPEC
+        and proof.key == receipt.resolved_scan == f"{proof.number}.{proof.occurrence}"
+        and proof.path == str(receipt.lexical_root)
+        and proof.resolved == os.path.normcase(str(receipt.resolved_root))
+        and revision is not None
+        and (proof.device, proof.inode) == revision[1:3]
+        and proof.captured is not None
+        and len(proof.captured) == 5
+        and proof.captured[:4] == revision[1:5]
+        and identity_ctime_ns(proof.captured[4]) == revision[5]
+    )
+
+
 def _receipt_dependency_holds(
     receipt: AnalysisSourceReceipt, index: int, lexical: Path, resolved: Path, revision: FileRevision | None,
 ) -> bool:
@@ -1182,7 +1205,7 @@ def _receipt_dependency_holds(
             resolves = _lexical_absolute(lexical).resolve(strict=False) == resolved
         except OSError:
             return False
-        return resolves and _occurrence_holds(receipt.spec_occurrence)
+        return resolves and _receipt_occurrence_is_bound(receipt) and _occurrence_holds(receipt.spec_occurrence)
     return _dependency_matches(lexical, resolved, revision)
 
 
@@ -1395,11 +1418,13 @@ def metadata_table_answers(
     if type(table) is not MetadataTableResult or table.disposition is not AnalysisDisposition.COMPLETED:
         return False
     current = table.receipt
-    if type(current) is not AnalysisSourceReceipt or table.labels != receipt.labels:
+    if (type(current) is not AnalysisSourceReceipt or table.labels != receipt.labels
+            or not _receipt_occurrence_is_bound(receipt) or not _receipt_occurrence_is_bound(current)):
         return False
     if current == receipt and table.table_fingerprint == table_fingerprint:
         return True
-    return (receipt.occurrence_fingerprint is not None
+    return (receipt.spec_occurrence is not None and current.spec_occurrence is not None
+            and receipt.occurrence_fingerprint is not None
             and current.occurrence_fingerprint == receipt.occurrence_fingerprint
             and _occurrence_holds(receipt.spec_occurrence)
             and _table_fingerprint(receipt.source_fingerprint, table.declared_scanned_positioner,
@@ -1598,7 +1623,9 @@ def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
     from xrd_tools.io.spec import spec_capture_scope
     with spec_capture_scope():  # the reopened source reads one view; it keeps what it read after the scope
         snapshot = _snapshot(receipt.source_spec)
-    if (receipt.occurrence_fingerprint is not None
+    bound = _receipt_occurrence_is_bound(receipt) and _receipt_occurrence_is_bound(snapshot.receipt)
+    if (bound and receipt.spec_occurrence is not None and snapshot.receipt.spec_occurrence is not None
+            and receipt.occurrence_fingerprint is not None
             and snapshot.receipt.occurrence_fingerprint == receipt.occurrence_fingerprint
             and _occurrence_holds(receipt.spec_occurrence)):
         return snapshot  # the same scan occurrence and everything else exact (NEXT-1219-SPEC-OCCURRENCE)
@@ -1608,7 +1635,7 @@ def _requalify(receipt: AnalysisSourceReceipt) -> _Snapshot:
         "primary_post_state", "labels", "labels_digest", "catalog_digest",
         "metadata_observation_modes", "dependency_revisions", "source_fingerprint",
     )
-    if any(
+    if not bound or any(
         getattr(snapshot.receipt, name) != getattr(receipt, name)
         for name in exact_fields
     ):

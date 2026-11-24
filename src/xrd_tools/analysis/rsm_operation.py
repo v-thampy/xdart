@@ -524,23 +524,29 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
     else:
         scan = _rsm_spec_scan_key(override.scan)
         try:
-            resolved = Path(override.spec_path).expanduser().resolve(strict=True)
+            lexical = Path(override.spec_path).expanduser().absolute()
+            resolved = lexical.resolve(strict=True)
             from xrd_tools.io.spec import spec_file_view
-            view = spec_file_view(resolved)  # inside a preparation: the one captured view the parser reads
+            view = spec_file_view(lexical)  # inside a preparation: the one captured view the parser reads
             if view is not None:
                 before, digest = (view.device, view.inode, view.size, view.mtime_ns), view.sha256
             else:
                 before = _rsm_ub_file_state(resolved)
                 digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-            ub = get_UB(str(resolved), scan)
+            ub = get_UB(resolved, scan)
             proof = None
             if view is not None:
                 from xrd_tools.io.spec import SpecCaptureFailed, spec_occurrence
                 try:
-                    proof = spec_occurrence(resolved, scan)
+                    proof = spec_occurrence(lexical, scan)
                 except SpecCaptureFailed as error:
                     raise RSMOperationRefused("RSM_UB_INVALID", f"the UB's SPEC scan is unreadable: {error}") from error
-            if _rsm_ub_file_state(resolved) != before:
+            if lexical.resolve(strict=True) != resolved or (
+                    proof is not None and (
+                        proof.resolved != view.resolved or proof.captured[:4] != before
+                    )):
+                raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file was replaced while read")
+            if proof is not None or _rsm_ub_file_state(resolved) != before:
                 from xrd_tools.analysis.scan_operations import _occurrence_holds
                 if proof is None or not _occurrence_holds(proof):  # a later write may leave its scan standing
                     raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")
@@ -6831,7 +6837,8 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
     ub = request.plan.ub_override
     if ub is None or ub.spec_receipt is None or ub.spec_occurrence is None:
         return False
-    source = (recorded.get("plan") or {}).get("ub_source") if type(recorded) is dict else None
+    recorded_plan = recorded.get("plan")
+    source = recorded_plan.get("ub_source") if type(recorded_plan) is dict else None
     if type(source) is not dict or source.get("kind") != "spec" or source.get("sha256") != ub.spec_receipt[2]:
         return False
     canonical = request.plan._canonical_value()
