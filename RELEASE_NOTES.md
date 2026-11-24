@@ -1,6 +1,6 @@
 # Release notes
 
-## 1.2.19 (unreleased)
+## 1.2.19 (2026-11-24)
 
 ### Changes
 
@@ -15,7 +15,6 @@
 - **HKL maps with a UB taken from a SPEC scan stay current for Append**
   while that SPEC file grows. A map saved before 1.2.19 is gridded once
   more the first time its UB's SPEC file has grown, then stays current.
-
 - **ROI Statistics and Metadata open the file browsed in the 2D Viewer:** an
   Eiger master, a NeXus stack or a processed NeXus selected in the 2D
   Viewer's Data Browser now opens in both windows, as a TIFF did. Before,
