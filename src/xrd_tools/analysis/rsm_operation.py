@@ -470,11 +470,23 @@ class RSMBoundUB:
     matrix: tuple[float, ...]
     #: (name, resolved path, SHA-256, stat state, scan key) of the SPEC file; None for a typed matrix
     spec_receipt: tuple | None
+    #: NEXT-1219-SPEC-OCCURRENCE, in memory only: the UB scan's occurrence proof, bound from the preparation's one
+    #: captured view of its SPEC file (None for a typed matrix, or a UB bound outside a preparation)
+    spec_occurrence: object = field(default=None, compare=False)
 
     def array(self) -> np.ndarray:
         return np.asarray(self.matrix, dtype=np.float64).reshape(3, 3)
 
     def identity(self) -> tuple[object, ...]:
+        """The plan's UB identity. A SPEC scan's UB bound with its occurrence: the scan's key, header and own lines
+        (unrelated later writes keep it; his word "Bind each scan's bytes"); otherwise ``legacy_identity``."""
+        proof = self.spec_occurrence
+        if self.spec_receipt is not None and proof is not None:
+            return ("ub-override-v2", self.matrix, (self.spec_receipt[4], proof.header_sha256, proof.block_sha256))
+        return self.legacy_identity()
+
+    def legacy_identity(self) -> tuple[object, ...]:
+        """The identity 1.2.18 recorded: the matrix with the SPEC file's whole SHA-256 (a typed matrix: None)."""
         return ("ub-override-v1", self.matrix,
                 None if self.spec_receipt is None else (self.spec_receipt[4], self.spec_receipt[2]))
 
@@ -506,7 +518,7 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
         raise TypeError("RSM UB override must be exact RSMUBOverride")
     if coordinate_frame is not RSMCoordinateFrame.HKL:
         raise RSMOperationRefused("RSM_UB_OVERRIDE_UNUSED", "a UB applies to an HKL map; Q coordinates use none")
-    receipt = None
+    receipt = proof = None
     if override.matrix is not None:
         values = override.matrix
     else:
@@ -521,8 +533,17 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
                 before = _rsm_ub_file_state(resolved)
                 digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
             ub = get_UB(str(resolved), scan)
+            proof = None
+            if view is not None:
+                from xrd_tools.io.spec import SpecCaptureFailed, spec_occurrence
+                try:
+                    proof = spec_occurrence(resolved, scan)
+                except SpecCaptureFailed as error:
+                    raise RSMOperationRefused("RSM_UB_INVALID", f"the UB's SPEC scan is unreadable: {error}") from error
             if _rsm_ub_file_state(resolved) != before:
-                raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")
+                from xrd_tools.analysis.scan_operations import _occurrence_holds
+                if proof is None or not _occurrence_holds(proof):  # a later write may leave its scan standing
+                    raise RSMOperationRefused("RSM_UB_INVALID", "the UB's SPEC file changed while read")
         except KeyError as error:
             if error.args and error.args[0] == "G3":
                 raise RSMOperationRefused("RSM_UB_MISSING",
@@ -538,12 +559,18 @@ def _bind_rsm_ub(override, coordinate_frame) -> RSMBoundUB | None:
     if array.shape != (9,) or not np.all(np.isfinite(array)):
         raise RSMOperationRefused("RSM_UB_INVALID", "a UB matrix is nine finite numbers")
     _rsm_coordinate_matrix(RSMCoordinateFrame.HKL, array.reshape(3, 3), invalid_ub_code="RSM_UB_INVALID")
-    return RSMBoundUB(override, tuple(float(value) for value in array), receipt)
+    return RSMBoundUB(override, tuple(float(value) for value in array), receipt, proof)
 
 
 def _revalidate_rsm_ub(bound) -> None:
-    """At the run: a SPEC file the UB came from is unchanged since Preview."""
+    """At the run: the SPEC scan the UB came from is unchanged since Preview (its occurrence, when bound with one:
+    later scans may be written meanwhile; else the whole file)."""
     if bound is None or bound.spec_receipt is None:
+        return
+    if bound.spec_occurrence is not None:
+        from xrd_tools.analysis.scan_operations import _occurrence_holds
+        if not _occurrence_holds(bound.spec_occurrence):
+            raise RSMOperationRefused("SOURCE_IDENTITY_MISMATCH", "the UB's SPEC scan changed since Preview")
         return
     path = Path(bound.spec_receipt[1])
     try:
@@ -1887,8 +1914,11 @@ def _capture_preflight_facts(
     )
     contributions: list[RSMContribution] = []
     detector_dtype = detector_saturation = None
+    from xrd_tools.io.spec import spec_capture_scope
     try:
-        with requalified_analysis_source(
+        # one captured view: the requalified source (its occurrence matched the admitted receipt's) and the member's
+        # own energy, UB and orientation reflections below read the same bytes (NEXT-1219-SPEC-OCCURRENCE)
+        with spec_capture_scope(), requalified_analysis_source(
             analysis,
             cancel_token=cancel_token,
         ) as opened:
@@ -6772,13 +6802,28 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
     plan_fingerprint, provenance = identity
     keys = _REVISION_KEYS | {"table_fingerprint"}
     try:
-        stored = json.loads(provenance)["members"]
+        recorded = json.loads(provenance)
+        stored = recorded["members"]
         planned = json.loads(json.dumps(request.provenance["members"]))
     except (ValueError, KeyError, TypeError):
         return False
-    return plan_fingerprint == request.plan.fingerprint and _manifest_currency_projection(
-        stored, keys
-    ) == _manifest_currency_projection(planned, keys)
+    if _manifest_currency_projection(stored, keys) != _manifest_currency_projection(planned, keys):
+        return False
+    if plan_fingerprint == request.plan.fingerprint:
+        return True
+    # A map made before NEXT-1219-SPEC-OCCURRENCE with a SPEC scan's UB recorded the UB file's whole SHA-256: it is
+    # current while that file is still byte for byte the file this preparation captured (1.2.18's own rule); once
+    # the file has grown it is gridded again once, under the occurrence identity (his word "Regrid once").
+    ub = request.plan.ub_override
+    if ub is None or ub.spec_receipt is None or ub.spec_occurrence is None:
+        return False
+    source = (recorded.get("plan") or {}).get("ub_source") if type(recorded) is dict else None
+    if type(source) is not dict or source.get("kind") != "spec" or source.get("sha256") != ub.spec_receipt[2]:
+        return False
+    canonical = request.plan._canonical_value()
+    if canonical[-1] != ub.identity():
+        return False
+    return plan_fingerprint == module_plan_fingerprint(ModuleKind.RSM, canonical[:-1] + (ub.legacy_identity(),))
 
 
 __all__ = [
