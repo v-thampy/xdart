@@ -7,6 +7,7 @@ named boundary of the real run.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +31,21 @@ from xrd_tools.analysis.stitch_operation import run_stitch_operation
 from xrd_tools.analysis.stitch_values import prepare_stitch_tool
 from xrd_tools.core.scan import SourceKind, SourceSpec
 from xrd_tools.sources.spec import SpecSource
+
+from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
+
+#: Windows has no trustworthy pathname change token (io.stat_identity): every check rereads the scan's span, so live
+#: open and verification-pass counts are pinned on POSIX only; parser and private-read bounds hold everywhere
+POSIX_STAT_SHORTCUT = IDENTITY_CARRIES_CTIME
+
+
+def _symlink(link, target):
+    """Create *link* -> *target*; skip where the host refuses symbolic links (the repo's guard)."""
+    try:
+        Path(link).symlink_to(target)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symbolic links unavailable here: {error}")
+
 
 LATER_SCAN = ("\n#S 2 ascan eta 0 1 1 1\n#D Mon Jan 15 10:40:00 2024\n#P0 13000.007 10 20 30 40 50\n"
               "#G3 1 0 0 0 1 0 0 0 1\n#N 4\n#L eta  Seconds  Seconds  foil status\n0 1 10 101\n")
@@ -216,13 +232,13 @@ def test_s4_an_hkl_map_refuses_when_its_ub_alias_is_retargeted(tmp_path, monkeyp
     _runnable(monkeypatch)
     form, ub_spec = _hkl(tmp_path)
     alias = tmp_path / "ub_alias"
-    alias.symlink_to(ub_spec)
+    _symlink(alias, ub_spec)
     form = replace(form, ub=replace(form.ub, spec_path=str(alias)))
     request = prepare_rsm_tool_v2(form).request
     copy = tmp_path / "ub_copy"
     copy.write_bytes(Path(ub_spec).read_bytes())
     alias.unlink()
-    alias.symlink_to(copy)
+    _symlink(alias, copy)
 
     result = run_rsm_operation_v2(request)
     assert result.terminal.disposition is ModuleDisposition.REFUSED, result.terminal
@@ -397,7 +413,7 @@ def test_s7_a_preparation_reads_each_spec_file_once(tmp_path, monkeypatch, case)
     prepare_rsm_tool_v2(form)
     assert sum(parsers.values()) <= len(files), parsers  # one parser per captured file, none of the live file
     for path in files:
-        assert parsers.get(path, 0) <= 1 and opens.get(path, 0) <= 2, (
+        assert parsers.get(path, 0) <= 1 and (opens.get(path, 0) <= 2 or not POSIX_STAT_SHORTCUT), (
             Path(path).name, {Path(k).name: v for k, v in parsers.items() if k},
             {Path(k).name: v for k, v in opens.items() if k in files})
 
@@ -609,7 +625,7 @@ def test_s7_a_run_reads_its_spec_file_a_bounded_number_of_times(tmp_path, monkey
     # measured 2026-11-23 (leaves/spec_readcount_run2.txt): one captured parse per file per Run; the live file opened
     # once (its capture) when unchanged, and 9 times with a 2.5 MB unrelated tail (each check re-reads the scan's span)
     bound = 12 if case.startswith("growing") else 1
-    assert live_parsers == 0 and captures == 1 and opens.get(spec, 0) <= bound, (case, {
+    assert live_parsers == 0 and captures == 1 and (opens.get(spec, 0) <= bound or not POSIX_STAT_SHORTCUT), (case, {
         "live parser opens": live_parsers, "captured-view parses": captures, "live file opens": opens.get(spec, 0)})
 
 
@@ -708,6 +724,8 @@ def test_s7_preparation_and_run_read_only_selected_spans_from_the_private_spool(
     for phase, spool, private_reads, selected, private_parses, live_parses, passes in observations:
         assert private_reads == selected, (case, phase, observations)
         assert private_parses == 1 and live_parses == 0, (case, phase, observations)
+        if not POSIX_STAT_SHORTCUT:
+            continue  # Windows rereads the span at every check
         if case == "grown-tail" and phase == "run":
             assert 1 <= passes <= 9, observations
         else:
@@ -760,7 +778,7 @@ def test_s11_a_spec_file_reached_through_a_link_repointed_at_an_identical_copy_r
     target = tmp_path / "data" / "RSM_synth_0"
     target.parent.mkdir()
     original.replace(target)
-    os.symlink(target, original)
+    _symlink(original, target)
     plan = MetadataTablePlan(SourceSpec(original, SourceKind.SPEC, options={
         "scan": "1.1", "image_dir": str(member.image_dir), "image_stem": member.image_stem}))
     table = run_metadata_table(plan)
@@ -768,7 +786,7 @@ def test_s11_a_spec_file_reached_through_a_link_repointed_at_an_identical_copy_r
     copy = tmp_path / "data" / "copy"
     copy.write_bytes(target.read_bytes())
     original.unlink()
-    os.symlink(copy, original)
+    _symlink(original, copy)
     requalified = run_metadata_table_requalification(
         MetadataTableRequalificationPlan(table.receipt, table.table_fingerprint))
     assert requalified.disposition is AnalysisDisposition.REFUSED, requalified.code
@@ -838,7 +856,9 @@ def test_s11_a_malformed_proof_refuses_without_a_file_change(tmp_path, invalid):
 
 
 @pytest.mark.parametrize("mutation, holds", [
-    ("replacement", False), ("selected edit", False), ("unrelated append", True),
+    pytest.param("replacement", False, marks=pytest.mark.skipif(
+        sys.platform == "win32", reason="an open file cannot be replaced on Windows")),
+    ("selected edit", False), ("unrelated append", True),
 ])
 def test_s11_a_file_changed_while_its_occurrence_is_read(tmp_path, monkeypatch, mutation, holds):
     import os
