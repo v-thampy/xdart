@@ -268,6 +268,14 @@ def _scoped_capture(spec_file: Path | str) -> _SpecCapture | None:
     return capture
 
 
+def spec_capture_activity() -> tuple[int, int]:
+    """Return completed captures and open parsers owned by this sweep."""
+    captures = _SPEC_CAPTURES.get()
+    if captures is None:
+        return 0, 0
+    return len(captures), sum(capture._parser is not None for capture in captures.values())
+
+
 def spec_occurrence(spec_file: Path | str, key: str):
     """The occurrence proof (``xrd_tools.io.metadata.SpecOccurrence``) of scan ``key`` in the scope's captured view
     of ``spec_file``: the bytes the parser read. silx and the byte index must agree on the file's scan keys and on

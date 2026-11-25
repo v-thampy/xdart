@@ -169,8 +169,11 @@ class LivePreviewOwner(QtCore.QObject):
                     self._watcher._state_changed()
             return
         current = self._candidate
-        if self._staged is not None and self.clock() >= self._published_at + 2:
-            self._publish_staged()
+        if self._staged is not None and self.clock() >= self._published_at + 2 and not self.working:
+            staged, self._staged = self._staged, None
+            if staged.request.target.identity not in self._retired:
+                self._verification.ask(staged)
+                return
         if self.working or current is None or not current.points or self._yield():
             if self.progress.replay_target is not None:
                 self._status("Rebuilding preview")
@@ -178,8 +181,9 @@ class LivePreviewOwner(QtCore.QObject):
                 self._work.progress = replace(self._work.progress, waiting=True)
             return
         if self._done_target is not None:
-            prior, count, ended = self._done_target
+            prior, count, ended, waiting_observation = self._done_target
             if (prior.identity == current.identity and ended == current.ended and count >= len(current.points)
+                    and (waiting_observation is None or waiting_observation is self._observation)
                     and all(a.identity == b.identity for (_, a), (_, b) in zip(prior.points, current.points))):
                 return
         self._requests.ask(_Slice(self._epoch, self._work, current))
@@ -202,16 +206,23 @@ class LivePreviewOwner(QtCore.QObject):
         snapshot = terminal.payload
         progress = request.work.progress
         if snapshot is None or progress.waiting:
-            self._done_target = request.target, len(request.target.points), request.target.ended
+            self._done_target = (request.target, len(request.target.points), request.target.ended,
+                                 self._observation if progress.waiting else None)
         elif progress.replay_target is None and progress.included + progress.held + progress.excluded >= len(
                 request.target.points):
-            self._done_target = request.target, len(request.target.points), request.target.ended
+            self._done_target = request.target, len(request.target.points), request.target.ended, None
         if snapshot is None:
             if progress.invalidated:
                 self._clear_snapshot(request.target.identity)
             self._status("Preview waiting for complete points" if progress.waiting else "Preview screening points")
             return False
-        self._verification.ask(_Verify(request, snapshot))
+        if snapshot is not self._snapshot:
+            verification = _Verify(request, snapshot)
+            if self.clock() >= self._published_at + 2:
+                self._staged = None
+                self._verification.ask(verification)
+            else:
+                self._staged = verification
         return True
 
     @staticmethod
@@ -236,20 +247,21 @@ class LivePreviewOwner(QtCore.QObject):
         if snapshot is self._snapshot:
             return True
         if self._snapshot is None or snapshot.rank >= self._snapshot.rank:
-            self._staged = snapshot
-            if self.clock() >= self._published_at + 2:
-                self._publish_staged()
+            self._publish(snapshot)
         return True
 
-    def _publish_staged(self):
-        snapshot, self._staged = self._staged, None
+    def _publish(self, snapshot):
         if snapshot.group_identity in self._retired:
             return
         if self._saved is not None and snapshot.rank <= self._saved[0]:
             return
+        try:
+            self._present(snapshot)
+        except (ValueError, TypeError) as error:
+            self._status(f"Preview display refused: {error}")
+            return
         self._snapshot = snapshot
         self._published_at = self.clock()
-        self._present(snapshot)
         point_count = len(snapshot.points)
         text = f"Provisional · scan {snapshot.points[-1][0]} · {point_count} points shown"
         if self.progress.held:
@@ -295,7 +307,7 @@ class LivePreviewOwner(QtCore.QObject):
         return False
 
     def _clear_snapshot(self, group=None):
-        if self._staged is not None and (group is None or self._staged.group_identity == group):
+        if self._staged is not None and (group is None or self._staged.snapshot.group_identity == group):
             self._staged = None
         if self._snapshot is not None and (group is None or self._snapshot.group_identity == group):
             self._snapshot = None

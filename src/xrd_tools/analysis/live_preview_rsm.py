@@ -20,7 +20,7 @@ from xrd_tools.analysis.rsm_geometry_asset import (
 )
 from xrd_tools.core.geometry.xu_runtime import xu_runtime_session
 from xrd_tools.integrate.stitch_conditioning import condition_stitch_frame
-from xrd_tools.io.spec import get_energy, get_energy_and_UB
+from xrd_tools.io.spec import get_energy, get_energy_and_UB, read_spec_preview_prefix
 from xrd_tools.rsm.coordinate_frame import RSMCoordinateFrame, rsm_coordinate_matrix
 from xrd_tools.rsm.gridding import RSMGridChunkLease, StreamingGridder
 from xrd_tools.sources.point_images import combine_point_images
@@ -128,7 +128,13 @@ class RSMPreviewKernel:
     def runtime(self):
         return xu_runtime_session(self.geometry.runtime_requirements)
 
-    def coordinates(self, member, session):
+    def coordinates(self, member, point, session):
+        # Energy and orientation must be read from a capture that agrees with
+        # the detached point even if the original was edited and restored.
+        current = read_spec_preview_prefix(member.path, member.key)
+        if (current is None or current[0].identity != member.prefix.identity
+                or not current[0].extent.extends(member.prefix.extent.through(point.label + 1))):
+            raise ValueError(f"SPEC geometry context changed for scan {member.key}")
         frame = self.options.coordinate_frame
         ub = None
         if frame is RSMCoordinateFrame.HKL and self.bound_ub is None:

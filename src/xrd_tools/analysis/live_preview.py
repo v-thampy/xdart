@@ -46,6 +46,7 @@ class PreviewGroupObserver:
         self.sweeps = self.captures = self.parser_opens = 0
 
     def __call__(self, rows, sweep):
+        from xrd_tools.io.spec import spec_capture_activity
         from xrd_tools.sources.live_preview import observe_spec_member
 
         self.sweeps += 1
@@ -87,8 +88,13 @@ class PreviewGroupObserver:
                     stop = points[-1].label
                     if self.selector.stop_label is not None:
                         stop = min(stop, self.selector.stop_label)
-                    selected = (replace(self.selector, stop_label=stop).select(tuple(point.label for point in points))
-                                if stop >= self.selector.start_label else ())
+                    try:
+                        selected = (
+                            replace(self.selector, stop_label=stop).select(tuple(point.label for point in points))
+                            if stop >= self.selector.start_label else ()
+                        )
+                    except ValueError:
+                        break
                     chosen = set(selected)
                     points = tuple(point for point in points if point.label in chosen)
                 raw_prefix.extend((member, point) for point in points)
@@ -110,11 +116,9 @@ class PreviewGroupObserver:
             if candidate is not None and candidate.points and candidate.rank == newest(row):
                 break
 
-        # v3 and preview share the capture owner. Count the SPEC files actually
-        # inspected for point evidence, once within this observation.
-        count = len({path for path, _key in inspected})
-        self.captures += count
-        self.parser_opens += count
+        captures, parsers = spec_capture_activity()
+        self.captures += captures
+        self.parser_opens += parsers
         return PreviewObservation(candidate or waiting, ranks, self.sweeps, self.captures, self.parser_opens)
 
 
@@ -216,6 +220,7 @@ class RSMPreviewWork:
         self.kernel = self.bounds = self.grid = self.replay = None
         self.tokens = ()
         self.keys = ()
+        self.decoded = None
         self.coordinates = {}
         self.masks = {}
         self.snapshot = None
@@ -227,6 +232,7 @@ class RSMPreviewWork:
         self.group = group
         self.kernel = self.bounds = self.grid = self.replay = self.snapshot = None
         self.tokens = self.keys = ()
+        self.decoded = None
         self.coordinates.clear()
         self.masks.clear()
         self._update(included=0, waiting=False, end_of_stream=False, replay_target=None)
@@ -244,17 +250,23 @@ class RSMPreviewWork:
         if self.kernel is not None:
             self.kernel.verify_assets()
 
-    def _read(self, member, point, session, cancelled, *, replay=False):
+    def _decode(self, point, cancelled, *, replay):
         from xrd_tools.sources.live_preview import read_preview_point
 
+        if self.decoded is None or self.decoded[0] != point.identity:
+            planes = read_preview_point(point, cancelled=cancelled)
+            count = len(planes)
+            self._update(decodes=self.progress.decodes + count,
+                         forward_decodes=self.progress.forward_decodes + (0 if replay else count))
+            self.decoded = point.identity, planes
+
+    def _ready_frame(self, member, point, session):
         coordinates = self.coordinates.get(member.key)
         if coordinates is None:
-            coordinates = self.kernel.coordinates(member, session)
+            coordinates = self.kernel.coordinates(member, point, session)
             self.coordinates[member.key] = coordinates
-        planes = read_preview_point(point, cancelled=cancelled)
-        count = len(planes)
-        self._update(decodes=self.progress.decodes + count,
-                     forward_decodes=self.progress.forward_decodes + (0 if replay else count))
+        _, planes = self.decoded
+        self.decoded = None
         return self.kernel.condition(point, planes), self.kernel.angles(point), coordinates
 
     def _mask(self, member, sample):
@@ -277,27 +289,27 @@ class RSMPreviewWork:
 
     def _step(self, group, cancelled, yield_priority, progress):
         allowed = 8
-        with self.kernel.runtime() as session:
-            while allowed and not cancelled() and not yield_priority():
-                if self.replay is not None:
-                    stage = self.replay
-                    if stage.cursor < len(stage.target):
-                        member, point = stage.target[stage.cursor]
-                        sample, angles, coordinates = self._read(member, point, session, cancelled, replay=True)
-                        self._add(stage.accumulator, member, point, sample, angles, coordinates, session)
-                        stage.cursor += 1
-                        allowed -= 1
+        while allowed and not cancelled() and not yield_priority():
+            stage = self.replay
+            offset = len(self.tokens)
+            if stage is None and offset >= len(group.points):
+                break
+            member, point = group.points[offset] if stage is None else stage.target[stage.cursor]
+            self._decode(point, cancelled, replay=stage is not None)
+            if cancelled() or yield_priority():
+                break
+            allowed -= 1
+            with self.kernel.runtime() as session:
+                sample, angles, coordinates = self._ready_frame(member, point, session)
+                if stage is not None:
+                    self._add(stage.accumulator, member, point, sample, angles, coordinates, session)
+                    stage.cursor += 1
                     if stage.cursor == len(stage.target):
                         self.grid = stage.accumulator
                         self.replay = None
                         self._update(replay_target=None, replays=(*self.progress.replays, stage.receipt),
                                      replayed_points=self.progress.replayed_points + stage.cursor)
                     continue
-                offset = len(self.tokens)
-                if offset >= len(group.points):
-                    break
-                member, point = group.points[offset]
-                sample, angles, coordinates = self._read(member, point, session, cancelled)
                 mask = self._mask(member, sample[1])
                 footprint = self.kernel.footprint(angles, coordinates, session)
                 bounds = enclosing_preview_bounds(footprint, frozenset(footprint), self.bounds)
@@ -320,12 +332,12 @@ class RSMPreviewWork:
                     progress("Rebuilding preview", 0, 1)
                 else:
                     self._add(self.grid, member, point, sample, angles, coordinates, session)
-                    allowed -= 1
                 self.bounds = bounds
-            if self.replay is not None or not self.keys or cancelled() or yield_priority():
-                return self.snapshot
-            if self.snapshot is not None and self.snapshot.points == self.keys:
-                return self.snapshot
+        if self.replay is not None or not self.keys or cancelled() or yield_priority():
+            return self.snapshot
+        if self.snapshot is not None and self.snapshot.points == self.keys:
+            return self.snapshot
+        with self.kernel.runtime() as session:
             volume = self.kernel.volume(self.grid, session)
         members = {key: mask.applied for key, mask in self.masks.items() if mask.applied is not None}
         self._update(included=len(self.keys), waiting=bool(group.reason),
