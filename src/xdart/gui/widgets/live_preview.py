@@ -229,6 +229,7 @@ class LivePreviewOwner(QtCore.QObject):
         if self._recheck_display and not self.working:
             self._recheck_display = False
             if self._display_witness is not None:
+                self._verification.forget()
                 self._verification.ask(self._display_witness)
                 return
         current = self._candidate
