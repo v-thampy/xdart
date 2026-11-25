@@ -4772,6 +4772,9 @@ def test_kernel_is_qt_free_and_has_only_headless_transaction_mounts() -> None:
         # Since 7dec88d0 a saved output's coverage support is rebuilt between
         # read-only revalidations of its load's target snapshot.
         "xrd_tools/analysis/angular_support.py",
+        # Since NEXT-1219-LIVE-PER-SCAN the Live observer reads an output target's normalized key and revision to
+        # reserve its slot (v3: reuse the coordinator's same-target rules). Read-only: no stage, lease or publish.
+        "xrd_tools/analysis/live_scans.py",
         # Since 947d93fb a confirmed calibration replacement is saved through
         # replace_into_place.
         "xrd_tools/integrate/stitch_calibration.py",
@@ -4811,6 +4814,9 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
         # Since 7dec88d0 a saved output's coverage support is rebuilt between
         # read-only revalidations of its load's target snapshot.
         "xrd_tools/analysis/angular_support.py",
+        # Since NEXT-1219-LIVE-PER-SCAN the Live observer reads an output target's normalized key and revision to
+        # reserve its slot (v3: reuse the coordinator's same-target rules). Read-only: no stage, lease or publish.
+        "xrd_tools/analysis/live_scans.py",
         # Since 947d93fb a confirmed calibration replacement is saved through
         # replace_into_place.
         "xrd_tools/integrate/stitch_calibration.py",
@@ -4850,6 +4856,13 @@ def test_c2_headless_transaction_kernel_purity_and_mount_split() -> None:
             for alias in node.names} == {"TargetChanged",
                                          "revalidate_stream_terminal",
                                          "revalidate_target_snapshot"}
+    # The Live observer only observes a target (see the allowlist reason above); pin its exact names.
+    live = ast.parse((source_root / "xrd_tools/analysis/live_scans.py").read_text(encoding="utf-8"))
+    assert {alias.name for node in ast.walk(live)
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "xrd_tools.io.output_transaction"
+            for alias in node.names} == {"TargetChanged", "_lease_key", "_normalize_target",
+                                         "capture_target_revision", "target_revision_key"}
 
 
 def _close_finalizes_seed_timestamps(monkeypatch, target: Path) -> list[int]:

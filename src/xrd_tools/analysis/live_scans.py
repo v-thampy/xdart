@@ -397,7 +397,8 @@ class _ObservationSweep:
                 try:
                     labels = tuple(opened.frame_indices)
                     if not paths or len(labels) != proof.rows or not opened.capabilities.has_raw_references:
-                        wait(f"{path.name}: waiting for detector coverage of scan {key}")
+                        # Not cached: coverage of an opened source can depend on linked files outside the key.
+                        raise ValueError(f"{path.name}: waiting for detector coverage of scan {key}")
                     graphs = []
                     for detector in paths:
                         self.check()
