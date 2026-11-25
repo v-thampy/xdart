@@ -73,6 +73,7 @@ class PreviewMember:
     motors: tuple[tuple[str, float], ...] = ()
     _image_dir: str = field(default="", repr=False)
     _image_stem: str | None = field(default=None, repr=False)
+    _successor_required: bool = field(default=False, repr=False)
 
 
 def _cancel(cancelled):
@@ -175,7 +176,8 @@ def _observe_spec_member(member, selection, read_options, cancelled):
     row_count = len(prefix.extent.marks) - 1
     command, successor = spec.spec_scan_completion_header(path, key)
     expected = _planned_points(command)
-    complete = prefix.complete and (successor or expected is not None and row_count >= expected)
+    by_points = expected is not None and row_count >= expected
+    complete = prefix.complete and (by_points or successor)
     # Grouping a full set of rows needs the existing confirmed per-scan policy.
     # While the scan is open, an extra indexed file can belong to its next row.
     if (complete and choice is None and len(slots) > row_count and len(slots) % row_count == 0
@@ -211,6 +213,7 @@ def _observe_spec_member(member, selection, read_options, cancelled):
         points.append(PreviewPoint(label, MappingProxyType({**dict(motors), **by_name}), physical,
                                    raw, choice, identity, shape, dtype.str, skip, rotation, max_bytes))
     return replace(result, points=tuple(points), end_of_stream=complete and len(points) == row_count,
+                   _successor_required=not by_points and successor,
                    reason=reason or ("" if complete else f"Watching SPEC scan {key}"))
 
 
@@ -332,7 +335,8 @@ def preview_prefixes_hold(requirements, *, cancelled=None):
                 covered = max(point.label for point in points) + 1
                 if covered > len(observed.points):
                     return False
-                spec_checks.append((observed.prefix, covered))
+                endpoint = observed._successor_required if observed.end_of_stream else None
+                spec_checks.append((observed.prefix, covered, endpoint))
                 slots = _named_slots(
                     observed.path, observed.key, observed._image_dir, observed._image_stem, cancelled)
                 # A frame selection cannot hide a missing or remapped predecessor of this point.

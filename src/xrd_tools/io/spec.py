@@ -19,7 +19,7 @@ import numpy as np
 from silx.io.specfile import SpecFile
 
 if TYPE_CHECKING:
-    from xrd_tools.io.metadata import SpecScanExtent
+    from xrd_tools.io.metadata import SpecOccurrenceFrame, SpecScanExtent
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +312,7 @@ class SpecPreviewPrefix:
     inode: int
     extent: SpecScanExtent
     complete: bool
+    frame: SpecOccurrenceFrame = field(compare=False, repr=False)
     revision: tuple = field(compare=False, repr=False)
 
     @property
@@ -394,7 +395,7 @@ def read_spec_preview_prefix(spec_file, key):
     extent = SpecScanExtent(os.path.abspath(os.fspath(spec_file)), frame.header, frame.header_sha256,
                             frame.offset, tuple(marks))
     prefix = SpecPreviewPrefix(key, tuple(frames).index(key), view.resolved, view.device, view.inode,
-                               extent, count == frame.rows and frame.boundary_holds, view.revision)
+                               extent, count == frame.rows and frame.boundary_holds, frame, view.revision)
     return prefix, columns, motors
 
 
@@ -408,19 +409,19 @@ def spec_preview_prefixes_hold(requirements, opener, *, cancelled=None):
                 identity_ctime_ns(status.st_ctime_ns))
 
     files = {}
-    for prefix, rows in requirements:
-        files.setdefault((prefix.resolved, prefix.device, prefix.inode), []).append((prefix, rows))
+    for prefix, rows, successor in requirements:
+        files.setdefault((prefix.resolved, prefix.device, prefix.inode), []).append((prefix, rows, successor))
     try:
         for (resolved, device, inode), selected in files.items():
             _spec_cancelled(cancelled)
-            paths = tuple(dict.fromkeys(item.extent.path for item, _ in selected))
+            paths = tuple(dict.fromkeys(item.extent.path for item, _, _ in selected))
             statuses = {path: os.stat(path) for path in paths}
             if (any(_capture_key(path)[1] != resolved or (named.st_dev, named.st_ino) != (device, inode)
                     for path, named in statuses.items())
-                    or any(not 0 < rows < len(item.extent.marks) for item, rows in selected)):
+                    or any(not 0 < rows < len(item.extent.marks) for item, rows, _ in selected)):
                 return False
             if IDENTITY_CARRIES_CTIME and all(
-                revision(statuses[item.extent.path]) == item.revision for item, _ in selected
+                revision(statuses[item.extent.path]) == item.revision for item, _, _ in selected
             ):
                 continue
             for attempt in range(2):
@@ -448,16 +449,30 @@ def spec_preview_prefixes_hold(requirements, opener, *, cancelled=None):
 def _check_spec_preview_ranges(stream, selected, cancelled):
     from xrd_tools.io.metadata import _spec_cancelled, iter_spec_occurrence_frames
 
-    last = max(item.extent.marks[rows][0] for item, rows in selected)
-    wanted = {item.key for item, _ in selected}
-    frames = {item.key: (ordinal, item) for ordinal, item in enumerate(
-        iter_spec_occurrence_frames(_SpecSpanStream(stream, last), cancelled=cancelled)) if item.key in wanted}
-    for item, rows in selected:
+    last = max(item.extent.marks[rows][0] if successor is None else item.frame.block_end
+               for item, rows, successor in selected)
+    wanted = {item.key for item, _, _ in selected}
+    successors = []
+    successor_after = max((item.frame.block_end for item, _, required in selected if required), default=None)
+    closed = any(required is not None for _, _, required in selected)
+    if closed:
+        records = iter_spec_occurrence_frames(
+            stream, stop_after=last, cancelled=cancelled, successor_after=successor_after,
+            successor_offsets=successors if successor_after is not None else None)
+    else:
+        records = iter_spec_occurrence_frames(_SpecSpanStream(stream, last), cancelled=cancelled)
+    frames = {item.key: (ordinal, item) for ordinal, item in enumerate(records) if item.key in wanted}
+    for item, rows, successor in selected:
         ordinal, frame = frames.get(item.key, (-1, None))
         extent = item.extent
         if ordinal != item.ordinal or (
             frame.offset, frame.header, frame.header_sha256
         ) != (extent.scan_offset, extent.header, extent.header_sha256):
+            return False
+        if successor is not None and (
+            not frame.boundary_holds or frame.framed != item.frame.framed
+            or successor and (not successors or successors[-1] < frame.block_end)
+        ):
             return False
         end, expected = extent.marks[rows]
         stream.seek(extent.scan_offset)
