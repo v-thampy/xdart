@@ -84,21 +84,30 @@ def _recorded_gi(gi, tables):
     """The form's grazing incidence as the selected scans record it: a sample circle (mu, phi) no
     selected scan records reads 0 (bound to None, and returned so Preview says so); one only some
     scans record is refused, naming a scan without it (Codex review F3: every scan decides)."""
+    sources = ((spec.uri, spec.options.get("scan", "-"), {column.name for column in table.columns})
+               for spec, table in tables)
+    return resolve_stitch_gi(gi, sources)
+
+
+def resolve_stitch_gi(gi, source_columns):
+    """Resolve recorded sample circles from exact member metadata columns."""
     from .stitch_values import StitchToolPreflightRefused
+
     if gi is None:
         return None, ()
-    names = [(spec, {column.name for column in table.columns}) for spec, table in tables]
+    names = tuple(source_columns)
     pairs, unrecorded = [], []
     for role, motor in gi.sample_motors:
-        lacking = [spec for spec, recorded in names if motor is not None and motor not in recorded]
+        lacking = [(path, scan) for path, scan, recorded in names
+                   if motor is not None and motor not in recorded]
         if motor is not None and len(lacking) == len(names):
             motor = None
             unrecorded.append(role)
         elif lacking:
-            spec = lacking[0]
+            path, scan = lacking[0]
             raise StitchToolPreflightRefused("GI_SAMPLE_CIRCLE_MIXED",
-                f"{role} ({motor}) is recorded by some selected scans and not others, not by {spec.uri} "
-                f"(scan {spec.options.get('scan', '-')}): select scans that record the same sample circles")
+                f"{role} ({motor}) is recorded by some selected scans and not others, not by {path} "
+                f"(scan {scan}): select scans that record the same sample circles")
         pairs.append((role, motor))
     return replace(gi, sample_motors=tuple(pairs)), tuple(unrecorded)
 
@@ -165,6 +174,58 @@ def _affine_geometry_warning(request):
     return None
 
 
+def capture_native_stitch_plan(form, project, gi):
+    """Bind the native calibration, correction assets and scientific settings."""
+    from .stitch_values import StitchToolPreflightRefused
+
+    common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
+                  monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
+                  native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
+                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi,
+                  azimuth_range_1d=form.chi_range_1d)
+    if form.foil_normalization is not None:  # the plan's default (None) otherwise: its identity unchanged
+        common.update(foil_normalization=form.foil_normalization)
+    if form.mode == "2d":  # the map on its own axis as Int 2D's, and I(q) beside it on the 1-D one
+        common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
+                      azimuth_range=form.chi_range, map_unit=form.map_unit,
+                      map_radial_range=form.map_radial_range)
+    if form.backend == "multigeometry":
+        geometry = capture_stitch_geometry(StitchGeometryInput(
+            form.geometry_path, form.geometry_kind,
+            expected_sha256=form.expected_geometry_sha256, source_motors=form.source_motors,
+            reference_motor_positions=form.poni_references, image_rotation=form.image_rotation,
+            image_flip=form.image_flip,
+        ))
+        plan = StitchOperationPlan(
+            geometry, use_detector_mask=form.use_detector_mask,
+            sample_position=form.sample_position, correct_solid_angle=form.correct_solid_angle,
+            polarization_factor=form.polarization_factor, error_model=form.error_model,
+            dark_path=form.dark_path, flat_path=form.flat_path,
+            flat_min_fraction=form.flat_min_fraction, **common)
+        motors = tuple(source for _name, source in form.source_motors)
+        energy_name = "energy"
+    else:
+        from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+        calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
+            XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)), project_root=project)
+        runtime_owner = xu_runtime_session()
+        with runtime_owner as session:
+            effective = resolve_xu_stitch_effective_geometry(calibration, session).projection
+        if runtime_owner.execution_record is None:
+            raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
+        plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
+                                     dark_path=form.dark_path, flat_path=form.flat_path,
+                                     flat_min_fraction=form.flat_min_fraction,
+                                     allow_extrapolation=form.allow_extrapolation, **common)
+        acquisition = calibration.projection.value["acquisition"]
+        motors = tuple(name for name in acquisition["source_motors"].values()
+                       if name is not None)  # a single 2θ arm reads no nu
+        energy_name = acquisition["source_energy_selector"]
+    if gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
+        motors += gi.metadata_names()
+    return plan, motors, energy_name
+
+
 def prepare_native_stitch_tool(form, project, *, live_handoff=None, cancel_token=None):
     from .stitch_values import (
         StitchToolPreflight, StitchToolPreflightRefused, _PREFLIGHT_FACTORY,
@@ -220,52 +281,8 @@ def prepare_native_stitch_tool(form, project, *, live_handoff=None, cancel_token
                     diagnostics=table.diagnostics)
             tables[cache_key] = (spec, table)
     gi, unrecorded = _recorded_gi(form.gi, tables.values())
-    common = dict(npt_1d=form.npt_1d, unit=form.unit, radial_range=form.q_range,
-                  monitor_selector=form.monitor_selector, max_frame_bytes=form.max_frame_bytes,
-                  native_records=True, conditioning=form.conditioning, mask_path=form.mask_path,
-                  frame_screen=FrameScreenPolicy(exclude=form.frame_screen), gi=gi,
-                  azimuth_range_1d=form.chi_range_1d)
-    if form.foil_normalization is not None:  # the plan's default (None) otherwise: its identity unchanged
-        common.update(foil_normalization=form.foil_normalization)
-    if form.mode == "2d":  # the map on its own axis as Int 2D's, and I(q) beside it on the 1-D one
-        common.update(mode="2d", npt_rad_2d=form.npt_rad_2d, npt_azim_2d=form.npt_azim_2d,
-                      azimuth_range=form.chi_range, map_unit=form.map_unit,
-                      map_radial_range=form.map_radial_range)
     kind = AnalysisArtifactKind.STITCH_2D if form.mode == "2d" else AnalysisArtifactKind.STITCH_1D
-    if form.backend == "multigeometry":
-        geometry = capture_stitch_geometry(StitchGeometryInput(
-            form.geometry_path, form.geometry_kind,
-            expected_sha256=form.expected_geometry_sha256, source_motors=form.source_motors,
-            reference_motor_positions=form.poni_references, image_rotation=form.image_rotation,
-            image_flip=form.image_flip,
-        ))
-        plan = StitchOperationPlan(
-            geometry, use_detector_mask=form.use_detector_mask,
-            sample_position=form.sample_position, correct_solid_angle=form.correct_solid_angle,
-            polarization_factor=form.polarization_factor, error_model=form.error_model,
-            dark_path=form.dark_path, flat_path=form.flat_path,
-            flat_min_fraction=form.flat_min_fraction, **common)
-        motors = tuple(source for _name, source in form.source_motors)
-        energy_name = "energy"
-    else:
-        from xrd_tools.integrate.stitch_calibration import xu_calibration_path
-        calibration = capture_xu_stitch_calibration(  # a pyFAI file's partner, saved beside it
-            XuStitchCalibrationInput(xu_calibration_path(form.geometry_path, project)), project_root=project)
-        runtime_owner = xu_runtime_session()
-        with runtime_owner as session:
-            effective = resolve_xu_stitch_effective_geometry(calibration, session).projection
-        if runtime_owner.execution_record is None:
-            raise StitchToolPreflightRefused("XU_RUNTIME_CONFIG_RESTORE_FAILED")
-        plan = XuStitchOperationPlan(calibration, effective, polarization_factor=form.polarization_factor,
-                                     dark_path=form.dark_path, flat_path=form.flat_path,
-                                     flat_min_fraction=form.flat_min_fraction,
-                                     allow_extrapolation=form.allow_extrapolation, **common)
-        acquisition = calibration.projection.value["acquisition"]
-        motors = tuple(name for name in acquisition["source_motors"].values()
-                       if name is not None)  # a single 2θ arm reads no nu
-        energy_name = acquisition["source_energy_selector"]
-    if gi is not None:  # every frame's sample circles: the incidence, the tilt, mu and phi
-        motors += gi.metadata_names()
+    plan, motors, energy_name = capture_native_stitch_plan(form, project, gi)
     requests, preview_members, warnings = [], [], []
     if form.allow_extrapolation:
         warnings.append("XU calibration extrapolation allowed: accuracy outside the validated motor range is unverified.")
