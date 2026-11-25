@@ -447,7 +447,7 @@ def test_p4_mask_shrinks_without_freezing_forward_progress(qapp, make_page, tmp_
                   analysis_artifact.read_analysis_artifact(finite_path))
 
 
-def _stitch_reference(page, root, snapshot, mode):
+def _stitch_reference(form, root, snapshot, mode):
     """The finite native Stitch Run of the same settled scan on the preview's own grid (Claude's oracle check).
 
     The preview's axes are bin centres; the finite range spans half a bin past the first and last centre, so the
@@ -469,7 +469,7 @@ def _stitch_reference(page, root, snapshot, mode):
                     chi_range=span(axes[1]), npt_azim_2d=len(axes[1]))
     folder = root / "reference"
     folder.mkdir(exist_ok=True)
-    form = replace(page.build_form(), output_path=str(folder / "reference.nexus"), **grid)
+    form = replace(form, output_path=str(folder / "reference.nexus"), **grid)
     request, = prepare_stitch_tool(form).requests
     result = run_stitch_operation(request)
     assert result.terminal.disposition.value == "committed", result.terminal
@@ -493,6 +493,7 @@ def test_p5_stitch_growth_preserves_the_screen_tail_and_native_axes(
     form, spec, _ = _stitch_acquisition(page, tmp_path, backend=backend, mode=mode)
     page.load_form(replace(form, mode=mode, npt_azim_2d=30, npt_rad_2d=32,
                            chi_range=(-179., 179.) if mode == "2d" else None))
+    reference_form = page.build_form()  # the frozen Live inputs, built before Live starts watching
     _stitch_raw(form, 1, 0, 1)
     owner = start_preview(page, qapp)
     _next(page, owner, qapp, lambda: owner.progress.held == 1)
@@ -527,7 +528,7 @@ def test_p5_stitch_growth_preserves_the_screen_tail_and_native_axes(
     if mode == "2d":
         assert np.min(axes[1]) >= -179. and np.max(axes[1]) <= 179.
     # Claude's oracle check: the settled preview equals the native finite science on the preview's own grid.
-    np.testing.assert_allclose(snapshot.intensity, _stitch_reference(page, tmp_path, snapshot, mode),
+    np.testing.assert_allclose(snapshot.intensity, _stitch_reference(reference_form, tmp_path, snapshot, mode),
                                rtol=1e-6, equal_nan=True)
 
 
