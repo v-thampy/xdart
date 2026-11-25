@@ -13,6 +13,7 @@ from tests.core.test_bluesky_nexus import _write_bluesky_nxwriter
 from tests.core.test_stitch_operation import _native_form
 from tests.xdart.pages import test_rsm_page as rsm_gui, test_stitch_page as stitch_gui
 from tests.xdart.pages.live_per_scan_support import start_live, tick_live, unimplemented_live, wait_until
+from tests.xdart.pages.live_preview_support import disable_preview
 from tests.xdart.pages.test_rsm_page import qapp  # noqa: F401
 from xdart.gui.tabs.rsm import page as rsm_page
 from xdart.gui.tools import stitch_owner
@@ -154,6 +155,7 @@ def test_g1_rsm_live_seals_each_scan_and_shows_the_latest_result(qapp, make_page
         return emit(self, stage, completed)
 
     monkeypatch.setattr(execution, "_emit", grow_later_scan_during_science)
+    disable_preview(page)
     start_live(page)
     _ticks(page, qapp)
     first, newest = (f"source-RSM_synth-{scan}_rsm.nexus" for scan in (1, 2))
@@ -237,6 +239,7 @@ def test_g2_append_current_keeps_the_view_and_owns_the_skip(qapp, make_page, tmp
 
     monkeypatch.setattr(values, currency_name, record_currency)
     assert page.run_bar.write_mode() == "Append"
+    disable_preview(page)
     start_live(page)
     _ticks(page, qapp)
     if kind == "stitch":

@@ -12,6 +12,7 @@ from pyqtgraph.Qt import QtWidgets
 
 from tests.core.test_stitch_operation import _native_form
 from tests.xdart.pages.live_per_scan_support import start_live, tick_live, unimplemented_live, wait_until
+from tests.xdart.pages.live_preview_support import disable_preview
 from tests.xdart.pages import test_rsm_page as rsm_tests
 from tests.xdart.pages import test_stitch_page as stitch_tests
 from xdart.gui.pages.catalog import RSM_PAGE, STITCH_PAGE
@@ -306,6 +307,7 @@ def test_g9_close_joins_the_live_worker_and_latches_dispatch(qapp, tmp_path, mon
 def test_g10_stop_restart_and_finite_append_keep_the_full_selection(qapp, tmp_path, kind):
     with _mounted(kind, tmp_path, qapp) as (page, _source, images):
         later = _take_images(images, "*scan2_*")
+        disable_preview(page)
         start_live(page)
         tick_live(page, qapp)
         wait_until(qapp, lambda: len(_outputs(tmp_path)) == 1 and not page._owner.busy)
