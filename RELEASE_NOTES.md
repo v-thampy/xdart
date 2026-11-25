@@ -10,8 +10,9 @@
   same SPEC file, which at a beamline is every count time. A job now binds
   only its own scan's lines and the file header in effect for it: later
   scans being written no longer refuse it, and a change to its own scan
-  (a row, a UB line, an earlier scan renumbered) still does. Each SPEC
-  file is also parsed once per Preview or Run instead of about 20 times.
+  (a row, a UB line, an earlier scan renumbered) still does. Preparation
+  and execution each parse a SPEC file once and share that view across the
+  job's scans.
 - **HKL maps with a UB taken from a SPEC scan stay current for Append**
   while that SPEC file grows. A map saved before 1.2.19 is gridded once
   more the first time its UB's SPEC file has grown, then stays current.
