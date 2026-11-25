@@ -170,7 +170,7 @@ class LivePreviewOwner(QtCore.QObject):
             if self._candidate.identity == shown.group_identity:
                 if not shown.covered_by(self._candidate):
                     self._clear_snapshot(shown.group_identity)
-                elif self._done_target is not None:
+                elif self._caught_up(self._candidate):
                     # Asset drift can occur while the detector has paused.
                     self._recheck_display = True
         if old is not None and (self._candidate is None or not self._candidate.points) and self._snapshot is not None:
@@ -207,6 +207,13 @@ class LivePreviewOwner(QtCore.QObject):
         self._staging_bytes = charge
         return True
 
+    def _caught_up(self, target):
+        if self._done_target is None:
+            return False
+        prior, count, ended, waiting = self._done_target
+        return (prior.identity == target.identity and ended == target.ended and count == len(target.points)
+                and (waiting is None or waiting is self._observation) and target.contains_prefix(prior))
+
     def poll_due(self):
         if not self.watching:
             if not self.working:
@@ -223,12 +230,6 @@ class LivePreviewOwner(QtCore.QObject):
             # displayed projection keeps its separate reservation.
             self._retire_staging()
             return
-        if self._recheck_display and not self.working:
-            self._recheck_display = False
-            if self._display_witness is not None:
-                self._verification.forget()
-                self._verification.ask(self._display_witness)
-                return
         current = self._candidate
         if (self._staged is not None and self.clock() >= self._published_at + 2 and not self.working
                 and self._display_room(self._staged.snapshot)):
@@ -236,18 +237,20 @@ class LivePreviewOwner(QtCore.QObject):
             if staged.request.target.identity not in self._retired:
                 self._verification.ask(staged)
                 return
+        if self._recheck_display and not self.working:
+            self._recheck_display = False
+            if self._display_witness is not None:
+                self._verification.forget()
+                self._verification.ask(self._display_witness)
+                return
         if self.working or current is None or not current.points:
             if self.progress.replay_target is not None:
                 self._status("Rebuilding preview")
             elif current is not None and not current.points:
                 self._work.progress = replace(self._work.progress, waiting=True)
             return
-        if self._done_target is not None:
-            prior, count, ended, waiting_observation = self._done_target
-            if (prior.identity == current.identity and ended == current.ended and count == len(current.points)
-                    and (waiting_observation is None or waiting_observation is self._observation)
-                    and all(a.identity == b.identity for (_, a), (_, b) in zip(prior.points, current.points))):
-                return
+        if self._caught_up(current):
+            return
         if self._admit_staging(current):
             self._requests.ask(_Slice(self._epoch, self._work, current))
         else:
@@ -354,6 +357,7 @@ class LivePreviewOwner(QtCore.QObject):
             return
         self._snapshot = snapshot
         self._display_witness = verification
+        self._recheck_display = False
         self._published_at = self.clock()
         point_count = len(snapshot.points)
         text = f"Provisional · scan {snapshot.points[-1][0]} · {point_count} points shown"
