@@ -327,13 +327,19 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
     if order == "[3,2]":
         advance_preview(page, owner, qapp)
         assert owner.snapshot is None
+    elif order == "2,[2-3]":
+        # "2" saves alone. [2-3] ties with it on scan 2's occurrence, so the saved view stays; a same-group "2"
+        # preview that won the race to show is superseded by its saved result (v2-1 display arbitration).
+        for _ in range(4):
+            tick_live(page, qapp)
+        wait_until(qapp, lambda: len(_shots(tmp_path / "output")) == 1 and page._live_watcher.handoff is None
+                   and not page._owner.busy)
+        advance_preview(page, owner, qapp)
+        assert owner.snapshot is None
     else:
         _next(page, owner, qapp, lambda: owner.snapshot is not None)
         assert {key for key, _ in owner.snapshot.points} == {"2.1"}
-        if order == "2,[2-3]":
-            wait_until(qapp, lambda: len(_shots(tmp_path / "output")) == 1)
-        else:
-            assert not _shots(tmp_path / "output")
+        assert not _shots(tmp_path / "output")
     # Leave scan 3 incomplete long enough to distinguish the order, then seal it.
     _append_spec(spec, "\n" + _stitch_scan(spec, 3, (14, 14.1, 14.2), planned=4))
     for index in range(3):
@@ -341,6 +347,8 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
     _next(page, owner, qapp, lambda: owner.snapshot is not None)
     if order == "[3,2]":
         assert {key for key, _ in owner.snapshot.points} == {"3.1"}
+    elif order == "2,[2-3]":
+        assert {key for key, _ in owner.snapshot.points} == {"2.1", "3.1"}
     _append_spec(spec, "14.3 -10\n")
     _stitch_raw(form, 3, 3, 2)
     for _ in range(4):

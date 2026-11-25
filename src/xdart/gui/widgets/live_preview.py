@@ -75,6 +75,7 @@ class LivePreviewOwner(QtCore.QObject):
         self._staging_bytes = 0
         self._published_at = float("-inf")
         self._retired = {}
+        self._ranks = {}
         self._activity = PreviewProgress()
         self._ownership_cancelled = False
         self._worker = self._requests.worker
@@ -138,6 +139,7 @@ class LivePreviewOwner(QtCore.QObject):
         self._activity = PreviewProgress()
         self._observation = None
         self._retired.clear()
+        self._ranks.clear()
         if not self.preference.isChecked():
             return
         if rsm:
@@ -159,6 +161,8 @@ class LivePreviewOwner(QtCore.QObject):
         if not self.watching or observation is None:
             return
         self._observation = observation
+        # Session ranks: a consumed group leaves later listings, and readback latency must not redate it.
+        self._ranks.update(observation.ranks)
         old = self._candidate
         candidate = observation.candidate
         if candidate is not None and candidate.identity not in self._retired:
@@ -390,7 +394,7 @@ class LivePreviewOwner(QtCore.QObject):
         """Register the saved fallback and answer whether native may select and paint it."""
         if not self.watching or self._observation is None:
             return True
-        rank = self._observation.ranks.get(group.identity)
+        rank = self._ranks.get(group.identity)
         if rank is None:
             rank = self._snapshot.rank if (self._snapshot is not None
                                            and self._snapshot.group_identity == group.identity) else (0, 0, 0)
