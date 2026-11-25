@@ -347,7 +347,8 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
         tick_live(page, qapp)
     outputs = tmp_path / "output"
     expected_count = 2 if order == "2,[2-3]" else 1
-    wait_until(qapp, lambda: len(_shots(outputs)) == expected_count)
+    wait_until(qapp, lambda: page._live_watcher.handoff is None and not page._owner.busy
+               and len(_shots(outputs)) == expected_count)
     assert all(analysis_artifact.read_analysis_artifact(path).provenance_json for path in outputs.glob("*.nexus"))
     assert len(owner.retired_groups) == expected_count
     ordered = ("3.1", "2.1") if order == "[3,2]" else ("2.1", "3.1")
