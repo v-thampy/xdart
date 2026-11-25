@@ -370,6 +370,7 @@ def rsm_member_groups(
     motor_selectors,
     cancelled=None,
     progress=None,
+    planned_group=None,
 ):
     """Stitch's source selection, resolved by Stitch's own owner (``resolve_stitch_sources``: discovery, the
     Selection syntax, Directory mode and its skips), as RSM member groups: one RSM per group, each SPEC scan one
@@ -381,17 +382,18 @@ def rsm_member_groups(
     from xrd_tools.io.image import shared_image_listings
     with shared_image_listings():
         return _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw_header_skip,
-                                  motor_selectors, cancelled, progress)
+                                  motor_selectors, cancelled, progress, planned_group)
 
 
 def _rsm_member_groups(selection, frame_selector, detector_shape, raw_dtype, raw_header_skip, motor_selectors,
-                       cancelled, progress):
+                       cancelled, progress, planned_group):
     from xrd_tools.analysis.stitch_sources import SourceSearchCancelled, StitchSourceSelection, resolve_stitch_sources
     if type(selection) is not StitchSourceSelection:
         raise TypeError("RSM members come from an exact Stitch source selection")
     read_image_kwargs = {"detector_shape": tuple(detector_shape), "raw_dtype": np.dtype(raw_dtype).str,
                          "raw_header_skip": int(raw_header_skip), "threshold": None, "rotation": 0}
-    resolution = resolve_stitch_sources(selection, read_image_kwargs, cancelled=cancelled, progress=progress)
+    resolution = resolve_stitch_sources(selection, read_image_kwargs, cancelled=cancelled, progress=progress,
+                                        planned_group=planned_group)
     if resolution.pending:
         raise PointImagesRequired(resolution.pending[0], resolution.pending)  # every one, for one question (C-13)
     groups, skipped = [], list(resolution.skipped)
@@ -1879,17 +1881,19 @@ def prepare_rsm_tool_v2(
     form: RSMToolFormV2,
     *,
     cancel_token: threading.Event | None = None,
+    live_handoff=None,
 ) -> RSMToolPreflightV2:
     """The preparation as one SPEC capture scope (each SPEC file read once; NEXT-1219-SPEC-OCCURRENCE)."""
     from xrd_tools.io.spec import spec_capture_scope
     with spec_capture_scope():
-        return _prepare_rsm_tool_v2(form, cancel_token=cancel_token)
+        return _prepare_rsm_tool_v2(form, cancel_token=cancel_token, live_handoff=live_handoff)
 
 
 def _prepare_rsm_tool_v2(
     form: RSMToolFormV2,
     *,
     cancel_token: threading.Event | None = None,
+    live_handoff=None,
 ) -> RSMToolPreflightV2:
     """Perform one ordered, detector-image-free RSM v2 Preview."""
 
@@ -1898,11 +1902,30 @@ def _prepare_rsm_tool_v2(
     if cancel_token is not None and type(cancel_token) is not threading.Event:
         raise TypeError("RSM v2 preflight cancellation must be threading.Event")
 
-    def member_table(source_spec):
+    from .live_scans import (
+        LiveHandoffChanged, live_output_current, require_current_handoff,
+        require_native_members, snapshot_member,
+    )
+
+    def require_live():
         try:
-            return run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token)
+            require_current_handoff(live_handoff,
+                cancelled=None if cancel_token is None else cancel_token.is_set)
+        except InterruptedError as error:
+            raise RSMToolPreflightRefused("CANCELLED") from error
+        except LiveHandoffChanged as error:
+            raise RSMToolPreflightRefused(error.code, str(error)) from error
+
+    require_live()
+
+    def member_table(source_spec, ordinal):
+        try:
+            return run_metadata_table(MetadataTablePlan(source_spec), cancel_token=cancel_token,
+                **({} if live_handoff is None else {"live_member": snapshot_member(live_handoff, ordinal)}))
         except PointImagesRequired:
             raise
+        except LiveHandoffChanged as error:
+            raise RSMToolPreflightRefused(error.code, str(error)) from error
         except ValueError as error:
             raise RSMToolPreflightRefused("SOURCE_PREFLIGHT_REFUSED", str(error)) from error
 
@@ -1953,7 +1976,7 @@ def _prepare_rsm_tool_v2(
         )
 
     sources: list[ModuleSourceReceipt] = []
-    for member in form.members:
+    for ordinal, member in enumerate(form.members):
         if cancel_token is not None and cancel_token.is_set():
             raise RSMToolPreflightRefused("CANCELLED")
         selectors = required_rsm_selectors_v2(
@@ -1965,7 +1988,7 @@ def _prepare_rsm_tool_v2(
             source_spec = SourceSpec(project / nexus_relative, member.kind, entry=member.entry,
                                      options={} if member.point_images is None else
                                      {"point_images": dict(member.point_images)})
-            table = member_table(source_spec)
+            table = member_table(source_spec, ordinal)
             if table.disposition is AnalysisDisposition.COMPLETED:
                 missing = _missing_role_in_table(table, member.motor_selectors)
                 if missing is not None:
@@ -2023,7 +2046,7 @@ def _prepare_rsm_tool_v2(
                 **({"nexus_entry": member.nexus_entry} if member.nexus_entry else {}),
             },
         )
-        table = member_table(source_spec)
+        table = member_table(source_spec, ordinal)
         if (
             table.disposition is not AnalysisDisposition.COMPLETED
             and table.code == "METADATA_COLUMN_PROJECTION_INVALID"
@@ -2045,6 +2068,8 @@ def _prepare_rsm_tool_v2(
             )
         _append_rsm_member_source(sources, table, member, selectors)
     try:
+        require_native_members(live_handoff, sources)
+        require_live()
         group = ModuleSourceGroupReceipt.from_members(tuple(sources))
         output = ModuleOutputRequest(
             project / output_relative,
@@ -2071,7 +2096,9 @@ def _prepare_rsm_tool_v2(
             **({} if form.ub is None or form.coordinate_frame is not RSMCoordinateFrame.HKL
                else {"ub_override": form.ub}),
         )
+        object.__setattr__(request, "live_handoff", live_handoff)
     except (
+        LiveHandoffChanged,
         RSMOperationRefused,
         RSMGeometryAssetRefused,
         XuRuntimeUnsupported,
@@ -2179,9 +2206,11 @@ def _prepare_rsm_tool_v2(
         calibration_kind=rsm_calibration_kind(request.preflight.geometry_asset_receipt),
         _claim=_PREFLIGHT_V2_FACTORY,
     )
-    return RSMToolPreflightV2(
-        form, request, summary, rsm_output_current(request), _PREFLIGHT_V2_FACTORY
-    )
+    current, revision = live_output_current(
+        live_handoff, request.module.output.target, lambda: rsm_output_current(request))
+    if live_handoff is not None:
+        object.__setattr__(request, "live_target_revision", revision)
+    return RSMToolPreflightV2(form, request, summary, current, _PREFLIGHT_V2_FACTORY)
 
 
 def _rsm_member_energy_lines(recorded: float, calibration) -> tuple[str, ...]:

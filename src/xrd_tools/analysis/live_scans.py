@@ -365,9 +365,7 @@ class _ObservationSweep:
                     files = tuple(dict.fromkeys((*raw, *(value for graph in graphs for value in _graph_files(graph)))))
                     if not _same_files(files, SourceFileState.capture):
                         raise ValueError(f"{path.name}: detector inputs changed while observing scan {key}")
-                    mapping = tuple(tuple((str(raw_path), index, opened._container_dataset_paths.get(raw_path))
-                                          for raw_path, index in opened.point_raw_locators(label))
-                                    for label in labels)
+                    mapping = _spec_mapping(opened, labels)
                     witness = LiveMemberWitness(member, source, identity, proof, needs_successor,
                                                 labels, mapping, files, tuple(graphs))
                 finally:
@@ -480,3 +478,106 @@ class LiveScanObserver:
         self._late = sweep.next_late
         self._still = still
         return LiveScanObservation(tuple(rows), tuple(late))
+
+
+class LiveHandoffChanged(ValueError):
+    code = "LIVE_HANDOFF_CHANGED"
+
+
+def require_current_handoff(handoff, *, cancelled=None, readiness=True):
+    """Check this handoff against disk without re-resolving its group."""
+    from xrd_tools.io.metadata import SpecOccurrenceVerification
+
+    if handoff is None:
+        return
+    members = handoff.evidence.members
+    proofs = tuple(member.occurrence for member in members if member.occurrence is not None)
+    successors = tuple(member.occurrence for member in members if member.successor_required)
+    verification = SpecOccurrenceVerification(
+        proofs, cancelled=cancelled, successor_proofs=successors if readiness else ())
+    states = {}
+
+    def state(path):
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Live scan admission stopped")
+        if path not in states:
+            states[path] = SourceFileState.capture(path)
+        return states[path]
+
+    try:
+        for member in members:
+            if member.occurrence is not None and not verification.holds(member.occurrence):
+                raise LiveHandoffChanged(f"{member.member.path.name}:{member.member.key} changed after Live observation")
+            if not _same_files(member.files, state):
+                raise LiveHandoffChanged(f"{member.member.path.name}:{member.member.key} detector inputs changed")
+        if readiness:
+            for container in handoff.evidence.containers:
+                if not _same_files((container.root,), state) or any(
+                        not _same_files(member.files, state) for _, _, member in container.entries):
+                    raise LiveHandoffChanged(f"{Path(container.root.path).name} present entries or linked inputs changed")
+    except InterruptedError:
+        raise
+    except LiveHandoffChanged:
+        raise
+    except _WAIT_ERRORS as error:
+        raise LiveHandoffChanged(str(error) or "Live source became unavailable") from error
+
+
+def _spec_mapping(source, labels):
+    return tuple(tuple((str(path), index, source._container_dataset_paths.get(path))
+                       for path, index in source.point_raw_locators(label))
+                 for label in labels)
+
+
+def require_snapshot(expected, requested, source, proof, labels, graph):
+    """Require that the actual native metadata reader answered the detached observation."""
+    if expected is None:
+        return
+    seen = expected.source
+    if (Path(requested.uri) != Path(seen.uri) or requested.kind is not seen.kind
+            or requested.entry != seen.entry or labels != expected.labels):
+        raise LiveHandoffChanged("Native source identity or frame labels differ from the Live observation")
+    for key in ("point_images", "scan", "nexus_entry"):
+        if seen.options.get(key) != requested.options.get(key):
+            raise LiveHandoffChanged(f"Native {key} differs from the Live observation")
+    if proof is not None:
+        if (_spec_identity(proof) != expected.occurrence_identity
+                or _spec_mapping(source, labels) != expected.mapping):
+            raise LiveHandoffChanged(f"SPEC scan {proof.key} or its detector mapping changed")
+    elif expected.occurrence is not None:
+        raise LiveHandoffChanged("Native SPEC source has no bound scan occurrence")
+    elif graph is None or _graph_projection(graph) != _graph_projection(expected.graphs[0]):
+        raise LiveHandoffChanged("Native detector selector or dependency graph changed")
+
+
+def _graph_projection(graph):
+    stamp = graph.stamp
+    return (graph.execution_source.entry, graph.dataset_paths, graph.detector_shape, graph.native_dtype,
+            stamp.frame_count, stamp.external_members, stamp.dependency_files, stamp.source_aliases)
+
+
+def require_native_members(handoff, receipts):
+    if handoff is not None and tuple(receipt.selected_labels for receipt in receipts) != handoff.evidence.labels:
+        raise LiveHandoffChanged("Native selected frames differ from the Live observation")
+
+
+def snapshot_member(handoff, ordinal):
+    if handoff is None:
+        return None
+    if ordinal >= len(handoff.evidence.members):
+        raise LiveHandoffChanged("Native group gained a member")
+    return handoff.evidence.members[ordinal]
+
+
+def live_output_current(handoff, target, check):
+    """Check Append currency and the exact target revision in the same worker."""
+    from xrd_tools.io.output_transaction import capture_target_revision, target_revision_key
+
+    if handoff is None:
+        return check(), None
+    before = capture_target_revision(target)
+    current = check()
+    after = capture_target_revision(target)
+    if target_revision_key(before) != target_revision_key(after):
+        return False, None
+    return current, after

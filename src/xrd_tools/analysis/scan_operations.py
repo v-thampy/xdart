@@ -776,6 +776,7 @@ def _snapshot(
     spec: SourceSpec, *, cancel_token: threading.Event | None = None,
     selected_source: Any | None = None,
     selected_revision: FileRevision | None = None,
+    live_member=None,
 ) -> _Snapshot:
     from xrd_tools.io.spec import SpecCaptureFailed, spec_file_view
 
@@ -870,6 +871,12 @@ def _snapshot(
                     raise _Refusal("SOURCE_REVISION_CHANGED")
                 member_states.append((path, revision))
                 member_revisions[path.resolve(strict=False)] = revision
+        if live_member is not None:
+            from xrd_tools.analysis.live_scans import LiveHandoffChanged, require_snapshot
+            try:
+                require_snapshot(live_member, spec, source, proof, labels, container_graph)
+            except LiveHandoffChanged as error:
+                raise _Refusal(error.code, (str(error),)) from error
         raw_facts: list[tuple[int, str | None, int | None, FileRevision | None]] = []
         options = dict(spec.options)
         metadata_format = getattr(
@@ -1350,17 +1357,20 @@ def scan_plot_defaults(
 def run_metadata_table(
     plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    live_member=None,
 ) -> MetadataTableResult:
     """One metadata table. A SPEC file is read as one captured view (``spec_capture_scope``; an enclosing
     preparation's scope is shared, so its members and UB read each file once; NEXT-1219-SPEC-OCCURRENCE)."""
     from xrd_tools.io.spec import spec_capture_scope
     with spec_capture_scope():
-        return _run_metadata_table(plan, cancel_token=cancel_token, progress_callback=progress_callback)
+        return _run_metadata_table(plan, cancel_token=cancel_token, progress_callback=progress_callback,
+                                   live_member=live_member)
 
 
 def _run_metadata_table(
     plan: MetadataTablePlan, *, cancel_token: threading.Event | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    live_member=None,
 ) -> MetadataTableResult:
     if not _valid_cancel(cancel_token):
         return MetadataTableResult(AnalysisDisposition.REFUSED, "INVALID_CANCEL_TOKEN")
@@ -1377,7 +1387,7 @@ def _run_metadata_table(
         handoff, selected_source = selected_source, None
         snapshot = _snapshot(
             spec, cancel_token=cancel_token, selected_source=handoff,
-            selected_revision=selected_revision,
+            selected_revision=selected_revision, live_member=live_member,
         )
         if cancel_token is not None and cancel_token.is_set():
             return MetadataTableResult(AnalysisDisposition.CANCELLED, "CANCELLED")

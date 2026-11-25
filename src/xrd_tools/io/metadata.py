@@ -1962,7 +1962,8 @@ def _long_spec_record(head, remainder, block_hash, header_hash):
     )
 
 
-def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_numbers=None, cancelled=None):
+def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_numbers=None, cancelled=None,
+                                successor_after=None, successor_offsets=None):
     """Frame the scans in byte order with bounded record buffers.
 
     A complete line belongs to its scan up to the next column-zero #S or #F.
@@ -1970,6 +1971,7 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_n
     previous scan even while that marker is being written. With a limit, finish
     at the first decision about the last protected byte's boundary. Live
     verification tracks ordinals and hashes only for its requested scan numbers.
+    Live completion can also require a complete subsequent command header.
     """
     seen: dict[int, int] = {}
     spans: list[tuple[int, int]] = []
@@ -1987,12 +1989,14 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_n
                                    end, digest.hexdigest(), rows, complete, boundary_holds)
 
     for line_number, (raw, remainder) in enumerate(iter_spec_record_parts(stream, cancelled=cancelled), 1):
+        successor_pending = (successor_after is not None and
+                             (not successor_offsets or successor_offsets[-1] < successor_after))
         rollover = None
         if remainder:
             # A later marker with a delimited number ends the selected span
             # even if the remainder of its line has not been written yet.
             match = _SPEC_RECORD_LINE.match(raw)
-            if (stop_after is not None and offset >= stop_after
+            if (not successor_pending and stop_after is not None and offset >= stop_after
                     and match is not None and match.end() < len(raw)):
                 if active:
                     yield frame(True)
@@ -2008,10 +2012,14 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_n
 
         match = _SPEC_RECORD_LINE.match(raw)
         if match:
+            if match[1] is not None and successor_offsets is not None and line_complete and raw[match.end():].strip():
+                # Only the last complete command's offset is needed for all proofs in this sweep.
+                successor_offsets[:] = (offset,)
+                successor_pending = offset < successor_after
             if active:
                 yield frame(True)
                 active = False
-            if stop_after is not None and offset >= stop_after:
+            if not successor_pending and stop_after is not None and offset >= stop_after:
                 return
             if match[1] is None:
                 header_open = True
@@ -2053,7 +2061,7 @@ def iter_spec_occurrence_frames(stream, *, stop_after: int | None = None, scan_n
                 block_hash = rollover[0] if match else rollover[1]
             else:
                 block_hash.update(raw)
-            if stop_after is not None and end > stop_after:
+            if not successor_pending and stop_after is not None and end > stop_after:
                 yield frame(True)
                 return
         offset += size
@@ -2115,12 +2123,13 @@ def _spec_occurrence_name_holds(proof: SpecOccurrence, status) -> bool:
         return False
 
 
-def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
+def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool, successor_ids=()):
     # Re-observe once if growth overlaps this read. The old prefix alone
     # cannot distinguish a concurrent selected rewrite from unrelated growth.
     stop_after = max(proof.block_end for proof in proofs)
     keys = {proof.key for proof in proofs}
     numbers = {proof.number for proof in proofs}
+    successor_after = max((proof.block_end for proof in proofs if id(proof) in successor_ids), default=None)
     for attempt in range(2 if retry else 1):
         status = os.fstat(descriptor)
         named = tuple(proof for proof in proofs if _spec_occurrence_name_holds(proof, status))
@@ -2136,8 +2145,10 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
                 remaining -= len(chunk)
                 return chunk
 
+        successor = [] if successor_after is not None else None
         frames = {frame.key: frame for frame in iter_spec_occurrence_frames(
             Stream(), stop_after=stop_after, scan_numbers=numbers, cancelled=cancelled,
+            successor_after=successor_after, successor_offsets=successor,
         ) if frame.key in keys}
         after = os.fstat(descriptor)
         if _spec_descriptor_revision(after) == _spec_descriptor_revision(status):
@@ -2147,6 +2158,8 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
                 if (frame is not None and frame.start_complete
                         and frame.framed == proof.content[2:]
                         and _spec_occurrence_name_holds(proof, after)):
+                    if id(proof) in successor_ids and (not successor or successor[-1] < proof.block_end):
+                        continue
                     result[id(proof)] = True if frame.boundary_holds else None
             return result, after, retry and attempt == 0
         if after.st_size <= status.st_size:
@@ -2154,7 +2167,7 @@ def _read_spec_occurrences(proofs, descriptor: int, cancelled, retry: bool):
     return {}, None, False
 
 
-def _verify_spec_occurrences(proofs, cancelled, retry: bool):
+def _verify_spec_occurrences(proofs, cancelled, retry: bool, successor_ids=()):
     from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME
 
     for proof in proofs:
@@ -2171,7 +2184,7 @@ def _verify_spec_occurrences(proofs, cancelled, retry: bool):
         except OSError:
             continue
         try:
-            return _read_spec_occurrences(proofs, descriptor, cancelled, retry)
+            return _read_spec_occurrences(proofs, descriptor, cancelled, retry, successor_ids)
         finally:
             os.close(descriptor)
     return {}, None, False
@@ -2180,8 +2193,10 @@ def _verify_spec_occurrences(proofs, cancelled, retry: bool):
 class SpecOccurrenceVerification:
     """One semantic check's live observations, shared across occurrences of the same file."""
 
-    def __init__(self, proofs, *, cancelled=None):
+    def __init__(self, proofs, *, cancelled=None, successor_proofs=()):
         self._proofs = {}
+        # These proofs were first captured with a complete successor in the same descriptor revision.
+        self._successor_ids = frozenset(map(id, successor_proofs))
         for proof in proofs:
             key = (proof.resolved, proof.device, proof.inode)
             self._proofs.setdefault(key, {})[id(proof)] = proof
@@ -2197,7 +2212,7 @@ class SpecOccurrenceVerification:
             return False
         try:
             if key not in self._observed:
-                self._observed[key] = _verify_spec_occurrences(tuple(group.values()), self._cancelled, True)
+                self._observed[key] = _verify_spec_occurrences(tuple(group.values()), self._cancelled, True, self._successor_ids)
             accepted = self._accepted.setdefault(key, set())
             while True:
                 results, observed, retry = self._observed[key]
@@ -2216,7 +2231,7 @@ class SpecOccurrenceVerification:
                     break
                 # The same file grew between members. Reobserve the whole
                 # group's protected ranges and keep earlier obligations.
-                refreshed = _verify_spec_occurrences(tuple(group.values()), self._cancelled, False)
+                refreshed = _verify_spec_occurrences(tuple(group.values()), self._cancelled, False, self._successor_ids)
                 if not all(refreshed[0].get(identity) is True for identity in accepted):
                     break
                 self._observed[key] = refreshed

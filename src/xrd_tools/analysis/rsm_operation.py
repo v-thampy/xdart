@@ -3282,6 +3282,9 @@ class RSMOperationRequestV2:
     provenance_json: str
     _claim: InitVar[object] = None
 
+    live_handoff: object | None = field(default=None, init=False, repr=False, compare=False)
+    live_target_revision: object | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self, _claim: object) -> None:
         if (
             _claim is not _RSM_V2_FACTORY
@@ -6239,6 +6242,7 @@ class RSMOperationExecutionV2:
         if type(request) is not RSMOperationRequestV2:
             raise TypeError("RSM v2 execution requires an exact request")
         self.request = request
+        self.live_accepted = False
         self.coordinator = coordinator
         self._state = "new"
         self._output: ModuleArtifactOutput | None = None
@@ -6428,6 +6432,20 @@ class RSMOperationExecutionV2:
         self._state = "done"
         return value
 
+    def _current_live(self, cancel_token, *, readiness=True):
+        if self.request.live_handoff is None:
+            return
+        from xrd_tools.analysis.live_scans import LiveHandoffChanged, require_current_handoff
+
+        try:
+            require_current_handoff(self.request.live_handoff,
+                cancelled=None if cancel_token is None else cancel_token.is_set, readiness=readiness)
+        except InterruptedError as error:
+            raise RSMOperationRefused("CANCELLED") from error
+        except LiveHandoffChanged as error:
+            code = error.code if readiness else "SOURCE_REVISION_CHANGED"
+            raise RSMOperationRefused(code, str(error)) from error
+
     def run(self, *args, **kwargs):
         """The Run as one SPEC capture scope: each SPEC file is parsed once per Run, and every later check reads
         the live file for its scan occurrence (NEXT-1219-SPEC-OCCURRENCE)."""
@@ -6440,6 +6458,7 @@ class RSMOperationExecutionV2:
         *,
         cancel_token: threading.Event | None = None,
         progress_callback: Callable[[ModuleProgress], object] | None = None,
+        on_accepted=None,
     ) -> RSMOperationResultV2:
         if self._state != "new":
             raise RuntimeError("RSM v2 execution is one-shot")
@@ -6461,6 +6480,7 @@ class RSMOperationExecutionV2:
         if cancel_token is not None and cancel_token.is_set():
             return self._terminal(ModuleDisposition.CANCELLED, "CANCELLED")
         try:
+            self._current_live(cancel_token)
             _require_rsm_v2_memory_plan(self.request)
             _create_rsm_v2_output_folder(self.request)
             _revalidate_rsm_v2_authorities(
@@ -6513,6 +6533,11 @@ class RSMOperationExecutionV2:
                         policy is not None and policy.operation == "difference"
                         for policy in map(_rsm_member_point_policy, self.request.preflight.members)),
                 )
+                self._current_live(cancel_token)
+                if self.request.live_handoff is not None:
+                    self.live_accepted = True
+                    if on_accepted is not None:
+                        on_accepted(self.request.live_handoff)
                 for source_receipt, member in zip(
                     self.request.module.source.members,
                     self.request.preflight.members,
@@ -6605,6 +6630,7 @@ class RSMOperationExecutionV2:
                         cropped_mask = None
                     if cancel_token is not None and cancel_token.is_set():
                         raise RSMOperationRefused("CANCELLED")
+                self._current_live(cancel_token, readiness=False)
                 if gridder.n_frames_processed != selected_frames:
                     raise RSMOperationRefused(
                         "RSM_EXECUTION_ATTESTATION_MISMATCH"
@@ -6769,6 +6795,7 @@ class RSMOperationExecutionV2:
 
         def prepublish_check() -> None:
             try:
+                self._current_live(cancel_token, readiness=False)
                 _revalidate_rsm_v2_authorities(
                     self.request,
                     cancel_token=cancel_token,
@@ -6821,6 +6848,7 @@ def run_rsm_operation_v2(
     cancel_token: threading.Event | None = None,
     progress_callback: Callable[[ModuleProgress], object] | None = None,
     coordinator=None,
+    on_accepted=None,
 ) -> RSMOperationResultV2:
     """Run one exact grouped RSM v2 request."""
 
@@ -6828,6 +6856,7 @@ def run_rsm_operation_v2(
     return execution.run(
         cancel_token=cancel_token,
         progress_callback=progress_callback,
+        on_accepted=on_accepted,
     )
 
 
@@ -6848,6 +6877,12 @@ def rsm_output_current(request: RSMOperationRequestV2) -> bool:
 
     if type(request) is not RSMOperationRequestV2:
         raise TypeError("RSM v2 output currency requires an exact request")
+    from xrd_tools.analysis.live_scans import LiveHandoffChanged, require_current_handoff
+
+    try:
+        require_current_handoff(request.live_handoff)
+    except LiveHandoffChanged:
+        return False
     target = Path(request.module.output.target)
     identity = rsm_record_identity(target) if target.is_file() else None
     if identity is None:

@@ -165,11 +165,20 @@ def _affine_geometry_warning(request):
     return None
 
 
-def prepare_native_stitch_tool(form, project):
+def prepare_native_stitch_tool(form, project, *, live_handoff=None):
     from .stitch_values import (
         StitchToolPreflight, StitchToolPreflightRefused, _PREFLIGHT_FACTORY,
         _inside_project,
     )
+    from .live_scans import (
+        LiveHandoffChanged, live_output_current, require_current_handoff,
+        require_native_members, snapshot_member,
+    )
+
+    try:
+        require_current_handoff(live_handoff)
+    except LiveHandoffChanged as error:
+        raise StitchToolPreflightRefused(error.code, str(error)) from error
     output_dir = Path(form.output_path).parent
     _check_output_directory(form.output_path, project)
     for path in form.source_selection.paths:
@@ -178,7 +187,14 @@ def prepare_native_stitch_tool(form, project):
             _inside_project(path, project, "source")
     read_options = dict(detector_shape=form.detector_shape, raw_dtype=form.raw_dtype,
                         raw_header_skip=form.raw_header_skip, rotation=0)
-    resolution = resolve_stitch_sources(form.source_selection, read_options)
+    try:
+        resolution = resolve_stitch_sources(
+            form.source_selection, read_options,
+            **({} if live_handoff is None else {"planned_group": live_handoff.group}))
+    except (OSError, ValueError, LookupError) as error:
+        if live_handoff is None:
+            raise
+        raise StitchToolPreflightRefused("LIVE_HANDOFF_CHANGED", str(error)) from error
     if resolution.pending:
         from xrd_tools.sources.point_images import PointImagesRequired
         raise PointImagesRequired(resolution.pending[0])
@@ -189,10 +205,11 @@ def prepare_native_stitch_tool(form, project):
     # Metadata is loaded once per exact source. The table is reused without
     # changing membership when a scan appears in more than one output group.
     tables = {}
-    for spec in (spec for group in resolution.groups for spec in group):
+    for ordinal, spec in enumerate(spec for group in resolution.groups for spec in group):
         cache_key = (str(spec.uri), spec.entry, str(spec.options))
         if cache_key not in tables:
-            table = run_metadata_table(MetadataTablePlan(spec))
+            table = run_metadata_table(MetadataTablePlan(spec),
+                **({} if live_handoff is None else {"live_member": snapshot_member(live_handoff, ordinal)}))
             if table.disposition is not AnalysisDisposition.COMPLETED:
                 raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
                     f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
@@ -292,8 +309,11 @@ def prepare_native_stitch_tool(form, project):
                 tuple(receipts), kind=ModuleKind.STITCH)
             # the tables this check admitted, reused rather than read again (PERF-STITCH-1)
             admitted = tuple(tables[(str(spec.uri), spec.entry, str(spec.options))][1] for spec in group)
+            require_native_members(live_handoff, receipts)
+            require_current_handoff(live_handoff)
             request = prepare_stitch_operation(source, output, plan, project_root=project,
                                                tables=admitted if len(admitted) > 1 else admitted[0])
+            object.__setattr__(request, "live_handoff", live_handoff)
             from xrd_tools.analysis.stitch_native import native_frame_members
             members = tuple(native_frame_members(request))
             if gi is not None:  # every frame's sample normal suits the pyFAI sample orientation
@@ -326,8 +346,15 @@ def prepare_native_stitch_tool(form, project):
         warnings.extend(item for item in detector_image_warnings(
             getattr(request.plan, "_dark_receipt", None), getattr(request.plan, "_flat_receipt", None))
             if item not in warnings)
-    unchanged = tuple(index for index, request in enumerate(requests) if stitch_output_current(request))
+    unchanged = []
+    for index, request in enumerate(requests):
+        current, revision = live_output_current(
+            live_handoff, request.module.output.target, lambda: stitch_output_current(request))
+        if live_handoff is not None:
+            object.__setattr__(request, "live_target_revision", revision)
+        if current:
+            unchanged.append(index)
     return StitchToolPreflight(form, requests[0], None, _PREFLIGHT_FACTORY,
                                requests=tuple(requests), skipped=resolution.skipped,
                                preview_members=tuple(preview_members), warnings=tuple(warnings),
-                               unchanged=unchanged)
+                               unchanged=tuple(unchanged))

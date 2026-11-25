@@ -2554,3 +2554,33 @@ def test_the_default_form_grids_with_header_shaped_weights(tmp_path, monkeypatch
     assert off.terminal.disposition is ModuleDisposition.COMMITTED, off.terminal
     assert on.payload.result_fingerprint != off.payload.result_fingerprint
     assert len(shapes) == weighted  # the off run took no weight
+
+
+def test_live_rsm_rejects_withdrawn_successor_before_science(tmp_path):
+    from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+    from xrd_tools.io.metadata import SpecOccurrenceVerification
+
+    member = _write_member(tmp_path, 0)
+    path = Path(member.spec_path)
+    selected = path.read_text(encoding="utf-8").replace("ascan eta 0 1 1 1", "ascan eta 0 1 7 1")
+    path.write_text(selected + "#S 2 ascan eta 0 1 1 1\n", encoding="utf-8", newline="\n")
+    selection = StitchSourceSelection("Spec", (str(path),), "1", image_dir=str(member.image_dir),
+                                      image_stem=member.image_stem)
+    observer = LiveScanObserver(selection, {
+        "detector_shape": member.detector_shape, "raw_dtype": member.raw_dtype, "rotation": 0,
+    }, select_labels=member.frame_selector.select)
+    observer.poll(now=0)
+    row, = observer.poll(now=2).groups
+    handoff = LiveScanHandoff.from_ready(row, session_id="rsm", attempt_id="one")
+    form = _form(tmp_path, (member,))
+    request = prepare_rsm_tool_v2(form, live_handoff=handoff).request
+
+    path.write_text(selected + "#S 2", encoding="utf-8", newline="\n")
+    proof = handoff.evidence.members[0].occurrence
+    assert SpecOccurrenceVerification((proof,)).holds(proof)
+    accepted = []
+    owner = RSMOperationExecutionV2(request)
+    terminal = owner.run(on_accepted=accepted.append).terminal
+    assert terminal.disposition is ModuleDisposition.REFUSED and terminal.code == "LIVE_HANDOFF_CHANGED"
+    assert not owner.live_accepted and not accepted and not Path(form.output_path).exists()

@@ -2355,6 +2355,9 @@ class StitchOperationRequest:
     #: (``stitch_native.native_frame_members`` returns them); None: read them again.
     _preview_members: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
+    live_handoff: object | None = field(default=None, init=False, repr=False, compare=False)
+    live_target_revision: object | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self, _claim: object) -> None:
         if (
             _claim not in (_REQUEST_FACTORY, _PREPARED_REQUEST_FACTORY)
@@ -3231,6 +3234,8 @@ class StitchOperationExecution:
         if type(request) is not StitchOperationRequest:
             raise TypeError("Stitch execution requires exact StitchOperationRequest")
         self.request = request
+        self.live_accepted = False
+        self._live_accept_callback = None
         self.coordinator = coordinator
         self._state = "new"
         self._output: ModuleArtifactOutput | None = None
@@ -3392,6 +3397,27 @@ class StitchOperationExecution:
         self._state = "done"
         return value
 
+    def _current_live(self, cancel_token, *, readiness=True):
+        from xrd_tools.analysis.live_scans import LiveHandoffChanged, require_current_handoff
+
+        if self.request.live_handoff is None:
+            return
+        try:
+            require_current_handoff(self.request.live_handoff,
+                cancelled=None if cancel_token is None else cancel_token.is_set, readiness=readiness)
+        except InterruptedError as error:
+            raise StitchOperationRefused("CANCELLED") from error
+        except LiveHandoffChanged as error:
+            code = error.code if readiness else "SOURCE_REVISION_CHANGED"
+            raise StitchOperationRefused(code, str(error)) from error
+
+    def _accept_live(self, cancel_token):
+        self._current_live(cancel_token)
+        if self.request.live_handoff is not None:
+            self.live_accepted = True
+            if self._live_accept_callback is not None:
+                self._live_accept_callback(self.request.live_handoff)
+
     def _run_xu(
         self,
         *,
@@ -3431,6 +3457,7 @@ class StitchOperationExecution:
 
                 screen = FrameScreen(plan.frame_screen, labels, _frame_screen_rows(self.request))
                 support = _xu_support_accumulator(self._support_policy)
+                self._accept_live(cancel_token)
                 scientific = run_xu_hist_stitch_1d(
                     plan.calibration,
                     source,
@@ -3469,6 +3496,7 @@ class StitchOperationExecution:
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts, self._frame_screen, source)
+            self._current_live(cancel_token, readiness=False)
             revalidate_xu_stitch_calibration(plan.calibration)
             revalidate_mask(plan._mask_receipt)
         except XuStitchCancelled:
@@ -3595,6 +3623,7 @@ class StitchOperationExecution:
 
         def require_current_effective_geometry() -> None:
             try:
+                self._current_live(cancel_token, readiness=False)
                 revalidate_mask(plan._mask_receipt)
                 revalidate_xu_stitch_calibration(plan.calibration)
                 runtime_owner = xu_runtime_session()
@@ -3655,6 +3684,7 @@ class StitchOperationExecution:
         progress_callback: Callable[[ModuleProgress], object] | None = None,
         workers: int = 1,
         angular_support=None,
+        on_accepted=None,
     ) -> StitchOperationResult:
         """``angular_support``: the support capture policy (an ``AngularSupportPolicy``; None: the default).
 
@@ -3672,6 +3702,13 @@ class StitchOperationExecution:
             raise ValueError("Stitch workers must be a positive int")
         self._state = "running"
         self._progress_callback = progress_callback
+        self._live_accept_callback = on_accepted
+        try:
+            self._current_live(cancel_token)
+        except StitchOperationRefused as error:
+            if error.code == "CANCELLED":
+                return self._terminal(ModuleDisposition.CANCELLED, error.code)
+            return self._terminal(ModuleDisposition.REFUSED, error.code, refusal_diagnostic(error))
         from xrd_tools.analysis.angular_support import AngularSupportPolicy
         policy = AngularSupportPolicy() if angular_support is None else angular_support
         if type(policy) is not AngularSupportPolicy:
@@ -3737,6 +3774,7 @@ class StitchOperationExecution:
                 screen = FrameScreen(self.request.plan.frame_screen, labels,
                                      _frame_screen_rows(self.request))
                 support = _support_accumulator(self._support_policy, self.request.plan)
+                self._accept_live(cancel_token)
                 scientific = run_stitch(
                     runtime_plan,
                     oriented,
@@ -3751,6 +3789,7 @@ class StitchOperationExecution:
                 )
                 self._frame_screen = screen.summary()
                 _record_frame_screen(records, screen.verdicts, self._frame_screen, oriented)
+            self._current_live(cancel_token, readiness=False)
             _revalidate_geometry(self.request.plan.geometry)
             revalidate_mask(self.request.plan._mask_receipt)
         except StitchCancelled:
@@ -3858,6 +3897,7 @@ class StitchOperationExecution:
 
         def prepublish_check() -> None:
             try:
+                self._current_live(cancel_token, readiness=False)
                 _revalidate_geometry(self.request.plan.geometry)
                 revalidate_mask(self.request.plan._mask_receipt)
             except StitchOperationRefused as error:
@@ -3970,6 +4010,12 @@ def stitch_output_current(request: StitchOperationRequest) -> bool:
 
     The recorded threshold policy must also match: it holds each member's resolved automatic ceiling
     (decision 39), which the plan does not, so an output made under the data-type rule is redone."""
+    from xrd_tools.analysis.live_scans import LiveHandoffChanged, require_current_handoff
+
+    try:
+        require_current_handoff(request.live_handoff)
+    except LiveHandoffChanged:
+        return False
     target = Path(request.module.output.target)
     identity = stitch_record_identity(target) if target.is_file() else None
     if identity is None:
@@ -3996,6 +4042,7 @@ def run_stitch_operation(
     coordinator=None,
     workers: int = 1,
     angular_support=None,
+    on_accepted=None,
 ) -> StitchOperationResult:
     """Run one prepared Stitch operation, retaining cleanup in its exception.
 
@@ -4007,6 +4054,7 @@ def run_stitch_operation(
         progress_callback=progress_callback,
         workers=workers,
         angular_support=angular_support,
+        on_accepted=on_accepted,
     )
 
 
