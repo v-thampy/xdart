@@ -638,6 +638,17 @@ class StreamingGridder:
         self.n_frames_processed: int = 0
         self._poisoned = False
 
+    @contextmanager
+    def runtime_slice(self, session: XuRuntimeSession):
+        """Operate on owned sums with a worker's current, short-lived XU session."""
+        if self._runtime_session is not None:
+            raise RuntimeError("StreamingGridder already has a runtime session")
+        self._runtime_session = require_active_xu_runtime_session(session)
+        try:
+            yield self
+        finally:
+            self._runtime_session = None
+
     # ------------------------------------------------------------------
     # Bounds
     # ------------------------------------------------------------------

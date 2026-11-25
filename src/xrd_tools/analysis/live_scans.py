@@ -72,6 +72,7 @@ class LiveScanRow:
 class LiveScanObservation:
     groups: tuple[LiveScanRow, ...]
     late_entries: tuple[tuple[str, str], ...] = ()
+    preview: object = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,12 +488,14 @@ def _confirmed_source(selection, source, *, detection=_INSPECT_GROUPING):
 class LiveScanObserver:
     """One frozen selection's poll state. Use on the poll worker only."""
 
-    def __init__(self, selection, read_image_kwargs, *, select_labels=None, stillness=2.0, source_ub=False):
+    def __init__(self, selection, read_image_kwargs, *, select_labels=None, stillness=2.0, source_ub=False,
+                 preview_observe=None):
         self.selection = selection
         self.read_options = dict(read_image_kwargs)
         self.select_labels = select_labels
         self.stillness = stillness
         self.source_ub = source_ub
+        self.preview_observe = preview_observe
         self._spec_keys = {}
         self._classification = {}
         self._listings = {}
@@ -542,6 +545,7 @@ class LiveScanObserver:
                 known = set(baseline)
                 _, entries, _ = sweep.listing(path)
                 late.extend((str(path), key) for key in entries if key not in known)
+            preview = None if self.preview_observe is None else self.preview_observe(rows, sweep)
             sweep.check()
         self._spec_keys = sweep.next_spec
         self._classification = sweep.next_classification
@@ -551,7 +555,7 @@ class LiveScanObserver:
         self._roots = sweep.next_roots
         self._late = sweep.next_late
         self._still = still
-        return LiveScanObservation(tuple(rows), tuple(late))
+        return LiveScanObservation(tuple(rows), tuple(late), preview)
 
 
 class LiveHandoffChanged(ValueError):

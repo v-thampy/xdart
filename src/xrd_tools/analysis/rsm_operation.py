@@ -1705,6 +1705,10 @@ def _rsm_reversed_circles(mapper: PixelQMap) -> tuple[str, ...]:
 
 
 def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tuple[np.ndarray, str]:
+    return rsm_spec_orientation_ub(analysis.resolved_root, analysis.resolved_scan, g3, mapper, runtime_session)
+
+
+def rsm_spec_orientation_ub(spec_path, scan_key, g3, mapper: PixelQMap, runtime_session) -> tuple[np.ndarray, str]:
     """A SPEC member's UB in the model RSM maps with (AUD-9 stage 2b decision 2; the maintainer: "Xu provides a
     way to specify the actual circle directions on the instrument. Shouldn't that be used?"). SPEC stores no circle
     directions, and ``#G3`` was computed in its own psic convention from the header's two orientation reflections
@@ -1728,7 +1732,7 @@ def _rsm_orientation_ub(analysis, g3, mapper: PixelQMap, runtime_session) -> tup
     plain = not reversed_roles and not any(mapper.angle_offsets)
     try:
         orientation = spec_orientation(
-            get_orientation_header(analysis.resolved_root, analysis.resolved_scan))
+            get_orientation_header(spec_path, scan_key))
     except KeyError:
         orientation = None
     if orientation is None:
