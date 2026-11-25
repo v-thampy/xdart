@@ -550,7 +550,7 @@ def test_p12_shared_advanced_and_run_bar_gate_and_persist_opt_out(qapp, make_pag
     assert page._background.active_key is None and _display_identity(view) == displayed
     _stop_live(qapp, page)
     settings.click()
-    assert page.advanced.isVisible() and checkbox.hasFocus()
+    wait_until(qapp, lambda: page.advanced.isVisible() and checkbox.hasFocus())
     checkbox.click()
     assert not checkbox.isChecked()
     checkbox.click()

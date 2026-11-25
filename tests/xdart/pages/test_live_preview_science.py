@@ -302,6 +302,8 @@ def test_p2_adoption_rechecks_the_covered_prefix_and_assets(qapp, make_page, tmp
     open_delivery.set()
     owner.poll_due()
     wait_until(qapp, delivered.is_set)
+    # The delivered computation starts a separate protected adoption check.
+    wait_until(qapp, lambda: not owner.working)
     if change == "append":
         assert _prefix(owner, ("1.1", 0), ("1.1", 1))
     else:
@@ -374,7 +376,7 @@ def test_p4_preview_voxel_cap_is_independent_of_the_saved_grid(
         _raw(images / f"{spec.stem}_scan1_0001.raw", 41)
         for _ in range(3):
             tick_live(page, qapp)
-        wait_until(qapp, lambda: bool(_shots(tmp_path / "live")), timeout_ms=60000)
+        wait_until(qapp, lambda: not page._owner.busy and bool(_shots(tmp_path / "live")), timeout_ms=60000)
         [path] = list((tmp_path / "live").glob("*.nexus"))
         assert analysis_artifact.read_analysis_artifact(path).intensity.shape == requested
 
@@ -451,7 +453,7 @@ def test_p4_mask_shrinks_without_freezing_forward_progress(qapp, make_page, tmp_
     _raw(images / f"{spec.stem}_scan1_0005.raw", 46, hot=42)
     for _ in range(3):
         tick_live(page, qapp)
-    wait_until(qapp, lambda: bool(_shots(tmp_path / "live")), timeout_ms=60000)
+    wait_until(qapp, lambda: not page._owner.busy and bool(_shots(tmp_path / "live")), timeout_ms=60000)
     _stop_live(qapp, page)
     finite = make_page("rsm")
     _rsm_form(finite, tmp_path, "1", tmp_path / "finite")
