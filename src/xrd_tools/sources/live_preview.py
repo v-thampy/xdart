@@ -309,10 +309,14 @@ def preview_prefixes_hold(requirements, *, cancelled=None):
                     continue
                 if observed.prefix is None:
                     return False
-                spec_checks.append((observed.prefix, max(point.label for point in points) + 1))
+                covered = max(point.label for point in points) + 1
+                if covered > len(observed.points):
+                    return False
+                spec_checks.append((observed.prefix, covered))
                 slots = _named_slots(
                     observed.path, observed.key, observed._image_dir, observed._image_stem, cancelled)
-                for point in points:
+                # A frame selection cannot hide a missing or remapped predecessor of this point.
+                for point in observed.points[:covered]:
                     _cancel(cancelled)
                     for expected in point.raw:
                         file = slots.get(expected.slot)

@@ -399,14 +399,8 @@ def read_spec_preview_prefix(spec_file, key):
 
 
 def spec_preview_prefixes_hold(requirements, opener, *, cancelled=None):
-    """Check exact covered prefixes with one structural read per changed SPEC object.
-
-    Use indexed framing for its ordinal and active header. Hash admitted spans
-    from the same descriptor, permitting appends after each protected mark.
-    """
-    from xrd_tools.io.metadata import (
-        _spec_cancelled, _spec_name_matches_read, iter_spec_occurrence_frames,
-    )
+    """Check exact covered prefixes, sharing a structural read per changed SPEC object."""
+    from xrd_tools.io.metadata import _spec_cancelled, _spec_name_matches_read
     from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME, identity_ctime_ns
 
     def revision(status):
@@ -415,51 +409,65 @@ def spec_preview_prefixes_hold(requirements, opener, *, cancelled=None):
 
     files = {}
     for prefix, rows in requirements:
-        files.setdefault(prefix.extent.path, []).append((prefix, rows))
+        files.setdefault((prefix.resolved, prefix.device, prefix.inode), []).append((prefix, rows))
     try:
-        for path, selected in files.items():
+        for (resolved, device, inode), selected in files.items():
             _spec_cancelled(cancelled)
-            lexical, resolved = _capture_key(path)
-            named = os.stat(lexical)
-            if any((resolved, named.st_dev, named.st_ino) != (item.resolved, item.device, item.inode)
-                   or not 0 < rows < len(item.extent.marks) for item, rows in selected):
+            paths = tuple(dict.fromkeys(item.extent.path for item, _ in selected))
+            statuses = {path: os.stat(path) for path in paths}
+            if (any(_capture_key(path)[1] != resolved or (named.st_dev, named.st_ino) != (device, inode)
+                    for path, named in statuses.items())
+                    or any(not 0 < rows < len(item.extent.marks) for item, rows in selected)):
                 return False
-            if IDENTITY_CARRIES_CTIME and all(revision(named) == item.revision for item, _ in selected):
+            if IDENTITY_CARRIES_CTIME and all(
+                revision(statuses[item.extent.path]) == item.revision for item, _ in selected
+            ):
                 continue
-            with os.fdopen(opener(lexical), "rb") as stream:
-                descriptor = stream.fileno()
-                before = os.fstat(descriptor)
-                if not _spec_name_matches_read(named, before):
-                    return False
-                last = max(item.extent.marks[rows][0] for item, rows in selected)
-                frames = {item.key: (ordinal, item) for ordinal, item in enumerate(
-                    iter_spec_occurrence_frames(_SpecSpanStream(stream, last), cancelled=cancelled))}
-                for item, rows in selected:
-                    ordinal, frame = frames.get(item.key, (-1, None))
-                    extent = item.extent
-                    if ordinal != item.ordinal or (
-                        frame.offset, frame.header, frame.header_sha256
-                    ) != (extent.scan_offset, extent.header, extent.header_sha256):
+            for attempt in range(2):
+                with os.fdopen(opener(paths[0]), "rb") as stream:
+                    descriptor = stream.fileno()
+                    before = os.fstat(descriptor)
+                    if (before.st_dev, before.st_ino) != (device, inode):
                         return False
-                    end, expected = extent.marks[rows]
-                    stream.seek(extent.scan_offset)
-                    bounded = _SpecSpanStream(stream, end - extent.scan_offset)
-                    digest = hashlib.sha256()
-                    while payload := bounded.read(1 << 20):
-                        _spec_cancelled(cancelled)
-                        digest.update(payload)
-                    if digest.hexdigest() != expected:
+                    if not _check_spec_preview_ranges(stream, selected, cancelled):
                         return False
-                after = os.fstat(descriptor)
-                if before.st_size == after.st_size and before.st_ctime_ns != after.st_ctime_ns:
-                    return False
-                if (after.st_size < before.st_size
-                        or not _spec_name_matches_read(os.stat(lexical), after)
-                        or _capture_key(lexical)[1] != resolved):
-                    return False
+                    after = os.fstat(descriptor)
+                    settled = all(_spec_name_matches_read(os.stat(path), after)
+                                  and _capture_key(path)[1] == resolved for path in paths)
+                    if (settled and after.st_size == before.st_size
+                            and (after.st_mtime_ns, after.st_ctime_ns) == (before.st_mtime_ns, before.st_ctime_ns)):
+                        break
+                    if attempt or after.st_size < before.st_size:
+                        return False
     except OSError:
         _spec_cancelled(cancelled)
         return False
+    return True
+
+
+def _check_spec_preview_ranges(stream, selected, cancelled):
+    from xrd_tools.io.metadata import _spec_cancelled, iter_spec_occurrence_frames
+
+    last = max(item.extent.marks[rows][0] for item, rows in selected)
+    wanted = {item.key for item, _ in selected}
+    frames = {item.key: (ordinal, item) for ordinal, item in enumerate(
+        iter_spec_occurrence_frames(_SpecSpanStream(stream, last), cancelled=cancelled)) if item.key in wanted}
+    for item, rows in selected:
+        ordinal, frame = frames.get(item.key, (-1, None))
+        extent = item.extent
+        if ordinal != item.ordinal or (
+            frame.offset, frame.header, frame.header_sha256
+        ) != (extent.scan_offset, extent.header, extent.header_sha256):
+            return False
+        end, expected = extent.marks[rows]
+        stream.seek(extent.scan_offset)
+        bounded = _SpecSpanStream(stream, end - extent.scan_offset)
+        digest = hashlib.sha256()
+        while payload := bounded.read(1 << 20):
+            _spec_cancelled(cancelled)
+            digest.update(payload)
+        if digest.hexdigest() != expected:
+            return False
     return True
 
 
