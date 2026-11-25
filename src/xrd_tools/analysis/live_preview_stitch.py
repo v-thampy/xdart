@@ -161,8 +161,9 @@ class _StitchPreviewKernel:
             unit=plan.unit, radial_range=plan.radial_range, conditioning=plan.conditioning,
             saturation=saturation, mask=self.mask, polarization_factor=plan.polarization_factor,
             dark=self.dark, flat=self.flat, flat_min_fraction=plan.flat_min_fraction, gi=plan.gi,
-            map_grid=None if plan.mode == "1d" else native._xu_map_grid(plan),
-            map_unit=plan.map_unit, map_radial_range=plan.map_radial_range,
+            **({} if plan.mode == "1d" else dict(
+                map_grid=native._xu_map_grid(plan), map_unit=plan.map_unit,
+                map_radial_range=plan.map_radial_range)),
             azimuth_range_1d=plan.azimuth_range_1d, allow_extrapolation=plan.allow_extrapolation,
             metadata_energy_eV=plan.metadata_energy_eV, cancel_token=cancel_token, preview=stream,
         )
