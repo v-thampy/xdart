@@ -10,12 +10,16 @@ import os
 import re
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import chain, islice
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from silx.io.specfile import SpecFile
+
+if TYPE_CHECKING:
+    from xrd_tools.io.metadata import SpecScanExtent
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,7 @@ logger = logging.getLogger(__name__)
 # ---- one immutable view of each SPEC file within a scope (NEXT-1219-SPEC-OCCURRENCE) ------------------------------
 #: Within :func:`spec_capture_scope`, the resolved SPEC path -> its _SpecCapture.
 _SPEC_CAPTURES = contextvars.ContextVar("xdart_spec_captures", default=None)
+_SPEC_CAPTURE_OPENER = contextvars.ContextVar("xdart_spec_capture_opener", default=None)
 
 
 class SpecCaptureFailed(OSError):
@@ -84,7 +89,9 @@ class _SpecCapture:
         descriptor = None
         captured = False
         try:
-            descriptor = os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            opener = _SPEC_CAPTURE_OPENER.get()
+            descriptor = (os.open(lexical, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                          if opener is None else opener(lexical))
             before = os.fstat(descriptor)
             if not stat.S_ISREG(before.st_mode):
                 raise SpecCaptureFailed(f"SPEC file {lexical} is not a regular file")
@@ -222,22 +229,24 @@ def _capture_key(spec_file: Path | str) -> tuple[str, str]:
 
 
 @contextlib.contextmanager
-def spec_capture_scope():
+def spec_capture_scope(*, opener=None):
     """Within this block, each SPEC file this module's readers open is captured once, on first use, as one
     immutable view (one descriptor, the size it had then), and every reader here parses that view: a preparation
     reads each file once however many scans, members or UB lookups it has. Nested blocks share the outermost
     one's captures. The outermost owner retires its copies before control returns to the caller. It retries a
     failed cleanup step once and reports a remaining failure with the spool path, preserving the operation outcome."""
     captures = _SPEC_CAPTURES.get()
-    if captures is not None:
+    if captures is not None and (opener is None or opener is _SPEC_CAPTURE_OPENER.get()):
         yield
         return
     captures = {}
     token = _SPEC_CAPTURES.set(captures)
+    open_token = _SPEC_CAPTURE_OPENER.set(opener)
     try:
         yield
     finally:
         _SPEC_CAPTURES.reset(token)
+        _SPEC_CAPTURE_OPENER.reset(open_token)
         for capture in captures.values():
             capture.close()
 
@@ -290,6 +299,168 @@ def spec_scan_completion_header(spec_file: Path | str, key: str) -> tuple[str, b
     if capture is None:
         raise RuntimeError("SPEC completion requires an active capture scope")
     return capture.scan_commands().get(key, ("", False))
+
+
+@dataclass(frozen=True, slots=True)
+class SpecPreviewPrefix:
+    """An indexed occurrence through its last qualified, complete data row."""
+
+    key: str
+    ordinal: int
+    resolved: str
+    device: int
+    inode: int
+    extent: SpecScanExtent
+    complete: bool
+    revision: tuple = field(compare=False, repr=False)
+
+    @property
+    def identity(self):
+        extent = self.extent
+        return (self.key, self.ordinal, self.resolved, self.device, self.inode,
+                extent.path, extent.header, extent.header_sha256, extent.scan_offset)
+
+
+def read_spec_preview_prefix(spec_file, key):
+    """Return the exact complete-row prefix and ordered native metadata from the current capture.
+
+    The parser may already see an unterminated last row. The byte index and strict
+    numeric validator determine which rows of that parser result can be admitted.
+    """
+    from xrd_tools.io.metadata import SpecScanExtent, iter_spec_record_parts
+
+    capture = _scoped_capture(spec_file)
+    if capture is None:
+        raise RuntimeError("previewing SPEC requires an active capture scope")
+    frames = capture.checked_frames()
+    frame = frames.get(key)
+    if frame is None or not frame.start_complete:
+        return None
+    scan = capture.parser[key]
+    labels = tuple(map(str, scan.labels))
+    data = np.asarray(scan.data)
+    if data.ndim != 2 or data.shape[0] != len(labels):
+        if not data.size:
+            return None
+        raise SpecCaptureFailed(f"SPEC {spec_file}: the parser and indexed preview rows disagree")
+    if data.shape[1] not in range(frame.rows, frame.rows + (1 if frame.boundary_holds else 2)):
+        raise SpecCaptureFailed(f"SPEC {spec_file}: the parser and indexed preview row counts disagree")
+    digest = hashlib.sha256()
+    marks = []
+    end = frame.offset
+    in_table = continued = False
+    with capture.scratch.open("rb") as stream:
+        stream.seek(frame.offset)
+        for head, tail in iter_spec_record_parts(_SpecSpanStream(stream, frame.block_end - frame.offset)):
+            start = end
+            end += len(head)
+            before = digest.copy() if not marks else None
+            digest.update(head)
+            last = head.rstrip()[-1:]
+            long = False
+            for chunk in tail:
+                long = True
+                digest.update(chunk)
+                end += len(chunk)
+                last = chunk.rstrip()[-1:] or last
+            stripped = head.strip()
+            if continued or stripped.startswith(b"@"):
+                continued = last == b"\\"
+                continue
+            if stripped.startswith(b"#L"):
+                in_table = True
+            if not in_table or not stripped or stripped.startswith(b"#"):
+                continue
+            if not marks:
+                marks.append((start, before.hexdigest()))
+            if long:
+                raise SpecCaptureFailed(f"SPEC {spec_file}: preview data row exceeds its bounded reader")
+            tokens = stripped.decode("ascii").split()
+            if _spec_row_problem(tokens, labels) is not None:
+                break
+            index = len(marks) - 1
+            numeric = np.asarray([float(token) for token in tokens])
+            if (not np.isfinite(numeric).all() or index >= data.shape[1]
+                    or not np.array_equal(numeric, data[:, index])):
+                raise SpecCaptureFailed(f"SPEC {spec_file}: the parser and indexed preview row {index} disagree")
+            marks.append((end, digest.hexdigest()))
+    if len(marks) <= 1:
+        return None
+    count = len(marks) - 1
+    columns = tuple((name, np.array(data[index, :count], dtype=float, copy=True))
+                    for index, name in enumerate(labels))
+    motors = _spec_motor_positions(scan)
+    view = capture.view
+    extent = SpecScanExtent(os.path.abspath(os.fspath(spec_file)), frame.header, frame.header_sha256,
+                            frame.offset, tuple(marks))
+    prefix = SpecPreviewPrefix(key, tuple(frames).index(key), view.resolved, view.device, view.inode,
+                               extent, count == frame.rows and frame.boundary_holds, view.revision)
+    return prefix, columns, motors
+
+
+def spec_preview_prefixes_hold(requirements, opener, *, cancelled=None):
+    """Check exact covered prefixes with one structural read per changed SPEC object.
+
+    Use indexed framing for its ordinal and active header. Hash admitted spans
+    from the same descriptor, permitting appends after each protected mark.
+    """
+    from xrd_tools.io.metadata import (
+        _spec_cancelled, _spec_name_matches_read, iter_spec_occurrence_frames,
+    )
+    from xrd_tools.io.stat_identity import IDENTITY_CARRIES_CTIME, identity_ctime_ns
+
+    def revision(status):
+        return (status.st_mode, status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns,
+                identity_ctime_ns(status.st_ctime_ns))
+
+    files = {}
+    for prefix, rows in requirements:
+        files.setdefault(prefix.extent.path, []).append((prefix, rows))
+    try:
+        for path, selected in files.items():
+            _spec_cancelled(cancelled)
+            lexical, resolved = _capture_key(path)
+            named = os.stat(lexical)
+            if any((resolved, named.st_dev, named.st_ino) != (item.resolved, item.device, item.inode)
+                   or not 0 < rows < len(item.extent.marks) for item, rows in selected):
+                return False
+            if IDENTITY_CARRIES_CTIME and all(revision(named) == item.revision for item, _ in selected):
+                continue
+            with os.fdopen(opener(lexical), "rb") as stream:
+                descriptor = stream.fileno()
+                before = os.fstat(descriptor)
+                if not _spec_name_matches_read(named, before):
+                    return False
+                last = max(item.extent.marks[rows][0] for item, rows in selected)
+                frames = {item.key: (ordinal, item) for ordinal, item in enumerate(
+                    iter_spec_occurrence_frames(_SpecSpanStream(stream, last), cancelled=cancelled))}
+                for item, rows in selected:
+                    ordinal, frame = frames.get(item.key, (-1, None))
+                    extent = item.extent
+                    if ordinal != item.ordinal or (
+                        frame.offset, frame.header, frame.header_sha256
+                    ) != (extent.scan_offset, extent.header, extent.header_sha256):
+                        return False
+                    end, expected = extent.marks[rows]
+                    stream.seek(extent.scan_offset)
+                    bounded = _SpecSpanStream(stream, end - extent.scan_offset)
+                    digest = hashlib.sha256()
+                    while payload := bounded.read(1 << 20):
+                        _spec_cancelled(cancelled)
+                        digest.update(payload)
+                    if digest.hexdigest() != expected:
+                        return False
+                after = os.fstat(descriptor)
+                if before.st_size == after.st_size and before.st_ctime_ns != after.st_ctime_ns:
+                    return False
+                if (after.st_size < before.st_size
+                        or not _spec_name_matches_read(os.stat(lexical), after)
+                        or _capture_key(lexical)[1] != resolved):
+                    return False
+    except OSError:
+        _spec_cancelled(cancelled)
+        return False
+    return True
 
 
 def spec_waiting_scan_keys(spec_file: Path | str) -> dict:
@@ -609,15 +780,17 @@ def read_spec_scan_columns(
         (name, np.array(data[index], dtype=float, copy=True))
         for index, name in enumerate(labels)
     )
-    motors: list[tuple[str, float]] = []
+    return columns, _spec_motor_positions(scan_data), npts
+
+
+def _spec_motor_positions(scan_data):
+    motors = []
     for motor in scan_data.motor_names:
         try:
-            motors.append(
-                (str(motor), float(scan_data.motor_position_by_name(motor)))
-            )
+            motors.append((str(motor), float(scan_data.motor_position_by_name(motor))))
         except Exception:
             logger.debug("read_spec_scan_columns: motor %r unreadable", motor)
-    return columns, tuple(motors), npts
+    return tuple(motors)
 
 
 def get_scan_path_info(scan: str) -> tuple[str, str]:

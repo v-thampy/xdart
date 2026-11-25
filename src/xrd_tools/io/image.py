@@ -867,6 +867,8 @@ def _read_raw_binary(
     shape: tuple[int, int],
     dtype: str = "int32",
     header_skip: int = 0,
+    *,
+    stream=None,
 ) -> np.ndarray:
     """
     Read a raw binary detector dump (no fabio support needed).
@@ -881,10 +883,15 @@ def _read_raw_binary(
         NumPy dtype string.
     header_skip : int
         Bytes to skip before pixel data.
+    stream : binary file, optional
+        A caller-owned, already qualified descriptor. The caller closes it.
     """
+    from contextlib import nullcontext
+
     dtype_value = np.dtype(dtype)
     expected_bytes = int(shape[0]) * int(shape[1]) * dtype_value.itemsize
-    with open(path, "rb") as fh:
+    opened = open(path, "rb") if stream is None else nullcontext(stream)
+    with opened as fh:
         fh.seek(header_skip)
         payload = fh.read(expected_bytes + 1)
     if len(payload) != expected_bytes:

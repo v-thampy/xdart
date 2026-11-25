@@ -275,6 +275,10 @@ def _cbf_incomplete_reason(path: Path) -> str | None:
         return f"CBF is not yet stable: {exc}"
     if captured != (int(after.st_size), int(after.st_mtime_ns)):
         return "CBF changed during structural completeness probing"
+    return _cbf_header_incomplete_reason(header, captured[0])
+
+
+def _cbf_header_incomplete_reason(header: bytes, size: int) -> str | None:
     starter = header.find(_CBF_BINARY_STARTER)
     if starter < 0:
         return "CBF binary STARTER is absent within the 1 MiB header ceiling"
@@ -283,7 +287,7 @@ def _cbf_incomplete_reason(path: Path) -> str | None:
     value = b"" if size_line is None else size_line.partition(b":")[2].strip()
     if not value.isdigit() or len(value) > 20:
         return "CBF X-Binary-Size is absent or invalid"
-    if captured[0] < starter + len(_CBF_BINARY_STARTER) + int(value):
+    if size < starter + len(_CBF_BINARY_STARTER) + int(value):
         return "CBF binary payload is still incomplete"
     return None
 
