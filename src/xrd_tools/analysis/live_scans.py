@@ -179,6 +179,7 @@ class _ObservationSweep:
         self.next_classification = {}
         self.next_listings = {}
         self.next_members = {}
+        self.next_waiting = {}
         self.next_roots = {}
         self.next_late = {}
 
@@ -358,6 +359,17 @@ class _ObservationSweep:
         paths = tuple(find_spec_image_files(options["image_dir"], path.stem, key, options["image_stem"]))
         raw = tuple(self.state(path) for path in paths)
         state = self.state(path)
+        waiting = self.observer._waiting.get(member)
+        if (waiting is not None and stat_identity.IDENTITY_CARRIES_CTIME
+                and waiting[:2] == (state, raw)):
+            # Unchanged SPEC file and image files: the same wait, without reopening the scan.
+            self.next_waiting[member] = waiting
+            raise ValueError(waiting[2])
+
+        def wait(reason):
+            self.next_waiting[member] = (state, raw, reason)
+            raise ValueError(reason)
+
         saved = self.observer._members.get(member)
         same_media = (saved is not None and saved[1] == raw and
                       _same_files(saved[2].files, self.state))
@@ -366,24 +378,26 @@ class _ObservationSweep:
         else:
             proof = spec.spec_occurrence(path, key)
             if proof is None:
-                raise ValueError(f"{path.name}: waiting for complete SPEC scan {key}")
+                wait(f"{path.name}: waiting for complete SPEC scan {key}")
             command, successor = spec.spec_scan_completion_header(path, key)
             planned = _planned_points(command)
             needs_successor = planned is None or proof.rows < planned
             if needs_successor and not successor:
-                raise ValueError(f"{path.name}: waiting for completion of SPEC scan {key}")
+                wait(f"{path.name}: waiting for completion of SPEC scan {key}")
             if not proof.rows:
                 raise _Skipped(f"{path.name}: SPEC scan {key} has no recorded points")
             identity = _spec_identity(proof)
             if same_media and saved[2].occurrence_identity == identity:
                 witness = replace(saved[2], occurrence=proof, successor_required=needs_successor)
             else:
+                if not paths:  # no detector files yet: do not open the scan
+                    wait(f"{path.name}: waiting for detector coverage of scan {key}")
                 source = _confirmed_source(self.selection, source)
                 opened = open_source(source)
                 try:
                     labels = tuple(opened.frame_indices)
                     if not paths or len(labels) != proof.rows or not opened.capabilities.has_raw_references:
-                        raise ValueError(f"{path.name}: waiting for detector coverage of scan {key}")
+                        wait(f"{path.name}: waiting for detector coverage of scan {key}")
                     graphs = []
                     for detector in paths:
                         self.check()
@@ -468,11 +482,14 @@ class LiveScanObserver:
         self._roots = {}
         self._late = {}
         self._still = {}
+        # A waiting member's verdict, kept while its SPEC file and image files are unchanged.
+        self._waiting = {}
 
     def invalidate(self, identity):
         self._still.pop(identity, None)
         self._spec_keys.clear()
         self._members.clear()
+        self._waiting.clear()
         self._roots.clear()
 
     def poll(self, *, now, consumed=(), cancelled=None):
@@ -512,6 +529,7 @@ class LiveScanObserver:
         self._classification = sweep.next_classification
         self._listings = sweep.next_listings
         self._members = sweep.next_members
+        self._waiting = sweep.next_waiting
         self._roots = sweep.next_roots
         self._late = sweep.next_late
         self._still = still

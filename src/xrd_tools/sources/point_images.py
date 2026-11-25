@@ -185,6 +185,7 @@ def _nexus_point_count(spec: SourceSpec, image_count: int, *, entry=None) -> int
     exposures, points = counts
     return points if exposures > 0 and points > 0 and exposures * points == image_count else None
 
+
 def inspect_point_images(spec: SourceSpec, *, warn_missing_spec: bool = True) -> PointImageDetection | None:
     """Inspect recorded SPEC points / declared NeXus counts and image layouts.
 
