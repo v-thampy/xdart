@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import json
 
 import numpy as np
@@ -61,6 +62,26 @@ class _MemberCoordinates:
     ub: np.ndarray
 
 
+def _verify_preview_assets(geometry, ub, bound, max_frame_bytes):
+    revalidate_rsm_geometry_source(geometry)
+    native._revalidate_rsm_ub(ub)
+    if bound is None:
+        return
+    from xrd_tools.analysis.stitch_native import capture_detector_image, revalidate_mask
+
+    revalidate_mask(bound.mask_receipt)
+    for role in ("dark", "flat"):
+        receipt = getattr(bound, f"{role}_receipt")
+        if receipt is None:
+            continue
+        current, _ = capture_detector_image(
+            receipt.lexical_path, role, max_frame_bytes,
+            bound.corrections.flat_min_fraction, detector_mask=bound.detector_mask,
+        )
+        if current != receipt:
+            raise ValueError(f"Live preview {role} changed")
+
+
 class RSMPreviewKernel:
     """Own calibration and correction state independently of a native output."""
 
@@ -107,23 +128,19 @@ class RSMPreviewKernel:
         return self.options.conditioning.static_hot_threshold
 
     def verify_assets(self):
-        revalidate_rsm_geometry_source(self.receipt)
-        native._revalidate_rsm_ub(self.bound_ub)
+        self.asset_witness()()
+
+    def asset_witness(self):
+        return partial(_verify_preview_assets, self.receipt, self.bound_ub, self.corrections,
+                       self.options.max_frame_bytes)
+
+    @property
+    def witness_bytes(self):
         bound = self.corrections
-        if bound is not None:
-            from xrd_tools.analysis.stitch_native import capture_detector_image, revalidate_mask
-            if bound.mask_receipt is not None:
-                revalidate_mask(bound.mask_receipt)
-            for role in ("dark", "flat"):
-                receipt = getattr(bound, f"{role}_receipt")
-                if receipt is None:
-                    continue
-                current, _ = capture_detector_image(
-                    receipt.lexical_path, role, self.options.max_frame_bytes,
-                    bound.corrections.flat_min_fraction, detector_mask=bound.detector_mask,
-                )
-                if current != receipt:
-                    raise ValueError(f"Live preview {role} changed")
+        if bound is None:
+            return 0
+        mask = 0 if bound.mask_receipt is None else len(bound.mask_receipt.pixels)
+        return mask + (0 if bound.detector_mask is None else bound.detector_mask.nbytes)
 
     def runtime(self):
         return xu_runtime_session(self.geometry.runtime_requirements)

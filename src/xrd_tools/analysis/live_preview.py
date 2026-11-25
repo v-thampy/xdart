@@ -2,13 +2,43 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import math
 
 import numpy as np
 
-from xrd_tools.analysis.live_preview_grid import enclosing_preview_bounds
+from xrd_tools.analysis.live_preview_grid import enclosing_preview_bounds, preview_rsm_bins
 from xrd_tools.core.scan import SourceKind
+
+
+MAX_PREVIEW_POINT_BYTES = 128 * 1024 * 1024
+
+
+@contextmanager
+def preview_compute_slot(yield_priority, *, uses_xu=True):
+    """Leave the XU waiter to native work and keep preview reads outside its lock."""
+    if yield_priority():
+        yield False
+        return
+    if not uses_xu:
+        yield True
+        return
+    from xrd_tools.core.geometry.xu_runtime import XU_RUNTIME_LOCK
+
+    if not XU_RUNTIME_LOCK.acquire(blocking=False):
+        yield False
+        return
+    try:
+        yield not yield_priority()
+    finally:
+        XU_RUNTIME_LOCK.release()
+
+
+def largest_preview_point_planes(group):
+    # The point-image policy is constant within one observed member.
+    return max((len(member.points[0].policy.raw_indices(0)) for member in group.members
+                if member.points and member.points[0].policy is not None), default=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +167,7 @@ class PreviewSnapshot:
     mask_pending: bool = False
     mask_update_queued: bool = False
     product: object = None
+    display_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +199,7 @@ class PreviewProgress:
     replayed_points: int = 0
     resident_bytes: int = 0
     admitted_bytes: int = 0
+    resource_restarts: int = 0
 
     @property
     def physical_replays(self):
@@ -228,6 +260,17 @@ class RSMPreviewWork:
     def _update(self, **changes):
         self.progress = replace(self.progress, **changes)
 
+    def staging_bytes(self, group):
+        options = self.options
+        pixels = math.prod(options.detector_shape)
+        grid = math.prod(preview_rsm_bins(options.bins)) * 4 * 8
+        planes = min(pixels * 8 * largest_preview_point_planes(group), options.max_frame_bytes,
+                     MAX_PREVIEW_POINT_BYTES)
+        masks = 0 if options.conditioning.static_hot_threshold is None else pixels * 10 * len(group.members)
+        # Four native grid channels, two resident grids, one candidate snapshot,
+        # and one point's decoding, correction and coordinate working set.
+        return 3 * grid + planes + masks + pixels * 128
+
     def reset(self, group):
         self.group = group
         self.kernel = self.bounds = self.grid = self.replay = self.snapshot = None
@@ -235,7 +278,13 @@ class RSMPreviewWork:
         self.decoded = None
         self.coordinates.clear()
         self.masks.clear()
-        self._update(included=0, waiting=False, end_of_stream=False, replay_target=None)
+        self._update(included=0, waiting=False, end_of_stream=False, replay_target=None,
+                     pending_watermark=None, resident_bytes=0, admitted_bytes=0)
+
+    def retire_staging(self):
+        if self.kernel is not None:
+            self.reset(self.group)
+            self._update(resource_restarts=self.progress.resource_restarts + 1)
 
     @staticmethod
     def verifies(group, *, cancelled=None):
@@ -254,6 +303,11 @@ class RSMPreviewWork:
         from xrd_tools.sources.live_preview import read_preview_point
 
         if self.decoded is None or self.decoded[0] != point.identity:
+            options = self.options
+            count = 1 if point.policy is None else len(point.policy.raw_indices(0))
+            bound = min(MAX_PREVIEW_POINT_BYTES, options.max_frame_bytes, self.kernel.max_chunk_bytes)
+            if math.prod(options.detector_shape) * 8 * count > bound:
+                raise ValueError("The grouped detector point exceeds the preview memory bound")
             planes = read_preview_point(point, cancelled=cancelled)
             count = len(planes)
             self._update(decodes=self.progress.decodes + count,
@@ -299,55 +353,68 @@ class RSMPreviewWork:
             if cancelled() or yield_priority():
                 break
             allowed -= 1
-            with self.kernel.runtime() as session:
-                sample, angles, coordinates = self._ready_frame(member, point, session)
-                if stage is not None:
-                    self._add(stage.accumulator, member, point, sample, angles, coordinates, session)
-                    stage.cursor += 1
-                    if stage.cursor == len(stage.target):
-                        self.grid = stage.accumulator
-                        self.replay = None
-                        self._update(replay_target=None, replays=(*self.progress.replays, stage.receipt),
-                                     replayed_points=self.progress.replayed_points + stage.cursor)
-                    continue
-                mask = self._mask(member, sample[1])
-                footprint = self.kernel.footprint(angles, coordinates, session)
-                bounds = enclosing_preview_bounds(footprint, frozenset(footprint), self.bounds)
-                grown = self.bounds is not None and bounds != self.bounds
-                changed_mask = mask is not None and (mask.due or grown and mask.changed)
-                self.tokens = (*self.tokens, point.identity)
-                self.keys = (*self.keys, (member.key, point.label))
-                if self.grid is None:
-                    self.grid = self.kernel.new_grid(bounds, session)
-                if grown or changed_mask:
-                    if changed_mask:
-                        mask.apply()
-                    previous = tuple(hi - lo for lo, hi in self.bounds.values()) if self.bounds is not None else ()
-                    current = tuple(hi - lo for lo, hi in bounds.values())
-                    self.replay = _RSMReplay(
-                        group.points[:offset + 1], 0, self.kernel.new_grid(bounds, session),
-                        PreviewReplay(grown, changed_mask, offset + 1, previous, current),
-                    )
-                    self._update(replay_target=offset + 1)
-                    progress("Rebuilding preview", 0, 1)
-                else:
-                    self._add(self.grid, member, point, sample, angles, coordinates, session)
-                self.bounds = bounds
+            with preview_compute_slot(yield_priority) as admitted:
+                if not admitted:
+                    return self.snapshot
+                with self.kernel.runtime() as session:
+                    sample, angles, coordinates = self._ready_frame(member, point, session)
+                    self._accumulate(group, stage, offset, member, point, sample, angles, coordinates,
+                                     session, progress)
         if self.replay is not None or not self.keys or cancelled() or yield_priority():
             return self.snapshot
         if self.snapshot is not None and self.snapshot.points == self.keys:
             return self.snapshot
-        with self.kernel.runtime() as session:
-            volume = self.kernel.volume(self.grid, session)
+        with preview_compute_slot(yield_priority) as admitted:
+            if not admitted:
+                return self.snapshot
+            with self.kernel.runtime() as session:
+                volume = self.kernel.volume(self.grid, session)
         members = {key: mask.applied for key, mask in self.masks.items() if mask.applied is not None}
         self._update(included=len(self.keys), waiting=bool(group.reason),
                      end_of_stream=group.ended and len(self.keys) == len(group.points))
+        storage = volume.intensity.nbytes + sum(axis.nbytes for _, axis in volume.axes)
         self.snapshot = PreviewSnapshot(
             group.identity, group.rank, self.keys, tuple(self.bounds.values()), volume.axes, volume.intensity,
             member_masks=members, mask_pending=any(mask.count == 1 for mask in self.masks.values()),
             mask_update_queued=any(mask.changed for mask in self.masks.values()), product=volume,
+            # Charge the detached volume, viewer conversion, and projection cache together.
+            display_bytes=3 * storage + sum(mask.nbytes for mask in members.values()) + self.kernel.witness_bytes,
         )
         return self.snapshot
+
+    def _accumulate(self, group, stage, offset, member, point, sample, angles, coordinates, session, progress):
+        if stage is not None:
+            self._add(stage.accumulator, member, point, sample, angles, coordinates, session)
+            stage.cursor += 1
+            if stage.cursor == len(stage.target):
+                self.grid = stage.accumulator
+                self.replay = None
+                self._update(replay_target=None, replays=(*self.progress.replays, stage.receipt),
+                             replayed_points=self.progress.replayed_points + stage.cursor)
+            return
+        mask = self._mask(member, sample[1])
+        footprint = self.kernel.footprint(angles, coordinates, session)
+        bounds = enclosing_preview_bounds(footprint, frozenset(footprint), self.bounds)
+        grown = self.bounds is not None and bounds != self.bounds
+        changed_mask = mask is not None and (mask.due or grown and mask.changed)
+        self.tokens = (*self.tokens, point.identity)
+        self.keys = (*self.keys, (member.key, point.label))
+        if self.grid is None:
+            self.grid = self.kernel.new_grid(bounds, session)
+        if grown or changed_mask:
+            if changed_mask:
+                mask.apply()
+            previous = tuple(hi - lo for lo, hi in self.bounds.values()) if self.bounds is not None else ()
+            current = tuple(hi - lo for lo, hi in bounds.values())
+            self.replay = _RSMReplay(
+                group.points[:offset + 1], 0, self.kernel.new_grid(bounds, session),
+                PreviewReplay(grown, changed_mask, offset + 1, previous, current),
+            )
+            self._update(replay_target=offset + 1)
+            progress("Rebuilding preview", 0, 1)
+        else:
+            self._add(self.grid, member, point, sample, angles, coordinates, session)
+        self.bounds = bounds
 
     def run(self, group, cancelled, yield_priority, progress):
         from xrd_tools.analysis.live_preview_rsm import RSMPreviewKernel

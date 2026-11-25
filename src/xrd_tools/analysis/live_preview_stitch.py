@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import partial
 import math
 from pathlib import Path
 from threading import Event
@@ -10,7 +11,10 @@ from threading import Event
 import numpy as np
 
 from xrd_tools.analysis import stitch_operation as native
-from xrd_tools.analysis.live_preview import PreviewProgress, PreviewReplay, PreviewSnapshot
+from xrd_tools.analysis.live_preview import (
+    MAX_PREVIEW_POINT_BYTES, PreviewProgress, PreviewReplay, PreviewSnapshot,
+    largest_preview_point_planes, preview_compute_slot,
+)
 from xrd_tools.analysis.live_preview_grid import enclosing_preview_bounds
 from xrd_tools.analysis.stitch_native import (
     calibration_detector, geometry_facts, native_detector_image, native_energy_selection,
@@ -22,7 +26,7 @@ from xrd_tools.core.energy import xray_energy_eV
 from xrd_tools.core.geometry.xu_runtime import XuRuntimeUnsupported
 from xrd_tools.core.invalid import resolve_detector_saturation
 from xrd_tools.core.scan import ScanFrame
-from xrd_tools.integrate.frame_screen import FrameScreen
+from xrd_tools.integrate.frame_screen import FrameScreen, FrameScreenPolicy
 from xrd_tools.integrate.stitch_stream import StitchPreviewStream
 from xrd_tools.integrate.xu_stitch import XuStitchCancelled, XuStitchScienceRefused, run_xu_hist_stitch_1d
 from xrd_tools.sources.live_preview import (
@@ -35,7 +39,6 @@ _SLICE_POINTS = 8
 _MAX_PREVIEW_PROFILE_BINS = 2048
 _MAX_PREVIEW_RADIAL_BINS = 512
 _MAX_PREVIEW_AZIMUTHAL_BINS = 180
-_PREVIEW_POINT_BYTES = 128 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -45,6 +48,17 @@ class _StitchReplay:
     target: tuple
     cursor: int
     receipt: PreviewReplay
+
+
+def _verify_preview_assets(plan):
+    if type(plan) is native.StitchOperationPlan:
+        native._revalidate_geometry(plan.geometry)
+    else:
+        revalidate_xu_stitch_calibration(plan.calibration)
+    revalidate_mask(plan._mask_receipt)
+    for receipt in (plan._dark_receipt, plan._flat_receipt):
+        if receipt is not None:
+            native_detector_image(plan, receipt)
 
 
 class _StitchPreviewKernel:
@@ -103,15 +117,10 @@ class _StitchPreviewKernel:
         return old is not None
 
     def verify_assets(self):
-        plan = self.base
-        if type(plan) is native.StitchOperationPlan:
-            native._revalidate_geometry(plan.geometry)
-        else:
-            revalidate_xu_stitch_calibration(plan.calibration)
-        revalidate_mask(plan._mask_receipt)
-        for receipt in (plan._dark_receipt, plan._flat_receipt):
-            if receipt is not None:
-                native_detector_image(plan, receipt)
+        _verify_preview_assets(self.base)
+
+    def asset_witness(self):
+        return partial(_verify_preview_assets, self.base)
 
     def _metadata(self, point):
         row = dict(point.metadata)
@@ -199,14 +208,29 @@ class StitchPreviewWork:
         self.group = self.kernel = self.stream = self.screen = self.replay = self.snapshot = None
         self.points = ()
         self.saturations = {}
+        self.decoded = None
 
     def _update(self, **changes):
         self.progress = replace(self.progress, **changes)
+
+    def staging_bytes(self, group):
+        form = self.form
+        pixels = math.prod(form.detector_shape)
+        planes = min(pixels * 8 * largest_preview_point_planes(group), form.max_frame_bytes,
+                     MAX_PREVIEW_POINT_BYTES)
+        profile = min(form.npt_1d, _MAX_PREVIEW_PROFILE_BINS) * (1 + (0 if form.gi is None else len(form.gi.cuts)))
+        image = min(form.npt_rad_2d, _MAX_PREVIEW_RADIAL_BINS) * min(form.npt_azim_2d, _MAX_PREVIEW_AZIMUTHAL_BINS)
+        if form.mode == "2d":
+            profile += image * (1 + (form.gi is not None))
+        # Both native grids and their held frame parts can coexist during replay.
+        window = FrameScreenPolicy(exclude=form.frame_screen).window
+        return planes + pixels * 128 + profile * 6 * 8 * (4 + 2 * window)
 
     def _clear_grid(self):
         self.stream = self.screen = self.replay = self.snapshot = None
         self.points = ()
         self.saturations.clear()
+        self.decoded = None
         self._update(included=0, held=0, excluded=0, waiting=False, end_of_stream=False,
                      replay_target=None, pending_watermark=None, resident_bytes=0, admitted_bytes=0)
 
@@ -215,6 +239,12 @@ class StitchPreviewWork:
         self.kernel = None
         self._clear_grid()
         self._update(invalidated=self.progress.invalidated + 1)
+
+    def retire_staging(self):
+        if self.kernel is not None:
+            self.kernel = None
+            self._clear_grid()
+            self._update(resource_restarts=self.progress.resource_restarts + 1)
 
     def verify_assets(self):
         if self.kernel is not None:
@@ -231,16 +261,31 @@ class StitchPreviewWork:
             selected.setdefault(id(member), (member, []))[1].append(point)
         return preview_prefixes_hold(selected.values(), cancelled=cancelled)
 
-    def _feed(self, member, point, stream, screen, position, cancelled, cancel_token, *, replay):
-        policy = point.policy
-        count = 1 if policy is None else len(policy.raw_indices(0))
-        # At most one detached physical point lives across the native session.
-        plane_bytes = math.prod(self.form.detector_shape) * 8
-        if plane_bytes * count > min(_PREVIEW_POINT_BYTES, self.form.max_frame_bytes):
-            raise ValueError("The grouped detector point exceeds the preview memory bound")
-        planes, recorded = read_preview_point(point, cancelled=cancelled, include_saturation=True)
-        self._update(decodes=self.progress.decodes + len(planes),
-                     forward_decodes=self.progress.forward_decodes + (0 if replay else len(planes)))
+    def _feed(self, member, point, stream, screen, position, cancelled, cancel_token, yield_priority, *, replay):
+        if self.decoded is None or self.decoded[0] != point.identity:
+            count = 1 if point.policy is None else len(point.policy.raw_indices(0))
+            plane_bytes = math.prod(self.form.detector_shape) * 8
+            if plane_bytes * count > min(MAX_PREVIEW_POINT_BYTES, self.form.max_frame_bytes):
+                raise ValueError("The grouped detector point exceeds the preview memory bound")
+            planes, recorded = read_preview_point(point, cancelled=cancelled, include_saturation=True)
+            self.decoded = point.identity, planes, recorded
+            self._update(decodes=self.progress.decodes + len(planes),
+                         forward_decodes=self.progress.forward_decodes + (0 if replay else len(planes)))
+        if cancelled():
+            return False
+        with preview_compute_slot(yield_priority, uses_xu=self._uses_xu) as admitted:
+            if not admitted:
+                return False
+            self._integrate_point(member, point, stream, screen, position, cancel_token)
+        return True
+
+    @property
+    def _uses_xu(self):
+        return type(self.kernel.plan) is not native.StitchOperationPlan
+
+    def _integrate_point(self, member, point, stream, screen, position, cancel_token):
+        _, planes, recorded = self.decoded
+        self.decoded = None
         member_key = member.path, member.key
         if member_key in self.saturations and self.saturations[member_key] != recorded[0]:
             raise ValueError(f"The detector saturation changed in scan {member.key}")
@@ -249,8 +294,11 @@ class StitchPreviewWork:
         screen.extend((position,), (self.kernel.screen_row(member, point),))
         self.kernel.compute(MemoryFrameSource([frame]), stream, screen, saturation, cancel_token)
 
-    def _grow(self, group, offset, end, cancel_token, progress_callback):
-        scout = self.kernel.scout(group.points[offset:end], cancel_token)
+    def _grow(self, group, offset, end, cancel_token, progress_callback, yield_priority):
+        with preview_compute_slot(yield_priority, uses_xu=self._uses_xu) as admitted:
+            if not admitted:
+                return False
+            scout = self.kernel.scout(group.points[offset:end], cancel_token)
         prior = None if self.stream is None else self.stream.bounds
         bounds = enclosing_preview_bounds(scout.footprint, scout.automatic, prior)
         if self.stream is None:
@@ -266,6 +314,7 @@ class StitchPreviewWork:
             )
             self._update(replay_target=end)
             progress_callback("Rebuilding preview", 0, 1)
+        return True
 
     def _step(self, group, cancelled, yield_priority, progress_callback, cancel_token):
         remaining = _SLICE_POINTS
@@ -274,8 +323,9 @@ class StitchPreviewWork:
             if stage is not None:
                 position = stage.cursor
                 member, point = stage.target[position]
-                self._feed(member, point, stage.stream, stage.screen, position,
-                           cancelled, cancel_token, replay=True)
+                if not self._feed(member, point, stage.stream, stage.screen, position,
+                                  cancelled, cancel_token, yield_priority, replay=True):
+                    return
                 stage.cursor += 1
                 remaining -= 1
                 if stage.cursor == len(stage.target):
@@ -288,15 +338,17 @@ class StitchPreviewWork:
             if offset == len(group.points):
                 break
             end = min(len(group.points), offset + remaining)
-            self._grow(group, offset, end, cancel_token, progress_callback)
+            if not self._grow(group, offset, end, cancel_token, progress_callback, yield_priority):
+                return
             if self.replay is not None:
                 continue
             for position in range(offset, end):
                 if cancelled() or yield_priority():
                     return
                 member, point = group.points[position]
-                self._feed(member, point, self.stream, self.screen, position,
-                           cancelled, cancel_token, replay=False)
+                if not self._feed(member, point, self.stream, self.screen, position,
+                                  cancelled, cancel_token, yield_priority, replay=False):
+                    return
                 self.points = (*self.points, (member, point))
                 remaining -= 1
 
@@ -333,8 +385,11 @@ class StitchPreviewWork:
         represented = {(self.points[item.label][0].path, self.points[item.label][0].key)
                        for item in self.screen.verdicts if not item.excluded}
         rank = max((ranked.get(key, group.rank) for key in represented), default=group.rank)
+        mask = self.kernel.base._mask_receipt
         self.snapshot = PreviewSnapshot(group.identity, rank, keys, bounds, axes, intensity,
-                                        normalization, coverage, sigma, product=product)
+                                        normalization, coverage, sigma, product=product,
+                                        display_bytes=3 * self.kernel.grid_bytes
+                                        + (0 if mask is None else len(mask.pixels)))
 
     def _memory(self):
         grid = self.kernel.grid_bytes
@@ -344,7 +399,7 @@ class StitchPreviewWork:
         visible = 0 if self.snapshot is None else grid
         self._update(resident_bytes=self.kernel.asset_bytes + grid * (stages + held) + visible,
                      admitted_bytes=self.kernel.asset_bytes + grid * (4 + 2 * self.kernel.plan.frame_screen.window)
-                     + min(_PREVIEW_POINT_BYTES, self.form.max_frame_bytes))
+                     + min(MAX_PREVIEW_POINT_BYTES, self.form.max_frame_bytes))
 
     def run(self, group, cancelled, yield_priority, progress_callback):
         if self.group != group.identity:
@@ -366,7 +421,10 @@ class StitchPreviewWork:
                 self.invalidate(group.identity)
                 return None
             if self.kernel is None:
-                self.kernel = _StitchPreviewKernel(self.form)
+                with preview_compute_slot(yield_priority, uses_xu=self.form.backend != "multigeometry") as admitted:
+                    if not admitted:
+                        return self.snapshot
+                    self.kernel = _StitchPreviewKernel(self.form)
             else:
                 self.verify_assets()
             if self.kernel.context(group):

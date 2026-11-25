@@ -12,6 +12,8 @@ from xrd_tools.analysis.live_preview import PreviewGroupObserver, PreviewProgres
 
 
 _mounts = WeakSet()
+_DISPLAY_RESERVE_BYTES = 64 * 1024 * 1024
+_STAGING_RESERVE_BYTES = 512 * 1024 * 1024
 _STATUS_TIP = ("Provisional preview from complete per-point detector files. The finished scan is processed and "
                "saved separately. A growing grid or changing hot-pixel mask can replay earlier points.")
 
@@ -27,6 +29,7 @@ class _Slice:
 class _Verify:
     request: _Slice
     snapshot: object
+    verify_assets: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,9 @@ class LivePreviewOwner(QtCore.QObject):
         self._timer.timeout.connect(self.poll_due)
         self._epoch = self._work = self._candidate = self._observation = None
         self._snapshot = self._saved = self._done_target = self._staged = None
+        self._display_witness = None
+        self._recheck_display = False
+        self._staging_bytes = 0
         self._published_at = float("-inf")
         self._retired = {}
         self._activity = PreviewProgress()
@@ -141,6 +147,8 @@ class LivePreviewOwner(QtCore.QObject):
             self._work = StitchPreviewWork(science, image_axis=image_axis)
         self._epoch = object()
         self._candidate = self._done_target = self._snapshot = self._staged = self._saved = None
+        self._display_witness = None
+        self._recheck_display = False
         self._published_at = float("-inf")
         self._ownership_cancelled = False
         observer.preview_observe = PreviewGroupObserver(observer.selection, observer.read_options,
@@ -165,23 +173,61 @@ class LivePreviewOwner(QtCore.QObject):
     def _yield(self):
         return self._ownership_cancelled or any(mount._foreground() for mount in tuple(_mounts))
 
+    def _display_room(self, snapshot):
+        # The old and replacement projections can coexist while the view swaps.
+        visible = sum(mount._snapshot.display_bytes for mount in tuple(_mounts)
+                      if mount._snapshot is not None and mount._snapshot is not snapshot)
+        return visible + snapshot.display_bytes <= _DISPLAY_RESERVE_BYTES
+
+    def _retire_staging(self):
+        self._staged = self._done_target = None
+        if self.working:
+            self._recheck_display |= self._display_witness is not None
+            self._verification.release()
+        else:
+            self._recheck_display |= bool(self._staging_bytes and self._display_witness is not None)
+            self._requests.forget()
+            self._verification.forget()
+            self._work.retire_staging()
+            self._staging_bytes = 0
+
+    def _admit_staging(self, target):
+        charge = self._work.staging_bytes(target)
+        other = sum(mount._staging_bytes for mount in tuple(_mounts) if mount is not self)
+        if charge + other > _STAGING_RESERVE_BYTES:
+            return False
+        self._staging_bytes = charge
+        return True
+
     def poll_due(self):
         if not self.watching:
             if not self.working:
                 self._timer.stop()
                 was_active = self._work is not None
                 self._work = None
+                self._staging_bytes = 0
                 self._bar.set_live_preview_working(False)
                 if was_active:
                     self._watcher._state_changed()
             return
+        if self._yield():
+            # A running slice owns its state until it yields. The detached
+            # displayed projection keeps its separate reservation.
+            self._retire_staging()
+            return
+        if self._recheck_display and not self.working:
+            self._recheck_display = False
+            if self._display_witness is not None:
+                self._verification.ask(self._display_witness)
+                return
         current = self._candidate
-        if self._staged is not None and self.clock() >= self._published_at + 2 and not self.working:
+        if (self._staged is not None and self.clock() >= self._published_at + 2 and not self.working
+                and self._display_room(self._staged.snapshot)):
             staged, self._staged = self._staged, None
             if staged.request.target.identity not in self._retired:
                 self._verification.ask(staged)
                 return
-        if self.working or current is None or not current.points or self._yield():
+        if self.working or current is None or not current.points:
             if self.progress.replay_target is not None:
                 self._status("Rebuilding preview")
             elif current is not None and not current.points:
@@ -193,7 +239,10 @@ class LivePreviewOwner(QtCore.QObject):
                     and (waiting_observation is None or waiting_observation is self._observation)
                     and all(a.identity == b.identity for (_, a), (_, b) in zip(prior.points, current.points))):
                 return
-        self._requests.ask(_Slice(self._epoch, self._work, current))
+        if self._admit_staging(current):
+            self._requests.ask(_Slice(self._epoch, self._work, current))
+        else:
+            self._status("Preview waiting for science memory")
 
     def _compute(self, request, cancel, progress):
         return request.work.run(request.target, cancel.is_set, self._yield, progress)
@@ -212,9 +261,11 @@ class LivePreviewOwner(QtCore.QObject):
             return False
         snapshot = terminal.payload
         progress = request.work.progress
-        if snapshot is None or progress.waiting:
-            self._done_target = (request.target, len(request.target.points), request.target.ended,
-                                 self._observation if progress.waiting else None)
+        if self._yield():
+            self._retire_staging()
+            return False
+        if progress.waiting:
+            self._done_target = (request.target, len(request.target.points), request.target.ended, self._observation)
         elif progress.replay_target is None and progress.included + progress.held + progress.excluded >= len(
                 request.target.points):
             self._done_target = request.target, len(request.target.points), request.target.ended, None
@@ -224,26 +275,30 @@ class LivePreviewOwner(QtCore.QObject):
             self._status("Preview waiting for complete points" if progress.waiting else "Preview screening points")
             return False
         if snapshot is not self._snapshot:
-            verification = _Verify(request, snapshot)
-            if self.clock() >= self._published_at + 2:
+            verification = _Verify(request, snapshot, request.work.kernel.asset_witness())
+            if self.clock() >= self._published_at + 2 and self._display_room(snapshot):
                 self._staged = None
                 self._verification.ask(verification)
             else:
                 self._staged = verification
+                if not self._display_room(snapshot):
+                    self._status("Preview waiting for display memory")
         return True
 
     @staticmethod
     def _verify(verification, cancel, _progress):
         request = verification.request
         try:
-            request.work.verify_assets()
+            verification.verify_assets()
             return request.work.verifies(request.target, cancelled=cancel.is_set)
         except (OSError, ValueError):
             return False
 
     def _verified(self, verification, terminal):
         request = verification.request
-        if request.epoch is not self._epoch or request.target.identity in self._retired:
+        rechecking_display = verification is self._display_witness
+        if (request.epoch is not self._epoch
+                or request.target.identity in self._retired and not rechecking_display):
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED or terminal.payload is not True:
             request.work.invalidate(request.target.identity)
@@ -251,13 +306,29 @@ class LivePreviewOwner(QtCore.QObject):
             self._status("Preview waiting after an input change")
             return False
         snapshot = verification.snapshot
+        if rechecking_display:
+            return False
         if snapshot is self._snapshot:
             return True
+        if self._yield():
+            self._retire_staging()
+            return False
+        if not self._display_room(snapshot):
+            self._staged = verification
+            self._status("Preview waiting for display memory")
+            return False
+        visible = self._snapshot
+        if (visible is not None and visible.group_identity == snapshot.group_identity
+                and len(snapshot.points) < len(visible.points)
+                and snapshot.points == visible.points[:len(snapshot.points)]):
+            # Reconstructing retired staging must catch up to the reserved view.
+            return False
         if self._snapshot is None or snapshot.rank >= self._snapshot.rank:
-            self._publish(snapshot)
+            self._publish(verification)
         return True
 
-    def _publish(self, snapshot):
+    def _publish(self, verification):
+        snapshot = verification.snapshot
         if snapshot.group_identity in self._retired:
             return
         if self._saved is not None and snapshot.rank <= self._saved[0]:
@@ -268,6 +339,7 @@ class LivePreviewOwner(QtCore.QObject):
             self._status(f"Preview display refused: {error}")
             return
         self._snapshot = snapshot
+        self._display_witness = verification
         self._published_at = self.clock()
         point_count = len(snapshot.points)
         text = f"Provisional · scan {snapshot.points[-1][0]} · {point_count} points shown"
@@ -309,7 +381,9 @@ class LivePreviewOwner(QtCore.QObject):
             return rank >= self._saved[0]
         if visible.group_identity == group.identity or rank > visible.rank:
             self._snapshot = None
+            self._display_witness = None
             self._staged = None
+            self._verification.forget()
             return True
         return False
 
@@ -318,6 +392,8 @@ class LivePreviewOwner(QtCore.QObject):
             self._staged = None
         if self._snapshot is not None and (group is None or self._snapshot.group_identity == group):
             self._snapshot = None
+            self._display_witness = None
+            self._verification.forget()
             self._fallback(None if self._saved is None else self._saved[1])
 
     def stop(self, *, closing=False):
@@ -327,6 +403,7 @@ class LivePreviewOwner(QtCore.QObject):
         self._verification.release()
         if closing:
             self._snapshot = self._staged = None
+            self._display_witness = None
         else:
             self._clear_snapshot()
         if self.working:
@@ -337,4 +414,8 @@ class LivePreviewOwner(QtCore.QObject):
         self.stop(closing=True)
         self._timer.stop()
         results = self._requests.shutdown(), self._verification.shutdown()
-        return next((receipt for receipt in results if receipt.status is not PageCleanup.CLEAN), results[0])
+        receipt = next((result for result in results if result.status is not PageCleanup.CLEAN), results[0])
+        if receipt.status is PageCleanup.CLEAN:
+            self._work = None
+            self._staging_bytes = 0
+        return receipt
