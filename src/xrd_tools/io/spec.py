@@ -80,6 +80,7 @@ class _SpecCapture:
         self._keys_checked = False
         self._strict_checked: set[str] = set()
         self._row_counts_checked: set[str] = set()
+        self._commands: dict[str, tuple[str, bool]] | None = None
         descriptor = None
         captured = False
         try:
@@ -160,6 +161,23 @@ class _SpecCapture:
                 f"its bytes hold {frame.rows}"
             )
         self._row_counts_checked.add(frame.key)
+
+    def scan_commands(self):
+        """Complete numbered headers in acquisition order from the captured bytes."""
+        if self._commands is None:
+            commands = {}
+            with self.scratch.open("rb") as stream:
+                for frame in self._frames.values():
+                    if not frame.start_complete:
+                        continue
+                    stream.seek(frame.offset)
+                    line = stream.readline(1 << 16)
+                    parts = line.split(maxsplit=2)
+                    if line.endswith(b"\n") and len(parts) == 3:
+                        commands[frame.key] = parts[2].strip().decode("utf-8", errors="replace")
+            last = next(reversed(commands), None)
+            self._commands = {key: (command, key != last) for key, command in commands.items()}
+        return self._commands
 
     def check_numeric_tokens(self, spec_file, scan_data, labels):
         key = f"{scan_data.number}.{scan_data.order}"
@@ -261,6 +279,14 @@ def spec_occurrence(spec_file: Path | str, key: str):
         frame.header, frame.header_sha256, frame.block_end, frame.block_sha256, frame.rows,
         (view.device, view.inode, view.size, view.mtime_ns, view.ctime_ns),
     )
+
+
+def spec_scan_completion_header(spec_file: Path | str, key: str) -> tuple[str, bool]:
+    """Return a selected command and whether a complete later numbered command follows."""
+    capture = _scoped_capture(spec_file)
+    if capture is None:
+        raise RuntimeError("SPEC completion requires an active capture scope")
+    return capture.scan_commands().get(key, ("", False))
 
 
 def _spec_parser(spec_file: Path | str):

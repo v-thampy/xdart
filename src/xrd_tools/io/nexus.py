@@ -1526,15 +1526,13 @@ def list_entries(path: Path | str) -> list[str]:
         raise FileNotFoundError(f"NeXus file not found: {p}")
 
     with h5py.File(p, "r") as f:
-        entries = [
-            name
-            for name, obj in f.items()
-            if isinstance(obj, h5py.Group) and _nx_class(obj) == "NXentry"
-        ]
-        if not entries:
-            # Graceful fallback: return all top-level groups
-            entries = [name for name, obj in f.items() if isinstance(obj, h5py.Group)]
-    return entries
+        return list_entries_from_open(f)
+
+
+def list_entries_from_open(stream) -> list[str]:
+    """The native entry order, from the caller's already open file."""
+    groups = [(name, obj) for name, obj in stream.items() if isinstance(obj, h5py.Group)]
+    return [name for name, obj in groups if _nx_class(obj) == "NXentry"] or [name for name, _ in groups]
 
 
 # ---------------------------------------------------------------------------

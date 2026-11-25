@@ -595,12 +595,12 @@ _SHARED_LISTINGS = contextvars.ContextVar("xdart_shared_image_listings", default
 
 
 @contextlib.contextmanager
-def shared_image_listings():
+def shared_image_listings(*, all_stems=False):
     """Within this block, :func:`find_image_files` lists each (folder, stem, extensions) once and reuses it
     (NEXT-1210-RESPONSIVENESS C-16: a search of a SPEC file's scans listed a 20,700-image folder twice per scan, about
     0.94 s each). One search's own scope: images that arrive during it are found by the next search. Nested blocks
     share the outermost one's listings."""
-    token = _SHARED_LISTINGS.set({}) if _SHARED_LISTINGS.get() is None else None
+    token = _SHARED_LISTINGS.set({"all_stems": all_stems}) if _SHARED_LISTINGS.get() is None else None
     try:
         yield
     finally:
@@ -617,6 +617,17 @@ def shared_listing(key, build):
     if key not in shared:
         shared[key] = build()
     return shared[key]
+
+
+def share_image_inventory(files):
+    """Expose the files of a directory discovery sweep to scoped image matching."""
+    shared = _SHARED_LISTINGS.get()
+    if shared is not None and shared.get("all_stems"):
+        folders = {}
+        for path in files:
+            folders.setdefault(path.parent, []).append(path)
+        for folder, paths in folders.items():
+            shared["image-folder", folder] = tuple(paths)
 
 
 def find_image_files(
@@ -637,7 +648,12 @@ def find_image_files(
     if shared is not None and key in shared:
         return list(shared[key])
     pattern = f"*{stem}*" if stem else "*"
-    candidates = [p for p in directory.glob(pattern) if p.suffix.lower() in exts]
+    if shared is not None and shared.get("all_stems"):
+        from fnmatch import fnmatch
+        children = shared_listing(("image-folder", directory), lambda: tuple(directory.glob("*")))
+        candidates = [p for p in children if p.suffix.lower() in exts and fnmatch(p.name, pattern)]
+    else:
+        candidates = [p for p in directory.glob(pattern) if p.suffix.lower() in exts]
     try:
         found = os_sorted(candidates)
     except Exception:

@@ -147,7 +147,7 @@ def detect_point_images(spec: SourceSpec, scan_label: str, point_count: int,
     return None
 
 
-def _nexus_point_count(spec: SourceSpec, image_count: int) -> int | None:
+def _nexus_point_count(spec: SourceSpec, image_count: int, *, entry=None) -> int | None:
     """Declared point counts only; never derive points from motor positions."""
     options = dict(spec.options)
     explicit = options.get("scan_point_count")
@@ -155,36 +155,35 @@ def _nexus_point_count(spec: SourceSpec, image_count: int) -> int | None:
         if type(explicit) is not int or explicit <= 0:
             raise ValueError("scan point count must be a positive whole count")
         return explicit
-    import h5py
-    from xrd_tools.io.bluesky_nexus import resolve_nxentry
+    if entry is None:
+        import h5py
+        from xrd_tools.io.bluesky_nexus import resolve_nxentry
 
-    with h5py.File(spec.uri, "r") as stream:
-        entry = resolve_nxentry(stream, spec.entry or "entry")
-        if entry is None:
+        with h5py.File(spec.uri, "r") as stream:
+            group = resolve_nxentry(stream, spec.entry or "entry")
+            return None if group is None else _nexus_point_count(spec, image_count, entry=group)
+    path = options.get("scan_point_count_path")
+    if path is not None:
+        if type(path) is not str or not path:
+            raise ValueError("scan point count path must be a dataset path")
+        dataset = entry.get(path)
+        if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
+            raise ValueError("scan point count dataset must be one positive whole count")
+        value = int(dataset[()])
+        if value <= 0:
+            raise ValueError("scan point count dataset must be one positive whole count")
+        return value
+    specific = entry.get("instrument/detector/detectorSpecific")
+    if specific is None:
+        return None
+    counts = []
+    for name in ("nimages", "ntrigger"):
+        dataset = specific.get(name)
+        if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
             return None
-        path = options.get("scan_point_count_path")
-        if path is not None:
-            if type(path) is not str or not path:
-                raise ValueError("scan point count path must be a dataset path")
-            dataset = entry.get(path)
-            if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
-                raise ValueError("scan point count dataset must be one positive whole count")
-            value = int(dataset[()])
-            if value <= 0:
-                raise ValueError("scan point count dataset must be one positive whole count")
-            return value
-        specific = entry.get("instrument/detector/detectorSpecific")
-        if specific is None:
-            return None
-        counts = []
-        for name in ("nimages", "ntrigger"):
-            dataset = specific.get(name)
-            if dataset is None or dataset.shape != () or dataset.dtype.kind not in "iu":
-                return None
-            counts.append(int(dataset[()]))
-        exposures, points = counts
-        return points if exposures > 0 and points > 0 and exposures * points == image_count else None
-
+        counts.append(int(dataset[()]))
+    exposures, points = counts
+    return points if exposures > 0 and points > 0 and exposures * points == image_count else None
 
 def inspect_point_images(spec: SourceSpec, *, warn_missing_spec: bool = True) -> PointImageDetection | None:
     """Inspect recorded SPEC points / declared NeXus counts and image layouts.

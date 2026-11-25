@@ -130,7 +130,10 @@ def _spec_image_layout(path, read_image_kwargs, nexus_entry=None):
     if Path(path).suffix.lower() in _HDF5_READ_EXTS:
         return shared_listing(("spec-container-layout", os.fspath(path), nexus_entry or None),
                               lambda: _read_spec_image_layout(path, read_image_kwargs, nexus_entry))
-    return _read_spec_image_layout(path, read_image_kwargs, nexus_entry)
+    options = tuple(read_image_kwargs.get(key) for key in ("detector_shape", "raw_dtype", "raw_header_skip"))
+    shape, dtype, skip = options
+    return shared_listing(("spec-image-layout", os.fspath(path), tuple(shape or ()), str(dtype), skip),
+                          lambda: _read_spec_image_layout(path, read_image_kwargs, nexus_entry))
 
 
 def _read_spec_image_layout(path, read_image_kwargs, nexus_entry=None):

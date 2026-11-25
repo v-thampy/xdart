@@ -1,0 +1,482 @@
+"""Readiness and detached custody for native per-scan Live."""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+import h5py
+from silx.io.specfile import SfError
+
+from xrd_tools.analysis import stitch_sources
+from xrd_tools.core.scan import SourceKind, SourceSpec
+from xrd_tools.io import image, nexus, spec, stat_identity
+from xrd_tools.io.bluesky_nexus import is_bluesky_nxwriter
+from xrd_tools.io.metadata import SpecOccurrence, SpecOccurrenceUnsettled
+from xrd_tools.io.processed_scan_id import has_processed_output_markers_file
+from xrd_tools.sources import descriptor, execution_graph, open_source
+from xrd_tools.sources.discover import _walk_files
+from xrd_tools.sources.execution_graph import SourceFileState
+from xrd_tools.sources.point_images import (
+    PointImagePolicy, PointImagesRequired, _nexus_point_count, detect_point_images, inspect_point_images,
+)
+from xrd_tools.sources.registry import _nexus_is_candidate
+from xrd_tools.sources.spec import find_spec_image_files
+
+_WAIT_ERRORS = (OSError, ValueError, LookupError, SfError, SpecOccurrenceUnsettled)
+
+
+class _Skipped(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class LiveMemberWitness:
+    member: stitch_sources.PlannedStitchMember
+    source: SourceSpec
+    occurrence_identity: tuple
+    occurrence: SpecOccurrence | None = field(compare=False)
+    successor_required: bool
+    labels: tuple[int, ...]
+    mapping: tuple
+    files: tuple[SourceFileState, ...]
+    graphs: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class LiveContainerWitness:
+    root: SourceFileState
+    entries: tuple[tuple[str, str, LiveMemberWitness], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveEvidence:
+    members: tuple[LiveMemberWitness, ...]
+    containers: tuple[LiveContainerWitness, ...]
+    labels: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LiveScanRow:
+    group: stitch_sources.PlannedStitchGroup
+    status: str
+    reason: str = ""
+    evidence: LiveEvidence | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LiveScanObservation:
+    groups: tuple[LiveScanRow, ...]
+    late_entries: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LiveScanHandoff:
+    group: stitch_sources.PlannedStitchGroup
+    evidence: LiveEvidence
+    session_id: str
+    attempt_id: str
+
+    @classmethod
+    def from_ready(cls, row, *, session_id, attempt_id):
+        if row.status != "ready" or row.evidence is None:
+            raise ValueError("Live can hand off only a ready group")
+        return cls(row.group, row.evidence, session_id, attempt_id)
+
+
+def _planned_points(command):
+    """Interpret only known SPEC macros with complete, numeric arguments."""
+    tokens = command.split()
+    if not tokens:
+        return None
+    macro, *args = tokens
+    match = re.fullmatch(r"[ad](\d*)scan", macro)
+    if match:
+        motors = int(match[1] or 1) if len(match[1]) < 5 else 0
+        if not motors or len(args) != 3 * motors + 2:
+            return None
+        coordinates = [i for i in range(3 * motors) if i % 3]
+        intervals = (len(args) - 2,)
+    elif macro in {"mesh", "dmesh"} and len(args) == 9:
+        coordinates, intervals = (1, 2, 5, 6), (3, 7)
+    elif macro == "hklscan" and len(args) == 8:
+        coordinates, intervals = range(6), (6,)
+    elif macro == "loopscan" and len(args) == 2:
+        coordinates, intervals = (), (0,)
+    else:
+        return None
+    try:
+        if not all(math.isfinite(float(args[i])) for i in (*coordinates, len(args) - 1)):
+            return None
+        if not all(re.fullmatch(r"[+]?[0-9]{1,18}", args[i]) for i in intervals):
+            return None
+        counts = tuple(int(args[i]) for i in intervals)
+    except ValueError:
+        return None
+    if macro == "loopscan":
+        return counts[0] or None
+    return math.prod(value + 1 for value in counts)
+
+
+def _end_marker(entry):
+    dataset = entry.get("end_time")
+    if not isinstance(dataset, h5py.Dataset) or dataset.shape not in {(), (1,)}:
+        return ""
+    if h5py.check_string_dtype(dataset.dtype) is None:
+        return ""
+    value = dataset.asstr()[()] if dataset.shape == () else dataset.asstr()[0]
+    return value.strip()
+
+
+def _spec_identity(proof):
+    return (proof.path, proof.resolved, proof.device, proof.inode, proof.content)
+
+
+def _same_files(files, state):
+    for expected in files:
+        current = state(Path(expected.path))
+        if current != expected or execution_graph._resolved(current) != execution_graph._resolved(expected):
+            return False
+    return True
+
+
+def _graph_files(graph):
+    stamp = graph.stamp
+    return tuple(dict.fromkeys((stamp.file, *stamp.members,
+                                *(member.file for member in stamp.external_members),
+                                *stamp.dependency_files)))
+
+
+class _ObservationSweep:
+    def __init__(self, observer, cancelled, retired):
+        self.observer = observer
+        self.selection = observer.selection
+        self.cancelled = cancelled
+        self.retired = retired
+        self.states = {}
+        self.keys = {}
+        self.listings = {}
+        self.members = {}
+        self.roots = {}
+        self.graphs = {}
+        self.next_spec = {}
+        self.next_members = {}
+        self.next_roots = {}
+        self.next_late = {}
+
+    def check(self):
+        if self.cancelled is not None and self.cancelled():
+            raise stitch_sources.SourceSearchCancelled("Live scan observation stopped")
+
+    def state(self, path):
+        if path not in self.states:
+            self.states[path] = SourceFileState.capture(path)
+        return self.states[path]
+
+    def spec_keys(self, path):
+        if path not in self.keys:
+            try:
+                state = self.state(path)
+                saved = self.observer._spec_keys.get(path)
+                if stat_identity.IDENTITY_CARRIES_CTIME and saved is not None and saved[0] == state:
+                    keys = saved[1]
+                else:
+                    keys = tuple(spec.list_spec_scans(path))
+                self.next_spec[path] = state, keys
+                self.keys[path] = keys
+            except _WAIT_ERRORS:
+                self.keys[path] = ()
+        return self.keys[path]
+
+    def inventory(self, directory, recursive, name_ok, check):
+        files = _walk_files(directory, recursive, check=check)
+        image.share_image_inventory(files)
+        spec_paths, nexus_paths, eiger_paths = [], [], []
+        for path in files:
+            check()
+            if _nexus_is_candidate(path) and name_ok(path.stem):
+                kind, _, _ = self.listing(path)
+                if kind is SourceKind.NEXUS_STACK:
+                    nexus_paths.append(path)
+                elif kind is SourceKind.EIGER_MASTER:
+                    eiger_paths.append(path)
+            elif path.suffix.lower() not in stitch_sources._NOT_SPEC and name_ok(path.name):
+                if spec.is_spec_file(path):
+                    spec_paths.append(path)
+        return spec_paths, (*nexus_paths, *eiger_paths)
+
+    def nexus_listing(self, path):
+        kind, entries, _ = self.listing(path)
+        return kind, entries
+
+    def listing(self, path):
+        if path in self.listings:
+            return self.listings[path]
+        try:
+            state = self.state(path)
+            baseline = self.retired.get(path)
+            saved = self.observer._late.get(path) if baseline is not None else self.observer._roots.get(path)
+            if baseline is not None and state == baseline.root:
+                value = SourceKind.NEXUS_STACK, tuple(key for key, *_ in baseline.entries), ""
+            elif saved is not None and saved[0] == state:
+                value = saved[1]
+            else:
+                value = self.read_listing(path, state, entries_only=baseline is not None)
+            if baseline is not None:
+                self.next_late[path] = state, value
+        except _WAIT_ERRORS as error:
+            value = SourceKind.NEXUS_STACK, (), str(error)
+        self.listings[path] = value
+        return value
+
+    @staticmethod
+    def read_listing(path, state, *, entries_only):
+        with h5py.File(path, "r") as stream:
+            entries = tuple(nexus.list_entries_from_open(stream))
+            if entries_only:
+                result = SourceKind.NEXUS_STACK, entries, ""
+            elif has_processed_output_markers_file(stream):
+                result = SourceKind.PROCESSED_NEXUS, (), "processed output"
+            else:
+                is_eiger = any(image.eiger_vendor_master(stream[key]) for key in entries)
+                kind = SourceKind.EIGER_MASTER if is_eiger else SourceKind.NEXUS_STACK
+                result = kind, entries, ""
+        if not state.matches_disk():
+            raise ValueError(f"{path.name} changed while listing its entries")
+        return result
+
+    def graph(self, path, key, kind):
+        identity = path, key
+        if identity not in self.graphs:
+            graph = execution_graph.qualify_source_execution_graph(
+                SourceSpec(path, kind, entry=key),
+                cancelled=self.cancelled, infer_point_images=False)
+            self.graphs[identity] = graph
+        return self.graphs[identity]
+
+    def container(self, path):
+        if path in self.roots:
+            return self.roots[path]
+        kind, entries, reason = self.listing(path)
+        state = self.state(path)
+        saved = self.observer._roots.get(path)
+        if reason:
+            raise ValueError(reason)
+        if kind is SourceKind.PROCESSED_NEXUS:
+            raise _Skipped(f"{path.name} is a processed output")
+        if not entries:
+            raise ValueError(f"{path.name}: waiting for NeXus entries")
+        if saved is not None and saved[0] == state and all(
+                _same_files(member.files, self.state) for _, _, member in saved[2].entries):
+            witness = saved[2]
+        else:
+            members = []
+            with h5py.File(path, "r") as stream:
+                if kind is SourceKind.EIGER_MASTER and not is_bluesky_nxwriter(stream):
+                    raise _Skipped(f"{path.name} is a detector-only Eiger master")
+                for key in entries:
+                    self.check()
+                    entry = stream[key]
+                    if not is_bluesky_nxwriter(entry):
+                        raise ValueError(f"{path.name}:{key} is waiting for NXWriter completion")
+                    marker = _end_marker(entry)
+                    if not marker:
+                        raise ValueError(f"{path.name}:{key} has no entry-local end_time")
+                    paths = tuple(nexus._exact_entry_stack_paths(stream, path, key))
+                    member = stitch_sources.PlannedStitchMember(path, key, kind)
+                    graph = self.graph(path, key, kind)
+                    files = _graph_files(graph)
+                    if tuple(graph.dataset_paths) != paths or not _same_files(files, self.state):
+                        raise ValueError(f"{path.name}:{key} detector graph is changing")
+                    source = SourceSpec(path, kind, entry=key)
+                    count = graph.stamp.frame_count
+                    points = _nexus_point_count(source, count, entry=entry)
+                    detection = detect_point_images(source, graph.group_key, points, count) if points else None
+                    source = _confirmed_source(self.selection, source, detection=detection)
+                    grouping = source.options.get("point_images")
+                    if grouping is None:
+                        labels = tuple(range(count))
+                        mapping = paths, count, graph.stamp.external_members
+                    else:
+                        policy = PointImagePolicy.from_dict(grouping)
+                        if not points or points * policy.images_per_point != count:
+                            raise ValueError(f"{path.name}:{key} no longer has the confirmed point grouping")
+                        labels = tuple(range(points))
+                        mapping = (paths, count, graph.stamp.external_members,
+                                   tuple(tuple(policy.raw_indices(label)) for label in labels))
+                    members.append((key, marker, LiveMemberWitness(
+                        member, source, (), None, False, labels, mapping, files, (graph,))))
+            if not state.matches_disk():
+                raise ValueError(f"{path.name} changed while checking completion")
+            witness = LiveContainerWitness(state, tuple(members))
+        self.roots[path] = witness
+        self.next_roots[path] = state, (kind, entries, ""), witness
+        return witness
+
+    def spec_member(self, member):
+        if member in self.members:
+            return self.members[member]
+        path, key = member.path, member.key
+        if key not in self.spec_keys(path):
+            raise ValueError(f"{path.name}: waiting for SPEC scan {key}")
+        source = stitch_sources.planned_member_source(self.selection, self.observer.read_options, member)
+        options = source.options
+        paths = tuple(find_spec_image_files(options["image_dir"], path.stem, key, options["image_stem"]))
+        raw = tuple(self.state(path) for path in paths)
+        state = self.state(path)
+        saved = self.observer._members.get(member)
+        same_media = (saved is not None and saved[1] == raw and
+                      _same_files(saved[2].files, self.state))
+        if same_media and saved[0] == state and stat_identity.IDENTITY_CARRIES_CTIME:
+            witness = saved[2]
+        else:
+            proof = spec.spec_occurrence(path, key)
+            if proof is None:
+                raise ValueError(f"{path.name}: waiting for complete SPEC scan {key}")
+            command, successor = spec.spec_scan_completion_header(path, key)
+            planned = _planned_points(command)
+            needs_successor = planned is None or proof.rows < planned
+            if needs_successor and not successor:
+                raise ValueError(f"{path.name}: waiting for completion of SPEC scan {key}")
+            if not proof.rows:
+                raise _Skipped(f"{path.name}: SPEC scan {key} has no recorded points")
+            identity = _spec_identity(proof)
+            if same_media and saved[2].occurrence_identity == identity:
+                witness = replace(saved[2], occurrence=proof, successor_required=needs_successor)
+            else:
+                source = _confirmed_source(self.selection, source)
+                opened = open_source(source)
+                try:
+                    labels = tuple(opened.frame_indices)
+                    if not paths or len(labels) != proof.rows or not opened.capabilities.has_raw_references:
+                        raise ValueError(f"{path.name}: waiting for detector coverage of scan {key}")
+                    graphs = []
+                    for detector in paths:
+                        self.check()
+                        if detector.suffix.lower() not in stitch_sources._CONTAINER_SUFFIXES:
+                            continue
+                        entry = options.get("nexus_entry") or "entry"
+                        native = descriptor.describe_container(detector, entry=entry)
+                        if native.resolved_entry is None:
+                            raise ValueError(f"{detector.name} has no detector entry")
+                        graphs.append(self.graph(detector, native.resolved_entry, native.kind))
+                    files = tuple(dict.fromkeys((*raw, *(value for graph in graphs for value in _graph_files(graph)))))
+                    if not _same_files(files, SourceFileState.capture):
+                        raise ValueError(f"{path.name}: detector inputs changed while observing scan {key}")
+                    mapping = tuple(tuple((str(raw_path), index, opened._container_dataset_paths.get(raw_path))
+                                          for raw_path, index in opened.point_raw_locators(label))
+                                    for label in labels)
+                    witness = LiveMemberWitness(member, source, identity, proof, needs_successor,
+                                                labels, mapping, files, tuple(graphs))
+                finally:
+                    _close(opened)
+        self.members[member] = witness
+        self.next_members[member] = state, raw, witness
+        return witness
+
+    def evidence(self, group):
+        containers = tuple(self.container(path) for path in group.paths
+                           if group.identity[0] in {"nexus", "directory-nexus"})
+        entries = {(value.member.path, key): value for root in containers
+                   for key, _, value in root.entries}
+        if not group.members:
+            raise ValueError("Waiting for the selected exact NeXus entry")
+        if self.selection.nexus_entry and containers and any(
+                self.selection.nexus_entry not in {key for key, _, _ in root.entries}
+                for root in containers):
+            raise ValueError(f"Waiting for exact NeXus entry {self.selection.nexus_entry!r}")
+        members = tuple(self.spec_member(member) if member.kind is SourceKind.SPEC
+                        else entries[(member.path, member.key)] for member in group.members)
+        select = self.observer.select_labels
+        labels = tuple(member.labels if select is None else tuple(select(member.labels)) for member in members)
+        if not all(labels):
+            raise _Skipped("No frames selected for this scan group")
+        return LiveEvidence(members, containers, labels)
+
+
+def _close(source):
+    close = getattr(source, "close", None)
+    if close is not None:
+        close()
+
+
+_INSPECT_GROUPING = object()
+
+
+def _confirmed_source(selection, source, *, detection=_INSPECT_GROUPING):
+    key = source.options.get("scan") or source.entry
+    policy = next((choice for uri, scan, choice in selection.point_image_choices
+                   if uri == str(source.uri) and scan == key), None)
+    if source.kind is SourceKind.SPEC and policy is None:
+        return source
+    if detection is _INSPECT_GROUPING:
+        detection = inspect_point_images(source)
+    if detection is None and source.kind is SourceKind.SPEC:
+        return source
+    if detection is not None and (policy is None or policy.images_per_point != detection.images_per_point):
+        raise _Skipped(f"{Path(source.uri).name}:{key} needs confirmed point-image grouping")
+    if policy is None:
+        return source
+    return replace(source, options={**source.options, "point_images": policy.to_dict()})
+
+
+class LiveScanObserver:
+    """One frozen selection's poll state. Use on the poll worker only."""
+
+    def __init__(self, selection, read_image_kwargs, *, select_labels=None, stillness=2.0):
+        self.selection = selection
+        self.read_options = dict(read_image_kwargs)
+        self.select_labels = select_labels
+        self.stillness = stillness
+        self._spec_keys = {}
+        self._members = {}
+        self._roots = {}
+        self._late = {}
+        self._still = {}
+
+    def invalidate(self, identity):
+        self._still.pop(identity, None)
+        self._spec_keys.clear()
+        self._members.clear()
+        self._roots.clear()
+
+    def poll(self, *, now, consumed=(), cancelled=None):
+        already = {handoff.group.identity for handoff in consumed}
+        retired = {Path(root.root.path): root for handoff in consumed for root in handoff.evidence.containers}
+        sweep = _ObservationSweep(self, cancelled, retired)
+        rows, late, still = [], [], {}
+        with image.shared_image_listings(all_stems=True), spec.spec_capture_scope():
+            groups = stitch_sources.list_planned_stitch_groups(
+                self.selection, check=sweep.check, allow_pending=True, spec_keys=sweep.spec_keys,
+                nexus_listing=sweep.nexus_listing, directory_inventory=sweep.inventory)
+            for group in groups:
+                if group.identity in already:
+                    continue
+                try:
+                    evidence = sweep.evidence(group)
+                except (_Skipped, PointImagesRequired) as error:
+                    rows.append(LiveScanRow(group, "skipped", str(error)))
+                except _WAIT_ERRORS as error:
+                    rows.append(LiveScanRow(group, "waiting", str(error) or "Waiting for recorded data"))
+                else:
+                    previous = self._still.get(group.identity)
+                    since = previous[1] if previous is not None and previous[0] == evidence else now
+                    still[group.identity] = evidence, since
+                    if now - since >= self.stillness:
+                        rows.append(LiveScanRow(group, "ready", evidence=evidence))
+                    else:
+                        rows.append(LiveScanRow(group, "waiting", "Waiting for source stillness"))
+            for path, baseline in retired.items():
+                sweep.check()
+                known = {key for key, _, _ in baseline.entries}
+                _, entries, _ = sweep.listing(path)
+                late.extend((str(path), key) for key in entries if key not in known)
+            sweep.check()
+        self._spec_keys = sweep.next_spec
+        self._members = sweep.next_members
+        self._roots = sweep.next_roots
+        self._late = sweep.next_late
+        self._still = still
+        return LiveScanObservation(tuple(rows), tuple(late))

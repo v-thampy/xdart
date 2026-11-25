@@ -278,6 +278,20 @@ class SourceSearchCancelled(InterruptedError):
     """A search of a Source's scans stopped between scans (NEXT-1210-RESPONSIVENESS C-16)."""
 
 
+def planned_member_source(selection, read_image_kwargs, member):
+    """The native ungrouped source options for a planned member."""
+    path, key = member.path, member.key
+    if member.kind is not SourceKind.SPEC:
+        return SourceSpec(path, member.kind, entry=key)
+    stem = selection.image_stem.format(spec=path.stem, scan=key.split(".")[0], occurrence=key)
+    return SourceSpec(path, member.kind, options={
+        "scan": key, "image_dir": selection.image_dir or str(path.parent),
+        "image_stem": stem or None, "read_image_kwargs": dict(read_image_kwargs),
+        "require_complete_images": True,
+        **({"nexus_entry": selection.nexus_entry} if selection.nexus_entry else {}),
+    })
+
+
 def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs, *, cancelled=None,
                            progress=None, planned_group=None) -> StitchSourceResolution:
     """Freeze discovery and skips once at Preview; never rediscover during Run.
@@ -338,13 +352,8 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress, p
         return spec
 
     def spec_member(path, key, every_scan):
-        stem = selection.image_stem.format(spec=path.stem, scan=key.split(".")[0], occurrence=key)
-        spec = SourceSpec(path, SourceKind.SPEC, options={
-            "scan": key, "image_dir": selection.image_dir or str(path.parent),
-            "image_stem": stem or None, "read_image_kwargs": dict(read_image_kwargs),
-            "require_complete_images": True,
-            **({"nexus_entry": selection.nexus_entry} if selection.nexus_entry else {}),
-        })
+        spec = planned_member_source(selection, read_image_kwargs,
+                                     PlannedStitchMember(path, key, SourceKind.SPEC))
         try:
             spec = confirmed(spec)
             if spec is None:
@@ -363,7 +372,7 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress, p
         try:
             if not source.capabilities.has_raw_references:
                 folder = selection.image_dir or str(path.parent)
-                searched = stem or f"{path.stem}_scan{key.split('.')[0]}_"
+                searched = spec.options["image_stem"] or f"{path.stem}_scan{key.split('.')[0]}_"
                 skipped.append((str(path), key, f"No detector images named *{searched}* in {folder}"))
                 return None
             names[id(spec)] = int_scan_name(source.raw_locator_for(0)[0])  # as Int names these images
@@ -393,7 +402,7 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress, p
             if member.kind is SourceKind.SPEC:
                 value = spec_member(path, key, False)
             else:
-                value = confirmed(SourceSpec(path, member.kind, entry=key),
+                value = confirmed(planned_member_source(selection, read_image_kwargs, member),
                                   directory=selection.kind == "Directory" and planned_group is None)
                 if value is not None:
                     names[id(value)] = int_scan_name(path)
