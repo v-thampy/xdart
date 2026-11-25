@@ -165,6 +165,17 @@ class LivePreviewOwner(QtCore.QObject):
             self._candidate = candidate
         else:
             self._candidate = None
+        if self._snapshot is not None and self._candidate is not None:
+            shown = self._snapshot
+            if self._candidate.identity == shown.group_identity:
+                seen = self._candidate.points
+                covered = shown.input_prefix.points
+                if len(seen) < len(covered) or any(
+                        left.identity != right.identity for (_, left), (_, right) in zip(seen, covered)):
+                    self._clear_snapshot(shown.group_identity)
+                elif self._done_target is not None:
+                    # Asset drift can occur while the detector has paused.
+                    self._recheck_display = True
         if old is not None and (self._candidate is None or not self._candidate.points) and self._snapshot is not None:
             if self._snapshot.group_identity not in self._retired:
                 self._clear_snapshot()
@@ -235,7 +246,7 @@ class LivePreviewOwner(QtCore.QObject):
             return
         if self._done_target is not None:
             prior, count, ended, waiting_observation = self._done_target
-            if (prior.identity == current.identity and ended == current.ended and count >= len(current.points)
+            if (prior.identity == current.identity and ended == current.ended and count == len(current.points)
                     and (waiting_observation is None or waiting_observation is self._observation)
                     and all(a.identity == b.identity for (_, a), (_, b) in zip(prior.points, current.points))):
                 return
@@ -287,10 +298,10 @@ class LivePreviewOwner(QtCore.QObject):
 
     @staticmethod
     def _verify(verification, cancel, _progress):
-        request = verification.request
         try:
             verification.verify_assets()
-            return request.work.verifies(verification.snapshot.input_prefix, cancelled=cancel.is_set)
+            snapshot = verification.snapshot
+            return snapshot.input_prefix.verifies(metadata=snapshot.metadata_prefix, cancelled=cancel.is_set)
         except (OSError, ValueError):
             return False
 
@@ -302,6 +313,7 @@ class LivePreviewOwner(QtCore.QObject):
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED or terminal.payload is not True:
             request.work.invalidate(request.target.identity)
+            self._done_target = None
             self._clear_snapshot(request.target.identity)
             self._status("Preview waiting after an input change")
             return False

@@ -12,7 +12,7 @@ import numpy as np
 
 from xrd_tools.analysis import stitch_operation as native
 from xrd_tools.analysis.live_preview import (
-    MAX_PREVIEW_POINT_BYTES, PreviewProgress, PreviewReplay, PreviewSnapshot,
+    MAX_PREVIEW_POINT_BYTES, PreviewGroup, PreviewProgress, PreviewReplay, PreviewSnapshot,
     largest_preview_point_planes, preview_compute_slot,
 )
 from xrd_tools.analysis.live_preview_grid import enclosing_preview_bounds
@@ -250,17 +250,6 @@ class StitchPreviewWork:
         if self.kernel is not None:
             self.kernel.verify_assets()
 
-    @staticmethod
-    def verifies(group, *, cancelled=None):
-        return StitchPreviewWork._holds(group.points, cancelled)
-
-    @staticmethod
-    def _holds(entries, cancelled):
-        selected = {}
-        for member, point in entries:
-            selected.setdefault(id(member), (member, []))[1].append(point)
-        return preview_prefixes_hold(selected.values(), cancelled=cancelled)
-
     def _feed(self, member, point, stream, screen, position, cancelled, cancel_token, yield_priority, *, replay):
         if self.decoded is None or self.decoded[0] != point.identity:
             count = 1 if point.policy is None else len(point.policy.raw_indices(0))
@@ -389,7 +378,7 @@ class StitchPreviewWork:
         self.snapshot = PreviewSnapshot(group.identity, rank, keys, bounds, axes, intensity,
                                         group.covered(len(self.points)), normalization, coverage, sigma, product=product,
                                         display_bytes=3 * self.kernel.grid_bytes
-                                        + (0 if mask is None else len(mask.pixels)))
+                                        + (0 if mask is None else len(mask.pixels)), metadata_prefix=group)
 
     def _memory(self):
         grid = self.kernel.grid_bytes
@@ -417,8 +406,9 @@ class StitchPreviewWork:
         try:
             if cancelled() or yield_priority():
                 return self.snapshot
-            if not self.verifies(group, cancelled=cancelled):
-                if self.snapshot is not None and self.verifies(self.snapshot.input_prefix, cancelled=cancelled):
+            if not group.verifies(cancelled=cancelled):
+                old = self.snapshot
+                if old is not None and old.input_prefix.verifies(metadata=old.metadata_prefix, cancelled=cancelled):
                     self._update(waiting=True)
                     return self.snapshot
                 self.invalidate(group.identity)
@@ -437,7 +427,7 @@ class StitchPreviewWork:
             if cancelled() or yield_priority():
                 return self.snapshot
             self.verify_assets()
-            if not self.verifies(group.covered(len(self.points)), cancelled=cancelled):
+            if not group.covered(len(self.points)).verifies(metadata=group, cancelled=cancelled):
                 self.invalidate(group.identity)
                 return None
             if self.stream is not None:
@@ -449,7 +439,7 @@ class StitchPreviewWork:
         except PreviewPointPending:
             # A temporarily unreadable newer detector slot does not revoke
             # settled input. The ordered stream cannot advance past this slot.
-            if not self._holds(self.points, cancelled):
+            if not preview_prefixes_hold(PreviewGroup.requirements(self.points), cancelled=cancelled):
                 self.invalidate(group.identity)
             self._update(waiting=True)
             return self.snapshot

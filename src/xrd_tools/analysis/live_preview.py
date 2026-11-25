@@ -61,6 +61,22 @@ class PreviewGroup:
         members = tuple({id(member): member for member, _ in points}.values())
         return replace(self, points=points, members=members, ended=self.ended and count == len(self.points))
 
+    @staticmethod
+    def requirements(points):
+        by_member = {}
+        for member, point in points:
+            by_member.setdefault(id(member), (member, []))[1].append(point)
+        return by_member.values()
+
+    def verifies(self, *, metadata=None, cancelled=None):
+        from xrd_tools.sources.live_preview import preview_prefixes_hold
+
+        return preview_prefixes_hold(
+            self.requirements(self.points),
+            metadata_requirements=() if metadata is None else metadata.requirements(metadata.points),
+            cancelled=cancelled,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewObservation:
@@ -175,6 +191,7 @@ class PreviewSnapshot:
     mask_update_queued: bool = False
     product: object = None
     display_bytes: int = 0
+    metadata_prefix: PreviewGroup | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,15 +309,6 @@ class RSMPreviewWork:
         if self.kernel is not None:
             self.reset(self.group)
             self._update(resource_restarts=self.progress.resource_restarts + 1)
-
-    @staticmethod
-    def verifies(group, *, cancelled=None):
-        from xrd_tools.sources.live_preview import preview_prefixes_hold
-
-        return preview_prefixes_hold(
-            ((member, tuple(point for source, point in group.points if source is member)) for member in group.members),
-            cancelled=cancelled,
-        )
 
     def verify_assets(self):
         if self.kernel is not None:
@@ -446,7 +454,7 @@ class RSMPreviewWork:
                 else:
                     self.verify_assets()
                 snapshot = self._step(group, cancelled, yield_priority, progress)
-            if snapshot is not None and not self.verifies(snapshot.input_prefix, cancelled=cancelled):
+            if snapshot is not None and not snapshot.input_prefix.verifies(cancelled=cancelled):
                 self.invalidate(group.identity)
                 return None
             grid_bytes = math.prod(self.kernel.bins) * 4 * 8

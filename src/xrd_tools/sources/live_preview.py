@@ -320,33 +320,36 @@ def preview_prefix_holds(observed: PreviewMember, points=None, *, cancelled=None
     return preview_prefixes_hold(((observed, points),), cancelled=cancelled)
 
 
-def preview_prefixes_hold(requirements, *, cancelled=None):
+def preview_prefixes_hold(requirements, *, metadata_requirements=(), cancelled=None):
     """Revalidate one slice, sharing the changed-file scan and the ready image inventory."""
     try:
-        spec_checks = []
+        spec_checks = {}
         with image.shared_image_listings(all_stems=True):
-            for observed, points in requirements:
-                _cancel(cancelled)
-                points = observed.points if points is None else tuple(points)
-                if not points:
-                    continue
-                if observed.prefix is None:
-                    return False
-                covered = max(point.label for point in points) + 1
-                if covered > len(observed.points):
-                    return False
-                endpoint = observed._successor_required if observed.end_of_stream else None
-                spec_checks.append((observed.prefix, covered, endpoint))
-                slots = _named_slots(
-                    observed.path, observed.key, observed._image_dir, observed._image_stem, cancelled)
-                # A frame selection cannot hide a missing or remapped predecessor of this point.
-                for point in observed.points[:covered]:
+            for check_raw, entries in ((True, requirements), (False, metadata_requirements)):
+                for observed, points in entries:
                     _cancel(cancelled)
-                    for expected in point.raw:
-                        file = slots.get(expected.slot)
-                        if file != expected.path or _raw_part(file, expected.slot) != expected:
-                            return False
-        return spec.spec_preview_prefixes_hold(spec_checks, _open_shared_read, cancelled=cancelled)
+                    points = observed.points if points is None else tuple(points)
+                    if not points:
+                        continue
+                    covered = max(point.label for point in points) + 1
+                    if observed.prefix is None or covered > len(observed.points):
+                        return False
+                    endpoint = observed._successor_required if observed.end_of_stream else None
+                    key = id(observed.prefix)
+                    if key not in spec_checks or spec_checks[key][1] < covered:
+                        spec_checks[key] = observed.prefix, covered, endpoint
+                    if not check_raw:
+                        continue
+                    slots = _named_slots(
+                        observed.path, observed.key, observed._image_dir, observed._image_stem, cancelled)
+                    # A frame selection cannot hide a missing or remapped predecessor of this point.
+                    for point in observed.points[:covered]:
+                        _cancel(cancelled)
+                        for expected in point.raw:
+                            file = slots.get(expected.slot)
+                            if file != expected.path or _raw_part(file, expected.slot) != expected:
+                                return False
+        return spec.spec_preview_prefixes_hold(spec_checks.values(), _open_shared_read, cancelled=cancelled)
     except (OSError, ValueError, LookupError):
         _cancel(cancelled)
         return False
