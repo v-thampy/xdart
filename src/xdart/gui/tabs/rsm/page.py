@@ -75,6 +75,7 @@ from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionC
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.live_scan_watcher import LiveScanWatcher
+from xdart.gui.widgets.live_preview import LivePreviewOwner
 from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver, require_current_handoff
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.rsm_geometry_asset import (
@@ -540,6 +541,12 @@ class RSMPage(QtWidgets.QWidget):
         )
         self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, batch=False, cores=False, per_scan_live=True)
         self._live_watcher = LiveScanWatcher(self._dispatch_live, self._live_status, self._sync_actions, parent=self)
+        self._live_preview = self._live_watcher.preview = LivePreviewOwner(
+            self, self._live_watcher, foreground=lambda: self._owner.busy or self._resolving is not None
+            or self._owner.finalization is not RSMOwnerFinalization.NONE,
+            present=self._present_live_preview, fallback=self._restore_live_result,
+        )
+        self._live_volume = None
         self.run_bar.liveToggled.connect(lambda _checked: self._sync_actions())
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("RSM")
@@ -1813,7 +1820,8 @@ class RSMPage(QtWidgets.QWidget):
         idle = (not busy and not reading and not metadata_reading and not authoring and not resolving and self._job_form is None
                 and final is RSMOwnerFinalization.NONE and not self._closing)
         preparing_live = getattr(self, "_live_watcher", None)
-        live = preparing_live is not None and preparing_live.busy
+        preview = getattr(self, "_live_preview", None)
+        live = preparing_live is not None and preparing_live.busy or preview is not None and (preview.working or preview.draining)
         idle = idle and not live
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
         self._sync_format_tip(idle, authoring)
@@ -1833,6 +1841,8 @@ class RSMPage(QtWidgets.QWidget):
             self._results.get(self._shown_path) is not None or bool(self._source_paths)))
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
+        if preview is not None:
+            self.run_bar.set_live_preview_editable(idle)
         self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
         # Stitch's: "▶ Run" throughout (RSM has no pause), enabled while idle and ready
         self.run_bar.startButton.setEnabled(idle and (self.run_bar.is_live() or self._readiness[1]))
@@ -2067,11 +2077,18 @@ class RSMPage(QtWidgets.QWidget):
                                         select_labels=options["frame_selector"].select,
                                         source_ub=values["coordinate_frame"] is RSMCoordinateFrame.HKL
                                         and values["ub"] is None)
+            from xrd_tools.analysis.live_preview_rsm import RSMPreviewOptions
+            science = RSMPreviewOptions(**{key: values[key] for key in (
+                "project_root", "geometry_asset", "coordinate_frame", "conditioning", "normalization", "bins",
+                "max_frame_bytes", "max_chunk_bytes", "corrections", "ub",
+            )}, motor_selectors=options["motor_selectors"], detector_shape=options["detector_shape"],
+                raw_dtype=options["raw_dtype"])
         except (OSError, ValueError, TypeError) as error:
             self._notice(f"Live refused: {error}")
             return
         self._prepared_fingerprint = None
         self._live_config = (selection, options, queue, values, self.run_bar.write_mode() == "Append")
+        self._live_preview.start(observer, science, rsm=True)
         self._live_watcher.start(observer)
 
     def _dispatch_live(self, handoff):
@@ -2142,7 +2159,8 @@ class RSMPage(QtWidgets.QWidget):
             terminal = result.terminal
             if terminal.disposition is ModuleDisposition.COMMITTED:
                 target = str(result.request.module.output.target)
-                self._add_result(target, result.payload, show=not self._closing)
+                show = not self._closing and self._live_preview.native_saved(handoff.group, target)
+                self._add_result(target, result.payload, show=show)
                 watcher.settle(handoff, consumed=True, reason=f"Saved {Path(target).name}",
                                slot=watcher.committed_slot(handoff, terminal))
             elif accepted:
@@ -2760,17 +2778,40 @@ class RSMPage(QtWidgets.QWidget):
         return viewer
 
     def _show(self, path, payload):
+        self._live_volume = None
         _payload, values, model = self._viewer(path, payload)
         self._draw(values, model.current_snapshot, path)
         self._shown_path = path
         self._follow_tools()
 
-    def _draw(self, values, snapshot, path=None):
+    def _present_live_preview(self, preview):
+        from xrd_tools.session.rsm_viewer_model import make_rsm_preview_viewer_values
+
+        values = make_rsm_preview_viewer_values(preview.product)
+        model = RSMViewerModel()
+        snapshot = model.snapshot(values, projection=self._mean_maps)
+        title = f"Provisional · scan {preview.points[-1][0]}"
+        self._live_volume = values, model, title
+        self._draw(values, snapshot, title, provisional=True)
+
+    def _restore_live_result(self, path):
+        self._live_volume = None
+        path = path or self._shown_path
+        payload = self._results.get(path)
+        if payload is None:
+            self._shown = None
+            self._show_empty_view()
+        else:
+            self._requested = path
+            self._publish_results()
+            self._show(path, payload)
+
+    def _draw(self, values, snapshot, path=None, *, provisional=False):
         path = self._shown_path if path is None else path
         state = rsm_keyed_projection(
             values, snapshot, color_map=self._color_map, log_scale=self._log_scale,
-            title=Path(path).name if path else "", background_enabled=True, share_axis=self._share_axis)
-        source = self._background.keyed_source()
+            title=Path(path).name if path else "", background_enabled=not provisional, share_axis=self._share_axis)
+        source = None if provisional else self._background.keyed_source()
         background = name = None
         if source is not None:
             background_path, background_payload, background_values, model = source
@@ -2855,6 +2896,10 @@ class RSMPage(QtWidgets.QWidget):
         self._background.release(receipt)
 
     def _redraw(self):
+        if self._live_volume is not None:
+            values, model, title = self._live_volume
+            self._draw(values, model.current_snapshot, title, provisional=True)
+            return
         shown = self.shown
         if shown is not None:
             self._draw(*shown)
@@ -2863,6 +2908,8 @@ class RSMPage(QtWidgets.QWidget):
         """Int's view's commands for the RSM drawn: its colour map, Log and Share Axis (as Int's bars set them),
         and a slice stepped along its normal."""
         kind = command.kind
+        if self._live_volume is not None and kind in {ShellCommandKind.PAGE_TOOL, ShellCommandKind.SET_BACKGROUND}:
+            return
         if kind is ShellCommandKind.SET_COLOR_MAP:
             self._color_map = str(command.value)
             self._redraw()
@@ -3037,6 +3084,8 @@ class RSMPage(QtWidgets.QWidget):
 
     def active(self):
         return bool(getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy
+                    or getattr(self, "_live_preview", None) is not None
+                    and (self._live_preview.working or self._live_preview.draining)
                     or self._owner.busy or self._reading is not None or self._resolving is not None
                     or self._metadata_reading is not None
                     or self._job_form is not None  # a queue between its RSMs
@@ -3113,7 +3162,8 @@ class RSMPage(QtWidgets.QWidget):
         for dialog in (self._metadata_dialog, self._metadata_plot_dialog):
             if dialog is not None:
                 dialog.close()
-        receipts = (self._live_watcher.shutdown(), self._owner.close(), self._reader.close(), self._resolver.close(), self._metadata_reader.close(),
+        receipts = (self._live_watcher.shutdown(), self._live_preview.shutdown(), self._owner.close(),
+                    self._reader.close(), self._resolver.close(), self._metadata_reader.close(),
                     *(dialog.shutdown() for dialog in self._authoring_dialogs),
                     *(window.shutdown() for window in self._tool_windows.values()))
         if not self._result_browser.close():

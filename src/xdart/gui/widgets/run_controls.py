@@ -267,6 +267,29 @@ class RunControlsBar(QtWidgets.QWidget):
     def set_stop_enabled(self, enabled):
         self.stopButton.setEnabled(bool(enabled))
 
+    def mount_live_preview_option(self, open_advanced, enabled):
+        button = self.livePreviewSettingsButton = QtWidgets.QToolButton(self.actionRow)
+        button.setObjectName("livePreviewSettingsButton")
+        button.clicked.connect(open_advanced)
+        self.actionRow.layout().insertWidget(1, button)
+        self.set_live_preview_enabled(enabled)
+        self.liveToggled.connect(button.setVisible)
+        button.setVisible(self.is_live())
+
+    def set_live_preview_enabled(self, enabled):
+        button = self.livePreviewSettingsButton
+        button.setText("Preview on" if enabled else "Preview off")
+        button.setToolTip("Open the Live preview setting in Advanced. Finished scans are saved with preview on "
+                          "or off.")
+
+    def set_live_preview_editable(self, editable):
+        self.livePreviewSettingsButton.setEnabled(bool(editable))
+
+    def set_live_preview_working(self, working):
+        if working:
+            self.set_readiness_summary("Stopping Live preview", tooltip="Waiting for active preview work to retire.",
+                                       live=True)
+
     # ── output mode (Append / Overwrite) ──
     # The button DISPLAYS 'Append'/'Replace'; the VALUE the writer compares
     # against stays 'Append'/'Overwrite' (write_mode).  Keep the two apart.

@@ -43,6 +43,7 @@ from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
 from xdart.gui.widgets.live_scan_watcher import LiveScanWatcher
+from xdart.gui.widgets.live_preview import LivePreviewOwner
 from xrd_tools.analysis.live_scans import LiveScanObserver
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
@@ -621,6 +622,12 @@ class StitchPage(QtWidgets.QWidget):
         # Int's Cores: the frames stitched at once, on either backend
         self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, batch=False, cores=True, per_scan_live=True)
         self._live_watcher = LiveScanWatcher(self._dispatch_live, self._live_status, self._sync_actions, parent=self)
+        self._live_preview = self._live_watcher.preview = LivePreviewOwner(
+            self, self._live_watcher, foreground=lambda: self._owner.busy
+            or self._owner.finalization is not StitchOwnerFinalization.NONE,
+            present=self._present_live_preview, fallback=self._restore_live_result,
+        )
+        self._live_view_key = None
         self.run_bar.liveToggled.connect(lambda _checked: self._sync_actions())
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("Stitch 1D")
@@ -2402,6 +2409,9 @@ class StitchPage(QtWidgets.QWidget):
         self._prepared_revision = None
         self._live_config = (form, self.run_bar.get_cores(), self._run_angular_support,
                              self.run_bar.write_mode() == "Append")
+        self._live_preview.start(observer, form, image_axis=(
+            "qip_qoop" if self._value("map_axis") == "Qip-Qoop" else "q_chi"
+        ))
         self._live_watcher.start(observer)
 
     def _dispatch_live(self, handoff):
@@ -2471,7 +2481,8 @@ class StitchPage(QtWidgets.QWidget):
             if terminal.disposition is ModuleDisposition.COMMITTED:
                 target = str(result.request.module.output.target)
                 if not self._closing:
-                    self._mount_payload(target, result.payload)
+                    self._mount_payload(target, result.payload,
+                                        show=self._live_preview.native_saved(handoff.group, target))
                 watcher.settle(handoff, consumed=True,
                                reason=outcome.finalization_message or f"Saved {Path(target).name}",
                                slot=watcher.committed_slot(handoff, terminal))
@@ -2812,6 +2823,8 @@ class StitchPage(QtWidgets.QWidget):
         return None if key is None else self._payloads.get(key)
 
     def _current_result_changed(self, *_args):
+        if getattr(self, "_live_preview", None) is not None and self._live_preview.snapshot is not None:
+            return
         if self._metadata_dialog is not None:
             self._metadata_dialog.close()
         self._view_revision += 1
@@ -3109,7 +3122,7 @@ class StitchPage(QtWidgets.QWidget):
             self._view = replace(self._view, **changes)
             self.browser.set_result_plot_mode(self._view.plot_mode)
 
-    def _mount_payload(self, path, payload):
+    def _mount_payload(self, path, payload, *, show=True):
         if type(payload) is not AnalysisArtifactPayload or payload.inspection.kind not in {
                 AnalysisArtifactKind.STITCH_1D, AnalysisArtifactKind.STITCH_2D}:
             raise TypeError("Stitch page requires an admitted Stitch result")
@@ -3123,6 +3136,10 @@ class StitchPage(QtWidgets.QWidget):
             self._listed.append(key)
             self._result_key(key)
         self._result_browser.follow_result(key)
+        if not show:
+            self._publish_results(self.browser.current_result())
+            return
+        self._live_view_key = None
         if payload.gi:  # a GI result opens on the axis Grazing chose (I(q) or a cut), else on a cut it has
             modes = {mode for mode, _cut in payload.gi}
             chosen = _GI_AXES.get(self._value("unit")) if self._gi["enabled"] else None
@@ -3229,6 +3246,10 @@ class StitchPage(QtWidgets.QWidget):
         (a Stitch 2D result's I(q), as Int 1D shows a 2-D record's)."""
         if not hasattr(self, "scientific"):
             return
+        live = getattr(self, "_live_preview", None)
+        if live is not None and live.snapshot is not None:
+            self._present_live_preview(live.snapshot)
+            return
         if self._member_preferences is not None:
             self._draw_member()
             return
@@ -3243,6 +3264,47 @@ class StitchPage(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self._diagnostic_combo)
         self._diagnostic_combo.setCurrentText(self._diagnostic)
         del blocker
+
+    def _present_live_preview(self, snapshot):
+        from xrd_tools.core.frame_view import FrameView
+        from xdart.gui.tabs.scattering.display_values import DisplayFrameKey, StandardDisplayPayload
+        from xdart.gui.tabs.scattering.events import RunIdentity
+        from xdart.gui.tabs.scattering.shell_projection import build_scientific_projection
+        from xdart.gui.tabs.scattering.shell_values import FrameNavigationProjection
+
+        product = snapshot.product
+        pattern = product.payload if product.profile is None else product.profile[0]
+        result_2d = None if product.profile is None else product.payload
+        title = f"Provisional · scan {snapshot.points[-1][0]}"
+        if self._live_view_key is None or self._live_view_key.source_scan != title:
+            self._live_view_key = DisplayFrameKey(RunIdentity(1, "stitch-live-preview"), title,
+                                                  "stitch-live-preview", 0, 1)
+        key = self._live_view_key
+        view = FrameView.from_results(label=0, result_1d=pattern, result_2d=result_2d)
+        extras = {}
+        options = replace(self._view, plot_mode="Single", slice_pins=())
+        if product.gi_map is not None:
+            gi = FrameView.from_results(label=0, result_2d=product.gi_map[0])
+            motor = self._live_config[0].gi.incidence_motor or "Manual"
+            extras = dict(measurement_mode="GI", gi_resolved_motor=motor, gi_mode_1d="q_total",
+                          gi_mode_2d="q_chi", extra_views_2d={"qip_qoop": gi})
+            options = replace(options, image_axis=(
+                "qip_qoop" if self._value("map_axis") == "Qip-Qoop" else "q_chi"
+            ))
+        shown = StandardDisplayPayload(0, key, title, view, status="complete", **extras)
+        navigation = FrameNavigationProjection((key,), key, (key,))
+        mode = "Int 2D" if result_2d is not None else "Int 1D"
+        state = build_scientific_projection((shown,), navigation, frozenset({key}), options, "",
+                                            processing_mode=mode)
+        state = replace(state, title=title, status=title, replace_trace_history=True)
+        self._last_map_state = state if result_2d is not None else None
+        self.scientific.reconcile(state, navigation, completed=1, total=1, detail="")
+
+    def _restore_live_result(self, path):
+        self._live_view_key = None
+        if path is not None:
+            self._publish_results(path)
+        self._current_result_changed()
 
     def _draw_member(self):
         """Drive the whole Int scientific view with one contributor, independently of file comparisons."""
@@ -3653,6 +3715,10 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.scientific_preferences import scientific_preference_updates
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, view = command.kind, self._member_preferences or self._view
+        if self._live_preview.snapshot is not None and kind in {
+                ShellCommandKind.PAGE_TOOL, ShellCommandKind.SET_BACKGROUND, ShellCommandKind.PIN_SLICE,
+                ShellCommandKind.SET_DETECTOR_MODE, ShellCommandKind.SELECT_FRAME, ShellCommandKind.HYDRATE_FRAME}:
+            return
         if self._member_preferences is not None and kind in {
                 ShellCommandKind.PIN_SLICE, ShellCommandKind.SET_PLOT_MODE, ShellCommandKind.SET_BACKGROUND}:
             return
@@ -3765,7 +3831,8 @@ class StitchPage(QtWidgets.QWidget):
         busy, final = self._owner.busy, self._owner.finalization
         authoring = self._authoring_active()
         watcher = getattr(self, "_live_watcher", None)
-        live = watcher is not None and watcher.busy
+        preview = getattr(self, "_live_preview", None)
+        live = watcher is not None and watcher.busy or preview is not None and (preview.working or preview.draining)
         idle = not live and not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
         # the editors lock and the action row stays usable: a pending result's Retry (Codex's RSM review F2)
         self.controls.set_editors_enabled(idle)
@@ -3799,6 +3866,8 @@ class StitchPage(QtWidgets.QWidget):
         self.browser.set_action_enabled("Metadata", idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
+        if preview is not None:
+            self.run_bar.set_live_preview_editable(idle)
         self.run_bar.liveButton.setEnabled(idle)
         self.run_bar.startButton.setEnabled(idle and (self.run_bar.is_live() or self._run_ready))  # partial selections still run their admitted groups
         action = self._owner.current_identity.request.action if busy else None
@@ -3828,6 +3897,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def active(self):
         return (getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy
+                or getattr(self, "_live_preview", None) is not None
+                and (self._live_preview.working or self._live_preview.draining)
                 or self._owner.busy or self._owner.finalization is not StitchOwnerFinalization.NONE or self._closing or self._authoring_active())
 
     def shutdown(self):
@@ -3842,6 +3913,7 @@ class StitchPage(QtWidgets.QWidget):
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
         child_receipts.append(self._source_observer.shutdown())
         child_receipts.append(self._live_watcher.shutdown())
+        child_receipts.append(self._live_preview.shutdown())
         child_receipts.append(self.scientific.shutdown_phase_overlays())
         child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
         if not self._result_browser.close():

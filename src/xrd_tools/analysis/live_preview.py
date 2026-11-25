@@ -19,6 +19,7 @@ class PreviewGroup:
     points: tuple
     ended: bool
     reason: str = ""
+    member_ranks: dict = field(default_factory=dict)
 
     @property
     def identity(self):
@@ -87,7 +88,11 @@ class PreviewGroupObserver:
             ended = len(members) == len(row.group.members) and all(member.end_of_stream for member in members)
             if raw_prefix:
                 rank = max(self.order[member.path, member.key] for member, _ in raw_prefix)
-                current = PreviewGroup(row.group, rank, tuple(members), tuple(raw_prefix), ended)
+                current = PreviewGroup(
+                    row.group, rank, tuple(members), tuple(raw_prefix), ended,
+                    member_ranks={(member.path, member.key): self.order[member.path, member.key]
+                                  for member, _ in raw_prefix},
+                )
                 if candidate is None or current.rank > candidate.rank:
                     candidate = current
             elif members and candidate is None:
@@ -219,11 +224,12 @@ class RSMPreviewWork:
 
     @staticmethod
     def verifies(group, *, cancelled=None):
-        from xrd_tools.sources.live_preview import preview_prefix_holds
+        from xrd_tools.sources.live_preview import preview_prefixes_hold
 
-        return all(preview_prefix_holds(member, tuple(point for source, point in group.points if source is member),
-                                        cancelled=cancelled)
-                   for member in group.members)
+        return preview_prefixes_hold(
+            ((member, tuple(point for source, point in group.points if source is member)) for member in group.members),
+            cancelled=cancelled,
+        )
 
     def verify_assets(self):
         if self.kernel is not None:

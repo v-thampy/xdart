@@ -338,6 +338,19 @@ class RSMViewerValues:
     ) = _viewer_uncopyable("RSM viewer values")
 
 
+def make_rsm_preview_viewer_values(volume) -> RSMViewerValues:
+    """Project one provisional in-memory volume with a separate view identity."""
+    from uuid import uuid4
+    from xrd_tools.rsm.volume import RSMVolume
+
+    if type(volume) is not RSMVolume:
+        raise TypeError("RSM preview requires a detached volume")
+    fingerprint = analysis_canonical_fingerprint("rsm-live-preview", uuid4().hex)
+    return RSMViewerValues(fingerprint, tuple((name, _freeze_float32(axis)) for name, axis in volume.axes),
+                           _freeze_float32(volume.intensity),
+                           coordinate_frame=volume.coordinate_frame, _claim=_RSM_VIEWER_FACTORY)
+
+
 def make_rsm_viewer_values(
     source: object,
 ) -> RSMViewerValues:

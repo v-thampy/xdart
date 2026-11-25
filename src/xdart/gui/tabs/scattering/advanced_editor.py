@@ -95,6 +95,17 @@ class AdvancedDialog(QtWidgets.QDialog):
         else:
             self._sections.addWidget(item)
 
+    def add_live_preview_setting(self):
+        editor = QtWidgets.QCheckBox("Preview frames")
+        editor.setObjectName("livePreviewCheck")
+        editor.setChecked(True)
+        editor.setToolTip(
+            "Show provisional results as per-point detector files arrive. Finished scans are processed "
+            "and saved by per-scan Live even when the preview is off."
+        )
+        self.add_group("Live", (editor,))
+        return editor
+
     def set_editors_enabled(self, enabled: bool) -> None:
         """Lock nonmodal group bodies while leaving contextual header help available."""
         for index in range(self._sections.count()):

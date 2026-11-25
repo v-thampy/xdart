@@ -80,6 +80,7 @@ class LiveScanWatcher(QtCore.QObject):
         self._invalidated = set()
         self._skipped = set()
         self._notice = ""
+        self.preview = None
 
     @property
     def watching(self):
@@ -121,6 +122,8 @@ class LiveScanWatcher(QtCore.QObject):
         if not self.watching:
             return
         self._session = self._observer = self._observation = None
+        if self.preview is not None:
+            self.preview.stop(closing=self._closing)
         self._due = False
         self._requests.release()
         if self._handoff is None:
@@ -169,8 +172,11 @@ class LiveScanWatcher(QtCore.QObject):
             if cancel.is_set():
                 return None
             request.observer.invalidate(key)
-        from xrd_tools.io.spec import spec_capture_scope
-        with spec_capture_scope():
+        if request.observer.preview_observe is None:
+            from xrd_tools.io.spec import spec_capture_scope as capture_scope
+        else:
+            from xrd_tools.sources.live_preview import preview_source_scope as capture_scope
+        with capture_scope():
             observation = request.observer.poll(
                 now=request.now, consumed=request.consumed, cancelled=cancel.is_set,
             )
@@ -202,6 +208,8 @@ class LiveScanWatcher(QtCore.QObject):
             self._notice = terminal.failure_message or terminal.failure_type
         self._publish_state()
         self.pump()
+        if self.preview is not None and self._observation is not None:
+            self.preview.observe(self._observation.preview)
         self.poll_due()
         return False
 
@@ -295,6 +303,8 @@ class LiveScanWatcher(QtCore.QObject):
             self._skipped.add(key)
             reason = reason or "Append-current skipped a saved result"
         self._notice = reason or self._notice
+        if self.preview is not None:
+            self.preview.consume(handoff.group, skipped=skipped)
         return True
 
     def settle(self, handoff, *, consumed, reason="", retry_at=None,

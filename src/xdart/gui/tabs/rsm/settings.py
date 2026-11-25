@@ -26,7 +26,8 @@ from xdart.gui.tools.page_settings import (
 )
 
 #: The document's kind and version, and its key in the session file.
-RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 2, "rsm_settings", "RSM", sections=("point_images",))
+RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 2, "rsm_settings", "RSM",
+                            sections=("point_images", "live_preview"))
 SESSION_KEY = RSM_SETTINGS.session_key
 #: Not saved field by field: the SPEC files row shows the source selection, and the Threshold is one policy.
 _NOT_FIELDS = frozenset({"spec_path", "threshold_enabled", "threshold_min", "threshold"})
@@ -41,6 +42,7 @@ def page_settings(page) -> dict[str, Any]:
         # Append skips an output already gridded with these settings; "Overwrite" is Replace
         write_mode=page.run_bar.write_mode(),
         point_images=page.point_images.document(),
+        live_preview=page._live_preview.settings(),
     )
     if page._output_suggested:  # the Save Path follows the Project until a folder is chosen, and so it does restored
         document["fields"]["output_path"] = ""
@@ -92,6 +94,7 @@ def apply_page_settings(page, document: Any) -> None:
     if "calibration" in document:  # a document without it keeps the window's
         page._set_calibration_settings(document["calibration"])
     restore_write_mode(page, document)
+    page._live_preview.apply_settings(document.get("live_preview", {}))
     page._set_format_choice(conflict)  # and page._edited(), as before
 
 

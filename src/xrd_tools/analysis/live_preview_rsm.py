@@ -144,7 +144,12 @@ class RSMPreviewKernel:
     def _column(point, selector):
         if selector is None:
             return None
-        return np.asarray([point.columns[(selector.name, selector.occurrence)]], dtype=float)
+        values = tuple(value for name, value in point.columns if name == selector.name)
+        if not values and selector.occurrence == 0 and selector.name in point.metadata:
+            values = (point.metadata[selector.name],)
+        if selector.occurrence >= len(values):
+            raise ValueError(f"Preview point lacks SPEC column {selector.name}")
+        return np.asarray([values[selector.occurrence]], dtype=float)
 
     def angles(self, point):
         return tuple(self._column(point, selector) for _, selector in self.selectors)
