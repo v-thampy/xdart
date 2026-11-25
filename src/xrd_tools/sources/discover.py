@@ -88,7 +88,7 @@ def _iter_files_unordered(directory: Path, recursive: bool, *, check=None) -> li
     return [Path(entry.path) for entry in _iter_file_entries_unordered(directory, recursive, check=check)]
 
 
-def discover_scans(directory, kind, *, recursive: bool = False, check=None,
+def discover_scans(directory, kind, *, recursive: bool = False, check=None, _files=None,
                    **options) -> list[SourceSpec]:
     """Return one :class:`SourceSpec` per scan found in ``directory`` for ``kind``.
 
@@ -106,7 +106,7 @@ def discover_scans(directory, kind, *, recursive: bool = False, check=None,
     kind = coerce_source_kind(kind)
     if not directory.is_dir():
         return []
-    files = _walk_files(directory, recursive, check=check)
+    files = _walk_files(directory, recursive, check=check) if _files is None else _files
 
     if kind is SourceKind.SPEC:
         from xrd_tools.io.spec import is_spec_file, list_spec_scans

@@ -88,6 +88,28 @@ def test_native_selection_brackets_all_and_directory_mixed_formats(tmp_path):
     assert directory.skipped == all_spec.skipped
 
 
+def test_exact_planned_group_keeps_ordinals_and_never_opens_its_neighbour(tmp_path):
+    from xrd_tools.analysis.stitch_sources import (
+        StitchSourceSelection, list_planned_stitch_groups, resolve_stitch_sources,
+    )
+
+    spec = _spec(tmp_path)
+    for index in range(3):
+        np.ones((2, 2), dtype=np.uint16).tofile(tmp_path / f"myscan_scan5_{index}.raw")
+    decode = {"detector_shape": (2, 2), "raw_dtype": "uint16"}
+    selection = StitchSourceSelection("Spec", (str(spec),), "5,[5,5.1],7")
+    first, duplicate, absent = list_planned_stitch_groups(selection)
+    assert first.members == duplicate.members
+    assert first.identity != duplicate.identity
+    assert absent.members[0].key == "7.1"
+    with pytest.raises(ValueError, match="scan 7 is not present"):
+        resolve_stitch_sources(selection, decode)
+    resolved = resolve_stitch_sources(selection, decode, planned_group=first)
+    assert [[member.options["scan"] for member in group] for group in resolved.groups] == [["5.1"]]
+    with pytest.raises(ValueError):
+        resolve_stitch_sources(selection, decode, planned_group=absent)
+
+
 def test_a_directory_takes_its_subfolders_and_a_name_filter_as_int_does(tmp_path, monkeypatch):
     """Maintainer, 2026-09-30: "Directory mode should have subfolders option as well as filters like in
     Int 2d". The SPEC files a Directory takes show in the scans it skips for want of images."""

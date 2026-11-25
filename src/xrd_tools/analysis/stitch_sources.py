@@ -79,18 +79,6 @@ _NOT_SPEC = frozenset({".raw", ".tif", ".tiff", ".edf", ".cbf", ".img", ".mar345
 _CONTAINER_SUFFIXES = frozenset({".nxs", ".h5", ".hdf5", ".nexus", ".cxi"})
 
 
-def _directory_spec_files(directory, recursive, name_ok, check):
-    """The SPEC files in a Directory (its subfolders' too) whose names pass the filter, in discovery
-    order. A known image or data file is never opened to find out: with subfolders, an images folder
-    of thousands of frames would otherwise each be read."""
-    from xrd_tools.io.spec import is_spec_file
-    from xrd_tools.sources.discover import _walk_files
-    for path in _walk_files(directory, recursive, check=check):
-        check()
-        if path.suffix.lower() not in _NOT_SPEC and name_ok(path.name) and is_spec_file(path):
-            yield path
-
-
 @dataclass(frozen=True, slots=True)
 class StitchSourceResolution:
     groups: tuple[tuple[SourceSpec, ...], ...]
@@ -98,6 +86,114 @@ class StitchSourceResolution:
     #: each group's members' scan names, as Int names them (``int_scan_name``)
     names: tuple[tuple[str, ...], ...] = ()
     pending: tuple = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedStitchMember:
+    path: Path
+    key: str
+    kind: SourceKind
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedStitchGroup:
+    identity: tuple
+    members: tuple[PlannedStitchMember, ...]
+    paths: tuple[Path, ...]
+    every_scan: bool = False
+    # Keep finite progress and absent-selector diagnostics from the requested tokens,
+    # including a second search position for two spellings of the same occurrence.
+    spec_searches: tuple[tuple[str, bool], ...] = ()
+    spec_total: int = 0
+
+
+def _spec_key(token):
+    return token if "." in token else token + ".1"
+
+
+def list_planned_stitch_groups(selection, *, check=lambda: None, allow_pending=False,
+                               spec_keys=None, nexus_listing=None, directory_inventory=None):
+    """Enumerate ordered output groups without opening their detector sources."""
+    from xrd_tools.io.spec import is_spec_file
+    from xrd_tools.sources.discover import _walk_files
+
+    if type(selection) is not StitchSourceSelection:
+        raise TypeError("exact Stitch source selection required")
+    get_keys = list_spec_scans if spec_keys is None else spec_keys
+    selection_groups = (parse_stitch_scan_groups(selection.scans)
+                        if selection.kind == "Spec" and not selection.stitch_all else ())
+    spec_total = 0
+
+    def spec_groups(path, lane, every_scan):
+        nonlocal spec_total
+        check()
+        keys = tuple(get_keys(path))
+        requested = tuple((key,) for key in keys) if every_scan else selection_groups
+        spec_total += sum(len(group) for group in requested)
+        present = set(keys)
+        for position, tokens in enumerate(requested):
+            check()
+            canonical = tuple(dict.fromkeys(_spec_key(token) for token in tokens))
+            identity = (*lane, canonical[0] if every_scan else position)
+            members = tuple(PlannedStitchMember(path, key, SourceKind.SPEC) for key in canonical)
+            searches = tuple((token, _spec_key(token) in present) for token in tokens)
+            yield PlannedStitchGroup(identity, members, (path,), every_scan, searches, spec_total)
+
+    def nexus_members(path):
+        check()
+        if nexus_listing is None:
+            entries = tuple(list_entries(path))
+            kind = describe_container(path, entry=selection.nexus_entry or "entry").kind
+        else:
+            kind, entries = nexus_listing(path)
+        entry = selection.nexus_entry
+        if entry and entry not in entries:
+            if not allow_pending:
+                raise ValueError(f"{path.name}: NeXus entry {entry!r} is not present")
+            entries = ()
+        elif entry:
+            entries = (entry,)
+        if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
+            if not allow_pending:
+                raise ValueError(f"{path.name} is not a raw NeXus detector source")
+            return ()
+        if not entries and not allow_pending:
+            raise ValueError(f"{path.name} has no NeXus entries")
+        return tuple(PlannedStitchMember(path, key, kind) for key in entries)
+
+    paths = tuple(Path(path) for path in selection.paths)
+    if selection.kind == "Spec":
+        for position, path in enumerate(paths):
+            yield from spec_groups(path, ("spec", position, path), selection.stitch_all)
+    elif selection.kind == "NeXus":
+        members = tuple(member for path in paths for member in nexus_members(path))
+        yield PlannedStitchGroup(("nexus", *paths), members, paths)
+    else:
+        directory = paths[0]
+        if not directory.is_dir():
+            raise ValueError("Source directory is unavailable")
+        name_ok = compile_filter(selection.name_filter)
+        if directory_inventory is None:
+            files = _walk_files(directory, selection.recursive, check=check)
+            spec_files = (path for path in files if path.suffix.lower() not in _NOT_SPEC
+                          and name_ok(path.name) and is_spec_file(path))
+            containers = (Path(spec.uri)
+                          for kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER)
+                          for spec in discover_scans(directory, kind, recursive=selection.recursive,
+                                                     check=check, _files=files)
+                          if name_ok(Path(spec.uri).stem if Path(spec.uri).suffix.lower()
+                                     in _CONTAINER_SUFFIXES else Path(spec.uri).name))
+        else:
+            spec_files, containers = directory_inventory(directory, selection.recursive, name_ok, check)
+        for path in spec_files:
+            yield from spec_groups(path, ("directory-spec", path), True)
+        seen = set()
+        for path in containers:
+            check()
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                yield PlannedStitchGroup(("directory-nexus", path), nexus_members(path), (path,))
 
 
 @functools.lru_cache(maxsize=8)
@@ -183,7 +279,7 @@ class SourceSearchCancelled(InterruptedError):
 
 
 def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs, *, cancelled=None,
-                           progress=None) -> StitchSourceResolution:
+                           progress=None, planned_group=None) -> StitchSourceResolution:
     """Freeze discovery and skips once at Preview; never rediscover during Run.
 
     C-16: ``cancelled()`` is checked before each scan (``SourceSearchCancelled``); ``progress(done, total)`` follows the
@@ -191,10 +287,10 @@ def resolve_stitch_sources(selection: StitchSourceSelection, read_image_kwargs, 
     from xrd_tools.io.image import shared_image_listings
     from xrd_tools.io.spec import spec_capture_scope
     with shared_image_listings(), spec_capture_scope():  # and each SPEC file read once (NEXT-1219-SPEC-OCCURRENCE)
-        return _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress)
+        return _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress, planned_group)
 
 
-def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
+def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress, planned_group=None):
     if type(selection) is not StitchSourceSelection:
         raise TypeError("exact Stitch source selection required")
     groups, skipped, names, pending = [], [], {}, {}
@@ -277,67 +373,47 @@ def _resolve_stitch_sources(selection, read_image_kwargs, cancelled, progress):
             if close is not None:
                 close()
 
-    def spec_file(path, all_scans):
-        step()
-        keys = tuple(list_spec_scans(path))
-        requested = tuple((key,) for key in keys) if all_scans else parse_stitch_scan_groups(selection.scans)
-        searched[1] += sum(len(group) for group in requested)
-        for group in requested:
-            members = []
-            for token in group:
+    def lower_group(group):
+        members = []
+        if group.spec_searches and planned_group is None:
+            searched[1] = group.spec_total
+            path = group.paths[0]
+            for token, present in group.spec_searches:
                 step()
-                key = token if token in keys else token + ".1"
-                if key not in keys:
+                if not present:
                     raise ValueError(f"{path.name}: scan {token} is not present")
-                value = spec_member(path, key, all_scans)
+                value = spec_member(path, _spec_key(token), group.every_scan)
                 searched_one()
                 if value is not None and value not in members:
                     members.append(value)
-            if members:
-                groups.append(tuple(members))
-
-    def nexus_members(path, *, directory=False):
-        step()
-        if selection.nexus_entry and selection.nexus_entry not in list_entries(path):
-            raise ValueError(f"{path.name}: NeXus entry {selection.nexus_entry!r} is not present")
-        kind = describe_container(path, entry=selection.nexus_entry or "entry").kind
-        if kind not in {SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER}:
-            raise ValueError(f"{path.name} is not a raw NeXus detector source")
-        entries = (selection.nexus_entry,) if selection.nexus_entry else tuple(list_entries(path))
-        if not entries:
-            raise ValueError(f"{path.name} has no NeXus entries")
-        # Each file remains one output/group; its exact entries contribute.
-        members = []
-        for entry in entries:
+            return tuple(members)
+        for member in group.members:
             step()
-            value = confirmed(SourceSpec(path, kind, entry=entry), directory=directory)
+            path, key = member.path, member.key
+            if member.kind is SourceKind.SPEC:
+                value = spec_member(path, key, False)
+            else:
+                value = confirmed(SourceSpec(path, member.kind, entry=key),
+                                  directory=selection.kind == "Directory" and planned_group is None)
+                if value is not None:
+                    names[id(value)] = int_scan_name(path)
             if value is not None:
                 members.append(value)
-        names.update(dict.fromkeys(map(id, members), int_scan_name(path)))
         return tuple(members)
 
-    if selection.kind == "Spec":
-        for path in selection.paths:
-            spec_file(Path(path), selection.stitch_all)
-    elif selection.kind == "NeXus":
-        groups.append(tuple(member for path in selection.paths for member in nexus_members(Path(path))))
+    if planned_group is None:
+        planned = list_planned_stitch_groups(selection, check=step)
     else:
-        directory = Path(selection.paths[0])
-        if not directory.is_dir():
-            raise ValueError("Source directory is unavailable")
-        name_ok = compile_filter(selection.name_filter)
-        for path in _directory_spec_files(directory, selection.recursive, name_ok, step):
-            spec_file(path, True)
-        seen_nexus = set()
-        for kind in (SourceKind.NEXUS_STACK, SourceKind.EIGER_MASTER):
-            for spec in discover_scans(directory, kind, recursive=selection.recursive, check=step):
-                path = Path(spec.uri)
-                if not name_ok(path.stem if path.suffix.lower() in _CONTAINER_SUFFIXES else path.name):
-                    continue
-                resolved = path.resolve()
-                if resolved not in seen_nexus:
-                    seen_nexus.add(resolved)
-                    groups.append(nexus_members(path, directory=True))
+        if type(planned_group) is not PlannedStitchGroup or not planned_group.members:
+            raise ValueError("An exact planned group with members is required")
+        planned = (planned_group,)
+    for group in planned:
+        group_sources = lower_group(group)
+        if planned_group is not None and len(group_sources) != len(group.members):
+            if not pending:
+                raise ValueError("An exact planned group member is unavailable")
+        if group_sources:
+            groups.append(group_sources)
     step()
     if len(groups) > 4096:
         raise ValueError("Selection exceeds 4096 result groups")
