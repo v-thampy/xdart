@@ -218,16 +218,39 @@ class _MultiGeometrySums:
     def snapshot(self):
         if self.result is None:
             return None
-        mode, unit, profile_unit, cuts, _ranges = self.identity
+        mode, unit, profile_unit, cuts, ranges = self.identity
         payload, diagnostics = (_stitch_1d_payload(self.result, unit) if mode == "1d"
                                 else _stitch_2d_payload(self.result))
         profile = None if self.profile is None else _stitch_1d_payload(self.profile, profile_unit)
         gi_cuts = tuple(gi_cut_result(values, GI_UNITS[cut])
                         for cut, values in zip(cuts, self.gi or ()))
         gi_map = None if self.gi is None or mode != "2d" else gi_map_result(self.gi[-1])
-        # The native result wrappers may retain a backend's axes. The detached
-        # preview projection owns every array while another slice runs.
+        # pyFAI's split pixel kernel extends its numeric upper bound to include
+        # the edge. Published provisional coordinates describe the allocated
+        # range, so selecting those centres as a Run range applies that guard
+        # exactly once. The same native parts and their weights stay intact.
+        _, _, _, _, radial, chi, profile_radial, _, gi_ranges = ranges
+        payload.radial = _preview_bin_centres(radial, len(payload.radial))
+        if mode == "2d":
+            payload.azimuthal = _preview_bin_centres(chi, len(payload.azimuthal))
+        if profile is not None:
+            profile[0].radial = _preview_bin_centres(profile_radial, len(profile[0].radial))
+        gi_bounds = dict(gi_ranges)
+        for cut, (curve, _) in zip(cuts, gi_cuts, strict=True):
+            curve.radial = _preview_bin_centres(gi_bounds[cut], len(curve.radial))
+        if gi_map is not None:
+            image = gi_map[0]
+            image.radial = _preview_bin_centres(gi_bounds["q_ip"], len(image.radial))
+            image.azimuthal = _preview_bin_centres(gi_bounds["q_oop"], len(image.azimuthal))
+        # Native payloads may borrow their backend's buffers. Detach every
+        # array before the projection may coexist with a later slice.
         return copy.deepcopy(StitchPreviewResult(payload, diagnostics, profile, gi_map, gi_cuts))
+
+
+def _preview_bin_centres(bounds, count):
+    lower, upper = bounds
+    half_step = (upper - lower) / (2 * count)
+    return np.linspace(lower + half_step, upper - half_step, count)
 
 
 def _streaming_multigeometry(
