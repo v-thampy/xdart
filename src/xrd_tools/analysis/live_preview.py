@@ -61,6 +61,11 @@ class PreviewGroup:
         members = tuple({id(member): member for member, _ in points}.values())
         return replace(self, points=points, members=members, ended=self.ended and count == len(self.points))
 
+    def contains_prefix(self, prefix):
+        return len(self.points) >= len(prefix.points) and all(
+            left.identity == right.identity for (_, left), (_, right) in zip(self.points, prefix.points)
+        )
+
     @staticmethod
     def requirements(points):
         by_member = {}
