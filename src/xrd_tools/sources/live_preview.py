@@ -234,33 +234,50 @@ def _read_flat_plane(part, point):
                 or (part.descriptor_ctime is not None and before.st_ctime_ns != part.descriptor_ctime)
                 or os.path.normcase(os.path.realpath(part.path)) != part.resolved):
             raise PreviewPointPending(f"{part.path.name} changed before decoding")
-        if before.st_size > point._max_bytes + _HEADER_ALLOWANCE:
+        overhead = point._skip if suffix == ".raw" else _HEADER_ALLOWANCE
+        if before.st_size > point._max_bytes + overhead:
             raise PreviewPointPending(f"{part.path.name} exceeds the admitted detector frame bytes")
+        saturation = None
         if suffix == ".raw":
             pixels = image._read_raw_binary(
                 part.path, point._shape, point._dtype, point._skip, stream=stream)
-        else:
-            import fabio
+        elif suffix == ".cbf":
+            from fabio.cbfimage import CbfImage
 
-            if suffix == ".cbf":
-                reason = _cbf_header_incomplete_reason(stream.read(min(before.st_size, _HEADER_ALLOWANCE)),
-                                                       before.st_size)
-                codec = fabio.cbfimage.CbfImage()
-            else:
-                try:
-                    reason = _tiff_header_incomplete_reason(stream, before.st_size)
-                except (KeyError, OverflowError, ValueError):
-                    reason = None  # unrecognized TIFF structure still requires the codec's exact proof
-                codec = fabio.tifimage.TifImage()
-            if isinstance(reason, str):
+            reason = _cbf_header_incomplete_reason(stream.read(min(before.st_size, _HEADER_ALLOWANCE)),
+                                                   before.st_size)
+            if reason is not None:
                 raise PreviewPointPending(f"{part.path.name}: {reason}")
             stream.seek(0)
             # Fabio may close its stream. Give it a duplicate, never the lexical pathname.
-            with os.fdopen(os.dup(descriptor), "rb") as codec_stream, codec:
+            with os.fdopen(os.dup(descriptor), "rb") as codec_stream, CbfImage() as codec:
                 codec.read(codec_stream)
                 if codec.nframes != 1:
                     raise PreviewPointPending(f"{part.path.name} does not hold one exact detector plane")
                 pixels = np.array(codec.data, copy=True)
+                saturation = image.pilatus_count_cutoff(dict(codec.header))
+        else:
+            import tifffile
+
+            try:
+                reason = _tiff_header_incomplete_reason(stream, before.st_size)
+            except (KeyError, OverflowError, ValueError):
+                reason = None  # unrecognized TIFF structure still requires exact decode
+            if isinstance(reason, str):
+                raise PreviewPointPending(f"{part.path.name}: {reason}")
+            stream.seek(0)
+            with tifffile.TiffFile(stream, name=part.path.name, _multifile=False) as codec:
+                first = codec.pages[0]
+                try:
+                    codec.pages[1]
+                except IndexError:
+                    pass
+                else:
+                    raise PreviewPointPending(f"{part.path.name} does not hold one exact detector plane")
+                if first.shape != point._shape or first.dtype.itemsize * first.size > point._max_bytes:
+                    raise PreviewPointPending(f"{part.path.name} does not match the admitted detector plane")
+                pixels = first.asarray()
+                saturation = image.pilatus_count_cutoff(first.description)
         after = os.fstat(descriptor)
         if (_spec_descriptor_revision(after) != _spec_descriptor_revision(before)
                 or not _spec_name_matches_read(part.path.stat(), after)
@@ -272,19 +289,22 @@ def _read_flat_plane(part, point):
         raise PreviewPointPending(f"{part.path.name} exceeds the admitted detector frame bytes")
     rotated = image.apply_rotation(pixels, point._rotation)
     rotated.setflags(write=False)
-    return rotated
+    return rotated, saturation
 
 
-def read_preview_point(point: PreviewPoint, *, cancelled=None):
-    """Decode the selected constituent planes exactly once on compatible, short descriptors."""
+def read_preview_point(point: PreviewPoint, *, cancelled=None, include_saturation=False):
+    """Decode selected planes once. Optionally return their recorded cutoffs beside them."""
     try:
-        planes = []
+        planes, saturations = [], []
         indices = (0,) if point.policy is None else point.policy.raw_indices(0)
         for index in indices:
             _cancel(cancelled)
-            planes.append(_read_flat_plane(point.raw[index], point))
+            pixels, saturation = _read_flat_plane(point.raw[index], point)
+            planes.append(pixels)
+            saturations.append(saturation)
         _cancel(cancelled)
-        return tuple(planes)
+        result = tuple(planes)
+        return (result, tuple(saturations)) if include_saturation else result
     except PreviewPointPending:
         raise
     except Exception as error:
