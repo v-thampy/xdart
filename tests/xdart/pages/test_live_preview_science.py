@@ -16,7 +16,7 @@ from tests.xdart.pages import test_rsm_page as rsm_gui
 from tests.xdart.pages.live_per_scan_support import tick_live, wait_until
 from tests.xdart.pages.live_preview_support import advance_preview, start_preview, unimplemented_preview
 from tests.xdart.pages.test_live_per_scan_native import (
-    _append_spec, _click_run, _rsm_form, _same_science, _shots, _spec_ub, _stop_live, _write_spec,
+    _append_spec, _click_run, _rsm_form, _same_science, _shots, _shown_name, _spec_ub, _stop_live, _write_spec,
     make_page, qapp,  # noqa: F401
 )
 from tests.xdart.scattering.test_p1b_comprehensive_live import _write_flat
@@ -334,8 +334,9 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
             tick_live(page, qapp)
         wait_until(qapp, lambda: len(_shots(tmp_path / "output")) == 1 and page._live_watcher.handoff is None
                    and not page._owner.busy)
+        [saved] = _shots(tmp_path / "output")
         advance_preview(page, owner, qapp)
-        assert owner.snapshot is None
+        assert owner.snapshot is None and _shown_name(page, "stitch") == saved
     else:
         _next(page, owner, qapp, lambda: owner.snapshot is not None)
         assert {key for key, _ in owner.snapshot.points} == {"2.1"}
@@ -348,7 +349,7 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
     if order == "[3,2]":
         assert {key for key, _ in owner.snapshot.points} == {"3.1"}
     elif order == "2,[2-3]":
-        assert {key for key, _ in owner.snapshot.points} == {"2.1", "3.1"}
+        assert _prefix(owner, ("2.1", 0), ("2.1", 1), ("2.1", 2), ("3.1", 0))
     _append_spec(spec, "14.3 -10\n")
     _stitch_raw(form, 3, 3, 2)
     for _ in range(4):
@@ -361,6 +362,8 @@ def test_p3_preview_group_is_an_ordered_prefix_of_its_native_slot(qapp, make_pag
     assert len(owner.retired_groups) == expected_count
     ordered = ("3.1", "2.1") if order == "[3,2]" else ("2.1", "3.1")
     assert ordered in [tuple(group.members) for group in owner.retired_groups]
+    if order == "2,[2-3]":
+        assert tuple(group.members for group in owner.retired_groups) == (("2.1",), ordered)
 
 
 @pytest.mark.parametrize(("requested", "preview_bins"), [

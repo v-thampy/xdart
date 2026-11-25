@@ -346,15 +346,19 @@ class LivePreviewOwner(QtCore.QObject):
                 and snapshot.points == visible.points[:len(snapshot.points)]):
             # Reconstructing retired staging must catch up to the reserved view.
             return False
-        if self._snapshot is None or snapshot.rank >= self._snapshot.rank:
-            self._publish(verification)
+        self._publish(verification)
         return True
 
     def _publish(self, verification):
         snapshot = verification.snapshot
         if snapshot.group_identity in self._retired:
             return
-        if self._saved is not None and snapshot.rank <= self._saved[0]:
+        visible = self._snapshot
+        if visible is not None:
+            if snapshot.rank < visible.rank or (
+                    snapshot.rank == visible.rank and snapshot.group_identity != visible.group_identity):
+                return
+        elif self._saved is not None and snapshot.rank <= self._saved[0]:
             return
         try:
             self._present(snapshot)
@@ -390,20 +394,28 @@ class LivePreviewOwner(QtCore.QObject):
         if self._candidate is not None and self._candidate.identity == group.identity:
             self._candidate = None
 
+    def settle(self, group):
+        """Retire any overlay that survived until the accepted operation settled."""
+        self._clear_snapshot(group.identity)
+
     def native_saved(self, group, path):
         """Register the saved fallback and answer whether native may select and paint it."""
-        if not self.watching or self._observation is None:
+        if not self.watching:
             return True
         rank = self._ranks.get(group.identity)
         if rank is None:
             rank = self._snapshot.rank if (self._snapshot is not None
                                            and self._snapshot.group_identity == group.identity) else (0, 0, 0)
-        if self._saved is None or rank > self._saved[0]:
-            self._saved = rank, path
         visible = self._snapshot
+        replaces_preview = visible is not None and (
+            visible.group_identity == group.identity or rank > visible.rank
+        )
+        newer_saved = self._saved is None or rank > self._saved[0]
+        if newer_saved or (replaces_preview and rank == self._saved[0]):
+            self._saved = rank, path
         if visible is None:
-            return rank >= self._saved[0]
-        if visible.group_identity == group.identity or rank > visible.rank:
+            return newer_saved
+        if replaces_preview:
             self._snapshot = None
             self._display_witness = None
             self._staged = None

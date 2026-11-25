@@ -315,6 +315,8 @@ class LiveScanWatcher(QtCore.QObject):
         key = handoff.group.identity
         if consumed or key in self._consumed:
             self.accept(handoff, reason=reason, slot=slot)
+            if self.preview is not None:
+                self.preview.settle(handoff.group)
         else:
             self._slots.pop(key, None)
             if self.watching:

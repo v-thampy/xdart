@@ -22,7 +22,7 @@ from tests.xdart.pages.test_live_per_scan_native import (
     _stop_live, _wait, _write_spec, make_page, qapp,  # noqa: F401
 )
 from tests.xdart.pages.test_live_preview_science import (
-    _next, _prefix, _raw, _rsm_acquisition, _scan, _stitch_raw, _stitch_scan,
+    _next, _prefix, _raw, _rsm_acquisition, _scan, _stitch_acquisition, _stitch_raw, _stitch_scan,
 )
 from tests.xdart.pages.test_rsm_eiger_source import _on_source
 from xdart.gui.pages.values import PageCleanup
@@ -245,6 +245,73 @@ def test_p8_simultaneous_directory_sources_follow_one_native_group_order(qapp, m
     for _ in range(3):
         advance_preview(page, owner, qapp)
         assert _display_identity(page.view) == chosen
+
+
+def test_p8_tied_native_results_register_without_replacing_the_current_view(qapp, make_page, tmp_path):
+    page = make_page("stitch")
+    form = replace(_native_form(tmp_path, "multigeometry", scans="3,[2-3]"), output_family=None)
+    spec = Path(form.spec_path)
+    output = Path(form.output_path).parent
+    header = spec.read_text(encoding="utf-8").split("#S 1", 1)[0]
+    _write_spec(spec, header + "".join(
+        _stitch_scan(spec, number, (14., 14.1, 14.2), planned=3) for number in (2, 3)
+    ))
+    for index in range(3):
+        _stitch_raw(form, 3, index, 5)
+    page.load_form(form)
+    owner = start_preview(page, qapp)
+    for _ in range(4):
+        advance_preview(page, owner, qapp)
+    wait_until(qapp, lambda: len(page._listed) == 1 and page._live_watcher.handoff is None)
+    first = page.browser.current_result()
+    display = _display_identity(page.scientific)
+    assert first and display and owner.snapshot is None
+
+    for index in range(3):
+        _stitch_raw(form, 2, index, 9)
+    for _ in range(4):
+        advance_preview(page, owner, qapp)
+    wait_until(qapp, lambda: len(page._listed) == 2 and page._live_watcher.handoff is None)
+    assert len(_shots(output)) == 2 and first in page._listed
+    assert owner.snapshot is None and page.browser.current_result() == first
+    assert _display_identity(page.scientific) == display
+
+
+def test_p11_accepted_native_cancellation_retires_its_preview_without_stopping_live(
+    qapp, make_page, tmp_path, monkeypatch,
+):
+    page = make_page("stitch")
+    form, spec, _ = _stitch_acquisition(page, tmp_path)
+    header = spec.read_text(encoding="utf-8").split("#S 1", 1)[0]
+    _write_spec(spec, header + _stitch_scan(spec, 1, (14., 14.1, 14.2), planned=4))
+    for index in range(3):
+        _stitch_raw(form, 1, index, 5)
+    owner = start_preview(page, qapp)
+    _next(page, owner, qapp, lambda: _prefix(owner, ("1.1", 0)))
+
+    entered, release = Event(), Event()
+    emit = stitch_operation.StitchOperationExecution._emit
+
+    def hold_science(execution, stage, completed, total):
+        emit(execution, stage, completed, total)
+        if stage == "science" and execution.live_accepted and not entered.is_set():
+            entered.set()
+            assert release.wait(20)
+
+    monkeypatch.setattr(stitch_operation.StitchOperationExecution, "_emit", hold_science)
+    try:
+        _append_spec(spec, "14.3 -10\n")
+        _stitch_raw(form, 1, 3, 5)
+        for _ in range(4):
+            tick_live(page, qapp)
+        wait_until(qapp, lambda: entered.is_set() and bool(owner.retired_groups))
+        assert owner.snapshot is not None
+        page._owner.cancel()
+    finally:
+        release.set()
+    wait_until(qapp, lambda: page._live_watcher.handoff is None)
+    assert page._live_watcher.watching and not _shots(Path(form.output_path).parent)
+    assert owner.snapshot is None
 
 
 @pytest.mark.parametrize("lane", ("spec-eiger", "nxwriter"))
