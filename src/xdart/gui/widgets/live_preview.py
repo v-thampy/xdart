@@ -81,10 +81,17 @@ class LivePreviewOwner(QtCore.QObject):
     def settings(self):
         return {"enabled": self.preference.isChecked()}
 
-    def apply_settings(self, value):
+    @staticmethod
+    def settings_enabled(document):
+        value = document.get("live_preview", {})
+        if type(value) is not dict:
+            raise ValueError("Live preview settings are malformed")
         enabled = value.get("enabled", True)
         if type(enabled) is not bool:
             raise ValueError("Live preview enabled must be a boolean")
+        return enabled
+
+    def apply_settings(self, enabled):
         self.preference.setChecked(enabled)
 
     @property

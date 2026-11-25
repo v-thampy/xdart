@@ -62,6 +62,7 @@ class AdvancedDialog(QtWidgets.QDialog):
         self.setObjectName(object_name)
         self.setWindowTitle(title)
         self._accept_buttons = accept_buttons
+        self._live_preview_setting = None
         layout = QtWidgets.QVBoxLayout(self)
         self._sections = QtWidgets.QVBoxLayout()
         layout.addLayout(self._sections)
@@ -103,7 +104,8 @@ class AdvancedDialog(QtWidgets.QDialog):
             "Show provisional results as per-point detector files arrive. Finished scans are processed "
             "and saved by per-scan Live even when the preview is off."
         )
-        self.add_group("Live", (editor,))
+        self._live_preview_setting = editor
+        self.add_section(editor)
         return editor
 
     def set_editors_enabled(self, enabled: bool) -> None:
@@ -112,6 +114,8 @@ class AdvancedDialog(QtWidgets.QDialog):
             card = self._sections.itemAt(index).widget()
             if isinstance(card, SubsectionCard):
                 card.body.setEnabled(enabled)
+        if self._live_preview_setting is not None:
+            self._live_preview_setting.setEnabled(enabled)
         self.buttons.setEnabled(enabled)
 
 

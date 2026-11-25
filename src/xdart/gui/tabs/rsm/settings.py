@@ -27,7 +27,7 @@ from xdart.gui.tools.page_settings import (
 
 #: The document's kind and version, and its key in the session file.
 RSM_SETTINGS = SettingsKind("xdart-rsm-settings", 2, "rsm_settings", "RSM",
-                            sections=("point_images", "live_preview"))
+                            sections=("point_images",))
 SESSION_KEY = RSM_SETTINGS.session_key
 #: Not saved field by field: the SPEC files row shows the source selection, and the Threshold is one policy.
 _NOT_FIELDS = frozenset({"spec_path", "threshold_enabled", "threshold_min", "threshold"})
@@ -56,6 +56,7 @@ def page_settings(page) -> dict[str, Any]:
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = RSM_SETTINGS.validate(document)
+    preview_enabled = page._live_preview.settings_enabled(document)
     formats, conflict = document_data_format(document)  # first: an older document's Source kind, migrated (or refused)
     if "point_images" in document:
         page.point_images.restore(document["point_images"])
@@ -94,7 +95,7 @@ def apply_page_settings(page, document: Any) -> None:
     if "calibration" in document:  # a document without it keeps the window's
         page._set_calibration_settings(document["calibration"])
     restore_write_mode(page, document)
-    page._live_preview.apply_settings(document.get("live_preview", {}))
+    page._live_preview.apply_settings(preview_enabled)
     page._set_format_choice(conflict)  # and page._edited(), as before
 
 

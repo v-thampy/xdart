@@ -64,9 +64,7 @@ load_settings = STITCH_SETTINGS.load
 def apply_page_settings(page, document: Any) -> None:
     """Restore a settings document onto the page (see the module docstring)."""
     document = validate_settings(document)
-    preview = document.get("live_preview", {})
-    if type(preview) is not dict:
-        raise ValueError("Stitch Live preview settings are malformed")
+    preview_enabled = page._live_preview.settings_enabled(document)
     formats, conflict = document_data_format(document)  # first: an older document's Source kind, migrated (or refused)
     phase_options = None
     if "phase_references" in document:
@@ -103,7 +101,7 @@ def apply_page_settings(page, document: Any) -> None:
     if "calibration" in document:  # null: a document saved with no window lets a retained one go
         page._set_calibration_settings(document["calibration"])
     restore_write_mode(page, document)
-    page._live_preview.apply_settings(preview)
+    page._live_preview.apply_settings(preview_enabled)
     if document.get("mode") in ("Stitch 1D", "Stitch 2D"):
         page.select_mode(document["mode"])
     if type(document.get("cores")) is int:
