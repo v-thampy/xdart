@@ -55,6 +55,12 @@ class PreviewGroup:
     def identity(self):
         return self.group.identity
 
+    def covered(self, count):
+        """Keep the ordered point inputs that the displayed calculation used."""
+        points = self.points[:count]
+        members = tuple({id(member): member for member, _ in points}.values())
+        return replace(self, points=points, members=members, ended=self.ended and count == len(self.points))
+
 
 @dataclass(frozen=True, slots=True)
 class PreviewObservation:
@@ -160,6 +166,7 @@ class PreviewSnapshot:
     bounds: tuple
     axes: tuple
     intensity: np.ndarray
+    input_prefix: PreviewGroup
     normalization: np.ndarray | None = None
     coverage: np.ndarray | None = None
     sigma: np.ndarray | None = None
@@ -373,12 +380,15 @@ class RSMPreviewWork:
         self._update(included=len(self.keys), waiting=bool(group.reason),
                      end_of_stream=group.ended and len(self.keys) == len(group.points))
         storage = volume.intensity.nbytes + sum(axis.nbytes for _, axis in volume.axes)
+        covered = group.covered(len(self.keys))
+        rank = max(group.member_ranks.get((member.path, member.key), group.rank) for member in covered.members)
         self.snapshot = PreviewSnapshot(
-            group.identity, group.rank, self.keys, tuple(self.bounds.values()), volume.axes, volume.intensity,
+            group.identity, rank, self.keys, tuple(self.bounds.values()), volume.axes, volume.intensity,
             member_masks=members, mask_pending=any(mask.count == 1 for mask in self.masks.values()),
             mask_update_queued=any(mask.changed for mask in self.masks.values()), product=volume,
             # Charge the detached volume, viewer conversion, and projection cache together.
             display_bytes=3 * storage + sum(mask.nbytes for mask in members.values()) + self.kernel.witness_bytes,
+            input_prefix=covered,
         )
         return self.snapshot
 
@@ -436,7 +446,7 @@ class RSMPreviewWork:
                 else:
                     self.verify_assets()
                 snapshot = self._step(group, cancelled, yield_priority, progress)
-            if snapshot is not None and not self.verifies(group, cancelled=cancelled):
+            if snapshot is not None and not self.verifies(snapshot.input_prefix, cancelled=cancelled):
                 self.invalidate(group.identity)
                 return None
             grid_bytes = math.prod(self.kernel.bins) * 4 * 8

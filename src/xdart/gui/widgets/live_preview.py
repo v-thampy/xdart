@@ -290,7 +290,7 @@ class LivePreviewOwner(QtCore.QObject):
         request = verification.request
         try:
             verification.verify_assets()
-            return request.work.verifies(request.target, cancelled=cancel.is_set)
+            return request.work.verifies(verification.snapshot.input_prefix, cancelled=cancel.is_set)
         except (OSError, ValueError):
             return False
 

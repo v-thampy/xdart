@@ -387,7 +387,7 @@ class StitchPreviewWork:
         rank = max((ranked.get(key, group.rank) for key in represented), default=group.rank)
         mask = self.kernel.base._mask_receipt
         self.snapshot = PreviewSnapshot(group.identity, rank, keys, bounds, axes, intensity,
-                                        normalization, coverage, sigma, product=product,
+                                        group.covered(len(self.points)), normalization, coverage, sigma, product=product,
                                         display_bytes=3 * self.kernel.grid_bytes
                                         + (0 if mask is None else len(mask.pixels)))
 
@@ -418,6 +418,9 @@ class StitchPreviewWork:
             if cancelled() or yield_priority():
                 return self.snapshot
             if not self.verifies(group, cancelled=cancelled):
+                if self.snapshot is not None and self.verifies(self.snapshot.input_prefix, cancelled=cancelled):
+                    self._update(waiting=True)
+                    return self.snapshot
                 self.invalidate(group.identity)
                 return None
             if self.kernel is None:
@@ -434,7 +437,7 @@ class StitchPreviewWork:
             if cancelled() or yield_priority():
                 return self.snapshot
             self.verify_assets()
-            if not self.verifies(group, cancelled=cancelled):
+            if not self.verifies(group.covered(len(self.points)), cancelled=cancelled):
                 self.invalidate(group.identity)
                 return None
             if self.stream is not None:
