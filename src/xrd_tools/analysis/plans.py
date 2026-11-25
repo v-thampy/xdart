@@ -507,6 +507,7 @@ def run_stitch(
     frame_screen: Any = None,
     workers: int = 1,
     angular_support: Any = None,
+    preview=None,
 ) -> AnalysisResult:
     """Run MultiGeometry stitching over one headless frame source or a GROUP.
 
@@ -551,6 +552,11 @@ def run_stitch(
     if frame_screen is not None and not (
             plan.streaming_multigeometry and plan.backend == "multigeometry"):
         raise ValueError("frame screening needs the streaming MultiGeometry stitch")
+    if preview is not None:
+        from xrd_tools.integrate.stitch_stream import StitchPreviewStream
+
+        if type(preview) is not StitchPreviewStream or not plan.streaming_multigeometry:
+            raise ValueError("Stitch preview needs a native streaming accumulator")
     streaming_corrections = (plan.error_model, plan.dark, plan.flat)
     if plan.backend == "multigeometry" and not plan.streaming_multigeometry and (
             plan.corrections is not None
@@ -837,7 +843,7 @@ def run_stitch(
                 radial_range=plan.map_radial_range if own_map else plan.radial_range,
                 azimuth_range=plan.azimuth_range,
                 mask=plan.mask, normalization=normalization,
-                frame_screen=frame_screen, **corrections,
+                frame_screen=frame_screen, preview=preview, **corrections,
             )
             if plan.stitch_profile:
                 payload, auxiliary, *profile, gi_cuts, gi_map = stitch_2d_with_1d_streaming(
@@ -868,7 +874,7 @@ def run_stitch(
                 npt=plan.npt_1d, unit=plan.unit, method=plan.method,
                 radial_range=plan.radial_range,
                 mask=plan.mask, normalization=normalization,
-                frame_screen=frame_screen, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
+                frame_screen=frame_screen, preview=preview, gi=plan.stitch_gi, gi_angles=gi_angles, workers=workers,
                 progress=merged, support=angular_support, **_chi_window(plan, "azimuth_range"), **corrections,
             )
         else:
@@ -918,6 +924,7 @@ def run_stitch(
                     mask=plan.mask,
                     normalization=normalization,
                     frame_screen=frame_screen,
+                    preview=preview,
                     **corrections,
                 )
             elif plan.mode == "2d":
@@ -934,6 +941,7 @@ def run_stitch(
                     mask=plan.mask,
                     normalization=normalization,
                     frame_screen=frame_screen,
+                    preview=preview,
                     **corrections,
                 )
             else:
@@ -959,6 +967,8 @@ def run_stitch(
             )
             auxiliary = None
     _stitch_cancelled(cancel_token)
+    if preview is not None:
+        return None
     _stitch_progress(progress_callback, progress_total, progress_total)
     return AnalysisResult(
         kind="stitch",

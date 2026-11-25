@@ -108,31 +108,48 @@ def screen_totals(totals, labels, rows, policy: FrameScreenPolicy) -> tuple[Fram
 class FrameScreen:
     """Screen a stream of frames with at most ``policy.window`` frames of look-ahead."""
 
-    def __init__(self, policy: FrameScreenPolicy, labels, rows) -> None:
+    def __init__(self, policy: FrameScreenPolicy, labels=(), rows=(), *, incremental=False) -> None:
         if type(policy) is not FrameScreenPolicy:
             raise TypeError('frame screen requires an exact FrameScreenPolicy')
         self.policy = policy
-        self._labels = tuple(labels)
-        self._rows = tuple(rows)
+        self._labels = list(labels)
+        self._rows = list(rows)
+        self._incremental = incremental
+        self._closed = False
+        self._position = 0
         if len(self._labels) != len(self._rows):
             raise ValueError('frame screen labels and rows differ in length')
         self._totals: list[float] = []
         self._pending: deque = deque()
         self._verdicts: list[FrameVerdict] = []
 
+    def extend(self, labels, rows):
+        """Declare the next slice's selected positions, keeping prior neighbours."""
+        if not self._incremental or self._closed or len(self._labels) != len(self._totals):
+            raise ValueError('frame screen is not ready to extend')
+        labels, rows = tuple(labels), tuple(rows)
+        if len(labels) != len(rows):
+            raise ValueError('frame screen labels and rows differ in length')
+        self._labels.extend(labels)
+        self._rows.extend(rows)
+
+    @property
+    def held(self):
+        return len(self._pending)
+
     def _decide(self, position):
         i, w = position, self.policy.window
         window = range(max(0, i - w), min(len(self._totals), i + w + 1))
         neighbours = [self._totals[j] for j in window
                       if j != i and self._rows[j] == self._rows[i] and math.isfinite(self._totals[j])]
-        verdict = _verdict(self.policy, i, self._labels[i], self._totals[i], neighbours)
+        verdict = _verdict(self.policy, self._position + i, self._labels[i], self._totals[i], neighbours)
         self._verdicts.append(verdict)
         return verdict
 
     def push(self, total, item):
         """Record the next frame; return the (item, verdict) pairs now decided, in order."""
         position = len(self._totals)
-        if position >= len(self._labels):
+        if self._closed or position >= len(self._labels):
             raise ValueError('frame screen received more frames than declared')
         self._totals.append(float(total))
         self._pending.append((position, item))
@@ -140,10 +157,18 @@ class FrameScreen:
         while self._pending and self._pending[0][0] <= position - self.policy.window:
             earlier, held = self._pending.popleft()
             released.append((held, self._decide(earlier)))
+        if self._incremental and self._pending:
+            discard = max(0, self._pending[0][0] - self.policy.window)
+            if discard:
+                self._position += discard
+                del self._totals[:discard], self._labels[:discard], self._rows[:discard]
+                self._pending = deque((i - discard, held) for i, held in self._pending)
         return released
 
     def finish(self):
         """Decide the frames still held at the end of the stream."""
+        if self._incremental:
+            self._closed = True
         released = []
         while self._pending:
             earlier, held = self._pending.popleft()

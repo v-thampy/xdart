@@ -33,6 +33,7 @@ from xrd_tools.integrate.detector_mask import mask_with_detector, writable_for_p
 from xrd_tools.integrate.calibration import poni_to_integrator
 from xrd_tools.integrate.gid import _nan_empty_1d
 from xrd_tools.integrate.stitch_gi import GI_CUTS, GI_UNITS
+from xrd_tools.integrate.stitch_stream import StitchPreviewResult, StitchPreviewStream
 
 if TYPE_CHECKING:
     from pyFAI.integrator.azimuthal import AzimuthalIntegrator
@@ -191,6 +192,44 @@ def _resolve_streaming_ranges(
     return resolved_radial, resolved_azimuth
 
 
+class _MultiGeometrySums:
+    """Native ordered pyFAI union, shared by finite and preview slices."""
+
+    def __init__(self, mode, unit, profile_unit, cuts, ranges):
+        self.identity = mode, unit, profile_unit, cuts, ranges
+        self.result = None
+        self.profile = None
+        self.gi = None
+
+    def add(self, result, gi_parts, profile):
+        with pyfai_numexpr.PYFAI_NUMEXPR_LOCK:
+            self.result = result if self.result is None else self.result.union(result)
+            if profile is not None:
+                self.profile = profile if self.profile is None else self.profile.union(profile)
+        if gi_parts:
+            self.gi = [list(part) for part in gi_parts] if self.gi is None else [
+                [total + value for total, value in zip(totals[:3], part[:3])] + [totals[3]]
+                for totals, part in zip(self.gi, gi_parts, strict=True)]
+
+    def add_held(self, parts):
+        result, gi_parts, profile, _member = parts
+        self.add(result, gi_parts, profile)
+
+    def snapshot(self):
+        if self.result is None:
+            return None
+        mode, unit, profile_unit, cuts, _ranges = self.identity
+        payload, diagnostics = (_stitch_1d_payload(self.result, unit) if mode == "1d"
+                                else _stitch_2d_payload(self.result))
+        profile = None if self.profile is None else _stitch_1d_payload(self.profile, profile_unit)
+        gi_cuts = tuple(gi_cut_result(values, GI_UNITS[cut])
+                        for cut, values in zip(cuts, self.gi or ()))
+        gi_map = None if self.gi is None or mode != "2d" else gi_map_result(self.gi[-1])
+        # The native result wrappers may retain a backend's axes. The detached
+        # preview projection owns every array while another slice runs.
+        return copy.deepcopy(StitchPreviewResult(payload, diagnostics, profile, gi_map, gi_cuts))
+
+
 def _streaming_multigeometry(
     images: Iterable[np.ndarray],
     image_count: int,
@@ -222,6 +261,7 @@ def _streaming_multigeometry(
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
     support: Any = None,
+    preview: StitchPreviewStream | None = None,
 ):
     """Returns (pyFAI's merged result, each GI cut's [signal, normalization, count, axis] in the plan's
     order, or () without GI, and with ``profile_npt`` beside a 2-D map pyFAI's merged I(q) over every χ,
@@ -264,14 +304,6 @@ def _streaming_multigeometry(
     flat, flat_invalid = correction_image(flat, "flat", min_fraction=flat_min_fraction)
     invalid = (dark_invalid if flat_invalid is None else flat_invalid if dark_invalid is None
                else dark_invalid | flat_invalid)
-    fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
-        integrator_factory,
-        image_count,
-        unit=unit,
-        radial_range=radial_range,
-        azimuth_range=azimuth_range,
-        workers=workers,
-    )
     if gi is not None and (gi_angles is None or len(gi_angles) != image_count
                            or (mode == "2d" and (profile_npt is None or gi_map_npt is None))):
         raise ValueError("a GI cut needs one (incidence, tilt) per frame, and in 2-D I(q) and the GI map")
@@ -283,21 +315,49 @@ def _streaming_multigeometry(
                                    or len(gi_map_npt) != 2
                                    or any(type(points) is not int or points < 1 for points in gi_map_npt)):
         raise ValueError("a GI map goes beside a 2-D GI Stitch, with its q_ip and q_oop points")
-    # a 1-D Stitch's ranges: its radial range (the map's unless it has its own), and its χ window or every
-    # χ (scouted as a 1-D Stitch scouts it); scouted with the map's when both are the frames' extent
+    if preview is not None and support is not None:
+        raise ValueError("angular coverage belongs to the saved Stitch")
+    # A profile uses the map's radial range when both represent the same axis.
+    shared = profile_unit is None or (profile_unit, profile_radial_range) == (unit, radial_range)
+    profile_unit = unit if profile_unit is None else profile_unit
     profile_radial = profile_azimuth = None
-    if profile_npt is not None:
-        shared = profile_unit is None or (profile_unit, profile_radial_range) == (unit, radial_range)
-        profile_unit = unit if profile_unit is None else profile_unit
-        profile_radial = fixed_radial if shared else profile_radial_range
-        profile_azimuth = (profile_azimuth_range if profile_azimuth_range is not None
-                           else fixed_azimuth if azimuth_range is None else None)
-        if profile_radial is None or profile_azimuth is None:
-            profile_radial, profile_azimuth = _resolve_streaming_ranges(
-                integrator_factory, image_count, unit=profile_unit, radial_range=profile_radial,
-                azimuth_range=profile_azimuth, workers=workers)
-    gi_bins = {} if gi is None else _gi_bins(integrator_factory, gi_angles, gi)
-    gi_totals = None
+    if preview is not None and preview.bounds is not None:
+        bounds = preview.bounds
+        fixed_radial, fixed_azimuth = bounds["radial"], bounds["azimuthal"]
+        if profile_npt is not None:
+            profile_radial, profile_azimuth = bounds["profile_radial"], bounds["profile_azimuthal"]
+        gi_bins = {} if gi is None else {cut: bounds[cut] for cut in GI_CUTS}
+    else:
+        fixed_radial, fixed_azimuth = _resolve_streaming_ranges(
+            integrator_factory, image_count, unit=unit, radial_range=radial_range,
+            azimuth_range=azimuth_range, workers=workers)
+        footprint = {"radial": fixed_radial, "azimuthal": fixed_azimuth}
+        automatic = {axis for axis, explicit in (("radial", radial_range), ("azimuthal", azimuth_range))
+                     if explicit is None}
+        if profile_npt is not None:
+            profile_radial = fixed_radial if shared else profile_radial_range
+            profile_azimuth = (profile_azimuth_range if profile_azimuth_range is not None
+                               else fixed_azimuth if azimuth_range is None else None)
+            if profile_radial is None or profile_azimuth is None:
+                profile_radial, profile_azimuth = _resolve_streaming_ranges(
+                    integrator_factory, image_count, unit=profile_unit, radial_range=profile_radial,
+                    azimuth_range=profile_azimuth, workers=workers)
+            footprint.update(profile_radial=profile_radial, profile_azimuthal=profile_azimuth)
+            if (radial_range if shared else profile_radial_range) is None:
+                automatic.add("profile_radial")
+            if profile_azimuth_range is None:
+                automatic.add("profile_azimuthal")
+        gi_bins = {} if gi is None else _gi_bins(integrator_factory, gi_angles, gi)
+        if preview is not None:  # geometry-only scout
+            footprint.update(gi_bins)
+            automatic.update(cut for cut in gi_bins if gi.bins(cut) is None)
+            preview.observe(footprint, automatic)
+            return None, (), None
+    sums = _MultiGeometrySums(mode, unit, profile_unit, () if gi is None else gi.cuts, (
+        npt_rad, npt_azim, profile_npt, gi_map_npt, fixed_radial, fixed_azimuth,
+        profile_radial, profile_azimuth, tuple(gi_bins.items())))
+    if preview is not None:
+        sums = preview.sums(sums)
     if support is not None:
         # angular support follows the native radial profile: a 1-D Stitch's I(q), or the I(q) beside a map
         if mode == "1d":
@@ -305,16 +365,8 @@ def _streaming_multigeometry(
         elif profile_npt is not None:
             support.window(profile_azimuth_range, profile_azimuth)
 
-    def add_gi(parts):
-        nonlocal gi_totals
-        if parts:
-            gi_totals = [list(part) for part in parts] if gi_totals is None else [
-                [total + value for total, value in zip(totals[:3], part[:3])] + [totals[3]]
-                for totals, part in zip(gi_totals, parts)]
-
     image_iterator = iter(images)
     integrator_iterator = iter(integrator_factory())
-    aggregate = profile_aggregate = None
     radial = azimuthal = None
     numexpr_lock = pyfai_numexpr.PYFAI_NUMEXPR_LOCK
 
@@ -488,12 +540,7 @@ def _streaming_multigeometry(
 
     def absorb(result, gi_part, profile, member=None):
         """Add one kept frame's sums to the merged ones (and its pose to the angular support union)."""
-        nonlocal aggregate, profile_aggregate
-        with numexpr_lock:  # pyFAI's union recomputes the means with numexpr
-            aggregate = result if aggregate is None else aggregate.union(result)
-            if profile is not None:
-                profile_aggregate = profile if profile_aggregate is None else profile_aggregate.union(profile)
-        add_gi(gi_part)
+        sums.add(result, gi_part, profile)
         if support is not None:
             support.include(member)
 
@@ -513,9 +560,9 @@ def _streaming_multigeometry(
             elif not np.array_equal(azimuthal, current_azimuthal):
                 raise ValueError("pyFAI returned inconsistent Stitch azimuth axes")
         if frame_screen is None:
-            absorb(copy.deepcopy(result) if aggregate is None else result, gi_part,
+            absorb(copy.deepcopy(result) if sums.result is None else result, gi_part,
                    None if profile is None else
-                   copy.deepcopy(profile) if profile_aggregate is None else profile, member)
+                   copy.deepcopy(profile) if sums.profile is None else profile, member)
         else:
             # Hold this frame until its row neighbours are known; merge the
             # released frames in their original order.
@@ -549,15 +596,17 @@ def _streaming_multigeometry(
         pass
     else:
         raise ValueError("streaming Stitch received more integrators than declared")
+    if preview is not None:
+        return None, (), None
     if frame_screen is not None:
         for (held, held_gi, held_profile, held_member), verdict in frame_screen.finish():
             if not verdict.excluded:
                 absorb(held, held_gi, held_profile, held_member)
-        if aggregate is None:
+        if sums.result is None:
             raise ValueError("every Stitch frame was excluded as a dropped frame")
-    if aggregate is None or radial is None:
+    if sums.result is None or radial is None:
         raise ValueError("streaming Stitch produced no result")
-    return aggregate, () if gi_totals is None else tuple(gi_totals), profile_aggregate
+    return sums.result, () if sums.gi is None else tuple(sums.gi), sums.profile
 
 
 def _drop_unsplit_bins(result):
@@ -743,6 +792,7 @@ def stitch_1d_streaming(
     progress: Callable[[int], object] | None = None,
     azimuth_range: tuple[float, float] | None = None,
     support: Any = None,
+    preview: StitchPreviewStream | None = None,
 ) -> tuple[IntegrationResult1D, StitchDiagnostics,
            tuple[tuple[IntegrationResult1D, StitchDiagnostics], ...]]:
     """Sequential MultiGeometry merge that retains only one detector frame per worker
@@ -779,7 +829,10 @@ def stitch_1d_streaming(
         workers=workers,
         progress=progress,
         support=support,
+        preview=preview,
     )
+    if preview is not None:
+        return None, None, ()
     payload, diagnostics = _stitch_1d_payload(result, unit)
     return payload, diagnostics, tuple(gi_cut_result(totals, GI_UNITS[cut])
                                        for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
@@ -852,6 +905,7 @@ def stitch_2d_streaming(
     workers: int = 1,
     progress: Callable[[int], object] | None = None,
     support: Any = None,
+    preview: StitchPreviewStream | None = None,
 ) -> tuple[IntegrationResult2D, StitchDiagnostics]:
     """Sequential 2-D MultiGeometry merge retaining one detector frame per worker (``workers`` as
     :func:`stitch_1d_streaming`). A map has no native radial profile: ``support`` records nothing here."""
@@ -879,8 +933,9 @@ def stitch_2d_streaming(
         workers=workers,
         progress=progress,
         support=support,
+        preview=preview,
     )
-    return _stitch_2d_payload(result)
+    return (None, None) if preview is not None else _stitch_2d_payload(result)
 
 
 def stitch_2d_with_1d_streaming(
@@ -911,6 +966,7 @@ def stitch_2d_with_1d_streaming(
     progress: Callable[[int], object] | None = None,
     azimuth_range_1d: tuple[float, float] | None = None,
     support: Any = None,
+    preview: StitchPreviewStream | None = None,
 ) -> tuple:
     """The 2-D map and I(q) beside it, as an Int 2D record holds them, from one pass over the frames:
     the map as :func:`stitch_2d_streaming` makes it, and I(q) over every χ in ``npt_1d`` bins as
@@ -952,7 +1008,10 @@ def stitch_2d_with_1d_streaming(
         workers=workers,
         progress=progress,
         support=support,
+        preview=preview,
     )
+    if preview is not None:
+        return None, None, None, None, (), None
     cuts = tuple(gi_cut_result(totals, GI_UNITS[cut]) for cut, totals in zip(() if gi is None else gi.cuts, gi_totals))
     gi_map = None if gi is None else gi_map_result(gi_totals[-1])
     return (*_stitch_2d_payload(result), *_stitch_1d_payload(profile, unit if unit_1d is None else unit_1d),
