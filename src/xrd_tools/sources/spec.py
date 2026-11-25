@@ -132,8 +132,10 @@ def _spec_image_layout(path, read_image_kwargs, nexus_entry=None):
                               lambda: _read_spec_image_layout(path, read_image_kwargs, nexus_entry))
     options = tuple(read_image_kwargs.get(key) for key in ("detector_shape", "raw_dtype", "raw_header_skip"))
     shape, dtype, skip = options
-    return shared_listing(("spec-image-layout", os.fspath(path), tuple(shape or ()), str(dtype), skip,
-                           str(read_image_kwargs.get("detector"))),
+    detector = read_image_kwargs.get("detector")
+    if isinstance(detector, list):
+        detector = tuple(detector)
+    return shared_listing(("spec-image-layout", os.fspath(path), tuple(shape or ()), str(dtype), skip, detector),
                           lambda: _read_spec_image_layout(path, read_image_kwargs, nexus_entry))
 
 

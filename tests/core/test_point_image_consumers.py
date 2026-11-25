@@ -12,7 +12,7 @@ def _source(tmp_path):
     path = tmp_path / 'sample'
     path.write_text('#F sample\n#E 1\n#D today\n#O0 del  nu\n\n'
                     '#S 1 ascan del 10 11 1 1\n#D today\n#P0 10 0\n#N 2\n'
-                    '#L del  nu\n10 0\n11 0\n')
+                    '#L del  nu\n10 0\n11 0\n', newline="\n")
     for index, value in enumerate((10, 4, 20, 8)):
         np.full((2, 2), value, dtype=np.uint16).tofile(tmp_path / f'sample_scan1_{index:04}.raw')
     return SourceSpec(path, SourceKind.SPEC, options={'scan': '1.1', 'image_dir': str(tmp_path),
@@ -305,3 +305,21 @@ def test_automatic_refinement_records_effective_point_screening(tmp_path, operat
         assert automatic['frame_screen']['positive_total_screening_bypassed_labels'] == [0, 1, 2]
     else:
         assert set(automatic['frame_screen']) == {'exclude', 'empty_ratio', 'partial_ratio', 'window', 'statistic'}
+
+
+def test_shared_spec_layout_does_not_treat_a_detector_name_as_a_shape(tmp_path):
+    from xrd_tools.io.image import shared_image_listings
+    from xrd_tools.sources.point_images import inspect_point_images
+
+    source = _source(tmp_path)
+    options = dict(source.options)
+    shaped = replace(source, options={**options, "read_image_kwargs": {
+        "detector": (2, 2), "raw_dtype": "uint16"}})
+    named = replace(source, options={**options, "read_image_kwargs": {
+        "detector": "(2, 2)", "raw_dtype": "uint16"}})
+    with pytest.raises(ValueError, match="requires an exact shape"):
+        inspect_point_images(named)
+    with shared_image_listings():
+        assert inspect_point_images(shaped).images_per_point == 2
+        with pytest.raises(ValueError, match="requires an exact shape"):
+            inspect_point_images(named)
