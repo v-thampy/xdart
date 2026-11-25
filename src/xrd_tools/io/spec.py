@@ -136,6 +136,9 @@ class _SpecCapture:
         return self._parser
 
     def frame(self, key):
+        return self.checked_frames().get(key)
+
+    def checked_frames(self):
         if not self._keys_checked:
             indexed = [frame.key for frame in self._frames.values() if frame.start_complete]
             keys = list(self.parser.keys())
@@ -148,7 +151,7 @@ class _SpecCapture:
                     f"SPEC {self.view.lexical}: the parser and the file's bytes list different scans"
                 )
             self._keys_checked = True
-        return self._frames.get(key)
+        return self._frames
 
     def check_row_count(self, frame):
         if frame.key in self._row_counts_checked:
@@ -287,6 +290,24 @@ def spec_scan_completion_header(spec_file: Path | str, key: str) -> tuple[str, b
     if capture is None:
         raise RuntimeError("SPEC completion requires an active capture scope")
     return capture.scan_commands().get(key, ("", False))
+
+
+def spec_waiting_scan_keys(spec_file: Path | str) -> dict:
+    """Give negative Live verdicts a scan-local key from the current capture.
+
+    Keys cover the file object, protected scan bytes and completion boundary.
+    Only a previously verified wait can use them. Ready scans still require
+    ``spec_occurrence`` and the native source checks.
+    """
+    capture = _scoped_capture(spec_file)
+    if capture is None:
+        raise RuntimeError("SPEC waiting keys require an active capture scope")
+    view = capture.view
+    binding = (view.resolved, view.device, view.inode)
+    frames = capture.checked_frames()
+    commands = capture.scan_commands()
+    return {key: (binding, frame, commands.get(key, ("", False))[1])
+            for key, frame in frames.items() if frame.start_complete and frame.boundary_holds}
 
 
 def _spec_parser(spec_file: Path | str):

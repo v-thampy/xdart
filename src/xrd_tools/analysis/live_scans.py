@@ -163,6 +163,14 @@ def _graph_files(graph):
                                 *stamp.dependency_files)))
 
 
+@dataclass(frozen=True, slots=True)
+class _WaitingSpecMember:
+    state: SourceFileState
+    raw: tuple[SourceFileState, ...]
+    scan_key: tuple | None
+    reason: str
+
+
 class _ObservationSweep:
     def __init__(self, observer, cancelled, retired):
         self.observer = observer
@@ -180,6 +188,7 @@ class _ObservationSweep:
         self.next_listings = {}
         self.next_members = {}
         self.next_waiting = {}
+        self.waiting_keys = {}
         self.next_roots = {}
         self.next_late = {}
 
@@ -348,6 +357,11 @@ class _ObservationSweep:
         self.next_roots[path] = state, (kind, entries, ""), witness
         return witness
 
+    def waiting_scan_key(self, path, key):
+        if path not in self.waiting_keys:
+            self.waiting_keys[path] = spec.spec_waiting_scan_keys(path)
+        return self.waiting_keys[path].get(key)
+
     def spec_member(self, member):
         if member in self.members:
             return self.members[member]
@@ -360,14 +374,17 @@ class _ObservationSweep:
         raw = tuple(self.state(path) for path in paths)
         state = self.state(path)
         waiting = self.observer._waiting.get(member)
-        if (waiting is not None and stat_identity.IDENTITY_CARRIES_CTIME
-                and waiting[:2] == (state, raw)):
-            # Unchanged SPEC file and image files: the same wait, without reopening the scan.
-            self.next_waiting[member] = waiting
-            raise ValueError(waiting[2])
+        can_reuse_wait = stat_identity.IDENTITY_CARRIES_CTIME
+        if can_reuse_wait and waiting is not None and waiting.raw == raw:
+            if waiting.state == state or (
+                    waiting.scan_key is not None and waiting.scan_key == self.waiting_scan_key(path, key)):
+                self.next_waiting[member] = replace(waiting, state=state)
+                raise ValueError(waiting.reason)
 
-        def wait(reason):
-            self.next_waiting[member] = (state, raw, reason)
+        def wait(reason, *, proved=True):
+            if can_reuse_wait:
+                scan_key = self.waiting_scan_key(path, key) if proved else None
+                self.next_waiting[member] = _WaitingSpecMember(state, raw, scan_key, reason)
             raise ValueError(reason)
 
         saved = self.observer._members.get(member)
@@ -378,7 +395,7 @@ class _ObservationSweep:
         else:
             proof = spec.spec_occurrence(path, key)
             if proof is None:
-                wait(f"{path.name}: waiting for complete SPEC scan {key}")
+                wait(f"{path.name}: waiting for complete SPEC scan {key}", proved=False)
             command, successor = spec.spec_scan_completion_header(path, key)
             planned = _planned_points(command)
             needs_successor = planned is None or proof.rows < planned
@@ -396,7 +413,7 @@ class _ObservationSweep:
                 opened = open_source(source)
                 try:
                     labels = tuple(opened.frame_indices)
-                    if not paths or len(labels) != proof.rows or not opened.capabilities.has_raw_references:
+                    if len(labels) != proof.rows or not opened.capabilities.has_raw_references:
                         # Not cached: coverage of an opened source can depend on linked files outside the key.
                         raise ValueError(f"{path.name}: waiting for detector coverage of scan {key}")
                     graphs = []
@@ -483,7 +500,7 @@ class LiveScanObserver:
         self._roots = {}
         self._late = {}
         self._still = {}
-        # A waiting member's verdict, kept while its SPEC file and image files are unchanged.
+        # Pre-open waits retain the verified scan key and the current image revisions.
         self._waiting = {}
 
     def invalidate(self, identity):
