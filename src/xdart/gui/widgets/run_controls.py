@@ -318,13 +318,19 @@ class RunControlsBar(QtWidgets.QWidget):
             w.setEnabled(enabled)
 
     # ── per-wrangler capability profile ──
-    def apply_profile(self, *, modes=None, live=True, batch=True, cores=True):
+    def apply_profile(self, *, modes=None, live=True, batch=True, cores=True, per_scan_live=False):
         """Repopulate the mode items + show/hide Live/Batch/cores for the active
         wrangler.  The caller blocks signals around this (swap restore race)."""
         if modes is not None:
             self.modeCombo.clear()
             self.modeCombo.addItems(list(modes))
         self.liveButton.setVisible(bool(live))
+        self.liveButton.setToolTip(
+            "Per-scan Live. Run watches for finished scans and processes each complete group once."
+            if per_scan_live else "Live (per-frame display)")
+        self.stopButton.setToolTip(
+            "Stop watching and cancel the active scan. A saved result still finishes loading."
+            if per_scan_live else "Stop")
         self.batchButton.setVisible(bool(batch))
         self.coresLabel.setVisible(bool(cores))
         self.coresSpin.setVisible(bool(cores))
