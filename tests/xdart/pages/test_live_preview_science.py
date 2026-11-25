@@ -16,7 +16,7 @@ from tests.xdart.pages import test_rsm_page as rsm_gui
 from tests.xdart.pages.live_per_scan_support import tick_live, wait_until
 from tests.xdart.pages.live_preview_support import advance_preview, start_preview, unimplemented_preview
 from tests.xdart.pages.test_live_per_scan_native import (
-    _append_spec, _click_run, _rsm_form, _same_science, _shots, _stop_live, _write_spec,
+    _append_spec, _click_run, _rsm_form, _same_science, _shots, _spec_ub, _stop_live, _write_spec,
     make_page, qapp,  # noqa: F401
 )
 from tests.xdart.scattering.test_p1b_comprehensive_live import _write_flat
@@ -242,11 +242,15 @@ def test_p1_native_windows_preview_handles_allow_a_writer_and_rename(qapp, make_
     assert landed == [frame] and not _shots(tmp_path / "live")
 
 
-@pytest.mark.parametrize("change", ("append", "rewrite", "replace-raw", "replace-spec", "calibration", "windows"))
+@pytest.mark.parametrize("change", ("append", "rewrite", "replace-raw", "replace-spec", "calibration", "ub", "windows"))
 def test_p2_adoption_rechecks_the_covered_prefix_and_assets(qapp, make_page, tmp_path, monkeypatch, change):
     page = make_page("rsm")
     spec, images = _rsm_acquisition(page, tmp_path, values=(0., 0.05))
     raw = images / f"{spec.stem}_scan1_0000.raw"
+    if change == "ub":
+        ub = tmp_path / "independent_ub.spec"
+        rsm_gui._spec_file(ub, [rsm_gui._spec_scan(1, 10)])
+        _spec_ub(page, ub)
     if change == "windows":
         monkeypatch.setattr(stat_identity, "IDENTITY_CARRIES_CTIME", False)
     owner = start_preview(page, qapp)
@@ -282,6 +286,11 @@ def test_p2_adoption_rechecks_the_covered_prefix_and_assets(qapp, make_page, tmp
     elif change == "calibration":
         geometry = tmp_path / "calibration/rsm_canonical.xu.json"
         geometry.write_bytes(geometry.read_bytes() + b"\n")
+    elif change == "ub":
+        original = ub.read_text(encoding="utf-8")
+        edited = original.replace("#G3 1 0 0 0 1 0 0 0 1", "#G3 2 0 0 0 2 0 0 0 2", 1)
+        assert original != edited
+        _write_spec(ub, edited)
     else:
         previous = spec.stat()
         _write_spec(spec, spec.read_text(encoding="utf-8").replace("0.05 1", "0.07 1"))
@@ -529,6 +538,45 @@ def test_p5_stitch_growth_preserves_the_screen_tail_and_native_axes(
         assert np.min(axes[1]) >= -179. and np.max(axes[1]) <= 179.
     # Claude's oracle check: the settled preview equals the native finite science on the preview's own grid.
     np.testing.assert_allclose(snapshot.intensity, _stitch_reference(reference_form, tmp_path, snapshot, mode),
+                               rtol=1e-6, equal_nan=True)
+
+
+@pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
+def test_p5_screen_distinguishes_member_and_motor_row(qapp, make_page, tmp_path, backend):
+    page = make_page("stitch")
+    form, spec, _ = _stitch_acquisition(page, tmp_path, selection="[1-2]", backend=backend)
+    suffix = "" if backend == "multigeometry" else " 17000.018"
+
+    def row(delta, nu):
+        return f"{delta} {nu}{suffix}\n"
+
+    replacement = _stitch_scan(spec, 1, (), planned=5)
+    text = spec.read_text(encoding="utf-8")
+    _write_spec(spec, text[:text.index("#S 1 ")] + replacement
+                + "".join(row(14 + index / 10, nu) for index, nu in enumerate((-10, -10, -10, -8, -10))))
+    for index, value in enumerate((8, 0, 8, 0, 8)):
+        _stitch_raw(form, 1, index, value)
+    reference_form = page.build_form()
+    owner = start_preview(page, qapp)
+    _next(page, owner, qapp, lambda: owner.progress.excluded == 1 and owner.progress.held == 2)
+    assert not _shots(tmp_path / "output")
+
+    # 1.1/3 has no same-row neighbours. 2.1/0 has only one in its own member.
+    # Including the bright adjacent frame across either boundary would exclude a second point.
+    _append_spec(spec, "\n" + _stitch_scan(spec, 2, ()) + row(14, -10) + row(14.1, -10) + row(14.2, -8))
+    for index, value in enumerate((0, 8, 8)):
+        _stitch_raw(form, 2, index, value)
+    expected = (("1.1", 0), ("1.1", 2), ("1.1", 3), ("1.1", 4),
+                ("2.1", 0), ("2.1", 1), ("2.1", 2))
+    _next(page, owner, qapp, lambda: owner.progress.included == 5 and owner.progress.held == 2)
+    assert owner.progress.excluded == 1
+    _append_spec(spec, "\n" + _stitch_scan(spec, 3, (14.,), planned=2))
+    advance_preview(page, owner, qapp)
+    wait_until(qapp, lambda: owner.progress.end_of_stream and not owner.working)
+    assert owner.progress.held == 0 and owner.progress.excluded == 1
+    assert _prefix(owner, *expected)
+    np.testing.assert_allclose(owner.snapshot.intensity,
+                               _stitch_reference(reference_form, tmp_path, owner.snapshot, "1d"),
                                rtol=1e-6, equal_nan=True)
 
 
