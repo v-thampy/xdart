@@ -447,6 +447,43 @@ def test_p4_mask_shrinks_without_freezing_forward_progress(qapp, make_page, tmp_
                   analysis_artifact.read_analysis_artifact(finite_path))
 
 
+def _stitch_reference(page, root, snapshot, mode):
+    """The finite native Stitch Run of the same settled scan on the preview's own grid (Claude's oracle check).
+
+    The preview's axes are bin centres; the finite range spans half a bin past the first and last centre, so the
+    finite bins coincide with the preview's. Axes are compared first so a convention mismatch is named plainly.
+    """
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.analysis.stitch_values import prepare_stitch_tool
+
+    axes = tuple(np.asarray(axis, dtype=float) for _, axis in snapshot.axes)
+
+    def span(axis):
+        step = (axis[-1] - axis[0]) / (len(axis) - 1)
+        return float(axis[0] - step / 2), float(axis[-1] + step / 2)
+
+    if mode == "1d":
+        grid = dict(q_range=span(axes[0]), npt_1d=len(axes[0]))
+    else:
+        grid = dict(map_radial_range=span(axes[0]), npt_rad_2d=len(axes[0]),
+                    chi_range=span(axes[1]), npt_azim_2d=len(axes[1]))
+    folder = root / "reference"
+    folder.mkdir(exist_ok=True)
+    form = replace(page.build_form(), output_path=str(folder / "reference.nexus"), **grid)
+    request, = prepare_stitch_tool(form).requests
+    result = run_stitch_operation(request)
+    assert result.terminal.disposition.value == "committed", result.terminal
+    payload = result.payload
+    for (_, actual), expected in zip(payload.axes, axes, strict=True):
+        # Saved results keep float32 axes and intensities (the published format): tolerate float32 rounding,
+        # scaled to the axis magnitude so a centre at zero is not held to a relative bound.
+        np.testing.assert_allclose(np.asarray(actual, dtype=float), expected, rtol=1e-6,
+                                   atol=1e-6 * float(np.max(np.abs(expected))))
+    intensity = np.asarray(payload.intensity)
+    # The saved 2-D result is (radial, azimuthal); the preview snapshot is (chi, q), as P5 asserts above.
+    return intensity.T if mode == "2d" else intensity
+
+
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
 @pytest.mark.parametrize("mode", ("1d", "2d"))
 def test_p5_stitch_growth_preserves_the_screen_tail_and_native_axes(
@@ -489,6 +526,9 @@ def test_p5_stitch_growth_preserves_the_screen_tail_and_native_axes(
         assert np.any(snapshot.coverage > 0)
     if mode == "2d":
         assert np.min(axes[1]) >= -179. and np.max(axes[1]) <= 179.
+    # Claude's oracle check: the settled preview equals the native finite science on the preview's own grid.
+    np.testing.assert_allclose(snapshot.intensity, _stitch_reference(page, tmp_path, snapshot, mode),
+                               rtol=1e-6, equal_nan=True)
 
 
 @pytest.mark.parametrize("backend", ("multigeometry", "xu_hist"))
