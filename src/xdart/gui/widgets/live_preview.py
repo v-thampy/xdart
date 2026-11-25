@@ -168,7 +168,7 @@ class LivePreviewOwner(QtCore.QObject):
         if self._snapshot is not None and self._candidate is not None:
             shown = self._snapshot
             if self._candidate.identity == shown.group_identity:
-                if not self._candidate.contains_prefix(shown.input_prefix):
+                if not shown.covered_by(self._candidate):
                     self._clear_snapshot(shown.group_identity)
                 elif self._done_target is not None:
                     # Asset drift can occur while the detector has paused.
@@ -319,8 +319,7 @@ class LivePreviewOwner(QtCore.QObject):
         if rechecking_display:
             return False
         current = self._candidate
-        if current is None or (current.identity == snapshot.group_identity
-                               and not current.contains_prefix(snapshot.input_prefix)):
+        if current is None or (current.identity == snapshot.group_identity and not snapshot.covered_by(current)):
             # The watcher has already seen a newer revision than this verification.
             return False
         if snapshot is self._snapshot:

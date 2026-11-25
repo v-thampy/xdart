@@ -66,6 +66,16 @@ class PreviewGroup:
             left.identity == right.identity for (_, left), (_, right) in zip(self.points, prefix.points)
         )
 
+    def contains_metadata(self, prefix):
+        present = {(member.path, member.key): member.prefix for member in self.members}
+        for member, points in self.requirements(prefix.points):
+            latest = present.get((member.path, member.key))
+            row = max(point.label for point in points) + 1
+            if (latest is None or latest.identity != member.prefix.identity or len(latest.extent.marks) <= row
+                    or latest.extent.marks[row] != member.prefix.extent.marks[row]):
+                return False
+        return True
+
     @staticmethod
     def requirements(points):
         by_member = {}
@@ -197,6 +207,11 @@ class PreviewSnapshot:
     product: object = None
     display_bytes: int = 0
     metadata_prefix: PreviewGroup | None = None
+
+    def covered_by(self, group):
+        return group.contains_prefix(self.input_prefix) and (
+            self.metadata_prefix is None or group.contains_metadata(self.metadata_prefix)
+        )
 
 
 @dataclass(frozen=True, slots=True)
