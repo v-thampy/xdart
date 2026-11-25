@@ -172,6 +172,8 @@ def test_p1_occurrence_origin_partial_row_and_point_mapping(qapp, make_page, tmp
 def test_p1_grouped_point_waits_for_both_bound_raw_slots(qapp, make_page, tmp_path):
     page = make_page("rsm")
     spec, images = _rsm_acquisition(page, tmp_path)
+    page.set_field("solid_angle", "Off")
+    page.set_field("polarization", "")
     page.point_images.restore({"choices": [{
         "uri": str(spec), "scan": "1.1", "policy": PointImagePolicy(2, "difference").to_dict(),
     }]})
@@ -379,7 +381,12 @@ def test_p4_preview_voxel_cap_is_independent_of_the_saved_grid(
 
 def _rsm_reference(page, snapshot, mask):
     """Bind the real finite source separately and feed its selected labels onto the preview axes."""
-    native = rsm_values.prepare_rsm_tool_v2(page.build_forms()[0]).request
+    selection, options, (project, folder) = page._resolution_request()
+    groups, skipped = rsm_values.rsm_member_groups(selection, **options)
+    assert not skipped
+    members, = groups
+    form = page._form_for(project, members, folder / "reference.nexus", None)
+    native = rsm_values.prepare_rsm_tool_v2(form).request
     assert len(native.preflight.members) == 1
     member, = native.preflight.members
     receipt, = native.module.source.members
