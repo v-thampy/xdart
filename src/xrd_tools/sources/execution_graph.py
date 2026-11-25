@@ -2264,6 +2264,22 @@ def _external_members(
     return tuple(values)
 
 
+def linked_metadata_dependencies(root, selectors, *, cancelled=None):
+    """Prove the same linked-object closure for selected non-detector datasets."""
+    if not selectors:
+        return ()
+    cancelled = _not_cancelled if cancelled is None else cancelled
+    states = {_source_state_key(root.path): _topology_from_captured_state(root)}
+    paths, seen = [], set()
+    for selector in selectors:
+        _trace_hdf5_object_dependencies(Path(root.path), selector, paths=paths, seen=seen,
+                                        cancelled=cancelled, required=False, states=states)
+    for path in dict.fromkeys(paths):
+        _remember_source_state(path, states, cancelled=cancelled)
+    _verify_source_states(states, cancelled=cancelled)
+    return tuple(item.followed_state for item in states.values() if item.raw_path != root.path)
+
+
 def _selected_dependency_files(
     master: Path,
     master_state: SourceFileState,

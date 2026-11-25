@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -43,6 +44,7 @@ class LiveMemberWitness:
     mapping: tuple
     files: tuple[SourceFileState, ...]
     graphs: tuple
+    raw_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,12 @@ class LiveScanObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class LiveConsumedGroup:
+    identity: tuple
+    containers: tuple[tuple[SourceFileState, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LiveScanHandoff:
     group: stitch_sources.PlannedStitchGroup
     evidence: LiveEvidence
@@ -84,6 +92,10 @@ class LiveScanHandoff:
         if row.status != "ready" or row.evidence is None:
             raise ValueError("Live can hand off only a ready group")
         return cls(row.group, row.evidence, session_id, attempt_id)
+
+    def consumed(self):
+        return LiveConsumedGroup(self.group.identity, tuple(
+            (item.root, tuple(key for key, *_ in item.entries)) for item in self.evidence.containers))
 
 
 def _planned_points(command):
@@ -121,6 +133,8 @@ def _planned_points(command):
 
 
 def _end_marker(entry):
+    if type(entry.get("end_time", getlink=True)) is not h5py.HardLink:
+        return ""
     dataset = entry.get("end_time")
     if not isinstance(dataset, h5py.Dataset) or dataset.shape not in {(), (1,)}:
         return ""
@@ -162,6 +176,8 @@ class _ObservationSweep:
         self.roots = {}
         self.graphs = {}
         self.next_spec = {}
+        self.next_classification = {}
+        self.next_listings = {}
         self.next_members = {}
         self.next_roots = {}
         self.next_late = {}
@@ -203,8 +219,16 @@ class _ObservationSweep:
                 elif kind is SourceKind.EIGER_MASTER:
                     eiger_paths.append(path)
             elif path.suffix.lower() not in stitch_sources._NOT_SPEC and name_ok(path.name):
-                if spec.is_spec_file(path):
-                    spec_paths.append(path)
+                try:
+                    state = self.state(path)
+                    previous = self.observer._classification.get(path)
+                    is_spec = (previous[1] if previous is not None and previous[0] == state
+                               else spec.is_spec_file(path, raise_access_errors=True))
+                    self.next_classification[path] = state, is_spec
+                    if is_spec:
+                        spec_paths.append(path)
+                except OSError:
+                    continue
         return spec_paths, (*nexus_paths, *eiger_paths)
 
     def nexus_listing(self, path):
@@ -217,15 +241,17 @@ class _ObservationSweep:
         try:
             state = self.state(path)
             baseline = self.retired.get(path)
-            saved = self.observer._late.get(path) if baseline is not None else self.observer._roots.get(path)
-            if baseline is not None and state == baseline.root:
-                value = SourceKind.NEXUS_STACK, tuple(key for key, *_ in baseline.entries), ""
+            saved = self.observer._late.get(path) if baseline is not None else self.observer._listings.get(path)
+            if baseline is not None and state == baseline[0]:
+                value = SourceKind.NEXUS_STACK, baseline[1], ""
             elif saved is not None and saved[0] == state:
                 value = saved[1]
             else:
                 value = self.read_listing(path, state, entries_only=baseline is not None)
             if baseline is not None:
                 self.next_late[path] = state, value
+            else:
+                self.next_listings[path] = state, value
         except _WAIT_ERRORS as error:
             value = SourceKind.NEXUS_STACK, (), str(error)
         self.listings[path] = value
@@ -234,6 +260,8 @@ class _ObservationSweep:
     @staticmethod
     def read_listing(path, state, *, entries_only):
         with h5py.File(path, "r") as stream:
+            if any(value is None for _, value in stream.items()):
+                raise ValueError(f"{path.name}: the root has an unresolved entry link")
             entries = tuple(nexus.list_entries_from_open(stream))
             if entries_only:
                 result = SourceKind.NEXUS_STACK, entries, ""
@@ -287,14 +315,18 @@ class _ObservationSweep:
                     paths = tuple(nexus._exact_entry_stack_paths(stream, path, key))
                     member = stitch_sources.PlannedStitchMember(path, key, kind)
                     graph = self.graph(path, key, kind)
-                    files = _graph_files(graph)
+                    metadata_paths = nexus.live_bluesky_metadata_selectors(entry, key)
+                    metadata_files = execution_graph.linked_metadata_dependencies(
+                        state, metadata_paths, cancelled=self.cancelled)
+                    files = tuple(dict.fromkeys((*_graph_files(graph), *metadata_files)))
                     if tuple(graph.dataset_paths) != paths or not _same_files(files, self.state):
                         raise ValueError(f"{path.name}:{key} detector graph is changing")
                     source = SourceSpec(path, kind, entry=key)
                     count = graph.stamp.frame_count
                     points = _nexus_point_count(source, count, entry=entry)
                     detection = detect_point_images(source, graph.group_key, points, count) if points else None
-                    source = _confirmed_source(self.selection, source, detection=detection)
+                    if not self.selection.nexus_entry or key == self.selection.nexus_entry:
+                        source = _confirmed_source(self.selection, source, detection=detection)
                     grouping = source.options.get("point_images")
                     if grouping is None:
                         labels = tuple(range(count))
@@ -367,7 +399,7 @@ class _ObservationSweep:
                         raise ValueError(f"{path.name}: detector inputs changed while observing scan {key}")
                     mapping = _spec_mapping(opened, labels)
                     witness = LiveMemberWitness(member, source, identity, proof, needs_successor,
-                                                labels, mapping, files, tuple(graphs))
+                                                labels, mapping, files, tuple(graphs), paths)
                 finally:
                     _close(opened)
         self.members[member] = witness
@@ -429,6 +461,8 @@ class LiveScanObserver:
         self.select_labels = select_labels
         self.stillness = stillness
         self._spec_keys = {}
+        self._classification = {}
+        self._listings = {}
         self._members = {}
         self._roots = {}
         self._late = {}
@@ -441,8 +475,9 @@ class LiveScanObserver:
         self._roots.clear()
 
     def poll(self, *, now, consumed=(), cancelled=None):
-        already = {handoff.group.identity for handoff in consumed}
-        retired = {Path(root.root.path): root for handoff in consumed for root in handoff.evidence.containers}
+        consumed = tuple(item.consumed() if isinstance(item, LiveScanHandoff) else item for item in consumed)
+        already = {item.identity for item in consumed}
+        retired = {Path(root.path): (root, entries) for item in consumed for root, entries in item.containers}
         sweep = _ObservationSweep(self, cancelled, retired)
         rows, late, still = [], [], {}
         with image.shared_image_listings(all_stems=True), spec.spec_capture_scope():
@@ -466,13 +501,15 @@ class LiveScanObserver:
                         rows.append(LiveScanRow(group, "ready", evidence=evidence))
                     else:
                         rows.append(LiveScanRow(group, "waiting", "Waiting for source stillness"))
-            for path, baseline in retired.items():
+            for path, (_, baseline) in retired.items():
                 sweep.check()
-                known = {key for key, _, _ in baseline.entries}
+                known = set(baseline)
                 _, entries, _ = sweep.listing(path)
                 late.extend((str(path), key) for key in entries if key not in known)
             sweep.check()
         self._spec_keys = sweep.next_spec
+        self._classification = sweep.next_classification
+        self._listings = sweep.next_listings
         self._members = sweep.next_members
         self._roots = sweep.next_roots
         self._late = sweep.next_late
@@ -482,6 +519,14 @@ class LiveScanObserver:
 
 class LiveHandoffChanged(ValueError):
     code = "LIVE_HANDOFF_CHANGED"
+
+
+class LiveOutputChanged(ValueError):
+    code = "LIVE_OUTPUT_CHANGED"
+
+    def __init__(self, target, message="Output changed after Live preflight"):
+        super().__init__(message)
+        self.live_blocked_target = target
 
 
 def require_current_handoff(handoff, *, cancelled=None, readiness=True):
@@ -505,6 +550,15 @@ def require_current_handoff(handoff, *, cancelled=None, readiness=True):
         return states[path]
 
     try:
+        with image.shared_image_listings(all_stems=True):
+            for member in members:
+                if readiness and member.occurrence is not None:
+                    source = member.source
+                    options = source.options
+                    current = tuple(find_spec_image_files(options["image_dir"], Path(source.uri).stem,
+                                                         options["scan"], options["image_stem"]))
+                    if current != member.raw_paths:
+                        raise LiveHandoffChanged(f"{member.member.path.name}:{member.member.key} detector mapping changed")
         for member in members:
             if member.occurrence is not None and not verification.holds(member.occurrence):
                 raise LiveHandoffChanged(f"{member.member.path.name}:{member.member.key} changed after Live observation")
@@ -571,13 +625,95 @@ def snapshot_member(handoff, ordinal):
 
 def live_output_current(handoff, target, check):
     """Check Append currency and the exact target revision in the same worker."""
-    from xrd_tools.io.output_transaction import capture_target_revision, target_revision_key
-
     if handoff is None:
         return check(), None
-    before = capture_target_revision(target)
+    before = observe_live_target(target)
     current = check()
-    after = capture_target_revision(target)
-    if target_revision_key(before) != target_revision_key(after):
-        return False, None
+    after = observe_live_target(target)
+    if before != after:
+        raise LiveOutputChanged(before, "Output changed while checking Append currency")
     return current, after
+
+
+@dataclass(frozen=True, slots=True)
+class LiveTarget:
+    name: str
+    alias: str
+    parent: str
+    revision: tuple
+
+    @property
+    def keys(self):
+        device, inode = self.revision[1:3]
+        values = {("path", self.name), ("parent", self.alias)}
+        if device is not None and inode:
+            values.add(("object", device, inode))
+        return frozenset(values)
+
+
+def observe_live_target(path):
+    from xrd_tools.io.output_transaction import (
+        TargetChanged, _lease_key, _normalize_target, capture_target_revision, target_revision_key,
+    )
+
+    normalized = _normalize_target(path)
+    parent = os.path.normcase(os.path.realpath(Path(path).parent))
+    before = _lease_key(normalized)
+    try:
+        revision = target_revision_key(capture_target_revision(path))
+    except TargetChanged as error:
+        raise OSError(str(error)) from error
+    after = _lease_key(normalized)
+    if before != after or parent != os.path.normcase(os.path.realpath(Path(path).parent)):
+        raise OSError(f"Output parent changed while checking {path}")
+    return LiveTarget(normalized, after, parent, revision)
+
+
+def require_live_target(request, *, allow_created_parent=False):
+    target = request.live_target_revision
+    try:
+        current = observe_live_target(request.module.output.target)
+    except OSError as error:
+        raise LiveOutputChanged(target, str(error)) from error
+    if current == target:
+        return
+    if (allow_created_parent and target is not None and not target.revision[0]
+            and target.alias == target.name and current.name == target.name
+            and current.parent == target.parent and current.revision == target.revision):
+        # Normal native Run can create a previously absent Save Path.
+        return
+    raise LiveOutputChanged(target)
+
+
+def live_asset_revisions(paths):
+    revisions = []
+    for path in paths:
+        try:
+            state = SourceFileState.capture(path)
+            revisions.append((state, execution_graph._resolved(state)))
+        except OSError as error:
+            revisions.append(error.errno)
+    return tuple(revisions)
+
+
+def capture_live_assets(form, handoff):
+    """Observe frozen per-job asset references for a relevant refusal retry."""
+    if handoff is None:
+        return None
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
+
+    project = Path(form.project_root)
+    geometry = getattr(form, "geometry_path", None)
+    if geometry is None:
+        geometry = form.geometry_asset.locator
+    correction = getattr(form, "corrections", form)
+    ub_path = getattr(getattr(form, "ub", None), "spec_path", None)
+    paths = [project / geometry, *(project / value for key in ("mask_path", "dark_path", "flat_path")
+                                  if (value := getattr(correction, key, None)))]
+    if getattr(form, "backend", "xu_hist") == "xu_hist":
+        partner = xu_partner_path(paths[0])
+        paths.extend((partner, partner.with_suffix(partner.suffix + ".provenance.json")))
+    if ub_path is not None and all(Path(ub_path) != member.member.path for member in handoff.evidence.members):
+        paths.append(Path(ub_path))
+    values = tuple(dict.fromkeys(paths))
+    return values, live_asset_revisions(values)

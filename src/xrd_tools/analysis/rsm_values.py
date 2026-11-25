@@ -1903,7 +1903,7 @@ def _prepare_rsm_tool_v2(
         raise TypeError("RSM v2 preflight cancellation must be threading.Event")
 
     from .live_scans import (
-        LiveHandoffChanged, live_output_current, require_current_handoff,
+        LiveHandoffChanged, live_output_current, observe_live_target, require_current_handoff,
         require_native_members, snapshot_member,
     )
 
@@ -1945,10 +1945,13 @@ def _prepare_rsm_tool_v2(
             "OUTPUT_SYMLINK_UNSUPPORTED",
             "RSM output target must not be a symbolic link",
         )
+    observed_target = None if live_handoff is None else observe_live_target(form.output_path)
     refusal = (analysis_output_refusal(form.output_path, AnalysisArtifactKind.RSM)
                if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
     if refusal is not None:  # what the run's Replace would refuse, before any gridding
-        raise RSMToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS", refusal)
+        error = RSMToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS", refusal)
+        error.live_blocked_target = observed_target
+        raise error
     # The output's folder need not exist: the operation qualifies its existing ancestry and its run
     # makes the folder, as Stitch's does (AUD-9 stage 2); Preview creates nothing.
     try:

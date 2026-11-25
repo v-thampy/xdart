@@ -930,14 +930,14 @@ def _inside_project(path: str | Path, root: Path, name: str) -> str:
     return relative.as_posix()
 
 
-def prepare_stitch_tool(form: StitchToolForm, *, live_handoff=None) -> StitchToolPreflight:
+def prepare_stitch_tool(form: StitchToolForm, *, live_handoff=None, cancel_token=None) -> StitchToolPreflight:
     """The preparation as one SPEC capture scope (each SPEC file read once; NEXT-1219-SPEC-OCCURRENCE)."""
     from xrd_tools.io.spec import spec_capture_scope
     with spec_capture_scope():
-        return _prepare_stitch_tool(form, live_handoff=live_handoff)
+        return _prepare_stitch_tool(form, live_handoff=live_handoff, cancel_token=cancel_token)
 
 
-def _prepare_stitch_tool(form: StitchToolForm, *, live_handoff=None) -> StitchToolPreflight:
+def _prepare_stitch_tool(form: StitchToolForm, *, live_handoff=None, cancel_token=None) -> StitchToolPreflight:
     """Perform blocking, read-only preflight for one exact operator form."""
 
     if type(form) is not StitchToolForm:
@@ -954,7 +954,7 @@ def _prepare_stitch_tool(form: StitchToolForm, *, live_handoff=None) -> StitchTo
         )
     if form.source_selection is not None:
         from .stitch_native_values import prepare_native_stitch_tool
-        return prepare_native_stitch_tool(form, project, live_handoff=live_handoff)
+        return prepare_native_stitch_tool(form, project, live_handoff=live_handoff, cancel_token=cancel_token)
     if live_handoff is not None:
         raise StitchToolPreflightRefused("LIVE_HANDOFF_CHANGED", "Live requires a native Stitch selection")
     output_relative = _inside_project(form.output_path, project, "output")

@@ -89,6 +89,7 @@ class RSMOwnerAction(str, Enum):
 
 class RSMOwnerOutcomeKind(str, Enum):
     PREFLIGHT_READY = "preflight-ready"
+    LIVE_APPEND = "live-append"
     PREFLIGHT_REFUSED = "preflight-refused"
     RESULT = "result"
     CLEANUP_PENDING = "cleanup-pending"
@@ -110,6 +111,9 @@ class RSMOwnerOutcome:
     refusal_message: str = ""
     diagnostics: tuple[str, ...] = ()
     finalization_message: str = ""
+
+    live_blocked_target: object | None = None
+    live_assets: tuple | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -254,6 +258,9 @@ class _WorkerCommand:
     form: _RSMForm | None = None
     preflight: _RSMPreflight | None = None
     execution: _RSMExecution | None = None
+
+    live_handoff: object | None = None
+    live_append: bool = False
 
     def __post_init__(self) -> None:
         form_type, preflight_type, execution_type, _result_type = _profile_types(
@@ -447,7 +454,15 @@ class RSMToolOwner:
         result_terminal = outcome.result.terminal
         return result_terminal.code + (f": {result_terminal.diagnostic}" if result_terminal.diagnostic else "")
 
-    def begin_preflight(self) -> OperationIdentity | None:
+    def retire_live_preflight(self, handoff):
+        with self._lock:
+            prepared = self._prepared
+            requests = () if prepared is None else (prepared.request,)
+            if any(getattr(request, "live_handoff", None) is handoff for request in requests):
+                self._prepared = None
+                self._prepared_revision = None
+
+    def begin_preflight(self, *, live_handoff=None) -> OperationIdentity | None:
         with self._lock:
             if (
                 self._form is None
@@ -459,7 +474,7 @@ class RSMToolOwner:
                 RSMOwnerAction.PREFLIGHT,
                 self._form.fingerprint,
                 self._form_revision,
-                form=self._form,
+                form=self._form, live_handoff=live_handoff,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -467,7 +482,7 @@ class RSMToolOwner:
                 self._prepared_revision = None
             return identity
 
-    def begin_run(self) -> OperationIdentity | None:
+    def begin_run(self, *, live_append=False) -> OperationIdentity | None:
         with self._lock:
             preflight = self._prepared
             if (
@@ -497,7 +512,7 @@ class RSMToolOwner:
                 preflight.form.fingerprint,
                 self._prepared_revision,
                 preflight=preflight,
-                execution=execution,
+                execution=execution, live_append=live_append,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -563,20 +578,25 @@ class RSMToolOwner:
         if type(request) is not _WorkerCommand:
             raise TypeError("RSM worker requires one exact command")
         if request.action is RSMOwnerAction.PREFLIGHT:
+            from xrd_tools.analysis.live_scans import LiveOutputChanged, capture_live_assets
+
             publish("preflight", 0, 1)
+            assets = capture_live_assets(request.form, request.live_handoff)
             try:
                 preflight = self._preflight_runner(
                     request.form,
                     cancel_token=cancel,
+                    **({} if request.live_handoff is None else {"live_handoff": request.live_handoff}),
                 )
-            except RSMToolPreflightRefused as error:
+            except (RSMToolPreflightRefused, LiveOutputChanged) as error:
                 if error.code == "CANCELLED":
                     raise OperationCancelled from error
                 return RSMOwnerOutcome(
                     RSMOwnerOutcomeKind.PREFLIGHT_REFUSED,
                     refusal_code=error.code,
                     refusal_message=str(error),
-                    diagnostics=error.diagnostics,
+                    diagnostics=getattr(error, "diagnostics", ()),
+                    live_blocked_target=getattr(error, "live_blocked_target", None), live_assets=assets,
                 )
             _form_type, preflight_type, _execution_type, _result_type = _profile_types(
                 request.generation
@@ -595,6 +615,27 @@ class RSMToolOwner:
             raise TypeError("RSM execution command lost its owner")
         try:
             if request.action is RSMOwnerAction.RUN:
+                if getattr(execution.request, "live_handoff", None) is not None:
+                    from xrd_tools.analysis.live_scans import (
+                        LiveHandoffChanged, LiveOutputChanged, require_current_handoff, require_live_target,
+                    )
+
+                    if cancel.is_set():
+                        raise OperationCancelled("Live stopped")
+                    try:
+                        if request.live_append:
+                            require_current_handoff(execution.request.live_handoff, cancelled=cancel.is_set)
+                        require_live_target(execution.request)
+                    except InterruptedError as error:
+                        raise OperationCancelled("Live stopped") from error
+                    except (LiveHandoffChanged, LiveOutputChanged) as error:
+                        return RSMOwnerOutcome(RSMOwnerOutcomeKind.PREFLIGHT_REFUSED,
+                            refusal_code=error.code, refusal_message=str(error),
+                            live_blocked_target=getattr(error, "live_blocked_target", None))
+                    if request.live_append:
+                        if cancel.is_set():
+                            raise OperationCancelled("Live stopped")
+                        return RSMOwnerOutcome(RSMOwnerOutcomeKind.LIVE_APPEND)
                 result = execution.run(
                     cancel_token=cancel,
                     progress_callback=lambda progress: publish(
@@ -683,6 +724,12 @@ class RSMToolOwner:
                 elif outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_REFUSED:
                     self._prepared = None
                     self._prepared_revision = None
+                    if command.action is RSMOwnerAction.RUN:
+                        self._execution = self._execution_preflight = self._execution_form_revision = None
+                elif outcome.kind is RSMOwnerOutcomeKind.LIVE_APPEND:
+                    self._execution = None
+                    self._execution_preflight = None
+                    self._execution_form_revision = None
                 elif outcome.kind is RSMOwnerOutcomeKind.RESULT:
                     self._last_result = outcome.result
                     self._execution = None

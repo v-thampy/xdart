@@ -232,6 +232,42 @@ class LiveScanWatcher(QtCore.QObject):
             self._dispatching = False
         self._publish_state()
 
+    def reserve_request(self, handoff, request, *, stitch=False):
+        output = request.module.output
+        return self.reserve_target(handoff, request.live_target_revision, output.artifact_family if stitch else None)
+
+    def reserve_target(self, handoff, target, family=None):
+        if target is None:
+            return "The native output has no current revision"
+        return self.reserve(handoff, LiveOutputSlot(target.name, target.keys, (family or "").casefold()))
+
+    def committed_slot(self, handoff, terminal):
+        slot = self._slots.get(handoff.group.identity)
+        if slot is None or terminal.commit is None:
+            return slot
+        file = terminal.commit.terminal
+        if file.device is None or not file.inode:
+            return slot
+        keys = frozenset(key for key in slot.keys if key[0] != "object")
+        return LiveOutputSlot(slot.target, keys | {("object", file.device, file.inode)}, slot.family)
+
+    def refuse(self, handoff, reason, *, code="", target=None, assets=None):
+        from xrd_tools.analysis.live_scans import live_asset_revisions, observe_live_target
+
+        gate = None if target is None else LiveRetryGate(target, lambda: observe_live_target(target.name))
+        if gate is None and assets is not None and code != "LIVE_HANDOFF_CHANGED":
+            paths, revisions = assets
+            gate = LiveRetryGate(revisions, lambda: live_asset_revisions(paths))
+        timed = any(word in code for word in ("BUSY", "LOCKED", "UNAVAILABLE", "LEASE"))
+        if target is not None:
+            collision = self.reserve_target(handoff, target)
+            if collision:
+                self.settle(handoff, consumed=False, blocked=True, reason=collision)
+                return
+        self.settle(handoff, consumed=False, reason=reason, retry_gate=gate,
+                    retry_at=self.clock() + 2 * self._cadence if timed else None,
+                    invalidate=code == "LIVE_HANDOFF_CHANGED")
+
     def reserve(self, handoff, slot):
         """Store a provisional slot, or return a stable collision reason."""
         if self._handoff is not handoff or not self.watching or self._closing:
@@ -249,7 +285,7 @@ class LiveScanWatcher(QtCore.QObject):
         if self._handoff is not handoff:
             return False
         key = handoff.group.identity
-        self._consumed[key] = handoff
+        self._consumed[key] = handoff.consumed()
         self._refusals.pop(key, None)
         if slot is not None:
             self._slots[key] = slot
@@ -293,8 +329,9 @@ class LiveScanWatcher(QtCore.QObject):
             waiting = sum(row.status == "waiting" for row in groups)
             skipped = sum(row.status == "skipped" for row in groups) + len(self._skipped)
             phase = "processing a scan" if self._handoff is not None else "watching"
-            title = (f"Live {phase} · {ready} ready · {waiting} waiting · "
-                     f"{skipped} skipped · {len(self._consumed)} consumed")
+            title = f"Live {phase} · {ready} ready · {waiting} waiting · {len(self._consumed)} consumed"
+            if skipped:
+                title += f" · {skipped} skipped"
             details = [title]
             if self._notice:
                 details.append(self._notice)

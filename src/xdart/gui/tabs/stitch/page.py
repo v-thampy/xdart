@@ -42,6 +42,8 @@ from xdart.gui.widgets.camera_editor import CAMERA_LABELS
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.latest_request import LatestRequestOwner
 from xdart.gui.widgets.run_controls import RunControlsBar
+from xdart.gui.widgets.live_scan_watcher import LiveScanWatcher
+from xrd_tools.analysis.live_scans import LiveScanObserver
 from xdart.gui.widgets.scientific_plot import scaled_intensity_label
 from xdart.gui.tabs.scattering.advanced_editor import AdvancedDialog
 from xdart.gui.tabs.scattering.controls_editing import processed_data_folder, save_path_follows_project
@@ -488,6 +490,8 @@ class StitchPage(QtWidgets.QWidget):
         #: Int's readiness line: (summary, ready) from the section checks.
         self._readiness = ("", False)
         self._run_ready = False
+        self._live_config = None
+        self._live_reopen = None
         #: Older saved settings whose sources disagree on the Data format: why the user must choose it ("" none)
         self._format_choice = ""
         #: The source kind the Source rows and files last showed (a format edit swaps files only when it changes)
@@ -615,7 +619,9 @@ class StitchPage(QtWidgets.QWidget):
             RUN_MODE_CHOICES, UNOWNED_RUN_MODE_REASONS,
         )
         # Int's Cores: the frames stitched at once, on either backend
-        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=True)
+        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, batch=False, cores=True, per_scan_live=True)
+        self._live_watcher = LiveScanWatcher(self._dispatch_live, self._live_status, self._sync_actions, parent=self)
+        self.run_bar.liveToggled.connect(lambda _checked: self._sync_actions())
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("Stitch 1D")
         self.run_bar.modeChanged.connect(self._mode_chosen)
@@ -636,6 +642,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def _control_action(self, action):
         """Int's action buttons on this page (``ControlsPanel.controlActionRequested``)."""
+        if self._live_watcher.busy and action is not ControlAction.RETRY:
+            return
         {ControlAction.CALIBRATE: self._calibrate, ControlAction.MAKE_MASK: self._make_mask,
          ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self._retry,
          ControlAction.ADVANCED_PROCESSING: self.advanced.show}.get(action, lambda: None)()
@@ -653,7 +661,7 @@ class StitchPage(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
         self.run_bar.modeCombo.setCurrentText(self._mode)
         del blocker
-        if mode in _STITCH_MODES:
+        if mode in _STITCH_MODES or self._live_watcher.busy:
             self._status("Stitch is busy · change the mode once it is done", ready=False)
             return
         if mode == "RSM":
@@ -1317,6 +1325,8 @@ class StitchPage(QtWidgets.QWidget):
         self._edited()
 
     def set_sources(self, paths):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         self._adopt_sources(paths)
         count = len(self._source_paths)
         self._source_shown = "" if not count else self._source_paths[0] if count == 1 else f"{count} files selected"
@@ -1444,6 +1454,8 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("output_path", processed_data_folder(value))
 
     def set_field(self, key, value):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         prior_project = str(self._value("project_root") or "") if key == "project_root" else ""
         prior_output = str(self._value("output_path") or "") if key == "project_root" else ""
         # the Save Path rule every tool shares (C-6): it moves with the Project while it is that Project's default
@@ -1591,6 +1603,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def _observe_source(self):
         """Committed SPEC inputs only; edits to processing reuse the last admission."""
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         if self._closing or "raw_dtype" not in self._rows:
             return
         if self._value("source_kind") not in {"Spec", "NeXus"} or not self._source_paths:
@@ -2092,6 +2106,8 @@ class StitchPage(QtWidgets.QWidget):
 
     def _browse(self, key):
         """Browse as Int does: the last folder picked, the same file types for the same inputs."""
+        if self._live_watcher.busy:
+            return
         from xdart.gui.widgets import file_dialogs as dialogs
         kind = self._value("source_kind")
         folders = {"project_root": "Choose folder", "output_path": "Choose processed-data folder",
@@ -2207,6 +2223,8 @@ class StitchPage(QtWidgets.QWidget):
         """Restore a prepared form, including native source and conditioning intent. A GI form's
         results open on the GI axis this page last chose (view state, restored with the settings;
         Codex re-review R2-F3)."""
+        if self._live_watcher.busy:
+            return
         if form.source_selection is None:
             raise ValueError("the Stitch page takes a native source selection")
         fields = {key: getattr(form, key) for key in (
@@ -2324,6 +2342,8 @@ class StitchPage(QtWidgets.QWidget):
         return True
 
     def begin_preview(self):
+        if self._live_watcher.busy:
+            return
         self._prepare("Preparing Preview…", then="preview")
 
     def _prepare(self, action, *, then):
@@ -2336,17 +2356,135 @@ class StitchPage(QtWidgets.QWidget):
             self._after_prepare = None
 
     def begin_run(self):
+        if self._live_watcher.busy:
+            return
         # Typing still in a field is part of this Run's inputs: committed first, it makes the check
         # below run again instead of Append reusing Preview's (Codex testing-fixes review F1).
         self._commit_typing()
         # “Record angular coverage” is frozen here, at Run start, for every job of this Run (decision 6)
         self._run_angular_support = AngularSupportPolicy(enabled=bool(self._value("record_angular_support")))
         self._follow_save_path(again=True)  # C-15: the browser lists this Run's results as they finish
+        if self.run_bar.is_live():
+            self._begin_live()
+            return
         if self._prepared_revision != self._revision or self._owner.prepared is None:
             # As Int's Run: the inputs are checked on the way (Preview's preflight), then run.
             self._prepare("Checking the inputs…", then="run")
             return
         self._run_prepared()
+
+    def _live_status(self, text, tooltip):
+        self.run_bar.set_readiness_summary(text, ready=True, tooltip=tooltip, live=True)
+
+    def _begin_live(self):
+        from xrd_tools.sources.grouping import parse_stitch_scan_groups
+
+        if self.active():
+            return
+        try:
+            form = self.build_form()
+            selection = form.source_selection
+            if not Path(form.project_root).is_dir() or not Path(form.geometry_path).is_file():
+                raise ValueError("Choose an existing Project and Calibration")
+            static_single = selection.kind == "NeXus" or (
+                selection.kind == "Spec" and not selection.stitch_all and len(selection.paths) == 1
+                and len(parse_stitch_scan_groups(selection.scans)) == 1)
+            if ((form.output_family or any(form.output_families))
+                    and (not static_single or len(form.output_families) > 1)):
+                raise ValueError("A custom result name in Live requires one static output group")
+            read = dict(detector_shape=form.detector_shape, raw_dtype=form.raw_dtype,
+                        raw_header_skip=form.raw_header_skip, rotation=0)
+            observer = LiveScanObserver(selection, read, select_labels=form.frame_selector.select)
+        except (OSError, ValueError, TypeError, IndexError) as error:
+            self._status(f"Live refused: {error}", ready=False)
+            return
+        self._source_observer.release()
+        self._prepared_revision = None
+        self._live_config = (form, self.run_bar.get_cores(), self._run_angular_support,
+                             self.run_bar.write_mode() == "Append")
+        self._live_watcher.start(observer)
+
+    def _dispatch_live(self, handoff):
+        if (self._owner.busy or self._closing or self._authoring_active()
+                or self._owner.finalization is not StitchOwnerFinalization.NONE):
+            return False
+        self._owner.set_form(self._live_config[0])
+        identity = self._owner.begin_preflight(live_handoff=handoff)
+        if identity is None:
+            return False
+        self._timer.start()
+        return True
+
+    def _accept_live(self, update, handoff):
+        watcher = self._live_watcher
+        command = update.identity.request
+        reopen = update.identity is self._live_reopen
+        if not reopen and command.live_handoff is not handoff and (
+                command.execution is None or command.execution.request.live_handoff is not handoff):
+            return False
+        accepted = bool(command.execution is not None and command.execution.live_accepted)
+        if accepted:
+            watcher.accept(handoff)
+        if update.progress is not None:
+            return True
+        outcome = update.outcome
+        if reopen:
+            self._live_reopen = None
+            reason = ((outcome.finalization_message if outcome is not None else
+                      f"Saved result readback failed: {update.failure_message}") or "Append-current skipped")
+            watcher.settle(handoff, consumed=True, reason=reason)
+        elif outcome is None:
+            self._owner.retire_live_preflight(handoff)
+            watcher.settle(handoff, consumed=accepted, reason=update.failure_message or "Stitch stopped")
+        elif outcome.kind is StitchOwnerOutcomeKind.PREFLIGHT_READY:
+            preflight = outcome.preflight
+            if not watcher.watching or update.stale or len(preflight.requests) != 1:
+                self._owner.retire_live_preflight(handoff)
+                watcher.settle(handoff, consumed=False, reason="Live has no current Stitch preflight")
+                return True
+            request = preflight.requests[0]
+            collision = watcher.reserve_request(handoff, request, stitch=True)
+            if collision:
+                self._owner.retire_live_preflight(handoff)
+                watcher.settle(handoff, consumed=False, blocked=True, reason=collision)
+            else:
+                _form, cores, angular_support, append = self._live_config
+                if self._owner.begin_run(workers=cores, angular_support=angular_support,
+                                         live_append=append and 0 in preflight.unchanged) is None:
+                    self._owner.retire_live_preflight(handoff)
+                    watcher.refuse(handoff, "Stitch Run owner is busy", code="BUSY")
+        elif outcome.kind is StitchOwnerOutcomeKind.LIVE_REFUSED:
+            self._owner.retire_live_preflight(handoff)
+            watcher.refuse(handoff, outcome.finalization_message, code=outcome.refusal_code,
+                           target=outcome.live_blocked_target)
+        elif outcome.kind is StitchOwnerOutcomeKind.LIVE_APPEND:
+            self._owner.retire_live_preflight(handoff)
+            watcher.accept(handoff, skipped=True)
+            target = str(command.execution.request.module.output.target)
+            self._live_reopen = self._owner.begin_reopen(target, export_paths=(target,))
+            if self._live_reopen is None:
+                watcher.settle(handoff, consumed=True, reason="Saved result readback could not start")
+        elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
+            self._owner.retire_live_preflight(handoff)
+            result = outcome.result
+            terminal = result.terminal
+            if terminal.disposition is ModuleDisposition.COMMITTED:
+                target = str(result.request.module.output.target)
+                if not self._closing:
+                    self._mount_payload(target, result.payload)
+                watcher.settle(handoff, consumed=True,
+                               reason=outcome.finalization_message or f"Saved {Path(target).name}",
+                               slot=watcher.committed_slot(handoff, terminal))
+            elif accepted:
+                watcher.settle(handoff, consumed=True, reason=terminal.diagnostic or terminal.code)
+            else:
+                watcher.refuse(handoff, terminal.diagnostic or terminal.code, code=terminal.code,
+                               target=result.request.live_target_revision if terminal.code == "LIVE_OUTPUT_CHANGED" else None)
+        else:
+            message = outcome.finalization_message or "Saved result retained · Retry"
+            watcher.accept(handoff, reason=message)
+            self._status(message, ready=False)
+        return True
 
     def _run_prepared(self):
         prepared = self._owner.prepared
@@ -2391,6 +2529,8 @@ class StitchPage(QtWidgets.QWidget):
             self._prepared_revision = None  # the next Run prepares again
 
     def open_result(self, path=None, *, completion_message="", export_paths=()):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         if path is None or isinstance(path, bool):
             from xdart.gui.widgets.file_dialogs import browse
             picks = browse(self, "Open stitched result", file_filter="NeXus (*.nexus)",
@@ -2405,6 +2545,11 @@ class StitchPage(QtWidgets.QWidget):
             self._open_complete_text = completion_message
 
     def stop(self):
+        if self._live_watcher.busy:
+            self._live_watcher.stop()
+            self._owner.cancel()
+            self._sync_actions()
+            return ActionAccepted("stitch-live-stop")
         self._queued_jobs.clear()
         if self._after_prepare == "run":  # the check finishes; nothing is stitched after it
             self._after_prepare = "stopped"
@@ -2433,6 +2578,9 @@ class StitchPage(QtWidgets.QWidget):
         if (update is not None and update.action is StitchOwnerAction.FRAME_READ
                 and self._raw_request_revision != self._raw_revision):
             update = None  # cancelled/superseded frame work cannot repaint a newer frame or file
+        handoff = self._live_watcher.handoff
+        if update is not None and handoff is not None and self._accept_live(update, handoff):
+            update = None
         if update is not None:
             if update.progress is not None:
                 p = update.progress
@@ -2467,6 +2615,7 @@ class StitchPage(QtWidgets.QWidget):
                 QtCore.QTimer.singleShot(0, self._request_raw)
             if self._reload_pending and not self._queued_jobs:
                 QtCore.QTimer.singleShot(0, self._request_reload)
+        self._live_watcher.pump()
         self._sync_actions()
 
     def _accept_outcome(self, update):
@@ -2617,6 +2766,8 @@ class StitchPage(QtWidgets.QWidget):
     def _browser_command(self, command):
         """The Data Browser's commands, as the lists' and buttons' own signals were handled: a new current result
         (its frames and the view), a new selection (the overlay), a frame for the raw image, the actions."""
+        if self._live_watcher.busy:
+            return
         from xdart.gui.tabs.scattering.shell_values import ShellCommandKind
         kind, value = command.kind, command.value
         if kind is ShellCommandKind.SELECT_SCAN and command.path == ("directory",):
@@ -2751,6 +2902,8 @@ class StitchPage(QtWidgets.QWidget):
         self._frame_changed()
 
     def _request_raw(self):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         if self._closing or (not self.scientific.raw_popup_shown() and self._member_preferences is None):
             self._raw_pending = False
             return
@@ -2811,6 +2964,8 @@ class StitchPage(QtWidgets.QWidget):
             **({"nexus_entry": entry} if entry else {})})
 
     def _calibrate(self):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
@@ -2923,6 +3078,8 @@ class StitchPage(QtWidgets.QWidget):
             return ImageOrientation()
 
     def _make_mask(self):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
@@ -3022,6 +3179,8 @@ class StitchPage(QtWidgets.QWidget):
     def _request_reload(self):
         """Read the next shown result back from its file, through the owner, between its other work:
         never inside a run's queue of outputs (a refused start would end the run's queue)."""
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         if self._closing or self._owner.busy or self._queued_jobs or self._reloading is not None:
             return
         resident = self._resident_paths()
@@ -3567,6 +3726,8 @@ class StitchPage(QtWidgets.QWidget):
         self._draw()
 
     def _show_metadata(self):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         payload = self._current_payload()
         if payload is None or self._owner.busy or self._closing:
             return
@@ -3601,7 +3762,9 @@ class StitchPage(QtWidgets.QWidget):
     def _sync_actions(self):
         busy, final = self._owner.busy, self._owner.finalization
         authoring = self._authoring_active()
-        idle = not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
+        watcher = getattr(self, "_live_watcher", None)
+        live = watcher is not None and watcher.busy
+        idle = not live and not busy and not authoring and final is StitchOwnerFinalization.NONE and not self._closing
         # the editors lock and the action row stays usable: a pending result's Retry (Codex's RSM review F2)
         self.controls.set_editors_enabled(idle)
         self.run_bar.set_mode_row_enabled(idle)  # as Int's: the mode and Append/Replace hold during a run
@@ -3634,9 +3797,10 @@ class StitchPage(QtWidgets.QWidget):
         self.browser.set_action_enabled("Metadata", idle and self._current_payload() is not None)
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
-        self.run_bar.startButton.setEnabled(idle and self._run_ready)  # partial selections still run their admitted groups
+        self.run_bar.liveButton.setEnabled(idle)
+        self.run_bar.startButton.setEnabled(idle and (self.run_bar.is_live() or self._run_ready))  # partial selections still run their admitted groups
         action = self._owner.current_identity.request.action if busy else None
-        self.run_bar.set_stop_enabled(action is StitchOwnerAction.RUN or (
+        self.run_bar.set_stop_enabled((watcher is not None and watcher.watching) or action is StitchOwnerAction.RUN or (
             action is StitchOwnerAction.PREFLIGHT and self._after_prepare == "run"))
         self.retry_button.setVisible(final is not StitchOwnerFinalization.NONE)
         self.retry_button.setEnabled(not busy)
@@ -3650,7 +3814,7 @@ class StitchPage(QtWidgets.QWidget):
     def _settings_busy(self):
         """Whether a settings load waits, and why (the shared owner's ``busy``): while a run works, and while the
         calibration or mask window works, whose inputs the load would change mid-job (G12's finding: a fit)."""
-        if self._owner.busy:
+        if self._live_watcher.busy or self._owner.busy:
             return True
         if any(host.computing for host in self._fit_hosts.values()):
             return "Stitch's fit window is working; load settings when it is done"
@@ -3661,7 +3825,8 @@ class StitchPage(QtWidgets.QWidget):
         return False
 
     def active(self):
-        return self._owner.busy or self._owner.finalization is not StitchOwnerFinalization.NONE or self._closing or self._authoring_active()
+        return (getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy
+                or self._owner.busy or self._owner.finalization is not StitchOwnerFinalization.NONE or self._closing or self._authoring_active())
 
     def shutdown(self):
         self._closing = True
@@ -3674,6 +3839,7 @@ class StitchPage(QtWidgets.QWidget):
         receipt = self._owner.close()
         child_receipts = [dialog.shutdown() for dialog in self._authoring_dialogs]
         child_receipts.append(self._source_observer.shutdown())
+        child_receipts.append(self._live_watcher.shutdown())
         child_receipts.append(self.scientific.shutdown_phase_overlays())
         child_receipts.extend(host.shutdown() for host in self._fit_hosts.values())
         if not self._result_browser.close():
@@ -3743,6 +3909,8 @@ class StitchPage(QtWidgets.QWidget):
                             tool_requested=self.toolRequested, mode_requested=self.modeRequested)
 
     def request(self):
+        if self._live_watcher.busy:
+            return
         return self._result_browser.request()
 
     def run_pause(self):

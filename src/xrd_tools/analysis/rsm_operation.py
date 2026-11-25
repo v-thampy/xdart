@@ -6535,6 +6535,11 @@ class RSMOperationExecutionV2:
                 )
                 self._current_live(cancel_token)
                 if self.request.live_handoff is not None:
+                    from xrd_tools.analysis.live_scans import LiveOutputChanged, require_live_target
+                    try:
+                        require_live_target(self.request, allow_created_parent=True)
+                    except LiveOutputChanged as error:
+                        raise RSMOperationRefused(error.code, str(error)) from error
                     self.live_accepted = True
                     if on_accepted is not None:
                         on_accepted(self.request.live_handoff)

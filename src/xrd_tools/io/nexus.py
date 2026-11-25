@@ -1529,6 +1529,50 @@ def list_entries(path: Path | str) -> list[str]:
         return list_entries_from_open(f)
 
 
+def live_bluesky_metadata_selectors(entry, key):
+    """Native Bluesky scalar and motor inputs with indirect HDF5 custody."""
+    from xrd_tools.io.bluesky_nexus import (
+        _BLUESKY_COUNT_TIME_COL, _DEFAULT_BLUESKY_COUNTERS, _EIGER_CONFIG_BASE,
+        bluesky_all_motor_names, bluesky_motor_names,
+    )
+
+    scanned = bluesky_motor_names(entry)
+    motors = bluesky_all_motor_names(entry, scanned)
+    baseline = "instrument/bluesky/streams/baseline"
+    paths = ["end_time", "instrument/bluesky/metadata/motors",
+             "instrument/monochromator/energy", "instrument/monochromator/wavelength",
+             *_SATURATION_PATHS]
+    paths.extend(f"data/{name}" for name in (*scanned, *_DEFAULT_BLUESKY_COUNTERS,
+                                          _BLUESKY_COUNT_TIME_COL, "EPOCH"))
+    for name in motors:
+        paths.append(f"instrument/positioners/{name}/value")
+        for signal in (name, f"{name}_user_readback", f"{name}_rbv", f"{name}_readback"):
+            group = f"{baseline}/{signal}"
+            paths.extend(f"{group}/{item}" for item in ("value_start", "value_end", "value"))
+            if isinstance(entry.get(group), h5py.Dataset):
+                paths.append(group)
+    configuration = entry.get(_EIGER_CONFIG_BASE)
+    if isinstance(configuration, h5py.Group):
+        for device in configuration:
+            paths.extend(f"{_EIGER_CONFIG_BASE}/{device}/data/eiger_cam_{field}"
+                         for field in ("wavelength", "photon_energy", "acquire_time", "acquire_period"))
+
+    def indirect(path):
+        node = entry
+        for part in path.split("/"):
+            if not isinstance(node, h5py.Group):
+                return False
+            link = node.get(part, getlink=True)
+            if isinstance(link, (h5py.ExternalLink, h5py.SoftLink)):
+                return True
+            node = node.get(part)
+        return isinstance(node, h5py.Dataset) and (node.is_virtual or bool(node.external))
+
+    external_entry = type(entry.file.get(key, getlink=True)) is not h5py.HardLink
+    return tuple(f"/{key}/{path}" for path in dict.fromkeys(paths)
+                 if indirect(path) or external_entry and isinstance(entry.get(path), h5py.Dataset))
+
+
 def list_entries_from_open(stream) -> list[str]:
     """The native entry order, from the caller's already open file."""
     groups = [(name, obj) for name, obj in stream.items() if isinstance(obj, h5py.Group)]

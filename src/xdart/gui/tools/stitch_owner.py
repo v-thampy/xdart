@@ -11,6 +11,7 @@ from threading import Lock
 from typing import Any
 
 from xdart.gui.pages.operation_owner import (
+    OperationCancelled,
     OperationIdentity,
     OperationProgress,
     OperationRunLog,
@@ -74,6 +75,8 @@ class StitchOwnerOutcomeKind(str, Enum):
     FRAME_READ = "frame-read"
     METADATA = "metadata"
     PREFLIGHT_READY = "preflight-ready"
+    LIVE_APPEND = "live-append"
+    LIVE_REFUSED = "live-refused"
     RESULT = "result"
     CLEANUP_PENDING = "cleanup-pending"
     VERIFICATION_PENDING = "verification-pending"
@@ -97,6 +100,10 @@ class StitchOwnerOutcome:
     artifact_path: str = ""
     frame_view: FrameView | None = None
     metadata: tuple[StitchMetadataTable, ...] | None = None
+
+    live_blocked_target: object | None = None
+    live_assets: tuple | None = None
+    refusal_code: str = ""
 
     def __post_init__(self) -> None:
         if self.kind is StitchOwnerOutcomeKind.METADATA:
@@ -256,6 +263,9 @@ class _WorkerCommand:
     export_paths: tuple[str, ...] = ()
     #: a Run's frozen “Record angular coverage” policy (an AngularSupportPolicy; None: the default)
     angular_support: Any = None
+
+    live_handoff: object | None = None
+    live_append: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -462,7 +472,15 @@ class StitchToolOwner:
         result_terminal = outcome.result.terminal
         return result_terminal.code + (f": {result_terminal.diagnostic}" if result_terminal.diagnostic else "")
 
-    def begin_preflight(self) -> OperationIdentity | None:
+    def retire_live_preflight(self, handoff):
+        with self._lock:
+            prepared = self._prepared
+            requests = () if prepared is None else prepared.requests
+            if any(getattr(request, "live_handoff", None) is handoff for request in requests):
+                self._prepared = None
+                self._prepared_revision = None
+
+    def begin_preflight(self, *, live_handoff=None) -> OperationIdentity | None:
         with self._lock:
             if (
                 self._form is None
@@ -473,7 +491,7 @@ class StitchToolOwner:
                 StitchOwnerAction.PREFLIGHT,
                 self._form.fingerprint,
                 self._form_revision,
-                form=self._form,
+                form=self._form, live_handoff=live_handoff,
             )
             identity = self._begin_locked(command)
             if identity is not None:
@@ -529,7 +547,7 @@ class StitchToolOwner:
             ))
 
     def begin_run(self, job_index: int = 0, workers: int = 1, *, export_paths: tuple[str, ...] = (),
-                  angular_support: Any = None) -> OperationIdentity | None:
+                  angular_support: Any = None, live_append=False) -> OperationIdentity | None:
         """Run the prepared output ``job_index`` with ``workers`` frame workers (the run bar's Cores) and the
         page's frozen “Record angular coverage” policy (``angular_support``; None: the default)."""
         if type(workers) is not int or workers < 1:
@@ -560,7 +578,7 @@ class StitchToolOwner:
                 preflight.form.fingerprint,
                 self._prepared_revision,
                 preflight=preflight,
-                execution=execution,
+                execution=execution, live_append=live_append,
                 workers=workers,
                 export_paths=export_paths,
                 angular_support=angular_support,
@@ -623,7 +641,9 @@ class StitchToolOwner:
 
         with self._lock:
             identity = self._active_identity
-            if self._active_action not in {StitchOwnerAction.RUN, StitchOwnerAction.METADATA}:
+            live_preflight = (self._active_action is StitchOwnerAction.PREFLIGHT
+                              and identity is not None and identity.request.live_handoff is not None)
+            if not live_preflight and self._active_action not in {StitchOwnerAction.RUN, StitchOwnerAction.METADATA}:
                 return False
         return identity is not None and self._worker.cancel(identity)
 
@@ -665,8 +685,21 @@ class StitchToolOwner:
                 finalization_message=self._export_xyes(payload, request.export_paths) if request.export_paths else "",
             )
         if request.action is StitchOwnerAction.PREFLIGHT:
+            from xrd_tools.analysis.live_scans import capture_live_assets
+
             publish("preflight", 0, 1)
-            preflight = self._preflight_runner(request.form)
+            assets = capture_live_assets(request.form, request.live_handoff)
+            try:
+                preflight = self._preflight_runner(request.form,
+                    **({} if request.live_handoff is None else {"live_handoff": request.live_handoff, "cancel_token": cancel}))
+            except InterruptedError as error:
+                raise OperationCancelled("Live stopped") from error
+            except (ValueError, OSError) as error:
+                if request.live_handoff is None:
+                    raise
+                return StitchOwnerOutcome(StitchOwnerOutcomeKind.LIVE_REFUSED,
+                    finalization_message=str(error), refusal_code=getattr(error, "code", "STITCH_PREFLIGHT_REFUSED"),
+                    live_blocked_target=getattr(error, "live_blocked_target", None), live_assets=assets)
             if type(preflight) is not StitchToolPreflight:
                 raise TypeError("preflight adapter returned an invalid value")
             if preflight.form.fingerprint != request.form_fingerprint:
@@ -681,6 +714,27 @@ class StitchToolOwner:
             raise TypeError("Stitch execution command lost its owner")
         try:
             if request.action is StitchOwnerAction.RUN:
+                if getattr(execution.request, "live_handoff", None) is not None:
+                    from xrd_tools.analysis.live_scans import (
+                        LiveHandoffChanged, LiveOutputChanged, require_current_handoff, require_live_target,
+                    )
+
+                    if cancel.is_set():
+                        raise OperationCancelled("Live stopped")
+                    try:
+                        if request.live_append:
+                            require_current_handoff(execution.request.live_handoff, cancelled=cancel.is_set)
+                        require_live_target(execution.request)
+                    except InterruptedError as error:
+                        raise OperationCancelled("Live stopped") from error
+                    except (LiveHandoffChanged, LiveOutputChanged) as error:
+                        return StitchOwnerOutcome(StitchOwnerOutcomeKind.LIVE_REFUSED,
+                            finalization_message=str(error), refusal_code=error.code,
+                            live_blocked_target=getattr(error, "live_blocked_target", None))
+                    if request.live_append:
+                        if cancel.is_set():
+                            raise OperationCancelled("Live stopped")
+                        return StitchOwnerOutcome(StitchOwnerOutcomeKind.LIVE_APPEND)
                 if request.preflight.form.source_selection is not None:
                     from .stitch_native_values import create_native_output_directory
                     create_native_output_directory(execution.request)
@@ -764,6 +818,10 @@ class StitchToolOwner:
                     if not stale:
                         self._prepared = outcome.preflight
                         self._prepared_revision = command.form_revision
+                elif outcome.kind is StitchOwnerOutcomeKind.LIVE_APPEND or outcome.kind is StitchOwnerOutcomeKind.LIVE_REFUSED:
+                    self._execution = None
+                    self._execution_preflight = None
+                    self._execution_form_revision = None
                 elif outcome.kind is StitchOwnerOutcomeKind.RESULT:
                     self._last_result = outcome.result
                     self._execution = None

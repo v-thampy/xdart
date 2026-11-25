@@ -193,7 +193,7 @@ def list_planned_stitch_groups(selection, *, check=lambda: None, allow_pending=F
             resolved = path.resolve()
             if resolved not in seen:
                 seen.add(resolved)
-                yield PlannedStitchGroup(("directory-nexus", path), nexus_members(path), (path,))
+                yield PlannedStitchGroup(("directory-nexus", resolved), nexus_members(path), (path,))
 
 
 @functools.lru_cache(maxsize=8)

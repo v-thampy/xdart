@@ -216,6 +216,8 @@ def test_g4_live_watching_fences_the_actual_host_and_page_commands(qapp, tmp_pat
 
 
 def test_g5_preflight_refusal_fairness_and_post_acceptance_failure(qapp, tmp_path, monkeypatch):
+    from xrd_tools.analysis import stitch_operation
+
     with _mounted("stitch", tmp_path, qapp) as (page, source, _images):
         prepared = prepare_stitch_tool(page.build_form())
         first, second = [Path(job.module.output.target) for job in prepared.requests]
@@ -224,21 +226,20 @@ def test_g5_preflight_refusal_fairness_and_post_acceptance_failure(qapp, tmp_pat
         first.write_bytes(b"foreign output")
         attempts, science = [], []
         original_prepare = page._owner._preflight_runner
-        original_emit = StitchOperationExecution._emit
+        original_science = stitch_operation.run_stitch
 
         def prepare(form, *args, **kwargs):
             attempts.append(form)
             return original_prepare(form, *args, **kwargs)
 
-        def emit(self, stage, *args):
-            original_emit(self, stage, *args)
-            target = Path(self.request.module.output.target)
-            if stage == "science" and target == second and target not in science:
-                science.append(target)
+        def run_science(*args, **kwargs):
+            if page._owner.current_identity.request.execution.request.module.output.target == str(second):
+                science.append(second)
                 raise ArithmeticError("injected failure after the native acceptance barrier")
+            return original_science(*args, **kwargs)
 
         monkeypatch.setattr(page._owner, "_preflight_runner", prepare)
-        monkeypatch.setattr(StitchOperationExecution, "_emit", emit)
+        monkeypatch.setattr(stitch_operation, "run_stitch", run_science)
         start_live(page)
         tick_live(page, qapp)
         wait_until(qapp, lambda: science == [second] and not page._owner.busy)

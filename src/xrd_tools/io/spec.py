@@ -303,7 +303,7 @@ def _get_spec_scan(spec_file: Path | str, scan_num: str):
 _SPEC_MARKERS = ("#F", "#S", "#E", "#C", "#O")
 
 
-def is_spec_file(path: Path | str) -> bool:
+def is_spec_file(path: Path | str, *, raise_access_errors=False) -> bool:
     """True if *path* looks like a SPEC data file.
 
     SSRL SPEC files are **extensionless**, so detection is content-based: the
@@ -322,6 +322,8 @@ def is_spec_file(path: Path | str) -> bool:
                 if stripped:
                     return stripped.startswith(_SPEC_MARKERS)
     except OSError:
+        if raise_access_errors:
+            raise
         return False
     return False
 

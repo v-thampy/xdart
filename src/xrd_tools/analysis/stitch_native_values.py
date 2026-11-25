@@ -165,18 +165,19 @@ def _affine_geometry_warning(request):
     return None
 
 
-def prepare_native_stitch_tool(form, project, *, live_handoff=None):
+def prepare_native_stitch_tool(form, project, *, live_handoff=None, cancel_token=None):
     from .stitch_values import (
         StitchToolPreflight, StitchToolPreflightRefused, _PREFLIGHT_FACTORY,
         _inside_project,
     )
     from .live_scans import (
-        LiveHandoffChanged, live_output_current, require_current_handoff,
+        LiveHandoffChanged, live_output_current, observe_live_target, require_current_handoff,
         require_native_members, snapshot_member,
     )
 
+    cancelled = None if cancel_token is None else cancel_token.is_set
     try:
-        require_current_handoff(live_handoff)
+        require_current_handoff(live_handoff, cancelled=cancelled)
     except LiveHandoffChanged as error:
         raise StitchToolPreflightRefused(error.code, str(error)) from error
     output_dir = Path(form.output_path).parent
@@ -190,7 +191,9 @@ def prepare_native_stitch_tool(form, project, *, live_handoff=None):
     try:
         resolution = resolve_stitch_sources(
             form.source_selection, read_options,
-            **({} if live_handoff is None else {"planned_group": live_handoff.group}))
+            **({} if live_handoff is None else {"planned_group": live_handoff.group, "cancelled": cancelled}))
+    except InterruptedError:
+        raise
     except (OSError, ValueError, LookupError) as error:
         if live_handoff is None:
             raise
@@ -209,7 +212,8 @@ def prepare_native_stitch_tool(form, project, *, live_handoff=None):
         cache_key = (str(spec.uri), spec.entry, str(spec.options))
         if cache_key not in tables:
             table = run_metadata_table(MetadataTablePlan(spec),
-                **({} if live_handoff is None else {"live_member": snapshot_member(live_handoff, ordinal)}))
+                **({} if live_handoff is None else {"live_member": snapshot_member(live_handoff, ordinal),
+                                                    "cancel_token": cancel_token}))
             if table.disposition is not AnalysisDisposition.COMPLETED:
                 raise StitchToolPreflightRefused(table.code or "SOURCE_PREFLIGHT_REFUSED",
                     f"Source metadata could not be admitted: {spec.uri} (entry {spec.entry or '-'}, scan {spec.options.get('scan', '-')})",
@@ -298,11 +302,14 @@ def prepare_native_stitch_tool(form, project, *, live_handoff=None):
             receipt = cached[cache_key]
             receipts.append(receipt)
         target = resolve_finite_output_target(output_dir, family, operation_token=f"stitch-{form.mode}")
+        observed_target = None if live_handoff is None else observe_live_target(target)
         refusal = (analysis_output_refusal(target, kind)
                    if form.overwrite is AnalysisArtifactOverwrite.REPLACE else None)
         if refusal is not None:  # what the run's Replace would refuse, before any integration
-            raise StitchToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS",
+            error = StitchToolPreflightRefused("OUTPUT_NOT_PREVIOUS_ANALYSIS",
                                              f"Output {len(requests) + 1} ({family}): {refusal}")
+            error.live_blocked_target = observed_target
+            raise error
         output = ModuleOutputRequest(target, kind, form.overwrite, artifact_family=family)
         try:
             source = receipts[0] if len(receipts) == 1 else ModuleSourceGroupReceipt.from_members(
@@ -310,7 +317,7 @@ def prepare_native_stitch_tool(form, project, *, live_handoff=None):
             # the tables this check admitted, reused rather than read again (PERF-STITCH-1)
             admitted = tuple(tables[(str(spec.uri), spec.entry, str(spec.options))][1] for spec in group)
             require_native_members(live_handoff, receipts)
-            require_current_handoff(live_handoff)
+            require_current_handoff(live_handoff, cancelled=cancelled)
             request = prepare_stitch_operation(source, output, plan, project_root=project,
                                                tables=admitted if len(admitted) > 1 else admitted[0])
             object.__setattr__(request, "live_handoff", live_handoff)

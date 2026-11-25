@@ -455,11 +455,12 @@ def test_g11_rsm_live_regrids_a_legacy_spec_ub_map_once(qapp, make_page, tmp_pat
     snapshot = _shots(output)
     _click_run(qapp, page)
     assert "up to date" in _state(page) and _shots(output) == snapshot
+    displayed_before_live = _shown(page, "rsm")
     _append_spec(spec, "\n" + rsm_gui._spec_scan(3, 12).rsplit("\n", 2)[0] + "\n")
     runs = _record_runs(monkeypatch, rsm_operation.RSMOperationExecutionV2)
     start_live(page)
     _ticks(page, qapp)
-    _wait(qapp, page, lambda: _shown(page, "rsm") is not None and _shots(output) != snapshot)
+    _wait(qapp, page, lambda: _shown(page, "rsm") is not displayed_before_live and _shots(output) != snapshot)
     target = Path(prior.inspection.path)
     assert runs == [target.name]
     regridded = _shots(output)

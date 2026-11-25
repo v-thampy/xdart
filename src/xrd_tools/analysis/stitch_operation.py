@@ -3414,6 +3414,11 @@ class StitchOperationExecution:
     def _accept_live(self, cancel_token):
         self._current_live(cancel_token)
         if self.request.live_handoff is not None:
+            from xrd_tools.analysis.live_scans import LiveOutputChanged, require_live_target
+            try:
+                require_live_target(self.request, allow_created_parent=True)
+            except LiveOutputChanged as error:
+                raise StitchOperationRefused(error.code, str(error)) from error
             self.live_accepted = True
             if self._live_accept_callback is not None:
                 self._live_accept_callback(self.request.live_handoff)

@@ -172,3 +172,32 @@ def test_entry_survives_rsm_member_projection_and_preflight(tmp_path):
     assert source.analysis.source_spec.options["nexus_entry"] == "experiment"
     with requalified_analysis_source(source.analysis) as opened:
         np.testing.assert_array_equal(opened.load_frame(1), images[1])
+
+
+def test_live_handoff_revokes_when_linked_motor_metadata_changes(tmp_path):
+    from tests.core.test_live_per_scan import _native_nexus_form
+    from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver
+    from xrd_tools.analysis.stitch_operation import run_stitch_operation
+    from xrd_tools.analysis.stitch_values import StitchToolPreflightRefused, prepare_stitch_tool
+
+    form, root = _native_nexus_form(tmp_path)
+    motors = tmp_path / "motor-values.h5"
+    with h5py.File(motors, "w") as stream:
+        stream.create_dataset("delta", data=(14.0, 15.0))
+    with h5py.File(root, "r+") as stream:
+        del stream["entry/data/del"]
+        stream["entry/data/del"] = h5py.ExternalLink(motors.name, "/delta")
+    observer = LiveScanObserver(form.source_selection, {}, select_labels=form.frame_selector.select)
+    observer.poll(now=0)
+    row, = observer.poll(now=2).groups
+    handoff = LiveScanHandoff.from_ready(row, session_id="metadata", attempt_id="one")
+    request = prepare_stitch_tool(form, live_handoff=handoff).request
+    original_root = root.stat()
+    with h5py.File(motors, "r+") as stream:
+        stream["delta"][1] = 15.5
+    assert root.stat() == original_root
+    with pytest.raises(StitchToolPreflightRefused, match="LIVE_HANDOFF_CHANGED"):
+        prepare_stitch_tool(form, live_handoff=handoff)
+    accepted = []
+    result = run_stitch_operation(request, on_accepted=accepted.append)
+    assert not accepted and result.terminal.code == "LIVE_HANDOFF_CHANGED"

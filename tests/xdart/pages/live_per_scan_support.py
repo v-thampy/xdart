@@ -1,10 +1,9 @@
 """Drive the mounted Run bar and the real Live cadence with a controlled clock."""
 
 from importlib.util import find_spec
-from time import monotonic
+from time import monotonic, sleep
 
 import pytest
-from pyqtgraph.Qt import QtTest
 
 
 class MissingLiveCapability(AssertionError):
@@ -34,7 +33,7 @@ def wait_until(qapp, predicate, *, timeout_ms=15000):
     deadline = monotonic() + timeout_ms / 1000
     while not predicate() and monotonic() < deadline:
         qapp.processEvents()
-        QtTest.QTest.qWait(5)
+        sleep(0.005)  # Yield to the native worker after pumping the Qt events.
     assert predicate(), "the expected native owner or Qt state never arrived"
 
 

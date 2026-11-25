@@ -74,6 +74,8 @@ from xdart.gui.tools.page_settings import PageSettings
 from xdart.gui.widgets.controls_panel import ControlsPanel, FormRow, SubsectionCard
 from xdart.gui.widgets.read_only_text import ReadOnlyTextWindow
 from xdart.gui.widgets.run_controls import RunControlsBar
+from xdart.gui.widgets.live_scan_watcher import LiveScanWatcher
+from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver, require_current_handoff
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.rsm_geometry_asset import (
     RSMGeometryAssetRefused, capture_rsm_calibration_geometry,
@@ -220,6 +222,17 @@ def _resolve_rsm_groups(arguments, cancel, _progress):
     from xrd_tools.analysis.stitch_sources import SourceSearchCancelled
     if cancel.is_set():
         raise OperationCancelled("the scan search was stopped")
+    if len(arguments) == 5:
+        selection, options, queue, values, handoff = arguments
+        try:
+            require_current_handoff(handoff, cancelled=cancel.is_set)
+            groups, _ = rsm_member_groups(selection, **options, cancelled=cancel.is_set,
+                                          planned_group=handoff.group)
+            members, = groups
+            (family, output), = queue_output_slots(*queue, groups, cancel=cancel)
+            return RSMToolFormV2(members=members, output_path=output, output_family=family, **values)
+        except InterruptedError as error:
+            raise OperationCancelled("the Live scan search was stopped") from error
     selection, options, queue = arguments
     try:  # C-16: Stop is checked between scans, and the scans searched are counted
         groups, skipped = rsm_member_groups(selection, **options, cancelled=cancel.is_set,
@@ -379,6 +392,7 @@ class RSMPage(QtWidgets.QWidget):
         self._resolver = SingleWorkerOwner(_resolve_rsm_groups) if resolver is None else resolver
         self._resolving = None
         self._groups = None
+        self._live_config = None
         self._selection_counts = None
         self._fields, self._rows = {}, {}
         self._ub_typed_rows = ("", "", "")
@@ -524,7 +538,9 @@ class RSMPage(QtWidgets.QWidget):
         from xdart.gui.tabs.scattering.run_mode_projection import (
             RUN_MODE_CHOICES, UNOWNED_RUN_MODE_REASONS,
         )
-        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, live=False, batch=False, cores=False)
+        self.run_bar.apply_profile(modes=RUN_MODE_CHOICES, batch=False, cores=False, per_scan_live=True)
+        self._live_watcher = LiveScanWatcher(self._dispatch_live, self._live_status, self._sync_actions, parent=self)
+        self.run_bar.liveToggled.connect(lambda _checked: self._sync_actions())
         self.run_bar.set_unavailable_modes(UNOWNED_RUN_MODE_REASONS)
         self.run_bar.modeCombo.setCurrentText("RSM")
         self.run_bar.modeChanged.connect(self._mode_chosen)
@@ -1083,6 +1099,8 @@ class RSMPage(QtWidgets.QWidget):
         return self._rows[key].current_value()
 
     def set_field(self, key, value):
+        if getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy:
+            return
         if key == "source_kind":  # no row of its own: the Data format and Files/Folder make it
             self._set_source_kind(value)
             return
@@ -1143,6 +1161,8 @@ class RSMPage(QtWidgets.QWidget):
     def set_sources(self, paths):
         """The SPEC or NeXus files, or the folder (Directory), as Stitch's ``set_sources``: one is shown, more
         as "N files selected"."""
+        if self._live_watcher.busy:
+            return
         self._adopt_sources(paths)
         self._show_early_ceiling()
         count = len(self._source_paths)
@@ -1281,6 +1301,8 @@ class RSMPage(QtWidgets.QWidget):
     def resolve_source(self):
         """The Source's member groups found now, on the calling thread (scripts and rows; Preview and Run find
         them on the shared single worker first): (groups, skipped). ``build_form`` reads them."""
+        if self._live_watcher.busy:
+            return (), ()
         from xdart.gui.tools.rsm_values import rsm_member_groups
         key = self._group_key()
         selection, options, queue = self._resolution_request()
@@ -1485,6 +1507,10 @@ class RSMPage(QtWidgets.QWidget):
     def _form_for(self, project, members, output, family):
         """The exact RSM v2 form of one RSM: these members, written to ``output`` (recording ``family`` when it
         is the family's slot), with every other row of the page."""
+        return RSMToolFormV2(members=members, output_path=output, output_family=family,
+                             **self._form_values(project))
+
+    def _form_values(self, project):
         try:
             policy = self._normalization_policy()
         except ValueError as error:
@@ -1503,15 +1529,14 @@ class RSMPage(QtWidgets.QWidget):
             ub = self._ub_override(project)  # a UB given for an HKL map; None in Q (the form takes none there)
         except ValueError as error:
             raise ValueError(f"UB matrix: {error}") from None
-        return RSMToolFormV2(
-            str(self._value("project_root")).strip(), geometry, members,
-            # "High → NaN" is Int's threshold's Manual High now (design §2)
-            RSMImageConditioning(float(self._value("offset")), None, optional("static_hot")),
-            policy, self._grid_bins(), int(self._value("adv_chunk")),
-            int(self._value("adv_max_frame_mib")) * _MIB, self._max_chunk_bytes(), output,
-            AnalysisArtifactOverwrite.REPLACE,  # Append is the page's skip, as Stitch's (_start_run)
-            coordinate_frame=_FRAMES[self._value("coordinates")], output_family=family, corrections=corrections,
-            ub=ub)
+        return dict(
+            project_root=str(self._value("project_root")).strip(), geometry_asset=geometry,
+            conditioning=RSMImageConditioning(float(self._value("offset")), None, optional("static_hot")),
+            normalization=policy, bins=self._grid_bins(), chunk_size=int(self._value("adv_chunk")),
+            max_frame_bytes=int(self._value("adv_max_frame_mib")) * _MIB, max_chunk_bytes=self._max_chunk_bytes(),
+            overwrite=AnalysisArtifactOverwrite.REPLACE,
+            coordinate_frame=_FRAMES[self._value("coordinates")], corrections=corrections, ub=ub,
+        )
 
     # ── readiness ──
     def _edited(self, *_args):
@@ -1787,6 +1812,9 @@ class RSMPage(QtWidgets.QWidget):
         resolving = self._resolving is not None
         idle = (not busy and not reading and not metadata_reading and not authoring and not resolving and self._job_form is None
                 and final is RSMOwnerFinalization.NONE and not self._closing)
+        preparing_live = getattr(self, "_live_watcher", None)
+        live = preparing_live is not None and preparing_live.busy
+        idle = idle and not live
         self.controls.set_editors_enabled(idle)  # the action row stays usable: Retry (Codex F2)
         self._sync_format_tip(idle, authoring)
         self.calibrate_button.setEnabled(idle)
@@ -1799,21 +1827,24 @@ class RSMPage(QtWidgets.QWidget):
             self._authoring_timer.stop()
         self.run_bar.set_mode_row_enabled(idle)
         self.advanced.set_editors_enabled(idle)
-        self.browser.set_action_enabled("Open…", not busy and not reading and not self._closing)
+        self.run_bar.liveButton.setEnabled(idle)
+        self.browser.set_action_enabled("Open…", not live and not busy and not reading and not self._closing)
         self.browser.set_action_enabled("Metadata", idle and self._metadata_reading is None and (
             self._results.get(self._shown_path) is not None or bool(self._source_paths)))
         self.preview_button.setEnabled(idle)
         self.advanced_button.setEnabled(idle)
         self.retry_button.setEnabled(not busy and final is not RSMOwnerFinalization.NONE and not self._closing)
         # Stitch's: "▶ Run" throughout (RSM has no pause), enabled while idle and ready
-        self.run_bar.startButton.setEnabled(idle and self._readiness[1])
+        self.run_bar.startButton.setEnabled(idle and (self.run_bar.is_live() or self._readiness[1]))
         identity = self._owner.current_identity if busy else None
-        self.run_bar.set_stop_enabled((resolving and self._resolving[1] is not None) or (
+        self.run_bar.set_stop_enabled((preparing_live is not None and preparing_live.watching) or (resolving and self._resolving[1] is not None) or (
             identity is not None and identity.request.action in {
                 RSMOwnerAction.PREFLIGHT, RSMOwnerAction.RUN}))  # what the owner cancels, or finding the scans
 
     # ── the owner ──
     def _control_action(self, action):
+        if self._live_watcher.busy and action is not ControlAction.RETRY:
+            return
         {ControlAction.CALIBRATE: self._calibrate, ControlAction.MAKE_MASK: self._make_mask,
          ControlAction.PREVIEW: self.begin_preview, ControlAction.RETRY: self.retry,
          ControlAction.ADVANCED_PROCESSING: self.advanced.show}.get(action, lambda: None)()
@@ -1868,6 +1899,8 @@ class RSMPage(QtWidgets.QWidget):
         the saved settings (File ▸ Load Settings, the last session, or the window a Project change closed), and the
         first selected scan fills only one with no calibration source of its own (the calibrant scan is usually
         another scan)."""
+        if self._live_watcher.busy:
+            return
         from xdart.gui.tabs.calibration.dialog import CalibrationContext, CalibrationDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
@@ -1953,6 +1986,8 @@ class RSMPage(QtWidgets.QWidget):
 
     def _make_mask(self):
         """Make Mask: the shared mask window on the first selected scan; its saved mask fills Mask File."""
+        if self._live_watcher.busy:
+            return
         from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
@@ -1990,6 +2025,8 @@ class RSMPage(QtWidgets.QWidget):
     def begin_preview(self):
         """Preview: find the Source's scans, check the inputs and list every exact identity, without
         gridding."""
+        if self._live_watcher.busy:
+            return
         self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
         self._find_scans("preview")
@@ -1997,13 +2034,125 @@ class RSMPage(QtWidgets.QWidget):
     def begin_run(self):
         """Run: find the Source's scans again, then grid them, Previewing first unless the prepared Preview is
         still the current form (as Stitch's Run prepares first)."""
+        if self._live_watcher.busy:
+            return
         self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
         self._follow_save_path(again=True)  # C-15: the browser lists this Run's results as they finish
+        if self.run_bar.is_live():
+            self._begin_live()
+            return
         if not self._readiness[1]:
             self._notice(self._readiness[0])
             return
         self._find_scans("run")
+
+    def _live_status(self, text, tooltip):
+        self.run_bar.set_readiness_summary(text, ready=True, tooltip=tooltip, live=True)
+
+    def _begin_live(self):
+        if self.active() or self._closing or self._grouping_question is not None:
+            return
+        try:
+            selection, options, queue = self._resolution_request()
+            project = self._form_project()
+            if not project.is_dir() or queue is None:
+                raise ValueError("Choose a Project and Save Path")
+            values = self._form_values(project)
+            if (not (project / self._calibration_locator(project)).is_file()
+                    or not str(self._value("output_path")).strip()):
+                raise ValueError("Choose a readable Calibration and Save Path")
+            read = {key: options[key] for key in ("detector_shape", "raw_dtype", "raw_header_skip")}
+            observer = LiveScanObserver(selection, {**read, "rotation": 0},
+                                        select_labels=options["frame_selector"].select)
+        except (OSError, ValueError, TypeError) as error:
+            self._notice(f"Live refused: {error}")
+            return
+        self._prepared_fingerprint = None
+        self._live_config = (selection, options, queue, values, self.run_bar.write_mode() == "Append")
+        self._live_watcher.start(observer)
+
+    def _dispatch_live(self, handoff):
+        if (self._closing or self._owner.busy or self._resolving is not None or self._reading is not None
+                or self._metadata_reading is not None or self._authoring_active()
+                or self._owner.finalization is not RSMOwnerFinalization.NONE):
+            return False
+        identity = self._resolver.begin((*self._live_config[:-1], handoff))
+        if identity is None:
+            return False
+        self._resolving = (identity, handoff, None)
+        self._timer.start()
+        return True
+
+    def _live_resolved(self, handoff, terminal):
+        watcher = self._live_watcher
+        if not watcher.watching:
+            watcher.settle(handoff, consumed=False)
+            return
+        if terminal.status is not OperationTerminalStatus.RETURNED:
+            watcher.refuse(handoff, terminal.failure_message or "Source resolution stopped",
+                           code="LIVE_HANDOFF_CHANGED" if terminal.failure_type == "LiveHandoffChanged" else "")
+            return
+        self._owner.set_form(terminal.payload)
+        if self._owner.begin_preflight(live_handoff=handoff) is None:
+            watcher.refuse(handoff, "RSM preflight owner is busy", code="BUSY")
+
+    def _accept_live(self, update, handoff):
+        watcher = self._live_watcher
+        command = update.identity.request
+        if command.live_handoff is not handoff and (
+                command.execution is None or command.execution.request.live_handoff is not handoff):
+            return False
+        accepted = bool(command.execution is not None and command.execution.live_accepted)
+        if accepted:
+            watcher.accept(handoff)
+        if update.progress is not None:
+            return True
+        outcome = update.outcome
+        if outcome is None:
+            self._owner.retire_live_preflight(handoff)
+            watcher.settle(handoff, consumed=accepted,
+                           reason=update.failure_message or "RSM stopped")
+        elif outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_READY:
+            preflight = outcome.preflight
+            if not watcher.watching or update.stale:
+                self._owner.retire_live_preflight(handoff)
+                watcher.settle(handoff, consumed=False, reason="Live stopped before RSM")
+                return True
+            collision = watcher.reserve_request(handoff, preflight.request)
+            if collision:
+                self._owner.retire_live_preflight(handoff)
+                watcher.settle(handoff, consumed=False, blocked=True, reason=collision)
+            elif self._owner.begin_run(live_append=self._live_config[-1] and preflight.output_current) is None:
+                self._owner.retire_live_preflight(handoff)
+                watcher.refuse(handoff, "RSM Run owner is busy", code="BUSY")
+        elif outcome.kind is RSMOwnerOutcomeKind.PREFLIGHT_REFUSED:
+            self._owner.retire_live_preflight(handoff)
+            watcher.refuse(handoff, outcome.refusal_message or outcome.refusal_code,
+                           code=outcome.refusal_code, target=outcome.live_blocked_target, assets=outcome.live_assets)
+        elif outcome.kind is RSMOwnerOutcomeKind.LIVE_APPEND:
+            self._owner.retire_live_preflight(handoff)
+            watcher.accept(handoff, skipped=True)
+            watcher.settle(handoff, consumed=True)
+        elif outcome.kind is RSMOwnerOutcomeKind.RESULT:
+            self._owner.retire_live_preflight(handoff)
+            result = outcome.result
+            terminal = result.terminal
+            if terminal.disposition is ModuleDisposition.COMMITTED:
+                target = str(result.request.module.output.target)
+                self._add_result(target, result.payload, show=not self._closing)
+                watcher.settle(handoff, consumed=True, reason=f"Saved {Path(target).name}",
+                               slot=watcher.committed_slot(handoff, terminal))
+            elif accepted:
+                watcher.settle(handoff, consumed=True, reason=terminal.diagnostic or terminal.code)
+            else:
+                watcher.refuse(handoff, terminal.diagnostic or terminal.code, code=terminal.code,
+                               target=result.request.live_target_revision if terminal.code == "LIVE_OUTPUT_CHANGED" else None)
+        else:
+            message = outcome.finalization_message or "Saved result retained · Retry"
+            watcher.accept(handoff, reason=message)
+            self._notice(message)
+        return True
 
     def _find_scans(self, action):
         """Find the Source's member groups on the shared single worker (``rsm_member_groups`` reads the SPEC
@@ -2031,6 +2180,11 @@ class RSMPage(QtWidgets.QWidget):
             return
         identity, action, key = self._resolving
         update = self._resolver.poll(identity)
+        if isinstance(action, LiveScanHandoff):
+            if update is not None and update.terminal is not None:
+                self._resolving = None
+                self._live_resolved(action, update.terminal)
+            return
         if update is not None and update.terminal is None and update.progress is not None and action is not None:
             # C-16: the search says how far it has got (a SPEC file of many scans on a slow share takes a while)
             self._status(f"{_SEARCHING}… {update.progress.completed} of {update.progress.total}")
@@ -2221,6 +2375,13 @@ class RSMPage(QtWidgets.QWidget):
         self._sync_actions()
 
     def stop(self):
+        if self._live_watcher.busy:
+            self._live_watcher.stop()
+            if self._resolving is not None:
+                self._resolver.cancel(self._resolving[0])
+            self._owner.cancel()
+            self._sync_actions()
+            return ActionAccepted("rsm-live-stop")
         self._stopping_preflight |= self._run_requested and self._owner.busy
         self._run_requested = False
         self._clear_jobs()  # Stop stops the queue: the RSM being gridded is cancelled, the rest never start
@@ -2258,6 +2419,7 @@ class RSMPage(QtWidgets.QWidget):
             self._poll_reader()
             self._poll_resolver()
             self._poll_metadata()
+            self._live_watcher.pump()
         except Exception as error:
             _LOG.exception("RSM page update failed")
             self._notice(f"RSM_VIEW_PRESENTATION_FAILED: {error}")
@@ -2268,6 +2430,9 @@ class RSMPage(QtWidgets.QWidget):
     def _accept(self, update):
         if type(update) is not RSMOwnerUpdate:
             raise TypeError("the RSM page requires an exact owner update")
+        handoff = self._live_watcher.handoff
+        if handoff is not None and self._accept_live(update, handoff):
+            return
         if self._stopping_preflight and update.action is RSMOwnerAction.PREFLIGHT:
             if update.progress is None:
                 self._stopping_preflight = False
@@ -2393,6 +2558,8 @@ class RSMPage(QtWidgets.QWidget):
         return self.browser.scans
 
     def _browser_command(self, command):
+        if self._live_watcher.busy:
+            return
         if command.kind is ShellCommandKind.SELECT_SCAN and command.path == ("directory",):
             self._result_browser.set_directory(command.value)
         elif command.kind is ShellCommandKind.REFRESH_BROWSER:
@@ -2476,6 +2643,8 @@ class RSMPage(QtWidgets.QWidget):
             dialog.status.setText(terminal.failure_message or "Metadata read stopped")
 
     def open_result(self):
+        if self._live_watcher.busy:
+            return
         from xdart.gui.widgets import file_dialogs as dialogs
         picks = dialogs.browse(self, "Open RSM result", file_filter=dialogs.NEXUS_FILTER,
                                current=str(self._value("output_path") or ""),
@@ -2486,6 +2655,8 @@ class RSMPage(QtWidgets.QWidget):
 
     def reopen(self, path, *, completion_message=""):
         """Read a saved RSM record on the shared single-worker reader, then show it."""
+        if self._live_watcher.busy:
+            return False
         identity = self._reader.begin(str(path))
         if identity is None:
             self._notice("A result is still being read")
@@ -2549,6 +2720,8 @@ class RSMPage(QtWidgets.QWidget):
             self._show(path, payload)
 
     def _result_selected(self, path):
+        if self._live_watcher.busy:
+            return
         self._requested = path
         payload = self._results.get(path)
         if payload is None:
@@ -2809,6 +2982,8 @@ class RSMPage(QtWidgets.QWidget):
     def _browse(self, key):
         """Browse as Int and Stitch do: the last folder picked, the same file types for the same inputs; the
         Source's files by its kind (SPEC files, NeXus files, or a folder)."""
+        if self._live_watcher.busy:
+            return
         from xdart.gui.widgets import file_dialogs as dialogs
         kind = self._value("source_kind")
         current = self._source_paths[0] if key == "spec_path" and self._source_paths else self._value(key)
@@ -2849,7 +3024,7 @@ class RSMPage(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self.run_bar.modeCombo)
         self.run_bar.modeCombo.setCurrentText("RSM")
         del blocker
-        if mode in _RSM_MODES:
+        if mode in _RSM_MODES or self._live_watcher.busy:
             return
         if mode in {"Stitch 1D", "Stitch 2D"}:
             self.modeRequested.emit(str(STITCH_TOOL_KEY), str(mode))
@@ -2857,7 +3032,8 @@ class RSMPage(QtWidgets.QWidget):
             self.modeRequested.emit(str(SCATTERING_PAGE_KEY), str(mode))
 
     def active(self):
-        return bool(self._owner.busy or self._reading is not None or self._resolving is not None
+        return bool(getattr(self, "_live_watcher", None) is not None and self._live_watcher.busy
+                    or self._owner.busy or self._reading is not None or self._resolving is not None
                     or self._metadata_reading is not None
                     or self._job_form is not None  # a queue between its RSMs
                     or self._owner.finalization is not RSMOwnerFinalization.NONE or self._authoring_active()
@@ -2915,6 +3091,8 @@ class RSMPage(QtWidgets.QWidget):
                             mode_requested=self.modeRequested)
 
     def request(self):
+        if self._live_watcher.busy:
+            return
         return self._result_browser.request()
 
     def run_pause(self):
@@ -2931,7 +3109,7 @@ class RSMPage(QtWidgets.QWidget):
         for dialog in (self._metadata_dialog, self._metadata_plot_dialog):
             if dialog is not None:
                 dialog.close()
-        receipts = (self._owner.close(), self._reader.close(), self._resolver.close(), self._metadata_reader.close(),
+        receipts = (self._live_watcher.shutdown(), self._owner.close(), self._reader.close(), self._resolver.close(), self._metadata_reader.close(),
                     *(dialog.shutdown() for dialog in self._authoring_dialogs),
                     *(window.shutdown() for window in self._tool_windows.values()))
         if not self._result_browser.close():
@@ -2962,7 +3140,7 @@ class _RSMProcessingMode:
 
     def select(self, mode):
         from xdart.gui.pages.values import MODE_REFUSED
-        if str(mode) in _RSM_MODES:
+        if not self._page.active() and str(mode) in _RSM_MODES:
             return ActionCompleted("processing-mode-RSM")
         return ActionRefused(MODE_REFUSED)
 

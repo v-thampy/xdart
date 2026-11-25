@@ -324,3 +324,19 @@ def test_all_does_not_prompt_to_group_images_with_numbering_gaps(tmp_path, with_
     assert not isinstance(resolved, str), resolved
     assert not resolved.pending, resolved
     assert any(key == "10.1" and "gaps or duplicates" in reason for _path, key, reason in resolved.skipped)
+
+
+def test_live_directory_keeps_consumed_container_identity_when_alias_arrives(tmp_path):
+    from tests.core.test_live_per_scan import _root_with_sibling, _symlink
+    from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver
+    from xrd_tools.analysis.stitch_sources import StitchSourceSelection
+
+    path = _root_with_sibling(tmp_path / "z_recording.nxs")
+    observer = LiveScanObserver(StitchSourceSelection("Directory", (str(tmp_path),)), {})
+    observer.poll(now=0)
+    row, = observer.poll(now=2).groups
+    handoff = LiveScanHandoff.from_ready(row, session_id="directory", attempt_id="one")
+    _symlink(tmp_path / "a_alias.nxs", path)
+
+    assert not observer.poll(now=4, consumed=(handoff,)).groups
+    assert not observer.poll(now=6, consumed=(handoff,)).groups
