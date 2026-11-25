@@ -906,12 +906,22 @@ def test_s11_a_file_changed_while_its_occurrence_is_read(tmp_path, monkeypatch, 
     _append(path, "\n#S 3 later\n")
     copy = tmp_path / "replacement"
     copy.write_bytes(path.read_bytes())
-    read = os.read
+    read, fstat = os.read, os.fstat
     changed = []
+    revisions = []
+
+    def is_source(state):
+        return (state.st_dev, state.st_ino) == (proof.device, proof.inode)
+
+    def observe_fstat(descriptor):
+        state = fstat(descriptor)
+        if is_source(state):
+            revisions.append((state.st_size, state.st_mtime_ns, state.st_ctime_ns))
+        return state
 
     def read_then_change(descriptor, size):
         data = read(descriptor, size)
-        if not changed and os.fstat(descriptor).st_ino == proof.inode:
+        if not changed and is_source(fstat(descriptor)):
             if mutation == "replacement":
                 copy.replace(path)
             elif mutation == "selected edit":
@@ -922,12 +932,16 @@ def test_s11_a_file_changed_while_its_occurrence_is_read(tmp_path, monkeypatch, 
         return data
 
     monkeypatch.setattr(os, "read", read_then_change)
+    monkeypatch.setattr(os, "fstat", observe_fstat)
     first = spec_occurrence_holds(proof)
     assert changed
-    if mutation == "selected edit" and sys.platform == "win32":
-        # 1.2.19 release CI 2 (run 45478738434): Windows stat need not show a same-size rewrite made while the
-        # check rereads, so that check may accept the bytes it read (the scan as it was on disk when read).
-        # The next check rereads the edit and refuses it.
+    if mutation == "selected edit":
+        before, after = revisions
+        # Windows may expose identical descriptor stats across this edit.
+        # Observable drift refuses immediately. A fresh check always reads the edit.
+        assert type(first) is bool
+        if sys.platform != "win32" or before != after:
+            assert first is False
         assert spec_occurrence_holds(proof) is False
     else:
         assert first is holds

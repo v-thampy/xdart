@@ -76,7 +76,10 @@ def test_changed_spec_file_is_read_once_per_stitch_custody_sweep(tmp_path, monke
     assert 0 < max(read for sweep in passes for read in sweep) <= 1 << 17
 
 
-def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(tmp_path, monkeypatch):
+@pytest.mark.parametrize("emulate_win32", (False, True) if IDENTITY_CARRIES_CTIME else (False,))
+def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(
+    tmp_path, monkeypatch, ctime_seam, win32_pathname_ctime, emulate_win32,
+):
     from dataclasses import replace
 
     from tests.core.test_rsm_operation_r2 import _form, _write_member
@@ -88,6 +91,9 @@ def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(tmp_p
     spec = Path(first.spec_path)
     second_scan = "#S 2 " + Path(second.spec_path).read_text().split("#S 1 ", 1)[1]
     _append(spec, "\n" + second_scan)
+    if emulate_win32:
+        monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+        win32_pathname_ctime(spec)
     form = replace(_form(tmp_path, (first, replace(second, spec_path=spec, scan="2.1"))),
                    ub=RSMUBOverride(spec_path=str(spec), scan="2.1"))
     request = prepare_rsm_tool_v2(form).request
@@ -95,9 +101,10 @@ def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(tmp_p
 
     opened = []
     real_open = os.open
+    spec_name = os.path.normcase(os.path.abspath(spec))
 
     def observing_open(path, flags, *args, **kwargs):
-        if os.fspath(path) == str(spec):
+        if os.path.normcase(os.path.abspath(os.fsdecode(path))) == spec_name:
             opened.append(path)
         return real_open(path, flags, *args, **kwargs)
 
@@ -106,10 +113,9 @@ def test_rsm_bound_ub_and_same_file_members_share_the_authority_byte_check(tmp_p
         monkeypatch.setattr(os, "open", observing_open)
         _revalidate_rsm_v2_authorities(request, cancel_token=None)
     print(f"two same-file RSM members and their UB authority: {len(opened)} verification passes")
-    if IDENTITY_CARRIES_CTIME:
-        assert len(opened) == 1
-    else:  # no pathname change token (io.stat_identity): each member's fresh proof is reread too, never more
-        assert len(opened) <= 1 + 2
+    # One shared authority pass, plus one fresh table fence for each member
+    # on platforms where a pathname stat cannot certify unchanged content.
+    assert len(opened) == (1 if ctime_seam.IDENTITY_CARRIES_CTIME else 3)
 
 
 def test_a_long_later_scan_header_needs_only_its_structural_marker(tmp_path, monkeypatch):
