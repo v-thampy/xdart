@@ -1529,7 +1529,7 @@ def list_entries(path: Path | str) -> list[str]:
         return list_entries_from_open(f)
 
 
-def live_bluesky_metadata_selectors(entry, key):
+def live_bluesky_metadata_selectors(entry, key, *, source_ub=False):
     """Native Bluesky scalar and motor inputs with indirect HDF5 custody."""
     from xrd_tools.io.bluesky_nexus import (
         _BLUESKY_COUNT_TIME_COL, _DEFAULT_BLUESKY_COUNTERS, _EIGER_CONFIG_BASE,
@@ -1542,6 +1542,8 @@ def live_bluesky_metadata_selectors(entry, key):
     paths = ["end_time", "instrument/bluesky/metadata/motors",
              "instrument/monochromator/energy", "instrument/monochromator/wavelength",
              *_SATURATION_PATHS]
+    if source_ub:
+        paths.extend(("sample/ub_matrix", "sample/orientation_matrix"))
     paths.extend(f"data/{name}" for name in (*scanned, *_DEFAULT_BLUESKY_COUNTERS,
                                           _BLUESKY_COUNT_TIME_COL, "EPOCH"))
     for name in motors:

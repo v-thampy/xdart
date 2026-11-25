@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -581,30 +582,37 @@ class RSMToolOwner:
             from xrd_tools.analysis.live_scans import LiveOutputChanged, capture_live_assets
 
             publish("preflight", 0, 1)
-            assets = capture_live_assets(request.form, request.live_handoff)
-            try:
-                preflight = self._preflight_runner(
-                    request.form,
-                    cancel_token=cancel,
-                    **({} if request.live_handoff is None else {"live_handoff": request.live_handoff}),
+            from xrd_tools.io.spec import spec_capture_scope
+            with (spec_capture_scope() if request.live_handoff is not None else nullcontext()):
+                assets = capture_live_assets(request.form, request.live_handoff)
+                try:
+                    preflight = self._preflight_runner(
+                        request.form,
+                        cancel_token=cancel,
+                        **({} if request.live_handoff is None else {"live_handoff": request.live_handoff}),
+                    )
+                except (RSMToolPreflightRefused, LiveOutputChanged, OSError) as error:
+                    if request.live_handoff is None and isinstance(error, OSError):
+                        raise
+                    code = getattr(error, "code", "LIVE_ACCESS_UNAVAILABLE")
+                    if code == "CANCELLED":
+                        raise OperationCancelled from error
+                    return RSMOwnerOutcome(
+                        RSMOwnerOutcomeKind.PREFLIGHT_REFUSED,
+                        refusal_code=code,
+                        refusal_message=str(error),
+                        diagnostics=getattr(error, "diagnostics", ()),
+                        live_blocked_target=getattr(error, "live_blocked_target", None), live_assets=assets,
+                    )
+                _form_type, preflight_type, _execution_type, _result_type = _profile_types(
+                    request.generation
                 )
-            except (RSMToolPreflightRefused, LiveOutputChanged) as error:
-                if error.code == "CANCELLED":
-                    raise OperationCancelled from error
-                return RSMOwnerOutcome(
-                    RSMOwnerOutcomeKind.PREFLIGHT_REFUSED,
-                    refusal_code=error.code,
-                    refusal_message=str(error),
-                    diagnostics=getattr(error, "diagnostics", ()),
-                    live_blocked_target=getattr(error, "live_blocked_target", None), live_assets=assets,
-                )
-            _form_type, preflight_type, _execution_type, _result_type = _profile_types(
-                request.generation
-            )
             if type(preflight) is not preflight_type:
                 raise TypeError("preflight adapter returned an invalid value")
             if preflight.form.fingerprint != request.form_fingerprint:
                 raise ValueError("preflight adapter changed the form identity")
+            if assets is not None:
+                object.__setattr__(preflight.request, "live_assets", assets)
             publish("preflight", 1, 1)
             return RSMOwnerOutcome(
                 RSMOwnerOutcomeKind.PREFLIGHT_READY,

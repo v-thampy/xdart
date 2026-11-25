@@ -101,3 +101,31 @@ def test_spec_file_change_resets_scan_and_auto_stem_but_folder_change_preserves_
         assert page.run_bar.startButton.isEnabled(), page.run_bar.readinessLabel.full_text()
     finally:
         _close(page, qapp)
+
+
+def test_live_retries_stitch_preflight_after_calibration_is_repaired(qapp, tmp_path):
+    from tests.core.test_stitch_operation import _native_form
+    from tests.xdart.pages.live_per_scan_support import start_live, tick_live, wait_until
+    from tests.xdart.pages.test_stitch_page import _dispose
+
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    geometry = Path(form.geometry_path)
+    saved = geometry.read_bytes()
+    page = StitchPage(empty_host_services(_Status()))
+    try:
+        page.load_form(form)
+        start_live(page)
+        geometry.write_text("broken calibration", encoding="utf-8")
+        tick_live(page, qapp)
+        wait_until(qapp, lambda: "goniometer JSON could not be parsed" in page.run_bar.readinessLabel.toolTip()
+                   and not page._owner.busy)
+        assert not list(Path(form.output_path).parent.glob("*.nexus"))
+
+        geometry.write_bytes(saved)
+        tick_live(page, qapp)
+        wait_until(qapp, lambda: page._current_payload() is not None)
+        assert page._current_payload().inspection.path.endswith("sample_scan1_stitch1d.nexus")
+        page.stop()
+        wait_until(qapp, lambda: not page.active())
+    finally:
+        _dispose(page, qapp)

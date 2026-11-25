@@ -169,21 +169,23 @@ class LiveScanWatcher(QtCore.QObject):
             if cancel.is_set():
                 return None
             request.observer.invalidate(key)
-        observation = request.observer.poll(
-            now=request.now, consumed=request.consumed, cancelled=cancel.is_set,
-        )
-        changed = []
-        for key, refused in request.retries:
-            if cancel.is_set():
-                return None
-            gate = refused.retry_gate
-            try:
-                current = gate.probe()
-            except OSError:
-                continue  # a retry time, if supplied, is independent of a successful probe
-            if current != gate.expected:
-                changed.append((key, refused))
-        return observation, changed
+        from xrd_tools.io.spec import spec_capture_scope
+        with spec_capture_scope():
+            observation = request.observer.poll(
+                now=request.now, consumed=request.consumed, cancelled=cancel.is_set,
+            )
+            changed = []
+            for key, refused in request.retries:
+                if cancel.is_set():
+                    return None
+                gate = refused.retry_gate
+                try:
+                    current = gate.probe()
+                except OSError:
+                    continue  # a retry time, if supplied, is independent of a successful probe
+                if current != gate.expected:
+                    changed.append((key, refused))
+            return observation, changed
 
     def _observed(self, request, terminal):
         if request.session is not self._session or self._closing:

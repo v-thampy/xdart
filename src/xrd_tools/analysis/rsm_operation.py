@@ -3284,6 +3284,7 @@ class RSMOperationRequestV2:
 
     live_handoff: object | None = field(default=None, init=False, repr=False, compare=False)
     live_target_revision: object | None = field(default=None, init=False, repr=False, compare=False)
+    live_assets: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self, _claim: object) -> None:
         if (

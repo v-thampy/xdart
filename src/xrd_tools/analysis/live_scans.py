@@ -315,7 +315,7 @@ class _ObservationSweep:
                     paths = tuple(nexus._exact_entry_stack_paths(stream, path, key))
                     member = stitch_sources.PlannedStitchMember(path, key, kind)
                     graph = self.graph(path, key, kind)
-                    metadata_paths = nexus.live_bluesky_metadata_selectors(entry, key)
+                    metadata_paths = nexus.live_bluesky_metadata_selectors(entry, key, source_ub=self.observer.source_ub)
                     metadata_files = execution_graph.linked_metadata_dependencies(
                         state, metadata_paths, cancelled=self.cancelled)
                     files = tuple(dict.fromkeys((*_graph_files(graph), *metadata_files)))
@@ -455,11 +455,12 @@ def _confirmed_source(selection, source, *, detection=_INSPECT_GROUPING):
 class LiveScanObserver:
     """One frozen selection's poll state. Use on the poll worker only."""
 
-    def __init__(self, selection, read_image_kwargs, *, select_labels=None, stillness=2.0):
+    def __init__(self, selection, read_image_kwargs, *, select_labels=None, stillness=2.0, source_ub=False):
         self.selection = selection
         self.read_options = dict(read_image_kwargs)
         self.select_labels = select_labels
         self.stillness = stillness
+        self.source_ub = source_ub
         self._spec_keys = {}
         self._classification = {}
         self._listings = {}
@@ -674,7 +675,9 @@ def require_live_target(request, *, allow_created_parent=False):
     try:
         current = observe_live_target(request.module.output.target)
     except OSError as error:
-        raise LiveOutputChanged(target, str(error)) from error
+        unavailable = LiveOutputChanged(target, str(error))
+        unavailable.code = "LIVE_OUTPUT_UNAVAILABLE"
+        raise unavailable from error
     if current == target:
         return
     if (allow_created_parent and target is not None and not target.revision[0]
@@ -687,12 +690,19 @@ def require_live_target(request, *, allow_created_parent=False):
 
 def live_asset_revisions(paths):
     revisions = []
-    for path in paths:
-        try:
-            state = SourceFileState.capture(path)
-            revisions.append((state, execution_graph._resolved(state)))
-        except OSError as error:
-            revisions.append(error.errno)
+    with spec.spec_capture_scope():
+        for path in paths:
+            try:
+                if isinstance(path, tuple):
+                    proof = spec.spec_occurrence(*path)
+                    revisions.append(None if proof is None else _spec_identity(proof))
+                else:
+                    state = SourceFileState.capture(path)
+                    revisions.append((state, execution_graph._resolved(state)))
+            except OSError as error:
+                revisions.append(error.errno)
+            except (ValueError, LookupError, SfError, SpecOccurrenceUnsettled):
+                revisions.append(None)
     return tuple(revisions)
 
 
@@ -707,13 +717,13 @@ def capture_live_assets(form, handoff):
     if geometry is None:
         geometry = form.geometry_asset.locator
     correction = getattr(form, "corrections", form)
-    ub_path = getattr(getattr(form, "ub", None), "spec_path", None)
+    ub = getattr(form, "ub", None)
     paths = [project / geometry, *(project / value for key in ("mask_path", "dark_path", "flat_path")
                                   if (value := getattr(correction, key, None)))]
     if getattr(form, "backend", "xu_hist") == "xu_hist":
         partner = xu_partner_path(paths[0])
         paths.extend((partner, partner.with_suffix(partner.suffix + ".provenance.json")))
-    if ub_path is not None and all(Path(ub_path) != member.member.path for member in handoff.evidence.members):
-        paths.append(Path(ub_path))
+    if ub is not None and ub.spec_path is not None:
+        paths.append((Path(ub.spec_path), ub.scan))
     values = tuple(dict.fromkeys(paths))
     return values, live_asset_revisions(values)

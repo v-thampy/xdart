@@ -2456,7 +2456,7 @@ class StitchPage(QtWidgets.QWidget):
         elif outcome.kind is StitchOwnerOutcomeKind.LIVE_REFUSED:
             self._owner.retire_live_preflight(handoff)
             watcher.refuse(handoff, outcome.finalization_message, code=outcome.refusal_code,
-                           target=outcome.live_blocked_target)
+                           target=outcome.live_blocked_target, assets=outcome.live_assets)
         elif outcome.kind is StitchOwnerOutcomeKind.LIVE_APPEND:
             self._owner.retire_live_preflight(handoff)
             watcher.accept(handoff, skipped=True)
@@ -2479,7 +2479,9 @@ class StitchPage(QtWidgets.QWidget):
                 watcher.settle(handoff, consumed=True, reason=terminal.diagnostic or terminal.code)
             else:
                 watcher.refuse(handoff, terminal.diagnostic or terminal.code, code=terminal.code,
-                               target=result.request.live_target_revision if terminal.code == "LIVE_OUTPUT_CHANGED" else None)
+                               target=(result.request.live_target_revision
+                                       if terminal.code.startswith("LIVE_OUTPUT_") else None),
+                               assets=result.request.live_assets)
         else:
             message = outcome.finalization_message or "Saved result retained · Retry"
             watcher.accept(handoff, reason=message)

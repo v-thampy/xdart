@@ -2064,7 +2064,9 @@ class RSMPage(QtWidgets.QWidget):
                 raise ValueError("Choose a readable Calibration and Save Path")
             read = {key: options[key] for key in ("detector_shape", "raw_dtype", "raw_header_skip")}
             observer = LiveScanObserver(selection, {**read, "rotation": 0},
-                                        select_labels=options["frame_selector"].select)
+                                        select_labels=options["frame_selector"].select,
+                                        source_ub=values["coordinate_frame"] is RSMCoordinateFrame.HKL
+                                        and values["ub"] is None)
         except (OSError, ValueError, TypeError) as error:
             self._notice(f"Live refused: {error}")
             return
@@ -2147,7 +2149,9 @@ class RSMPage(QtWidgets.QWidget):
                 watcher.settle(handoff, consumed=True, reason=terminal.diagnostic or terminal.code)
             else:
                 watcher.refuse(handoff, terminal.diagnostic or terminal.code, code=terminal.code,
-                               target=result.request.live_target_revision if terminal.code == "LIVE_OUTPUT_CHANGED" else None)
+                               target=(result.request.live_target_revision
+                                       if terminal.code.startswith("LIVE_OUTPUT_") else None),
+                               assets=result.request.live_assets)
         else:
             message = outcome.finalization_message or "Saved result retained · Retry"
             watcher.accept(handoff, reason=message)
