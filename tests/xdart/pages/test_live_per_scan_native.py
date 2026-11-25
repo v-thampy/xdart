@@ -88,8 +88,13 @@ def _append_spec(path, text):
 
 
 def _shots(folder):
-    return {path.name: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
-            for path in folder.glob("*.nexus")}
+    shots = {}
+    for path in folder.glob("*.nexus"):
+        try:  # A Run in flight unlinks its private .xdart-finite-* candidate between this listing and the read.
+            shots[path.name] = (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        except FileNotFoundError:
+            pass
+    return shots
 
 
 def _shown(page, kind):
