@@ -3875,6 +3875,9 @@ class StitchPage(QtWidgets.QWidget):
             action is StitchOwnerAction.PREFLIGHT and self._after_prepare == "run"))
         self.retry_button.setVisible(final is not StitchOwnerFinalization.NONE)
         self.retry_button.setEnabled(not busy)
+        if idle and self._live_config is not None:
+            self._live_config = None
+            QtCore.QTimer.singleShot(0, self._source_committed)
         if idle and self._reload_pending and self._reloading is None and not self._queued_jobs:
             QtCore.QTimer.singleShot(0, self._request_reload)
 

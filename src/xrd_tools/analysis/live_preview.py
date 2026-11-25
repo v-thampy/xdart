@@ -41,7 +41,7 @@ class PreviewGroupObserver:
     def __init__(self, selection, read_options, select_labels):
         self.selection = selection
         self.read_options = read_options
-        self.select_labels = select_labels
+        self.selector = None if select_labels is None else select_labels.__self__
         self.order = {}
         self.sweeps = self.captures = self.parser_opens = 0
 
@@ -57,13 +57,17 @@ class PreviewGroupObserver:
         for position, (path, keys) in enumerate(files.items()):
             for ordinal, key in enumerate(keys):
                 self.order.setdefault((path, key), (self.sweeps, -position, ordinal))
+        for position, row in enumerate(rows):
+            for ordinal, member in enumerate(row.group.members):
+                if member.kind is not SourceKind.SPEC:
+                    self.order.setdefault((member.path, member.key), (self.sweeps, -len(files) - position, ordinal))
 
         def newest(row):
             return max((self.order.get((item.path, item.key), (0, 0, 0)) for item in row.group.members),
                        default=(0, 0, 0))
 
         ranks = {row.group.identity: newest(row) for row in rows}
-        candidate = None
+        candidate = waiting = None
         inspected = {}
         for row in sorted(rows, key=newest, reverse=True):
             raw_prefix = []
@@ -79,8 +83,13 @@ class PreviewGroupObserver:
                 member = inspected[key]
                 members.append(member)
                 points = member.points
-                if points and self.select_labels is not None:
-                    chosen = set(self.select_labels(tuple(point.label for point in points)))
+                if points and self.selector is not None:
+                    stop = points[-1].label
+                    if self.selector.stop_label is not None:
+                        stop = min(stop, self.selector.stop_label)
+                    selected = (replace(self.selector, stop_label=stop).select(tuple(point.label for point in points))
+                                if stop >= self.selector.start_label else ())
+                    chosen = set(selected)
                     points = tuple(point for point in points if point.label in chosen)
                 raw_prefix.extend((member, point) for point in points)
                 if not member.end_of_stream:
@@ -95,9 +104,9 @@ class PreviewGroupObserver:
                 )
                 if candidate is None or current.rank > candidate.rank:
                     candidate = current
-            elif members and candidate is None:
-                candidate = PreviewGroup(row.group, ranks[row.group.identity], tuple(members), (), False,
-                                         members[0].reason)
+            elif members and waiting is None:
+                waiting = PreviewGroup(row.group, ranks[row.group.identity], tuple(members), (), False,
+                                       members[0].reason)
             if candidate is not None and candidate.points and candidate.rank == newest(row):
                 break
 
@@ -106,7 +115,7 @@ class PreviewGroupObserver:
         count = len({path for path, _key in inspected})
         self.captures += count
         self.parser_opens += count
-        return PreviewObservation(candidate, ranks, self.sweeps, self.captures, self.parser_opens)
+        return PreviewObservation(candidate or waiting, ranks, self.sweeps, self.captures, self.parser_opens)
 
 
 @dataclass(frozen=True, slots=True)
