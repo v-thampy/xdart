@@ -263,14 +263,20 @@ class LivePreviewOwner(QtCore.QObject):
         if request.epoch is self._epoch:
             self._status(update.stage)
 
+    def _refuse_preview(self, request, message):
+        target = request.target
+        request.work.invalidate(target.identity)
+        # A failed input check needs a fresh observation before another attempt.
+        self._done_target = target, len(target.points), target.ended, self._observation
+        self._clear_snapshot(target.identity)
+        self._status(message)
+        return False
+
     def _computed(self, request, terminal):
         if request.epoch is not self._epoch or request.target.identity in self._retired:
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED:
-            request.work.invalidate(request.target.identity)
-            self._clear_snapshot(request.target.identity)
-            self._status("Preview waiting for verified data")
-            return False
+            return self._refuse_preview(request, "Preview waiting for verified data")
         snapshot = terminal.payload
         progress = request.work.progress
         if self._yield():
@@ -313,11 +319,7 @@ class LivePreviewOwner(QtCore.QObject):
                 or request.target.identity in self._retired and not rechecking_display):
             return False
         if terminal.status is not OperationTerminalStatus.RETURNED or terminal.payload is not True:
-            request.work.invalidate(request.target.identity)
-            self._done_target = None
-            self._clear_snapshot(request.target.identity)
-            self._status("Preview waiting after an input change")
-            return False
+            return self._refuse_preview(request, "Preview waiting after an input change")
         snapshot = verification.snapshot
         if rechecking_display:
             return False
