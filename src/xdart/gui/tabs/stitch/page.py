@@ -934,6 +934,10 @@ class StitchPage(QtWidgets.QWidget):
             self._field(advanced_card, SectionId.SOURCE, key, label, value,
                         choices=CAMERAS if key == "camera" else (),
                         choice_labels=CAMERA_LABELS if key == "camera" else None)
+        for key, which in (("detector_rows", "rows"), ("detector_cols", "columns")):
+            self._rows[key].setToolTip(
+                f"The raw images' {which}, for headerless RAW frames. Follows the Calibration's detector when one "
+                "is chosen; an Eiger or NeXus stack takes its own frames' shape.")
         self._rows["camera"].setToolTip(
             "The detector's camera, as Calibrate ▸ 1 · Instrument ▸ Detector gives it: the lab directions the "
             "mounting looking downstream. Upright is stored rows x−, columns z+; rotation is clockwise, "
@@ -1518,6 +1522,7 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("output_path", processed_data_folder(value))
         if key in {"geometry_path", "project_root"}:
             self._refresh_xu_geometry()
+            self._follow_calibration_shape()
         if key == "geometry_path":
             self._show_early_ceiling()
             self._sync_calibration_window()
@@ -1662,6 +1667,31 @@ class StitchPage(QtWidgets.QWidget):
             self._show_readiness()
         self._sync_actions()
         return True
+
+    def _follow_calibration_shape(self):
+        """The Advanced Rows/Columns follow the Calibration's detector (``rsm_calibration_raw_frame``: the
+        partner's raw frame, else the pyFAI file's own detector), as RSM's do. The maintainer, 2026-11-27, after an
+        Eiger's 512×1028 stayed for Pilatus 100K RAW frames: "i thought the rows and columns were supposed to update
+        automatically based on the detector and images". Runs when the Calibration or Project changes, the window
+        saves a calibration, and Preview, Run or Live begins (a partner saved later under the same name). Nothing
+        changes while no calibration can be read (a PONI file, a missing file)."""
+        from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_raw_frame
+        named = str(self._value("geometry_path") or "").strip()
+        project = str(self._value("project_root") or "").strip()
+        if self._closing or self._owner.busy or not named or not (project or Path(named).expanduser().is_absolute()):
+            return  # a Run keeps the shape it started with
+        root = Path(project).expanduser() if project else Path(named).expanduser().parent
+        try:
+            shape = rsm_calibration_raw_frame(named, project_root=root)
+        except (OSError, ValueError, TypeError):
+            return
+        try:
+            current = (int(str(self._value("detector_rows"))), int(str(self._value("detector_cols"))))
+        except (TypeError, ValueError):
+            current = None
+        if shape is not None and shape != current:
+            self.set_field("detector_rows", str(shape[0]))
+            self.set_field("detector_cols", str(shape[1]))
 
     def _show_early_ceiling(self, *_args):
         """Threshold Auto's ceiling as soon as the selection is committed, as Int shows it (maintainer,
@@ -2351,6 +2381,7 @@ class StitchPage(QtWidgets.QWidget):
     def begin_preview(self):
         if self._live_watcher.busy:
             return
+        self._follow_calibration_shape()
         self._prepare("Preparing Preview…", then="preview")
 
     def _prepare(self, action, *, then):
@@ -2368,6 +2399,7 @@ class StitchPage(QtWidgets.QWidget):
         # Typing still in a field is part of this Run's inputs: committed first, it makes the check
         # below run again instead of Append reusing Preview's (Codex testing-fixes review F1).
         self._commit_typing()
+        self._follow_calibration_shape()
         # “Record angular coverage” is frozen here, at Run start, for every job of this Run (decision 6)
         self._run_angular_support = AngularSupportPolicy(enabled=bool(self._value("record_angular_support")))
         self._follow_save_path(again=True)  # C-15: the browser lists this Run's results as they finish
@@ -3067,6 +3099,7 @@ class StitchPage(QtWidgets.QWidget):
             return
         self.set_field("geometry_kind", "Goniometer JSON")
         self.set_field("geometry_path", path)
+        self._follow_calibration_shape()  # the row may already hold this name (the partner saved beside it)
         dialog = self._calibration_dialog
         if dialog is not None:  # the fit's own instrument and motors, as saved with it
             from xrd_tools.session.instrument import InstrumentGeometry
