@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import os
 from pathlib import Path
 from threading import Event
 import time
 
 import pytest
 
-from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry
+from xdart.gui.tabs.scattering.browser_catalog import BrowserCatalogEntry, enumerate_processed_artifacts
 from xdart.gui.tabs.scattering.browse_values import (
     BrowseLoadOutcome,
     BrowseLoadRequest,
@@ -829,3 +830,38 @@ def test_clock_failure_drops_only_terminal_telemetry() -> None:
     finally:
         owner.begin_close()
         _wait(owner.retry_close)
+
+
+@pytest.mark.parametrize(("mode", "shown"), (("Int 2D", "scan1.nexus"), ("2D Viewer", "frame_0001.tif")))
+def test_hidden_names_never_reach_the_results_list_or_the_data_browser(tmp_path, mode, shown) -> None:
+    """Maintainer, 2026-11-26: "ignore hidden files. Don't show them in the data browser either"."""
+    folder = tmp_path / "data"
+    (folder / "scans").mkdir(parents=True)
+    (folder / ".cache").mkdir()
+    (folder / shown).write_bytes(b"x")
+    (folder / ".xdart-finite-0123-4567.nexus").write_bytes(b"x")  # a save's private candidate, mid-write
+    (folder / "._frame_0001.tif").write_bytes(b"x")  # a macOS AppleDouble twin on an SMB share
+    wakes: list[BrowserCatalogWake] = []
+    owner = ProcessedBrowserOwner(save_path=str(folder), processing_mode=mode, deliver=wakes.append)
+    try:
+        assert owner.request_catalog() is not None
+        _wait(lambda: bool(wakes))
+        assert owner.consume_catalog(wakes.pop(0)).refresh is BrowserRefreshEffect.CATALOG
+        assert {entry.label for entry in owner.catalog} == {"..", "scans/", shown}
+    finally:
+        owner.begin_close()
+        _wait(owner.retry_close)
+
+
+def test_a_hidden_child_does_not_move_a_folders_date(tmp_path) -> None:
+    folder = tmp_path / "data" / "scans"
+    folder.mkdir(parents=True)
+    shown, hidden = folder / "scan1.nexus", folder / ".DS_Store"
+    shown.write_bytes(b"x")
+    hidden.write_bytes(b"x")
+    os.utime(shown, ns=(1_000_000_000_000_000_000,) * 2)
+    os.utime(hidden, ns=(2_000_000_000_000_000_000,) * 2)
+    os.utime(folder, ns=(500_000_000_000_000_000,) * 2)
+    entries = enumerate_processed_artifacts(str(folder.parent), inspect_directory_contents=True)
+    [listed] = [entry for entry in entries if entry.label == "scans/"]
+    assert listed.modified_ns == 1_000_000_000_000_000_000

@@ -163,6 +163,8 @@ def enumerate_processed_artifacts(
                 if cancelled is not None and cancelled.is_set():
                     return ()
                 child = Path(entry.path)
+                if _hidden(child.name):
+                    continue
                 try:
                     fact = entry.stat()
                 except OSError:
@@ -210,6 +212,13 @@ def enumerate_processed_artifacts(
     ))
 
 
+def _hidden(name: str) -> bool:
+    """A dot-named file or folder, never listed nor dated (maintainer, 2026-11-26: "ignore hidden files. Don't show
+    them in the data browser either"). It covers a save's private ``.xdart-finite-*`` candidate while it is written,
+    macOS ``._*`` twins on shares and ``.DS_Store``. Run inputs keep their own discovery rules."""
+    return name.startswith(".")
+
+
 def _directory_modified_ns(
     directory: Path,
     own_mtime_ns: int,
@@ -224,6 +233,8 @@ def _directory_modified_ns(
             for child in children:
                 if cancelled is not None and cancelled.is_set():
                     return own_mtime_ns, False
+                if _hidden(child.name):
+                    continue
                 try:
                     child_mtime_ns = int(
                         child.stat(follow_symlinks=False).st_mtime_ns
