@@ -40,13 +40,18 @@ def qapp():
 def _wait(page, qapp, timeout=30, *, catalog=False):
     until = time.monotonic() + timeout
     qapp.processEvents()
-    # a shown result the page dropped from memory is reloaded between its other work (C12)
-    while (page._owner.busy or page._source_observer.computing or page._raw_pending or page._queued_jobs
-           or getattr(page, "_reload_pending", None)
-           or (catalog and page._result_browser.busy)) and time.monotonic() < until:
+    while True:
+        # a shown result the page dropped from memory is reloaded between its other work (C12)
+        while (page._owner.busy or page._source_observer.computing or page._raw_pending or page._queued_jobs
+               or getattr(page, "_reload_pending", None)
+               or (catalog and page._result_browser.busy)) and time.monotonic() < until:
+            qapp.processEvents()
+            time.sleep(.005)
         qapp.processEvents()
-        time.sleep(.005)
-    qapp.processEvents()
+        # The browser's 1.5 s idle poll can start a new folder read in that last pump (main CI run 45963782174):
+        # the catalog has landed only once the browser is idle right after a pump.
+        if not (catalog and page._result_browser.busy) or time.monotonic() >= until:
+            break
     assert not page._owner.busy, page.run_bar.readinessLabel.full_text()
     if catalog:
         assert not page._result_browser.busy
