@@ -1,5 +1,50 @@
 # Release notes
 
+## 1.2.20 (2026-11-27)
+
+### Changes
+
+- **Per-scan Live in RSM and Stitch:** with Live (◉) on, Run watches the
+  selected SPEC file, NeXus files or folder and processes each scan once it
+  has finished, through the page's normal Run. Results are saved exactly as
+  an ordinary Run saves them. A SPEC scan counts as finished when it has its
+  planned points or a complete later scan header follows it, and its
+  detector files are all present and unchanged. A Bluesky/NXWriter
+  container is taken once every entry in it is marked complete. A scan
+  whose output is already current is skipped, and the view stays. Stop
+  cancels the current scan; closing the page stops Live and waits for a
+  running job to end.
+- **Live preview while a scan records:** when a SPEC scan writes one
+  detector file per point (RAW, TIFF or CBF), the RSM map or Stitch pattern
+  fills in as the points arrive, titled "Provisional · scan N". The grid
+  grows when a new point falls outside it. RSM applies a provisional
+  all-frame hot-pixel mask from the second point, and the preview is capped
+  at 1,000,000 voxels.
+  Nothing is written during the scan; when it finishes, the saved result
+  replaces the preview. The newest scan stays on screen and an older scan's
+  saved result goes to the results list. The preview is on by default;
+  "Preview frames" in Advanced (also the "Preview on" button next to Run)
+  turns it off. Scans whose detector files appear only at scan end (Eiger
+  HDF5) and NXWriter containers get per-scan Live without a preview.
+- **Hidden files stay out of the browsers:** the Data Browser and the
+  results lists no longer show files or folders whose names start with a
+  dot. That includes the private file a save writes before it takes the
+  result's name, macOS "._" copies on network shares and ".DS_Store". A
+  folder's Date comes from its newest visible item; a folder with none
+  shows its own date. Which files a Run processes is unchanged.
+
+### Known issue
+
+- In Stitch, after Live is stopped and started again, pressing Run
+  occasionally starts no Run (about 1 in 20 to 30 in local tests; the
+  cause is not yet known). Nothing is written. Press Run again.
+
+### Not yet tested
+
+- Per-scan Live and the preview have not been run on a real beamline
+  recording, on SMB shares while a detector writes, or under memory
+  pressure.
+
 ## 1.2.19 (2026-11-24)
 
 ### Changes
