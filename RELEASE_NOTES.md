@@ -1,5 +1,21 @@
 # Release notes
 
+## 1.2.21 (2026-11-27)
+
+### Fixes
+
+- **RSM and Stitch Rows/Columns follow the calibration's detector:** when
+  Advanced Rows/Columns were left from another detector (an Eiger, say),
+  headerless RAW frames were refused ("raw detector layout does not match
+  the exact file size"), and changing the detector in Calibrate did not
+  change them. Rows/Columns now take the shape the calibration was made
+  for when a calibration is chosen or saved, and again when Preview, Run or
+  Live starts, so a calibration saved again under the same name is read
+  too. An Eiger or NeXus file still sets its own shape once its scans are
+  found, and Preview still refuses images that do not match the
+  calibration. Nothing changes while a Run or Live is in progress, or
+  while the calibration cannot be read (for example a PONI file in Stitch).
+
 ## 1.2.20 (2026-11-27)
 
 ### Changes
