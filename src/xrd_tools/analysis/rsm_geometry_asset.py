@@ -1415,8 +1415,8 @@ def _xu_record_raw_frame(path, project_root):
         if _partner_orientation(value["acquisition"]).swaps_axes:
             rows, columns = columns, rows
         return (rows, columns) if min(rows, columns) >= 2 else None
-    except (ImportError, OSError, ValueError, TypeError):
-        return None
+    except (ImportError, OSError, ValueError, TypeError, LookupError):
+        return None  # a hint only: Preview and Run keep the partner's own refusals
 
 
 def _pyfai_record_raw_frame(path: Path, *, rotation: int | None = None) -> tuple[int, int] | None:
