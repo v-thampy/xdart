@@ -91,3 +91,31 @@ def win32_pathname_ctime(monkeypatch):
         return _WIN32_CTIME_GAP_NS
 
     return install
+
+
+@pytest.fixture
+def win32_share_pathname_cache(monkeypatch):
+    """``install(path)``: pathname ``os.stat``/``os.lstat`` of *path* keep reporting the state it had at install,
+    as a Windows SMB client serves a share's pathname attributes from its cache (about 10 s by default) while another
+    computer appends to the file. Descriptor views stay live, as on Windows. Beamline, 2026-11-27: every RSM Preview
+    during a scan refused SOURCE_REVISION_CHANGED."""
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def install(path) -> None:
+        spelled = {os.path.abspath(os.fspath(path)), os.path.realpath(path)}
+        frozen = {real_stat: real_stat(path), real_lstat: real_lstat(path)}
+
+        def cached(real):
+            def call(target, *args, **kwargs):
+                if isinstance(target, (str, bytes, os.PathLike)) and (
+                    os.path.abspath(os.fsdecode(target)) in spelled
+                ):
+                    return frozen[real]
+                return real(target, *args, **kwargs)
+
+            return call
+
+        monkeypatch.setattr(os, "stat", cached(real_stat))
+        monkeypatch.setattr(os, "lstat", cached(real_lstat))
+
+    return install

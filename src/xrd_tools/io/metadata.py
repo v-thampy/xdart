@@ -2098,12 +2098,18 @@ def _spec_name_matches_read(named, observed) -> bool:
     """Whether the pathname view *named* still shows the file the descriptor view *observed* read.
 
     A pathname view against a descriptor view: the ctime slot rides the win32 seam (``stat_identity``),
-    because Windows reports the creation time for one and the change time for the other."""
-    from xrd_tools.io.stat_identity import identity_ctime_ns
+    because Windows reports the creation time for one and the change time for the other. On win32 the size
+    and mtime stay out as well (``PATHNAME_STATE_IS_CURRENT``): a share's pathname view lags the open file
+    while another computer appends, so only the file object is compared there."""
+    from xrd_tools.io import stat_identity
 
-    return ((named.st_dev, named.st_ino, named.st_size, named.st_mtime_ns)
-            == (observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns)
-            and identity_ctime_ns(named.st_ctime_ns) == identity_ctime_ns(observed.st_ctime_ns))
+    if (named.st_dev, named.st_ino) != (observed.st_dev, observed.st_ino):
+        return False
+    if not stat_identity.PATHNAME_STATE_IS_CURRENT:
+        return True
+    return ((named.st_size, named.st_mtime_ns) == (observed.st_size, observed.st_mtime_ns)
+            and stat_identity.identity_ctime_ns(named.st_ctime_ns)
+            == stat_identity.identity_ctime_ns(observed.st_ctime_ns))
 
 
 def _spec_occurrence_named_status(proof: SpecOccurrence, status):

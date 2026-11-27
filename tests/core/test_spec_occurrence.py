@@ -851,6 +851,66 @@ def test_s11_the_proof_holds_where_pathname_and_descriptor_ctimes_disagree(
     assert spec_occurrence_holds(proof) is holds
 
 
+def _windows_share(monkeypatch, ctime_seam, win32_share_pathname_cache, path):
+    """Windows on a share: no pathname change token, and a pathname view (size, mtime, ctime) that stays as it was
+    while the file grows (tests/conftest.py)."""
+    monkeypatch.setattr(ctime_seam, "IDENTITY_CARRIES_CTIME", False)
+    monkeypatch.setattr(ctime_seam, "PATHNAME_STATE_IS_CURRENT", False, raising=False)
+    win32_share_pathname_cache(path)
+
+
+@pytest.mark.parametrize("change, holds", [
+    ("unchanged", True), ("later scan appended", True),
+    ("row appended to the scan", False), ("selected row rewritten", False), ("replaced by a copy", False),
+])
+def test_s12_the_proof_holds_where_a_share_caches_the_pathname_size(
+        tmp_path, monkeypatch, ctime_seam, win32_share_pathname_cache, change, holds):
+    """Maintainer, 2026-11-27, at the beamline on Windows: "I get this issue on a Windows machine right now but it
+    runs fine on my mac" (Preview refused: SOURCE_REVISION_CHANGED: SPEC source could not be admitted for RSM v2,
+    the SPEC file on a share while a later scan records). The share's pathname view lags the open file's while
+    another computer appends, so the check that the name still shows the file it read never held."""
+    from xrd_tools.io.metadata import spec_occurrence_holds
+    from xrd_tools.io.spec import spec_capture_scope, spec_occurrence
+    path = tmp_path / "f"
+    path.write_text(_TWO_SCANS, encoding="utf-8", newline="\n")
+    with spec_capture_scope():
+        proof = spec_occurrence(path, "2.1")
+    _windows_share(monkeypatch, ctime_seam, win32_share_pathname_cache, path)
+    if change == "later scan appended":
+        _append(path, "\n#S 3 ascan eta 0 1 1 1\n#L eta  I0\n0 50\n")
+    elif change == "row appended to the scan":
+        _append(path, "2 50\n")
+    elif change == "selected row rewritten":
+        _rewrite(path, "1 40\n", "1 41\n")
+    elif change == "replaced by a copy":
+        copy = tmp_path / "copy"
+        copy.write_bytes(path.read_bytes())
+        copy.replace(path)
+    assert spec_occurrence_holds(proof) is holds
+
+
+def test_s12_rsm_previews_and_runs_while_a_later_scan_grows_the_file_on_a_share(
+        tmp_path, monkeypatch, ctime_seam, win32_share_pathname_cache):
+    _runnable(monkeypatch)
+    form = _rsm(tmp_path)
+    spec_path = form.members[0].spec_path
+    _windows_share(monkeypatch, ctime_seam, win32_share_pathname_cache, spec_path)
+    _append(spec_path)  # the next scan records while its predecessor is previewed
+    request = prepare_rsm_tool_v2(form).request
+    _append(spec_path, "1 2 20 110\n")
+    _committed(run_rsm_operation_v2(request))
+
+
+def test_s12_stitch_previews_and_runs_while_a_later_scan_grows_the_file_on_a_share(
+        tmp_path, monkeypatch, ctime_seam, win32_share_pathname_cache):
+    form = _native_form(tmp_path, "multigeometry", scans="1")
+    _windows_share(monkeypatch, ctime_seam, win32_share_pathname_cache, form.spec_path)
+    _append(form.spec_path, "\n#S 4 ascan del 14 15 1 1\n#D today\n#P0 14 -10\n#N 2\n#L del  nu\n14 -10\n")
+    request = prepare_stitch_tool(form).request
+    _append(form.spec_path, "15 -10\n")
+    _committed(run_stitch_operation(request))
+
+
 def _two_scans_with_motor_positions():
     return _TWO_SCANS.replace("#L eta", "#P0 20\n#L eta")
 

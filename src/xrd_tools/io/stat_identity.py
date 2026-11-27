@@ -27,6 +27,18 @@ milliseconds to a third of a second after the file is written (beamline
 2026-10-25), so those comparisons route the slot through the seam too.  The
 capture (``SourceFileState``) stays exact for its other consumers.  On win32
 the slot never caught an in-place edit; size and mtime still do.
+
+On a Windows share the SMB client also serves a pathname stat's size and
+mtime from its attribute cache (about ten seconds by default), while an open
+handle sees the file as it is.  While another computer appends to a SPEC
+file, the two views of one file therefore disagree for as long as the scan
+records (beamline 2026-11-27: every RSM Preview during a scan refused
+SOURCE_REVISION_CHANGED, while the same data previewed on a Mac).  Where a
+pathname view only has to show that the name still reaches the file a
+descriptor read, :data:`PATHNAME_STATE_IS_CURRENT` keeps the size and mtime
+in that compare on POSIX and leaves the file object (device, inode) alone
+deciding it on win32.  The bytes themselves are proved through the
+descriptor.
 """
 
 from __future__ import annotations
@@ -34,6 +46,10 @@ from __future__ import annotations
 import sys
 
 IDENTITY_CARRIES_CTIME = sys.platform != "win32"
+
+#: Whether a pathname stat's size and mtime are the file's current ones (POSIX), or may lag an open handle's
+#: (win32: a share's attribute cache).
+PATHNAME_STATE_IS_CURRENT = sys.platform != "win32"
 
 
 def identity_ctime_ns(ctime_ns: int) -> int:
