@@ -216,3 +216,87 @@ def test_switching_spec_format_resolves_the_newly_enabled_entry_before_run(qapp,
         assert len(page.browser.listed_results()) == 1, page.run_bar.readinessLabel.full_text()
     finally:
         _close(page, qapp)
+
+
+def _pilatus_raw_source(root, *, partner):
+    """Maintainer, 2026-11-27, at the beamline: scan 1's Pilatus 100K frames as headerless int32 RAW (195 x 487) and
+    the calibration window's quarter-turned Pilatus 100K calibration: its pyFAI file alone (the partner not saved
+    yet) or with its xrayutilities partner."""
+    import json
+    from tests.core.test_turned_detector import _pair, _rough
+    from xrd_tools.core.geometry.diffractometer import ImageOrientation
+    images = root / "source" / "images"
+    images.mkdir(parents=True, exist_ok=True)
+    _spec_file(root / "source" / "RSM_synth", [_spec_scan(1, 10)])
+    for label in range(2):
+        np.zeros((195, 487), dtype="<i4").tofile(images / f"RSM_synth_scan1_{label:04d}.raw")
+    folder = root / "calibration"
+    folder.mkdir(exist_ok=True)
+    turned = ImageOrientation(rotation=90)
+    if partner:
+        _pair(folder, "Pilatus100k", turned)
+    else:
+        (folder / "cal.json").write_text(json.dumps(_rough("Pilatus100k", turned)), encoding="utf-8")
+    return "calibration/cal.json"
+
+
+def _on_raw_source(page, qapp, root, calibration):
+    _choose(qapp, page._rows["data_format"], "spec_series")
+    page.set_field("project_root", str(root))
+    page.set_field("geometry_path", calibration)
+    page.set_sources([str(root / "source" / "RSM_synth")])
+    page.set_field("image_dir", "source/images")
+    page.set_field("normalization", "None")
+    page.set_field("offset", "0")
+    page._threshold_edited(THRESHOLD_ENABLED, False)
+    page.set_field("static_hot", "")
+    page.set_field("scan", "1")
+
+
+@pytest.mark.parametrize("partner", [False, True], ids=["pyfai-file-alone", "with-partner"])
+def test_the_calibrations_raw_frame_reads_from_the_partner_or_the_pyfai_file(tmp_path, partner):
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_raw_frame
+    locator = _pilatus_raw_source(tmp_path, partner=partner)
+    assert rsm_calibration_raw_frame(locator, project_root=tmp_path) == (195, 487)  # the stored images', not turned
+    assert rsm_calibration_raw_frame("calibration/absent.json", project_root=tmp_path) is None
+
+
+def test_raw_rows_columns_follow_the_calibration_when_preview_starts(qapp, tmp_path):
+    """Maintainer, 2026-11-27: "the detector was initially set to eiger2 500k. i changed it to pilatus 100k but it
+    still didn't change the number of rows and columns" and "i thought the rows and columns were supposed to update
+    automatically based on the detector and images". An earlier Eiger left 512 x 1028 in Rows/Columns, so his
+    Pilatus 100K RAW frames were refused ("raw detector layout does not match the exact file size"). His sequence:
+    the calibration is named while Rows/Columns still hold the Eiger's, the pyFAI file first, its partner saved later
+    under the same name."""
+    locator = _pilatus_raw_source(tmp_path, partner=False)
+    page = _page(qapp)
+    try:
+        _on_raw_source(page, qapp, tmp_path, locator)
+        page.set_field("adv_rows", "512"); page.set_field("adv_columns", "1028")  # the Eiger 2 500K's, left over
+        refusal = _preview(page, qapp)
+        assert "exact file size" not in refusal and "xrayutilities partner" in refusal, refusal
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+        _pilatus_raw_source(tmp_path, partner=True)  # the window saves the partner beside the same pyFAI file
+        page.set_field("adv_rows", "512"); page.set_field("adv_columns", "1028")
+        assert "Preview ready" in _preview(page, qapp)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+    finally:
+        _close(page, qapp)
+
+
+def test_raw_rows_columns_follow_a_calibration_chosen_and_one_saved_from_the_window(qapp, tmp_path):
+    """Choosing a calibration sets Rows/Columns at once, and so does the window saving one under the name the row
+    already holds (its row does not change)."""
+    locator = _pilatus_raw_source(tmp_path, partner=True)
+    page = _page(qapp)
+    try:
+        page.set_field("project_root", str(tmp_path))
+        page.set_field("adv_rows", "512"); page.set_field("adv_columns", "1028")
+        page.set_field("geometry_path", locator)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+        page.set_field("adv_rows", "512"); page.set_field("adv_columns", "1028")
+        page._calibration_project = str(tmp_path)
+        page._adopt_calibration(locator)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+    finally:
+        _close(page, qapp)

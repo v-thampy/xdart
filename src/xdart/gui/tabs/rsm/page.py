@@ -80,7 +80,7 @@ from xrd_tools.analysis.live_scans import LiveScanHandoff, LiveScanObserver, req
 from xrd_tools.analysis.module_transaction import MetadataColumnSelector, ModuleDisposition
 from xrd_tools.analysis.rsm_geometry_asset import (
     RSMGeometryAssetRefused, capture_rsm_calibration_geometry,
-    rsm_calibration_detector, rsm_calibration_geometry_input,
+    rsm_calibration_detector, rsm_calibration_geometry_input, rsm_calibration_raw_frame,
 )
 from xrd_tools.analysis.rsm_operation import (
     RSMFrameCorrections, RSMImageConditioning, RSMNormalizationMode, RSMNormalizationPolicy, RSMOperationResultV2,
@@ -1041,7 +1041,10 @@ class RSMPage(QtWidgets.QWidget):
                 for key, label, value, choices in rows))
         for spec in corrections:
             self._tip(spec.key, spec.tip)
-        self._tip("adv_rows", "The raw images' rows (a NeXus stack's frames are this shape too).")
+        self._tip("adv_rows", "The raw images' rows. Follows the Calibration's detector when one is chosen, and "
+                              "an Eiger or NeXus stack's own frames when Preview or Run finds the scans.")
+        self._tip("adv_columns", "The raw images' columns. Follows the Calibration's detector when one is chosen, "
+                                 "and an Eiger or NeXus stack's own frames when Preview or Run finds the scans.")
         self._tip("adv_header", "Bytes before the pixels in each raw image file.")
         self._tip("adv_angle_mapping", "Which source column each psic circle reads, as role=column: mu, eta, chi, "
                                        "phi, nu and del, each once. A column the scan repeats takes its "
@@ -1150,6 +1153,8 @@ class RSMPage(QtWidgets.QWidget):
                 str(self._value("output_path")), str(self._value("project_root")))
         if key == "geometry_path":
             self._sync_calibration_window()
+        if key in {"geometry_path", "project_root"}:
+            self._follow_calibration_shape()
         if key in {"geometry_path", "project_root", "refinement", "spec_path", "scan_mode", "scan",
                    "data_format", "nexus_entry", "input_mode", "image_dir", "image_stem"}:
             self._show_early_ceiling()
@@ -1311,6 +1316,7 @@ class RSMPage(QtWidgets.QWidget):
         if self._live_watcher.busy:
             return (), ()
         from xdart.gui.tools.rsm_values import rsm_member_groups
+        self._follow_calibration_shape()
         key = self._group_key()
         selection, options, queue = self._resolution_request()
         groups, skipped = rsm_member_groups(selection, **options)
@@ -1346,6 +1352,32 @@ class RSMPage(QtWidgets.QWidget):
         self.set_field("adv_rows", str(rows))
         self.set_field("adv_columns", str(columns))
         return self._group_key()
+
+    def _follow_calibration_shape(self):
+        """The Advanced Rows/Columns follow the Calibration's detector (``rsm_calibration_raw_frame``). The
+        maintainer, 2026-11-27, after an Eiger's 512×1028 stayed for Pilatus 100K RAW frames: "i thought the rows
+        and columns were supposed to update automatically based on the detector and images". Headerless RAW records
+        no shape, so its decoder takes the calibration's; an Eiger or NeXus stack still takes its own once found
+        (``_follow_member_shape``), and Preview refuses images that differ from the calibration. Runs when the
+        Calibration or Project changes, the window saves a calibration, and Preview, Run or Live begins (a partner
+        saved later under the same name). Nothing changes while no calibration can be read, or while busy."""
+        project = str(self._value("project_root") or "").strip()
+        if (self._closing or self._owner.busy or self._resolving is not None or not project
+                or not str(self._value("geometry_path") or "").strip()):
+            return  # a Run or search keeps the shape it started with
+        try:
+            root = Path(project).expanduser()
+            shape = rsm_calibration_raw_frame(self._calibration_locator(root), project_root=root,
+                                              refinement=bool(self._value("refinement")))
+        except (OSError, ValueError, TypeError):
+            return
+        try:
+            current = (int(self._value("adv_rows")), int(self._value("adv_columns")))
+        except (TypeError, ValueError):
+            current = None
+        if shape is not None and shape != current:
+            self.set_field("adv_rows", str(shape[0]))
+            self.set_field("adv_columns", str(shape[1]))
 
     def _skipped_scans(self):
         """The scans the last search skipped for the Source as it stands, as (file, scan, why)."""
@@ -1990,6 +2022,7 @@ class RSMPage(QtWidgets.QWidget):
             self._notice(f"Calibration saved: {path} · Project changed; select the calibration to use it")
             return
         self.set_field("geometry_path", str(path))
+        self._follow_calibration_shape()  # the row may already hold this name (the partner saved beside it)
         dialog = self._calibration_dialog
         if dialog is not None and dialog.saved_mask:
             self.set_field("mask_path", dialog.saved_mask)
@@ -2039,6 +2072,7 @@ class RSMPage(QtWidgets.QWidget):
             return
         self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
+        self._follow_calibration_shape()
         self._find_scans("preview")
 
     def begin_run(self):
@@ -2048,6 +2082,7 @@ class RSMPage(QtWidgets.QWidget):
             return
         self.point_images.finish_run(reset_brake=True)
         self._commit_typing()
+        self._follow_calibration_shape()
         self._follow_save_path(again=True)  # C-15: the browser lists this Run's results as they finish
         if self.run_bar.is_live():
             self._begin_live()
