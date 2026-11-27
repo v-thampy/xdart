@@ -330,6 +330,8 @@ def test_g10_stop_restart_and_finite_append_keep_the_full_selection(qapp, tmp_pa
             assert len(page.build_forms()) == 2
         else:
             assert len(page._owner.prepared.requests) == 2
+        # Stitch's detector admission check can outlast native Preview.
+        wait_until(qapp, page.run_bar.startButton.isEnabled)
         page.run_bar.startButton.click()
         wait_until(qapp, lambda: len(_outputs(tmp_path)) == 2 and not page.active())
         assert (first.stat().st_mtime_ns, first.read_bytes()) == first_revision
