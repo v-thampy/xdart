@@ -25,11 +25,15 @@ def settle(page, qapp):
 def catalog(page, qapp):
     """Wait for the results folder's catalog, which the browser lists since 063fc88f."""
     end = time.monotonic() + 30
-    while True:  # the browser's 1.5 s idle poll can start a new read in any pump: idle counts right after one
+    while True:
+        while page._result_browser.busy and time.monotonic() < end:
+            qapp.processEvents()
+            time.sleep(.01)
         qapp.processEvents()
+        # the browser's 1.5 s idle poll can start a new read in that last pump: the catalog has landed only once
+        # the browser is idle right after a pump
         if not page._result_browser.busy or time.monotonic() >= end:
             break
-        time.sleep(.01)
     assert not page._result_browser.busy
 
 

@@ -64,11 +64,14 @@ def test_the_browser_follows_the_projects_and_the_save_paths_changes(qapp, tmp_p
         tool.set_project(str(second))
         assert browser.directory == str(second / "xdart_processed_data")
         until = time.monotonic() + 10  # its folder does not exist yet: the read ends quietly
-        while True:  # the browser's 1.5 s idle poll can start a new read in any pump: idle counts right after one
+        while True:
+            while browser.busy and time.monotonic() < until:
+                qapp.processEvents()
+                time.sleep(.01)
             qapp.processEvents()
+            # the browser's 1.5 s idle poll can start a new read in that last pump: wait that read out too
             if not browser.busy or time.monotonic() >= until:
                 break
-            time.sleep(.01)
         assert not browser.busy and notices == [], notices
         tool.set_save_path(str(chosen))
         assert browser.directory == str(chosen)
