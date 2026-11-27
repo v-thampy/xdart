@@ -107,6 +107,8 @@ def test_stitch_typed_calibration_follows_before_any_preview(qapp, tmp_path):
 
 @pytest.mark.parametrize("turned", [False, True], ids=["upright", "legacy-camera"])
 def test_stitch_restore_admits_raw_and_preview_keeps_the_forms_decoder(qapp, tmp_path, turned):
+    from xrd_tools.notebooks.operation_replay import _restore_forms
+
     form = _native_form(tmp_path, "multigeometry", scans="1")
     if turned:
         orientation = ImageOrientation(rotation=90)
@@ -119,8 +121,9 @@ def test_stitch_restore_admits_raw_and_preview_keeps_the_forms_decoder(qapp, tmp
         page.load_form(form)
         assert page.build_form().detector_shape == form.detector_shape
         settings = page.settings()
-        decoder = page._capture_run_workflow().configuration["forms"][0]["fields"]["detector_shape"]
-        assert tuple(decoder) == form.detector_shape
+        recipe = page._capture_run_workflow()
+        restored, = _restore_forms(recipe.mode, recipe.configuration, data_root=tmp_path, output_root=tmp_path)
+        assert restored.detector_shape == form.detector_shape
         page.begin_preview()
         wait_until(qapp, lambda: not page._owner.busy)
         assert page.build_form().detector_shape == form.detector_shape
