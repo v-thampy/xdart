@@ -33,12 +33,6 @@
   folder's Date comes from its newest visible item; a folder with none
   shows its own date. Which files a Run processes is unchanged.
 
-### Known issue
-
-- In Stitch, after Live is stopped and started again, pressing Run
-  occasionally starts no Run (about 1 in 20 to 30 in local tests; the
-  cause is not yet known). Nothing is written. Press Run again.
-
 ### Not yet tested
 
 - Per-scan Live and the preview have not been run on a real beamline
