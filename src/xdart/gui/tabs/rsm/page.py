@@ -1362,9 +1362,9 @@ class RSMPage(QtWidgets.QWidget):
         Calibration or Project changes, the window saves a calibration, and Preview, Run or Live begins (a partner
         saved later under the same name). Nothing changes while no calibration can be read, or while busy."""
         project = str(self._value("project_root") or "").strip()
-        if (self._closing or self._owner.busy or self._resolving is not None or not project
-                or not str(self._value("geometry_path") or "").strip()):
-            return  # a Run or search keeps the shape it started with
+        if (self._closing or self._owner.busy or self._live_watcher.busy or self._resolving is not None
+                or not project or not str(self._value("geometry_path") or "").strip()):
+            return  # a Run, Live or search keeps the shape it started with
         try:
             root = Path(project).expanduser()
             shape = rsm_calibration_raw_frame(self._calibration_locator(root), project_root=root,

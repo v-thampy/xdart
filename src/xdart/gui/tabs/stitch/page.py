@@ -1678,8 +1678,9 @@ class StitchPage(QtWidgets.QWidget):
         from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_raw_frame
         named = str(self._value("geometry_path") or "").strip()
         project = str(self._value("project_root") or "").strip()
-        if self._closing or self._owner.busy or not named or not (project or Path(named).expanduser().is_absolute()):
-            return  # a Run keeps the shape it started with
+        if (self._closing or self._owner.busy or self._live_watcher.busy or not named
+                or not (project or Path(named).expanduser().is_absolute())):
+            return  # a Run or Live keeps the shape it started with
         root = Path(project).expanduser() if project else Path(named).expanduser().parent
         try:
             shape = rsm_calibration_raw_frame(named, project_root=root)

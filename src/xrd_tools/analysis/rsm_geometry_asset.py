@@ -1392,8 +1392,8 @@ def rsm_calibration_raw_frame(
         header = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(
             locator, project_root=project_root, refinement=refinement)).detector_header
         return int(header.Nch1), int(header.Nch2)
-    except (RSMGeometryAssetRefused, OSError, ValueError, TypeError, KeyError):
-        pass
+    except (RSMGeometryAssetRefused, ImportError, OSError, ValueError, TypeError, KeyError):
+        pass  # no partner yet, or one this install cannot read
     return _pyfai_record_raw_frame(Path(project_root).expanduser() / Path(locator).expanduser())
 
 
