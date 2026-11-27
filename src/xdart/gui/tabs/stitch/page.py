@@ -753,6 +753,7 @@ class StitchPage(QtWidgets.QWidget):
         self._field(project, SectionId.PROJECT, "project_root", "Folder", browse=True)
         self._rows["project_root"].valueChanged.connect(self._project_typed)
         self._rows["project_root"].valueChanged.connect(self._refresh_xu_geometry)
+        self._rows["project_root"].valueChanged.connect(self._follow_calibration_shape)
         self._field(project, SectionId.PROJECT, "output_path", "Save Path", browse=True)
         # One Data format for this page (LT-004; maintainer, October 14: Stitch and RSM each remember their own): the
         # Source rows and files, and the calibration window's calibrant and direct-beam sources, follow it
@@ -786,6 +787,7 @@ class StitchPage(QtWidgets.QWidget):
         self.mask_button.setToolTip("Draw a detector mask on one of the scan's frames.")
         self.controls.controlActionRequested.connect(self._control_action)
         self._rows["geometry_path"].valueChanged.connect(self._refresh_xu_geometry)
+        self._rows["geometry_path"].valueChanged.connect(self._follow_calibration_shape)
         self._rows["geometry_path"].valueChanged.connect(self._show_early_ceiling)
         self._rows["geometry_path"].valueChanged.connect(self._sync_calibration_window)
         # Grazing incidence as Int sets it, in the Experiment section (maintainer, 2026-09-29):
@@ -935,9 +937,9 @@ class StitchPage(QtWidgets.QWidget):
                         choices=CAMERAS if key == "camera" else (),
                         choice_labels=CAMERA_LABELS if key == "camera" else None)
         for key, which in (("detector_rows", "rows"), ("detector_cols", "columns")):
-            self._rows[key].setToolTip(
-                f"The raw images' {which}, for headerless RAW frames. Follows the Calibration's detector when one "
-                "is chosen; an Eiger or NeXus stack takes its own frames' shape.")
+            self._tip(key, f"The stored images' {which} for headerless RAW frames. Follows the Calibration "
+                           "and Camera orientation. Eiger and NeXus readers use their frames' own shape.")
+        self._rows["camera"].valueChanged.connect(self._follow_calibration_shape)
         self._rows["camera"].setToolTip(
             "The detector's camera, as Calibrate ▸ 1 · Instrument ▸ Detector gives it: the lab directions the "
             "mounting looking downstream. Upright is stored rows x−, columns z+; rotation is clockwise, "
@@ -1668,14 +1670,9 @@ class StitchPage(QtWidgets.QWidget):
         self._sync_actions()
         return True
 
-    def _follow_calibration_shape(self):
-        """The Advanced Rows/Columns follow the Calibration's detector (``rsm_calibration_raw_frame``: the
-        partner's raw frame, else the pyFAI file's own detector), as RSM's do. The maintainer, 2026-11-27, after an
-        Eiger's 512×1028 stayed for Pilatus 100K RAW frames: "i thought the rows and columns were supposed to update
-        automatically based on the detector and images". Runs when the Calibration or Project changes, the window
-        saves a calibration, and Preview, Run or Live begins (a partner saved later under the same name). Nothing
-        changes while no calibration can be read (a PONI file, a missing file)."""
-        from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_raw_frame
+    def _follow_calibration_shape(self, *_args):
+        """Set the RAW decoder from the selected backend's calibration in the stored frame."""
+        from xrd_tools.analysis.rsm_geometry_asset import stitch_calibration_raw_frame
         named = str(self._value("geometry_path") or "").strip()
         project = str(self._value("project_root") or "").strip()
         if (self._closing or self._owner.busy or self._live_watcher.busy or not named
@@ -1683,7 +1680,10 @@ class StitchPage(QtWidgets.QWidget):
             return  # a Run or Live keeps the shape it started with
         root = Path(project).expanduser() if project else Path(named).expanduser().parent
         try:
-            shape = rsm_calibration_raw_frame(named, project_root=root)
+            shape = stitch_calibration_raw_frame(
+                named, project_root=root, xu=self._value("backend") == "xrayutilities histogram",
+                rotation=self._image_orientation().rotation,
+            )
         except (OSError, ValueError, TypeError):
             return
         try:
@@ -1929,6 +1929,7 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("camera", CAMERAS[0])
         self.set_field("q_max", "5.2" if xu else "6.2")
         self._refresh_xu_geometry()
+        self._follow_calibration_shape()
         self._sync_goniometer_mapping()
         self._sync_actions()
 
@@ -2382,6 +2383,7 @@ class StitchPage(QtWidgets.QWidget):
     def begin_preview(self):
         if self._live_watcher.busy:
             return
+        self._commit_typing()
         self._follow_calibration_shape()
         self._prepare("Preparing Preview…", then="preview")
 
@@ -3100,7 +3102,6 @@ class StitchPage(QtWidgets.QWidget):
             return
         self.set_field("geometry_kind", "Goniometer JSON")
         self.set_field("geometry_path", path)
-        self._follow_calibration_shape()  # the row may already hold this name (the partner saved beside it)
         dialog = self._calibration_dialog
         if dialog is not None:  # the fit's own instrument and motors, as saved with it
             from xrd_tools.session.instrument import InstrumentGeometry
@@ -3118,6 +3119,7 @@ class StitchPage(QtWidgets.QWidget):
             self.set_field("camera", camera_text(ImageOrientation(rotation=dialog.saved_image_rotation,
                                                                   flip_horizontal=dialog.saved_image_flip)))
             self._refresh_xu_geometry()
+        self._follow_calibration_shape()  # the name may be unchanged, and a saved fit can change the camera
 
     def _image_orientation(self):
         """The camera's turn and mirror into Stitch's frame (none while it is blank or malformed)."""
@@ -3132,6 +3134,8 @@ class StitchPage(QtWidgets.QWidget):
         from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
+        self._commit_typing()
+        self._follow_calibration_shape()
         try:
             source = self._source_spec_for_tools()
             dialog = MaskDialog(str(self._value("project_root")), source=source,
@@ -3804,6 +3808,7 @@ class StitchPage(QtWidgets.QWidget):
         from xrd_tools.notebooks.workflow import WorkflowRecipe
         from xrd_tools.notebooks.operation_replay import capture_stitch_form
         self._commit_typing()
+        self._follow_calibration_shape()
         return WorkflowRecipe("stitch", capture_stitch_form(self.build_form()))
 
     def _install_diagnostic_option(self):

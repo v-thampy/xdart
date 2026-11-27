@@ -300,3 +300,36 @@ def test_raw_rows_columns_follow_a_calibration_chosen_and_one_saved_from_the_win
         assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
     finally:
         _close(page, qapp)
+
+
+def test_rsm_restores_the_raw_decoder_from_the_calibration_after_stale_settings(qapp, tmp_path):
+    locator = _pilatus_raw_source(tmp_path, partner=True)
+    page = _page(qapp)
+    try:
+        _on_raw_source(page, qapp, tmp_path, locator)
+        settings = page.settings()
+        settings["fields"].update(adv_rows="512", adv_columns="1028")
+        page.apply_settings(settings)
+        assert (page._value("adv_rows"), page._value("adv_columns")) == ("195", "487")
+    finally:
+        _close(page, qapp)
+
+
+def test_legacy_saved_pyfai_rotation_matches_its_later_partner(tmp_path):
+    from tests.core.test_turned_detector import _rough
+    from xrd_tools.analysis.rsm_geometry_asset import rsm_calibration_raw_frame
+    from xrd_tools.integrate.stitch_calibration import CalibrationFit, save_calibration_pair
+
+    path = tmp_path / "old.json"
+    fit = CalibrationFit("multigeometry", {
+        "calibration": _rough("Pilatus100k"),
+        "provenance": {"source_motors": {"del_angle": "del", "nu_angle": "nu"},
+                       "image_rotation": 270},
+    }, 0., 1., 40, "synthetic fit")
+    saved = save_calibration_pair(fit, path, validation_angles=[(0., 0.), (12., 0.), (25., 4.)])
+    assert saved.xu_path is not None, saved.xu_refusal
+    partner = Path(saved.xu_path)
+    expected = rsm_calibration_raw_frame(path, project_root=tmp_path)
+    assert expected == (487, 195)
+    partner.rename(tmp_path / "pending.json")
+    assert rsm_calibration_raw_frame(path, project_root=tmp_path) == expected

@@ -96,6 +96,7 @@ def apply_page_settings(page, document: Any) -> None:
         page._set_calibration_settings(document["calibration"])
     restore_write_mode(page, document)
     page._live_preview.apply_settings(preview_enabled)
+    page._follow_calibration_shape()
     page._set_format_choice(conflict)  # and page._edited(), as before
 
 

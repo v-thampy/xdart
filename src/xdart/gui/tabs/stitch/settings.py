@@ -121,6 +121,7 @@ def apply_page_settings(page, document: Any) -> None:
     # As after load_form: the XU asset owns some fields, now that its paths are back.
     page._sync_advanced()
     page._refresh_xu_geometry()
+    page._follow_calibration_shape()
     page._render_gi()
     from xdart.gui.tabs.stitch.page import _LEGACY_AXES
     for key in ("unit", "map_axis"):  # Grazing's axes exist once Grazing is back

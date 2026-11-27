@@ -9,12 +9,12 @@
   headerless RAW frames were refused ("raw detector layout does not match
   the exact file size"), and changing the detector in Calibrate did not
   change them. Rows/Columns now take the shape the calibration was made
-  for when a calibration is chosen or saved, and again when Preview, Run or
-  Live starts, so a calibration saved again under the same name is read
-  too. An Eiger or NeXus file still sets its own shape once its scans are
-  found, and Preview still refuses images that do not match the
-  calibration. Nothing changes while a Run or Live is in progress, or
-  while the calibration cannot be read (for example a PONI file in Stitch).
+  for when a calibration is chosen, saved or restored, and again before
+  Preview, Run, Live or Make Mask. Eiger and NeXus readers use the shape
+  recorded in the file. RSM also shows that shape after finding the scans.
+  Preview still checks the image shape against the calibration. The RAW
+  fields stay fixed during a Run or Live, and keep their current values
+  when the calibration provides no shape, as with Stitch's PONI inputs.
 
 ## 1.2.20 (2026-11-27)
 

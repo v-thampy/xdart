@@ -1367,8 +1367,7 @@ class RSMPage(QtWidgets.QWidget):
             return  # a Run, Live or search keeps the shape it started with
         try:
             root = Path(project).expanduser()
-            shape = rsm_calibration_raw_frame(self._calibration_locator(root), project_root=root,
-                                              refinement=bool(self._value("refinement")))
+            shape = rsm_calibration_raw_frame(self._calibration_locator(root), project_root=root)
         except (OSError, ValueError, TypeError):
             return
         try:
@@ -2034,6 +2033,8 @@ class RSMPage(QtWidgets.QWidget):
         from xdart.gui.tabs.calibration.mask import MaskDialog
         if self._owner.busy or self._closing or self._authoring_active():
             return
+        self._commit_typing()
+        self._follow_calibration_shape()
         try:
             dialog = MaskDialog(str(self._value("project_root")), source=self._source_spec_for_tools(), rotation=0,
                                 reader_options=dict(self._reader_options(), rotation=0), parent=self)

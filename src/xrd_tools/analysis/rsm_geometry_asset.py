@@ -1374,57 +1374,92 @@ def rsm_calibration_detector(receipt) -> str | None:
 
 
 def rsm_calibration_raw_frame(
-    locator: str | Path,
-    *,
-    project_root: str | Path,
-    refinement: bool = True,
+    locator: str | Path, *, project_root: str | Path,
 ) -> tuple[int, int] | None:
-    """The stored images' shape (rows, columns) a calibration was made for, or None when it records none.
+    """RSM's RAW decoder follows its XU partner, with the pyFAI record as a fallback before transfer."""
+    from xrd_tools.integrate.stitch_calibration import xu_partner_path
 
-    The xrayutilities partner's raw frame comes first: Preview checks every scan against this shape
-    (``lower_rsm_effective_geometry``). Before the partner is saved, the pyFAI file's own detector is used: its
-    ``detector_config`` ``max_shape``, transposed back by a recorded quarter turn, or else a named model's shape.
-    The page's Advanced Rows/Columns follow it, because headerless RAW records no shape. The maintainer,
-    2026-11-27, after an Eiger's 512×1028 stayed for Pilatus 100K RAW frames: "i thought the rows and columns were
-    supposed to update automatically based on the detector and images". Preview still refuses images that differ.
-    Reads two small files and no pixels."""
+    root = Path(project_root).expanduser()
+    named = root / Path(locator).expanduser()
+    partner = named if named.stem.endswith(".xu") else xu_partner_path(named)
+    return _xu_record_raw_frame(partner, root) or _pyfai_record_raw_frame(named)
+
+
+def stitch_calibration_raw_frame(
+    path: str | Path, *, project_root: str | Path, xu: bool, rotation: int,
+) -> tuple[int, int] | None:
+    """Use the calibration and camera that the selected Stitch backend will read."""
+    from xrd_tools.integrate.stitch_calibration import xu_calibration_path
+
+    named = Path(os.path.abspath(Path(path).expanduser()))  # as the Stitch form resolves Calibration
+    if xu:
+        try:
+            partner = xu_calibration_path(named, project_root)
+        except (OSError, ValueError):
+            pass
+        else:
+            shape = _xu_record_raw_frame(partner, project_root)
+            if shape is not None:
+                return shape
+    return _pyfai_record_raw_frame(named, rotation=None if xu else rotation)
+
+
+def _xu_record_raw_frame(path, project_root):
+    from xrd_tools.analysis.xu_stitch_calibration import XuStitchCalibrationInput, capture_xu_stitch_calibration
+
     try:
-        header = lower_rsm_effective_geometry(capture_rsm_calibration_geometry(
-            locator, project_root=project_root, refinement=refinement)).detector_header
-        return int(header.Nch1), int(header.Nch2)
-    except (RSMGeometryAssetRefused, ImportError, OSError, ValueError, TypeError, KeyError):
-        pass  # no partner yet, or one this install cannot read
-    return _pyfai_record_raw_frame(Path(project_root).expanduser() / Path(locator).expanduser())
+        value = capture_xu_stitch_calibration(
+            XuStitchCalibrationInput(path), project_root=project_root,
+        ).projection.value
+        rows, columns = value["detector"]["shape"]
+        if _partner_orientation(value["acquisition"]).swaps_axes:
+            rows, columns = columns, rows
+        return (rows, columns) if min(rows, columns) >= 2 else None
+    except (ImportError, OSError, ValueError, TypeError):
+        return None
 
 
-def _pyfai_record_raw_frame(path: Path) -> tuple[int, int] | None:
-    """A pyFAI goniometer or PONI JSON's stored-image shape (``rsm_calibration_raw_frame``'s fallback), or None."""
+def _pyfai_record_raw_frame(path: Path, *, rotation: int | None = None) -> tuple[int, int] | None:
+    """Read the configured detector's frame and invert its recorded or selected camera turn."""
     from xrd_tools.core.geometry.stacked_arm import TURNED_DETECTOR_KEY, checked_turned_detector
 
     try:
         if path.suffix.lower() != ".json" or path.stat().st_size > 1 << 20:
             return None
         record = json.loads(path.read_text(encoding="utf-8"))
-        turned = checked_turned_detector(record.get(TURNED_DETECTOR_KEY)) if isinstance(record, Mapping) else None
-    except (OSError, ValueError):
-        return None
-    if not isinstance(record, Mapping):
-        return None
-    config = record.get("detector_config")
-    if isinstance(config, Mapping) and config.get("max_shape") is not None:
-        # the record's frame: a quarter-turned one is the stored images transposed
-        shape, transposed = config["max_shape"], turned is not None
-    else:
-        from xrd_tools.io.image import resolve_detector_shape
+        if not isinstance(record, Mapping):
+            return None
+        name, config = record.get("detector"), record.get("detector_config", {})
+        if (not isinstance(name, str) or not name.strip() or any(mark in name for mark in ("\0", "/", "\\", ":"))
+                or Path(name).is_file() or not isinstance(config, dict)):
+            return None
+        turned = checked_turned_detector(record.get(TURNED_DETECTOR_KEY))
+        from pyFAI.detectors import detector_factory
 
-        name = turned["detector"] if turned is not None else record.get("detector")
-        shape = resolve_detector_shape(name) if isinstance(name, str) and name.strip() else None
-        transposed = False
-    try:
-        rows, columns = (int(value) for value in shape)
-    except (TypeError, ValueError):
+        config = {key: value for key, value in config.items() if key in {"binning", "orientation", "max_shape"}}
+        if "binning" in config:
+            binning = config["binning"]
+            if (not isinstance(binning, list) or len(binning) != 2
+                    or any(type(scale) is not int or scale <= 0 for scale in binning)):
+                return None
+        if "max_shape" in config:
+            config["max_shape"] = tuple(config["max_shape"])
+        rows, columns = (int(size) for size in detector_factory(name, config=config).shape)
+    except (ImportError, OSError, TypeError, ValueError, RuntimeError, ArithmeticError, LookupError):
         return None
-    if transposed:
+    if turned is not None:
+        rotation = turned["image_rotation"]
+    elif rotation is None:
+        # Old window saves recorded the camera in the sidecar, before the detector turn marker existed.
+        provenance = path.with_suffix(path.suffix + ".provenance.json")
+        try:
+            if provenance.stat().st_size <= 1 << 20:
+                value = json.loads(provenance.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    rotation = value.get("image_rotation")
+        except (OSError, ValueError):
+            pass
+    if rotation in (90, 270):
         rows, columns = columns, rows
     return (rows, columns) if min(rows, columns) >= 2 else None
 
