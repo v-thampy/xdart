@@ -163,7 +163,7 @@ def enumerate_processed_artifacts(
                 if cancelled is not None and cancelled.is_set():
                     return ()
                 child = Path(entry.path)
-                if _hidden(child.name):
+                if is_hidden_browser_name(child.name):
                     continue
                 try:
                     fact = entry.stat()
@@ -212,7 +212,7 @@ def enumerate_processed_artifacts(
     ))
 
 
-def _hidden(name: str) -> bool:
+def is_hidden_browser_name(name: str) -> bool:
     """A dot-named file or folder, never listed nor dated (maintainer, 2026-11-26: "ignore hidden files. Don't show
     them in the data browser either"). It covers a save's private ``.xdart-finite-*`` candidate while it is written,
     macOS ``._*`` twins on shares and ``.DS_Store``. Run inputs keep their own discovery rules."""
@@ -233,7 +233,7 @@ def _directory_modified_ns(
             for child in children:
                 if cancelled is not None and cancelled.is_set():
                     return own_mtime_ns, False
-                if _hidden(child.name):
+                if is_hidden_browser_name(child.name):
                     continue
                 try:
                     child_mtime_ns = int(
@@ -301,6 +301,7 @@ __all__ = [
     "DirectoryModifiedCache",
     "catalog_order_key",
     "enumerate_processed_artifacts",
+    "is_hidden_browser_name",
     "natural_name_key",
     "processed_directory",
 ]

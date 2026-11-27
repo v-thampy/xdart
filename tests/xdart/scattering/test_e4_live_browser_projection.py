@@ -882,6 +882,28 @@ def test_browser_projection_borrows_only_inflight_artifact_keys() -> None:
     assert index.scans == () and index.identifiers == frozenset()
 
 
+def test_a_dot_named_inflight_result_cannot_lend_a_browser_row(tmp_path: Path) -> None:
+    visible = tmp_path / "visible.nexus"
+    visible.write_bytes(b"catalog evidence")
+    frame = replace(_keys()[0], artifact=str(tmp_path / ".private.nexus"))
+    navigation = FrameNavigationProjection((frame,), frame, (frame,))
+
+    projected = build_browser_projection(
+        contexts=(),
+        selection=None,
+        navigation=navigation,
+        browser_directory=str(tmp_path),
+        date_sorted=False,
+        auto_last=True,
+        catalog=enumerate_processed_artifacts(str(tmp_path)),
+        transient_frame=frame,
+    )
+
+    assert tuple(scan.label for scan in projected.scans) == ("..", "visible.nexus")
+    assert projected.selected_scan == "" and projected.frames == ()
+    assert navigation.current is frame
+
+
 def test_catalog_directory_fact_reaches_exact_activation_command() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     navigation = FrameNavigationProjection()

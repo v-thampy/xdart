@@ -278,6 +278,41 @@ def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monk
 
 
 @pytest.mark.parametrize("kind", ("stitch", "rsm"))
+def test_a_loaded_dot_named_result_stays_out_of_the_native_browser(qapp, tmp_path, kind):
+    hidden = tmp_path / f".sample_{'stitch1d' if kind == 'stitch' else 'rsm'}.nexus"
+    visible = hidden.with_name(hidden.name[1:])
+    if kind == "stitch":
+        from tests.core.test_analysis_stitch_auxiliary import _publish
+
+        _publish(tmp_path, target=hidden)
+        page = StitchPage(empty_host_services(_Status()))
+        close = _close
+    else:
+        from tests.core.test_analysis_artifact import (
+            test_analysis_artifact_v2_rsm_round_trip_is_a_closed_exact_branch as write_record,
+        )
+        from tests.xdart.pages.test_rsm_page import _close as close, _page
+
+        write_record(tmp_path, False, target=hidden)
+        page = _page(qapp)
+    visible.write_bytes(hidden.read_bytes())
+    try:
+        page.browser.filename_filter.setText("*")
+        if kind == "stitch":
+            page.open_result(hidden)
+            _wait(page, qapp, catalog=True)
+        else:
+            from tests.xdart.pages.test_rsm_page import _wait as wait_rsm
+
+            assert page.reopen(hidden)
+            wait_rsm(page, qapp, lambda: not page.active() and not page._result_browser.busy)
+        assert str(hidden) in page._listed  # read and registered, even if absent from the visible selection cache
+        assert page.browser.listed_results() == (str(visible),)
+    finally:
+        close(page, qapp)
+
+
+@pytest.mark.parametrize("kind", ("stitch", "rsm"))
 def test_native_browser_filename_filter_refresh_navigation_and_time(qapp, tmp_path, kind):
     from xdart.gui.tabs.rsm.page import RSMPage
     page = (StitchPage if kind == "stitch" else RSMPage)(empty_host_services(_Status()))

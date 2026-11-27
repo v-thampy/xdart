@@ -12,7 +12,7 @@ from xdart.gui.themes.spacing import current_spacing_tokens
 from xdart.utils.throttle import Coalescer
 from xrd_tools.core.filters import GRAMMAR_HELP, compile_filter
 
-from .browser_catalog import BrowserCatalogEntry
+from .browser_catalog import BrowserCatalogEntry, is_hidden_browser_name
 from .browser_model import FrameListModel
 from .display_values import DisplayFrameKey
 from .shell_values import (
@@ -524,13 +524,14 @@ class ResultDirectoryBrowser(QtCore.QObject):
     def entries(self, loaded):
         catalog = self._owner.catalog
         known = {entry.artifact for entry in catalog}
-        # A loaded result not yet catalogued stays visible without a filesystem read. It was just written or
-        # opened, so it sorts as the newest until the next catalog supplies its timestamp: Time order then
-        # moves no row when it lands (it listed last, then jumped to the top).
+        # A visible loaded result can supply its row without a filesystem read. It was just written or opened,
+        # so it sorts as newest until the catalog supplies its timestamp, without a later jump in Time order.
         now = time.time_ns()
-        catalog += tuple(BrowserCatalogEntry(path, os.path.basename(path), now) for path in loaded
-                         if path not in known and (not self._active
-                         or os.path.dirname(os.path.abspath(path)) == self.directory))
+        catalog += tuple(
+            BrowserCatalogEntry(path, os.path.basename(path), now) for path in loaded
+            if path not in known and not is_hidden_browser_name(os.path.basename(path))
+            and (not self._active or os.path.dirname(os.path.abspath(path)) == self.directory)
+        )
         index = build_browser_scan_index(catalog, self._owner.date_sorted)
         if self._active and not self._owner.date_sorted:
             from .browser_catalog import catalog_order_key

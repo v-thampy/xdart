@@ -11,7 +11,7 @@ from xdart.modules.display_context import (
     BrowseContext,
     DisplaySelection,
 )
-from .browser_catalog import BrowserCatalogEntry
+from .browser_catalog import BrowserCatalogEntry, is_hidden_browser_name
 from .display_values import (
     DisplayFrameKey,
     StandardDisplayPayload,
@@ -125,6 +125,7 @@ def build_browser_projection(
             or transient_owner is None
             or frame.run_identity is not transient_owner.run_identity
             or frame.artifact != transient_owner.artifact
+            or is_hidden_browser_name(os.path.basename(frame.artifact))
             or (
                 browser_directory
                 and normcase(os.path.abspath(os.path.dirname(frame.artifact)))
