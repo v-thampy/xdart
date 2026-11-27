@@ -232,6 +232,19 @@ def _held_catalog(monkeypatch):
     return entered, release
 
 
+def _wait_for_catalog(bridge, qapp):
+    deadline = time.monotonic() + 10
+    while True:
+        while bridge.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.005)
+        qapp.processEvents()
+        # The final pump can deliver an idle catalog poll that starts another read.
+        if not bridge.busy or time.monotonic() >= deadline:
+            break
+    assert not bridge.busy
+
+
 def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monkeypatch):
     """Stitch's and RSM's shared bridge: a loaded result the folder catalog has not read yet (or never will) is listed
     where the catalog lists it, so no row moves when the catalog lands; with no folder nothing lands (arrival order)."""
@@ -257,12 +270,7 @@ def test_results_not_yet_catalogued_take_the_catalogs_place(qapp, tmp_path, monk
             pending = bridge.entries(loaded)
         assert [Path(entry.identifier).stem for entry in pending] == folder_order
         release.set()
-        deadline = time.monotonic() + 10
-        while bridge.busy and time.monotonic() < deadline:
-            qapp.processEvents()
-            time.sleep(.005)
-        qapp.processEvents()
-        assert not bridge.busy
+        _wait_for_catalog(bridge, qapp)
         assert [entry.label for entry in bridge.entries(loaded)] == [
             "..", "combined.nexus", "missing.nexus", "scan1.nexus", "scan02.nexus", "scan2.nexus", "scan5/",
             "scan10.nexus"]
@@ -380,23 +388,16 @@ def test_a_result_not_yet_catalogued_lists_as_the_newest_in_time_order(qapp, tmp
     browser = BrowserView()
     bridge = ResultDirectoryBrowser(browser, processing_mode="Stitch 1D")
 
-    def settle():
-        deadline = time.monotonic() + 10
-        while bridge.busy and time.monotonic() < deadline:
-            qapp.processEvents()
-            time.sleep(.005)
-        qapp.processEvents()
-        assert not bridge.busy
     try:
         bridge.set_directory(str(tmp_path))
-        settle()
+        _wait_for_catalog(bridge, qapp)
         bridge.set_date_sorted(True)
-        settle()
+        _wait_for_catalog(bridge, qapp)
         written = tmp_path / "c_stitch1d.nexus"
         written.write_bytes(b"catalog only")
         pending = [entry.label for entry in bridge.entries([str(written)])]
         bridge.refresh()
-        settle()
+        _wait_for_catalog(bridge, qapp)
         assert pending == [entry.label for entry in bridge.entries([str(written)])] == [
             "..", "c_stitch1d.nexus", "b_stitch1d.nexus", "a_stitch1d.nexus"]
     finally:
