@@ -4,6 +4,15 @@
 
 ### Fixes
 
+- **RSM and Stitch preview SPEC scans on a Windows share while a scan
+  records:** on Windows, Preview and Run refused a finished scan
+  ("SOURCE_REVISION_CHANGED: SPEC source could not be admitted") whenever
+  the beamline was still appending a later scan to the same SPEC file on a
+  network share. Windows reports a shared file's size from a cache that
+  can be several seconds old, and xdart compared it with the file as it
+  was read. On Windows the check now confirms only that the name still
+  leads to the same file; the scan's own lines are still checked, so a
+  rewritten or replaced scan still refuses.
 - **RSM and Stitch Rows/Columns follow the calibration's detector:** when
   Advanced Rows/Columns were left from another detector (an Eiger, say),
   headerless RAW frames were refused ("raw detector layout does not match
